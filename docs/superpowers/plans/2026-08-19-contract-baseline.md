@@ -50,6 +50,7 @@
 ### Task 1: Package and module skeleton
 
 **Files:**
+
 - Create: `package.json`
 - Create: `tsconfig.json`
 - Create: `tsconfig.build.json`
@@ -72,6 +73,7 @@
 - Test: `test/package-metadata.test.ts`
 
 **Interfaces:**
+
 - Consumes: no earlier task.
 - Produces: `PACKAGE_NAME`, `PACKAGE_VERSION`, `PROTOCOL_VERSION`, and `UnavailableCapabilityError` for all later tasks.
 
@@ -89,7 +91,16 @@ Use this package contract and then run the exact install commands:
   "exports": {
     ".": { "types": "./dist/src/index.d.ts", "import": "./dist/src/index.js" }
   },
-  "files": ["bin", "dist", "contracts", "docs/contracts", "examples", "README.md", "CHANGELOG.md", "LICENSE"],
+  "files": [
+    "bin",
+    "dist",
+    "contracts",
+    "docs/contracts",
+    "examples",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
   "engines": { "node": ">=22.23.0 <25" },
   "os": ["darwin", "linux"],
   "scripts": {
@@ -180,11 +191,13 @@ git commit -m "chore: bootstrap runtime package boundaries"
 ### Task 2: Safe JSON, canonicalization, and hashing
 
 **Files:**
+
 - Create: `src/protocol/json.ts`
 - Create: `src/protocol/errors.ts`
 - Test: `test/protocol-json.test.ts`
 
 **Interfaces:**
+
 - Consumes: Node `crypto`, `jsonc-parser`, and the package error conventions.
 - Produces: `parseJsonBytes(input, limits)`, `assertPlainJson(value)`, `canonicalJson(value)`, `sha256(value)`, and `deepFreezeJson(value)`.
 
@@ -207,7 +220,13 @@ describe("protocol JSON", () => {
 
   it("rejects accessors without invoking them", () => {
     let invoked = false;
-    const value = Object.defineProperty({}, "secret", { enumerable: true, get() { invoked = true; return "x"; } });
+    const value = Object.defineProperty({}, "secret", {
+      enumerable: true,
+      get() {
+        invoked = true;
+        return "x";
+      },
+    });
     expect(() => canonicalJson(value)).toThrow(/accessor/i);
     expect(invoked).toBe(false);
   });
@@ -236,9 +255,18 @@ accessor descriptors.
 
 ```ts
 export type JsonPrimitive = null | boolean | number | string;
-export type JsonValue = JsonPrimitive | readonly JsonValue[] | { readonly [key: string]: JsonValue };
-export interface JsonLimits { readonly maxBytes: number; readonly maxDepth: number; readonly maxMembers: number; }
-export const DEFAULT_JSON_LIMITS: JsonLimits = { maxBytes: 2 * 1024 * 1024, maxDepth: 64, maxMembers: 10_000 };
+export type JsonValue =
+  JsonPrimitive | readonly JsonValue[] | { readonly [key: string]: JsonValue };
+export interface JsonLimits {
+  readonly maxBytes: number;
+  readonly maxDepth: number;
+  readonly maxMembers: number;
+}
+export const DEFAULT_JSON_LIMITS: JsonLimits = {
+  maxBytes: 2 * 1024 * 1024,
+  maxDepth: 64,
+  maxMembers: 10_000,
+};
 
 export function parseJsonBytes(input: string | Uint8Array, limits = DEFAULT_JSON_LIMITS): JsonValue;
 export function assertPlainJson(value: unknown, limits?: JsonLimits): asserts value is JsonValue;
@@ -271,12 +299,14 @@ git commit -m "feat: add safe canonical protocol JSON"
 ### Task 3: Common schema registry and typed validation
 
 **Files:**
+
 - Create: `contracts/runtime/runtime-common.v1.schema.json`
 - Create: `src/protocol/types.ts`
 - Create: `src/protocol/validator.ts`
 - Test: `test/protocol-validator.test.ts`
 
 **Interfaces:**
+
 - Consumes: `parseJsonBytes`, `deepFreezeJson`, Ajv 2020, and ajv-formats.
 - Produces: `RuntimeDocument`, `ArtifactReference`, `RuntimeError`, `ValidationFailure`, `createProtocolValidator()`, and `parseRuntimeDocument(input, expectedType)`.
 
@@ -289,10 +319,20 @@ import { createProtocolValidator } from "../src/protocol/validator.js";
 describe("runtime common schema", () => {
   it("accepts exact artifact references and rejects unknown fields", () => {
     const validator = createProtocolValidator();
-    const valid = { document_type: "task-contract", artifact_id: "TASK-001", revision: 1,
-      hash: `sha256:${"a".repeat(64)}`, location: "project-management/tasks/TASK-001.json" };
-    expect(validator.validateFragment("artifact-reference", valid)).toEqual({ ok: true, value: valid });
-    expect(validator.validateFragment("artifact-reference", { ...valid, accepted: true })).toMatchObject({ ok: false });
+    const valid = {
+      document_type: "task-contract",
+      artifact_id: "TASK-001",
+      revision: 1,
+      hash: `sha256:${"a".repeat(64)}`,
+      location: "project-management/tasks/TASK-001.json",
+    };
+    expect(validator.validateFragment("artifact-reference", valid)).toEqual({
+      ok: true,
+      value: valid,
+    });
+    expect(
+      validator.validateFragment("artifact-reference", { ...valid, accepted: true }),
+    ).toMatchObject({ ok: false });
   });
 });
 ```
@@ -322,8 +362,14 @@ export type ValidationSuccess<T> = Readonly<{ ok: true; value: T }>;
 export type ValidationResult<T> = ValidationSuccess<T> | ValidationFailure;
 
 export interface ProtocolValidator {
-  validateFragment(name: "artifact-reference" | "runtime-error" | "trace-context", value: unknown): ValidationResult<unknown>;
-  parse<T extends RuntimeDocument>(input: string | Uint8Array, expectedType: T["document_type"]): ValidationResult<T>;
+  validateFragment(
+    name: "artifact-reference" | "runtime-error" | "trace-context",
+    value: unknown,
+  ): ValidationResult<unknown>;
+  parse<T extends RuntimeDocument>(
+    input: string | Uint8Array,
+    expectedType: T["document_type"],
+  ): ValidationResult<T>;
 }
 ```
 
@@ -351,6 +397,7 @@ git commit -m "feat: define runtime common contract validation"
 ### Task 4: Execution request contract and semantic checks
 
 **Files:**
+
 - Create: `contracts/runtime/execution-request.v1.schema.json`
 - Create: `src/protocol/request.ts`
 - Create: `test/fixtures/protocol/valid/execution-request.v1.json`
@@ -359,6 +406,7 @@ git commit -m "feat: define runtime common contract validation"
 - Test: `test/execution-request.test.ts`
 
 **Interfaces:**
+
 - Consumes: the common schema registry and canonical hash functions.
 - Produces: `ExecutionRequestV1`, `parseExecutionRequest(input)`, and `hashExecutionRequest(request)`.
 
@@ -448,6 +496,7 @@ git commit -m "feat: publish execution request v1 contract"
 ### Task 5: Event, result, and capability contracts
 
 **Files:**
+
 - Create: `contracts/runtime/execution-event.v1.schema.json`
 - Create: `contracts/runtime/execution-result.v1.schema.json`
 - Create: `contracts/runtime/runtime-capabilities.v1.schema.json`
@@ -460,6 +509,7 @@ git commit -m "feat: publish execution request v1 contract"
 - Test: `test/execution-chain.test.ts`
 
 **Interfaces:**
+
 - Consumes: request hash, common types, schema registry, and package metadata.
 - Produces: `ExecutionEventV1`, `ExecutionResultV1`, `RuntimeCapabilitiesV1`, their parsers, `hashExecutionEvent(eventWithoutHash)`, `createBaselineCapabilities(platform)`, and `negotiateRequest(request, capabilities)`.
 
@@ -564,6 +614,7 @@ git commit -m "feat: complete runtime contract protocol v1"
 ### Task 6: Closed configuration and secret references
 
 **Files:**
+
 - Create: `contracts/runtime/runtime-config.v1.schema.json`
 - Create: `src/config/types.ts`
 - Create: `src/config/load.ts`
@@ -572,6 +623,7 @@ git commit -m "feat: complete runtime contract protocol v1"
 - Test: `test/config.test.ts`
 
 **Interfaces:**
+
 - Consumes: safe JSON/YAML parsing, protocol validator conventions, and platform facts.
 - Produces: `RuntimeConfigV1`, `SecretReference`, `defaultConfig(platform, home)`, and `loadConfig({ explicitPath, env, platform, home })`.
 
@@ -583,14 +635,24 @@ import { loadConfig } from "../src/config/load.js";
 
 describe("runtime configuration", () => {
   it("prefers an explicit path over the environment path", async () => {
-    const result = await loadConfig({ explicitPath: "/tmp/explicit.yaml",
-      env: { TOSS_RUNTIME_CONFIG: "/tmp/env.yaml" }, platform: "linux", home: "/home/test" });
+    const result = await loadConfig({
+      explicitPath: "/tmp/explicit.yaml",
+      env: { TOSS_RUNTIME_CONFIG: "/tmp/env.yaml" },
+      platform: "linux",
+      home: "/home/test",
+    });
     expect(result.source).toBe("/tmp/explicit.yaml");
   });
 
   it("rejects inline secret material", async () => {
-    await expect(loadConfig({ explicitPath: "test/fixtures/config/inline-secret.yaml",
-      env: {}, platform: "linux", home: "/home/test" })).rejects.toMatchObject({ code: "RUNTIME_CONFIG_INVALID" });
+    await expect(
+      loadConfig({
+        explicitPath: "test/fixtures/config/inline-secret.yaml",
+        env: {},
+        platform: "linux",
+        home: "/home/test",
+      }),
+    ).rejects.toMatchObject({ code: "RUNTIME_CONFIG_INVALID" });
   });
 });
 ```
@@ -615,7 +677,11 @@ export interface RuntimeConfigV1 {
   readonly mode: "development" | "production";
   readonly paths: Readonly<{ state: string; logs: string; socket: string }>;
   readonly shutdown_timeout_ms: number;
-  readonly logs: Readonly<{ level: "debug" | "info" | "warn" | "error"; retention_days: 7; max_bytes: 104857600 }>;
+  readonly logs: Readonly<{
+    level: "debug" | "info" | "warn" | "error";
+    retention_days: 7;
+    max_bytes: 104857600;
+  }>;
   readonly gateway_profile: string | null;
   readonly provider_profiles: readonly string[];
   readonly mcp_profiles: readonly string[];
@@ -652,6 +718,7 @@ git commit -m "feat: add secure runtime configuration"
 ### Task 7: Stable CLI grammar and truthful commands
 
 **Files:**
+
 - Create: `contracts/runtime/command-result.v1.schema.json`
 - Create: `src/cli/grammar.ts`
 - Create: `src/cli/result.ts`
@@ -660,6 +727,7 @@ git commit -m "feat: add secure runtime configuration"
 - Test: `test/cli.test.ts`
 
 **Interfaces:**
+
 - Consumes: package metadata, `createBaselineCapabilities`, `loadConfig`, and stable validation errors.
 - Produces: `parseCli(argv)`, `runCli(argv, services)`, `CommandResultV1`, `renderHuman(result)`, and executable behavior.
 
@@ -671,14 +739,22 @@ import { runCli } from "../src/cli/main.js";
 
 describe("baseline CLI", () => {
   it("returns one versioned capabilities document in JSON mode", async () => {
-    const output = await runCli(["capabilities", "--json"], { platform: { os: "linux", arch: "x64", node: "22.23.1" } });
+    const output = await runCli(["capabilities", "--json"], {
+      platform: { os: "linux", arch: "x64", node: "22.23.1" },
+    });
     expect(output.exitCode).toBe(0);
-    expect(JSON.parse(output.stdout)).toMatchObject({ schema_version: "command-result.v1", command: "capabilities", ok: true });
+    expect(JSON.parse(output.stdout)).toMatchObject({
+      schema_version: "command-result.v1",
+      command: "capabilities",
+      ok: true,
+    });
     expect(output.stderr).toBe("");
   });
 
   it("rejects credential-shaped options as usage errors", async () => {
-    const output = await runCli(["doctor", "--api-key", "secret"], { platform: { os: "linux", arch: "x64", node: "22.23.1" } });
+    const output = await runCli(["doctor", "--api-key", "secret"], {
+      platform: { os: "linux", arch: "x64", node: "22.23.1" },
+    });
     expect(output.exitCode).toBe(2);
     expect(output.stdout).not.toContain("secret");
     expect(output.stderr).not.toContain("secret");
@@ -746,6 +822,7 @@ git commit -m "feat: add truthful runtime baseline CLI"
 ### Task 8: Graceful daemon lifecycle shell
 
 **Files:**
+
 - Create: `src/platform/signals.ts`
 - Create: `src/service/lifecycle.ts`
 - Modify: `src/cli/main.ts`
@@ -753,6 +830,7 @@ git commit -m "feat: add truthful runtime baseline CLI"
 - Test: `test/serve-smoke.test.ts`
 
 **Interfaces:**
+
 - Consumes: validated config, CLI serve dispatch, and injected clock/signal adapters.
 - Produces: `runService(options)`, `ServiceController`, and deterministic signal shutdown.
 
@@ -787,7 +865,9 @@ Expected: FAIL because lifecycle and signal adapters do not exist.
 ```ts
 export interface ServiceController {
   readonly accepting: boolean;
-  stop(reason: "SIGINT" | "SIGTERM" | "requested"): Promise<Readonly<{ reason: string; forced: boolean }>>;
+  stop(
+    reason: "SIGINT" | "SIGTERM" | "requested",
+  ): Promise<Readonly<{ reason: string; forced: boolean }>>;
 }
 
 export async function runService(options: {
@@ -823,6 +903,7 @@ git commit -m "feat: add graceful runtime daemon lifecycle"
 ### Task 9: Protocol documentation, package integrity, and CI
 
 **Files:**
+
 - Create: `README.md`
 - Create: `LICENSE`
 - Create: `CHANGELOG.md`
@@ -839,6 +920,7 @@ git commit -m "feat: add graceful runtime daemon lifecycle"
 - Test: `test/documentation-integrity.test.ts`
 
 **Interfaces:**
+
 - Consumes: all wave-one schemas, fixtures, CLI, and package scripts.
 - Produces: normative published documentation, verified tarball contents, Node 22/24 CI, and a non-publishing release skeleton.
 
@@ -851,7 +933,12 @@ import { describe, expect, it } from "vitest";
 describe("published protocol documentation", () => {
   it("names every protocol document and the TOSS authority boundary", async () => {
     const text = await readFile("docs/contracts/runtime-contract-protocol-v1.md", "utf8");
-    for (const name of ["execution-request.v1", "execution-event.v1", "execution-result.v1", "runtime-capabilities.v1"]) {
+    for (const name of [
+      "execution-request.v1",
+      "execution-event.v1",
+      "execution-result.v1",
+      "runtime-capabilities.v1",
+    ]) {
       expect(text).toContain(name);
     }
     expect(text).toContain("Runtime output is execution evidence, not governance authority");
@@ -919,10 +1006,12 @@ git commit -m "docs: publish runtime protocol baseline"
 ### Task 10: Wave acceptance and issue evidence
 
 **Files:**
+
 - Create: `docs/verification/v1-wave-1.md`
 - Modify: `CHANGELOG.md`
 
 **Interfaces:**
+
 - Consumes: issues #2/#4 acceptance criteria and fresh verification output.
 - Produces: an exact commit-bound verification record used to close the first dependency wave after push/CI.
 
