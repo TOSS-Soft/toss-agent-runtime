@@ -1,12 +1,27 @@
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  chmod,
+  mkdir,
+  mkdtemp,
+  rm,
+  symlink,
+  truncate,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { defaultConfig, loadConfig, resolveDefaultConfigPath } from "../src/config/load.js";
+import {
+  defaultConfig,
+  loadConfig,
+  resolveDefaultConfigPath,
+  RuntimeConfigError,
+} from "../src/config/load.js";
 
 const temporaryDirectories: string[] = [];
+const RUNTIME_CONFIG_BYTE_CAP = 2 * 1024 * 1024;
 
 async function temporaryDirectory(): Promise<string> {
   const directory = await mkdtemp(path.join(tmpdir(), "toss-runtime-config-"));
@@ -40,6 +55,14 @@ function linuxConfigRoot(home: string): string {
 
 function linuxStateRoot(home: string): string {
   return path.join(home, ".local", "state", "toss", "runtime");
+}
+
+function validConfigWithSize(root: string, extension: "json" | "yaml" | "yml", size: number) {
+  const document =
+    extension === "json" ? JSON.stringify(defaultConfig("linux", root)) : validYaml(root);
+  const encoded = Buffer.from(document, "utf8");
+  if (encoded.byteLength > size) throw new Error("test fixture is larger than requested size");
+  return Buffer.concat([encoded, Buffer.alloc(size - encoded.byteLength, 0x20)]);
 }
 
 async function writeProductionConfig(
@@ -136,6 +159,110 @@ describe("runtime configuration", () => {
     await expect(
       loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home: root }),
     ).rejects.toMatchObject({ code: "RUNTIME_CONFIG_INVALID" });
+  });
+
+  it.each(["json", "yaml"] as const)(
+    "rejects an oversized sparse %s config before reading or parsing it",
+    async (extension) => {
+      const root = await temporaryDirectory();
+      const configPath = path.join(root, `oversized.${extension}`);
+      await writeFile(configPath, "", { mode: 0o600 });
+      await truncate(configPath, RUNTIME_CONFIG_BYTE_CAP + 1);
+
+      let error: unknown;
+      try {
+        await loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home: root });
+      } catch (caught) {
+        error = caught;
+      }
+
+      expect(error).toBeInstanceOf(RuntimeConfigError);
+      expect(error).toMatchObject({
+        code: "RUNTIME_CONFIG_INVALID",
+        message: "Configuration exceeds maximum supported size",
+      });
+      expect(String(error)).not.toContain(configPath);
+      expect(String(error)).not.toContain(String(RUNTIME_CONFIG_BYTE_CAP + 1));
+    },
+  );
+
+  it.each(["json", "yaml", "yml"] as const)(
+    "accepts an exact-cap %s config for parsing",
+    async (extension) => {
+      const root = await temporaryDirectory();
+      const configPath = path.join(root, `exact-cap.${extension}`);
+      await writeFile(configPath, validConfigWithSize(root, extension, RUNTIME_CONFIG_BYTE_CAP), {
+        mode: 0o600,
+      });
+
+      const loaded = await loadConfig({
+        explicitPath: configPath,
+        env: {},
+        platform: "linux",
+        home: root,
+      });
+
+      expect(loaded.source).toBe(configPath);
+      expect(loaded.config.schema_version).toBe("runtime-config.v1");
+    },
+  );
+
+  it.each(["json", "yaml"] as const)(
+    "rejects a %s config that grows beyond the cap after descriptor validation",
+    async (extension) => {
+      const root = await temporaryDirectory();
+      const configPath = path.join(root, `growing.${extension}`);
+      await writeFile(configPath, validConfigWithSize(root, extension, 1024), { mode: 0o600 });
+
+      let error: unknown;
+      try {
+        await loadConfig({
+          explicitPath: configPath,
+          env: {},
+          platform: "linux",
+          home: root,
+          beforeRead: async () => {
+            await appendFile(configPath, Buffer.alloc(RUNTIME_CONFIG_BYTE_CAP, 0x20));
+          },
+        });
+      } catch (caught) {
+        error = caught;
+      }
+
+      expect(error).toBeInstanceOf(RuntimeConfigError);
+      expect(error).toMatchObject({
+        code: "RUNTIME_CONFIG_INVALID",
+        message: "Configuration exceeds maximum supported size",
+      });
+      expect(String(error)).not.toContain(configPath);
+    },
+  );
+
+  it("normalizes a config before-read hook failure without reflecting its detail", async () => {
+    const root = await temporaryDirectory();
+    const configPath = path.join(root, "hook-failure.yaml");
+    await writeFile(configPath, validYaml(root), { mode: 0o600 });
+
+    let error: unknown;
+    try {
+      await loadConfig({
+        explicitPath: configPath,
+        env: {},
+        platform: "linux",
+        home: root,
+        beforeRead: () => Promise.reject(new Error(`must-not-persist at ${configPath}`)),
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(RuntimeConfigError);
+    expect(error).toMatchObject({
+      code: "RUNTIME_CONFIG_INVALID",
+      message: "Configuration could not be read safely",
+    });
+    expect(String(error)).not.toContain("must-not-persist");
+    expect(String(error)).not.toContain(configPath);
   });
 
   it("rejects a symlinked config file", async () => {

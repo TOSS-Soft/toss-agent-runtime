@@ -1,5 +1,5 @@
-import { constants } from "node:fs";
-import { lstat, open } from "node:fs/promises";
+import { constants, type Stats } from "node:fs";
+import { lstat, open, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 
 import Ajv2020Module from "ajv/dist/2020.js";
@@ -8,6 +8,7 @@ import { parseDocument } from "yaml";
 import configSchema from "../../contracts/runtime/runtime-config.v1.schema.json" with { type: "json" };
 import {
   assertPlainJson,
+  DEFAULT_JSON_LIMITS,
   deepFreezeJson,
   parseJsonBytes,
   type JsonValue,
@@ -28,6 +29,7 @@ const ajv = new Ajv2020({
   useDefaults: false,
 });
 const validateConfig = ajv.compile(configSchema);
+const MAX_RUNTIME_CONFIG_BYTES = DEFAULT_JSON_LIMITS.maxBytes;
 
 export class RuntimeConfigError extends Error {
   constructor(
@@ -168,6 +170,25 @@ function errorCode(error: unknown): string | undefined {
     : undefined;
 }
 
+function configSizeInvalid(): never {
+  throw new RuntimeConfigError(
+    "RUNTIME_CONFIG_INVALID",
+    "Configuration exceeds maximum supported size",
+  );
+}
+
+async function readBoundedConfig(handle: FileHandle): Promise<Buffer> {
+  const bytes = Buffer.allocUnsafe(MAX_RUNTIME_CONFIG_BYTES + 1);
+  let offset = 0;
+  while (offset < bytes.length) {
+    const result = await handle.read(bytes, offset, bytes.length - offset, offset);
+    if (result.bytesRead === 0) break;
+    offset += result.bytesRead;
+  }
+  if (offset > MAX_RUNTIME_CONFIG_BYTES) configSizeInvalid();
+  return bytes.subarray(0, offset);
+}
+
 function isWithin(root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);
   return (
@@ -293,6 +314,8 @@ export async function loadConfig(options: {
   readonly env: RuntimeEnvironment;
   readonly platform: RuntimePlatform;
   readonly home: string;
+  /** @internal Deterministic race hook used only by real-filesystem tests. */
+  readonly beforeRead?: () => Promise<void>;
 }): Promise<LoadedConfig> {
   const environmentPath = options.env.TOSS_RUNTIME_CONFIG;
   const selectedPath =
@@ -323,19 +346,36 @@ export async function loadConfig(options: {
     throw new RuntimeConfigError("RUNTIME_CONFIG_UNAVAILABLE", "Configuration file is unavailable");
   }
 
-  let metadata;
+  let metadata: Stats;
   let input: Buffer;
   try {
-    metadata = await handle.stat();
-    if (!metadata.isFile()) {
-      throw new RuntimeConfigError(
-        "RUNTIME_CONFIG_UNSAFE",
-        "Configuration must be a regular non-symlink file",
-      );
+    try {
+      metadata = await handle.stat();
+      if (!metadata.isFile()) {
+        throw new RuntimeConfigError(
+          "RUNTIME_CONFIG_UNSAFE",
+          "Configuration must be a regular non-symlink file",
+        );
+      }
+      if (metadata.size > MAX_RUNTIME_CONFIG_BYTES) configSizeInvalid();
+      try {
+        await options.beforeRead?.();
+      } catch {
+        throw new RuntimeConfigError(
+          "RUNTIME_CONFIG_INVALID",
+          "Configuration could not be read safely",
+        );
+      }
+      input = await readBoundedConfig(handle);
+    } finally {
+      await handle.close();
     }
-    input = await handle.readFile();
-  } finally {
-    await handle.close();
+  } catch (error) {
+    if (error instanceof RuntimeConfigError) throw error;
+    throw new RuntimeConfigError(
+      "RUNTIME_CONFIG_INVALID",
+      "Configuration could not be read safely",
+    );
   }
 
   let config: RuntimeConfigV1;

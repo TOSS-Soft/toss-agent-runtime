@@ -11,6 +11,15 @@ import { RuntimeServiceError, type RuntimeServiceErrorCode } from "../src/servic
 import { createServiceManager, type ServiceManagerStatus } from "../src/service/manager.js";
 
 const platform = { os: "linux" as const, arch: "x64", node: "22.23.1" };
+const RUNTIME_CONFIG_BYTE_CAP = 2 * 1024 * 1024;
+
+function oversizedValidYaml(root: string): Buffer {
+  const encoded = Buffer.from(JSON.stringify(defaultConfig("linux", root)), "utf8");
+  return Buffer.concat([
+    encoded,
+    Buffer.alloc(RUNTIME_CONFIG_BYTE_CAP + 1 - encoded.byteLength, 0x20),
+  ]);
+}
 
 const services = {
   platform,
@@ -335,6 +344,108 @@ describe("baseline CLI", () => {
       });
       expect(path.isAbsolute(managerOptions?.nodePath ?? "")).toBe(true);
       expect(path.isAbsolute(managerOptions?.cliPath ?? "")).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an oversized install config before creating or mutating a manager", async () => {
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-runtime-cli-config-")));
+    const configPath = path.join(root, "oversized.yaml");
+    const cliPath = path.join(root, "cli.js");
+    await writeFile(configPath, oversizedValidYaml(root), { mode: 0o600 });
+    await writeFile(cliPath, "", { mode: 0o600 });
+    let managerCreations = 0;
+    let managerMutations = 0;
+    try {
+      const mainServices = createMainServices({
+        platform,
+        env: {},
+        home: root,
+        signals: { subscribe: () => () => undefined },
+        pid: 4217,
+        now: () => new Date("2026-08-20T10:00:00.000Z"),
+        createServiceInstanceId: () => healthySocketStatus.service_instance_id,
+        resolveExecutableHash: () => Promise.resolve("a".repeat(64)),
+        sendReady: () => undefined,
+        cliPath,
+        uid: typeof process.getuid === "function" ? process.getuid() : 501,
+        createServiceManager: () => {
+          managerCreations += 1;
+          return {
+            install: () => {
+              managerMutations += 1;
+              return Promise.resolve(activeManagerStatus);
+            },
+            start: () => Promise.resolve(activeManagerStatus),
+            stop: () => Promise.resolve(activeManagerStatus),
+            restart: () => Promise.resolve(activeManagerStatus),
+            status: () => Promise.resolve(activeManagerStatus),
+            uninstall: () => Promise.resolve(absentManagerStatus),
+            installedConfigPath: () => Promise.resolve(configPath),
+          };
+        },
+      });
+
+      const output = await runCli(
+        ["service", "install", "--config", configPath, "--json"],
+        mainServices,
+      );
+
+      expect(output).toMatchObject({ exitCode: 5, stderr: "" });
+      expect(JSON.parse(output.stdout)).toMatchObject({
+        error: { code: "RUNTIME_CONFIG_INVALID" },
+      });
+      expect(output.stdout).not.toContain(configPath);
+      expect(output.stdout).not.toContain(String(RUNTIME_CONFIG_BYTE_CAP + 1));
+      expect(managerCreations).toBe(0);
+      expect(managerMutations).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an oversized serve config before supervisor startup", async () => {
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-runtime-cli-config-")));
+    const configPath = path.join(root, "oversized.yaml");
+    await writeFile(configPath, oversizedValidYaml(root), { mode: 0o600 });
+    let executableHashCalls = 0;
+    let signalSubscriptions = 0;
+    let readinessCalls = 0;
+    try {
+      const mainServices = createMainServices({
+        platform,
+        env: {},
+        home: root,
+        signals: {
+          subscribe: () => {
+            signalSubscriptions += 1;
+            return () => undefined;
+          },
+        },
+        pid: 4217,
+        now: () => new Date("2026-08-20T10:00:00.000Z"),
+        createServiceInstanceId: () => healthySocketStatus.service_instance_id,
+        resolveExecutableHash: () => {
+          executableHashCalls += 1;
+          return Promise.reject(new Error("must-not-persist after config load"));
+        },
+        sendReady: () => {
+          readinessCalls += 1;
+        },
+      });
+
+      const output = await runCli(["serve", "--config", configPath, "--json"], mainServices);
+
+      expect(output).toMatchObject({ exitCode: 5, stderr: "" });
+      expect(JSON.parse(output.stdout)).toMatchObject({
+        error: { code: "RUNTIME_CONFIG_INVALID" },
+      });
+      expect(output.stdout).not.toContain(configPath);
+      expect(output.stdout).not.toContain("must-not-persist");
+      expect(executableHashCalls).toBe(0);
+      expect(signalSubscriptions).toBe(0);
+      expect(readinessCalls).toBe(0);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
