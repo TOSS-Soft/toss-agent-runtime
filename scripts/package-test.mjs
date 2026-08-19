@@ -1,9 +1,10 @@
 import { execFile as execFileCallback, spawn } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
+import { lstat, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import net from "node:net";
 import path from "node:path";
 import { promisify } from "node:util";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const execFile = promisify(execFileCallback);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -27,12 +28,33 @@ const REQUIRED_FILES = Object.freeze([
   "contracts/runtime/service-control-request.v1.schema.json",
   "contracts/runtime/service-control-response.v1.schema.json",
   "contracts/runtime/service-lock.v1.schema.json",
+  "dist/contracts/runtime/service-control-request.v1.schema.json",
+  "dist/contracts/runtime/service-control-response.v1.schema.json",
+  "dist/contracts/runtime/service-lock.v1.schema.json",
   "dist/src/index.d.ts",
   "dist/src/index.js",
+  "dist/src/platform/commands.d.ts",
+  "dist/src/platform/commands.js",
   "dist/src/service/contracts.d.ts",
   "dist/src/service/contracts.js",
+  "dist/src/service/control.d.ts",
+  "dist/src/service/control.js",
+  "dist/src/service/definition-store.d.ts",
+  "dist/src/service/definition-store.js",
+  "dist/src/service/definition.d.ts",
+  "dist/src/service/definition.js",
   "dist/src/service/errors.d.ts",
   "dist/src/service/errors.js",
+  "dist/src/service/instance-lock.d.ts",
+  "dist/src/service/instance-lock.js",
+  "dist/src/service/lifecycle.d.ts",
+  "dist/src/service/lifecycle.js",
+  "dist/src/service/manager.d.ts",
+  "dist/src/service/manager.js",
+  "dist/src/service/paths.d.ts",
+  "dist/src/service/paths.js",
+  "dist/src/service/supervisor.d.ts",
+  "dist/src/service/supervisor.js",
   "docs/contracts/runtime-contract-protocol-v1.md",
   "docs/contracts/runtime-contract-v1.manifest.json",
   "docs/contracts/toss-cli-v2.2-compatibility.md",
@@ -93,54 +115,348 @@ function assertPackageFiles(files) {
   }
 }
 
-async function assertExecutableSignalShutdown(executable, configPath, signal) {
-  const child = spawn(executable, ["serve", "--json", "--config", configPath], {
+const PROCESS_TIMEOUT_MS = 10_000;
+const CONTROL_TIMEOUT_MS = 5_000;
+const activeServes = new Set();
+
+function parseCanonicalDocument(output, canonicalJson, label) {
+  assert(output.endsWith("\n"), `${label} did not end with one newline`);
+  const lines = output.split("\n");
+  assert(
+    lines.length === 2 && lines[0].length > 0 && lines[1] === "",
+    `${label} was not one JSON document`,
+  );
+  const document = JSON.parse(lines[0]);
+  assert(output === `${canonicalJson(document)}\n`, `${label} was not canonical JSON`);
+  return document;
+}
+
+function startInstalledServe(executable, configPath) {
+  const child = spawn(process.execPath, [executable, "serve", "--json", "--config", configPath], {
     cwd: path.dirname(configPath),
+    shell: false,
     stdio: ["ignore", "pipe", "pipe", "ipc"],
   });
-  let stdout = "";
-  let stderr = "";
+  const run = {
+    child,
+    stdout: "",
+    stderr: "",
+    closed: false,
+    spawnError: undefined,
+    exit: undefined,
+  };
+  activeServes.add(run);
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
   child.stdout.on("data", (chunk) => {
-    stdout += chunk;
+    run.stdout += chunk;
   });
   child.stderr.on("data", (chunk) => {
-    stderr += chunk;
+    run.stderr += chunk;
   });
+  child.once("error", (error) => {
+    run.spawnError = error;
+  });
+  run.exit = new Promise((resolve) => {
+    child.once("close", (code, signal) => {
+      run.closed = true;
+      activeServes.delete(run);
+      resolve({ code, signal });
+    });
+  });
+  return run;
+}
 
-  const outcome = await new Promise((resolve, reject) => {
-    const forceTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
-    let ready = false;
-    child.once("message", (message) => {
+function waitForReadiness(run) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("Installed serve did not announce readiness before the timeout"));
+    }, PROCESS_TIMEOUT_MS);
+    const onMessage = (message) => {
       if (message?.type !== "toss-runtime-ready") return;
-      ready = true;
-      child.kill(signal);
-    });
-    child.once("error", (error) => {
-      clearTimeout(forceTimer);
-      reject(error);
-    });
-    child.once("close", (code, closeSignal) => {
-      clearTimeout(forceTimer);
-      resolve({ code, signal: closeSignal, ready });
-    });
+      cleanup();
+      resolve();
+    };
+    const onClose = (code, signal) => {
+      cleanup();
+      reject(
+        new Error(
+          `Installed serve exited before readiness: ${JSON.stringify({ code, signal })}; stdout=${JSON.stringify(run.stdout)}; stderr=${JSON.stringify(run.stderr)}`,
+        ),
+      );
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      run.child.off("message", onMessage);
+      run.child.off("close", onClose);
+    };
+    run.child.on("message", onMessage);
+    run.child.once("close", onClose);
   });
+}
 
+async function waitForExit(run, label) {
+  let timer;
+  try {
+    return await Promise.race([
+      run.exit,
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${label} did not exit before the timeout`)),
+          PROCESS_TIMEOUT_MS,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+async function forceReap(run) {
+  if (run.closed) return;
+  run.child.kill("SIGKILL");
+  await waitForExit(run, "Forced installed serve cleanup");
+}
+
+function assertReaped(pid, label) {
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ESRCH") return;
+    throw error;
+  }
+  throw new Error(`${label} process remained alive after it was reaped`);
+}
+
+async function assertPrivateRuntime(paths, run, canonicalJson) {
+  const stateMetadata = await lstat(paths.state);
+  const logsMetadata = await lstat(paths.logs);
+  const runtimeMetadata = await lstat(paths.runtime);
+  const socketMetadata = await lstat(paths.socket);
+  const lockMetadata = await lstat(paths.lock);
+  const ownerMetadata = await lstat(paths.owner);
   assert(
-    outcome.ready && outcome.code === 0 && outcome.signal === null,
-    `${signal} shutdown was not graceful: ${JSON.stringify(outcome)}; stderr=${JSON.stringify(stderr)}`,
+    stateMetadata.isDirectory() && (stateMetadata.mode & 0o777) === 0o700,
+    "Installed serve state directory was not private",
   );
-  assert(stderr === "", `${signal} shutdown wrote to stderr`);
-  const result = JSON.parse(stdout);
-  assert(result.ok === true && result.exit_code === 0, `${signal} result was not successful`);
-  if (child.pid !== undefined) {
-    try {
-      process.kill(child.pid, 0);
-      throw new Error(`${signal} process survived terminal close`);
-    } catch (error) {
-      if (error instanceof Error && "code" in error && error.code !== "ESRCH") throw error;
+  assert(
+    logsMetadata.isDirectory() && (logsMetadata.mode & 0o777) === 0o700,
+    "Installed serve log directory was not private",
+  );
+  assert(runtimeMetadata.isDirectory(), "Installed serve runtime path was not a directory");
+  assert(
+    (runtimeMetadata.mode & 0o777) === 0o700,
+    "Installed serve runtime directory was not mode 0700",
+  );
+  assert(socketMetadata.isSocket(), "Installed serve control path was not a Unix socket");
+  assert(
+    (socketMetadata.mode & 0o777) === 0o600,
+    "Installed serve control socket was not mode 0600",
+  );
+  assert(lockMetadata.isDirectory(), "Installed serve lock path was not a directory");
+  assert((lockMetadata.mode & 0o777) === 0o700, "Installed serve lock directory was not mode 0700");
+  assert(ownerMetadata.isFile(), "Installed serve lock owner was not a regular file");
+  assert((ownerMetadata.mode & 0o777) === 0o600, "Installed serve lock owner was not mode 0600");
+  if (typeof process.getuid === "function") {
+    const expectedUid = process.getuid();
+    for (const metadata of [
+      stateMetadata,
+      logsMetadata,
+      runtimeMetadata,
+      socketMetadata,
+      lockMetadata,
+      ownerMetadata,
+    ]) {
+      assert(metadata.uid === expectedUid, "Installed serve created a cross-owner runtime path");
     }
+  }
+  const runtimeEntries = (await readdir(paths.runtime)).sort();
+  const stagingGuards = runtimeEntries.filter((entry) => /^\.c[0-9a-f]{8}$/u.test(entry));
+  assert(
+    runtimeEntries.includes("instance.lock") &&
+      runtimeEntries.includes("runtime.sock") &&
+      stagingGuards.length === 1 &&
+      runtimeEntries.length === 3,
+    `Installed serve runtime directory contained unexpected entries: ${JSON.stringify(runtimeEntries)}`,
+  );
+  const stagingGuard = await lstat(path.join(paths.runtime, stagingGuards[0]));
+  assert(
+    stagingGuard.isDirectory() && (stagingGuard.mode & 0o777) === 0o700,
+    "Installed serve socket publication guard was not a private directory",
+  );
+  assert(
+    JSON.stringify(await readdir(paths.lock)) === JSON.stringify(["owner.json"]),
+    "Installed serve lock contained unexpected entries",
+  );
+  const ownerText = await readFile(paths.owner, "utf8");
+  const owner = JSON.parse(ownerText);
+  assert(ownerText === canonicalJson(owner), "Installed serve lock owner was not canonical JSON");
+  assert(owner.pid === run.child.pid, "Installed serve lock owner recorded the wrong pid");
+  assert(
+    typeof owner.service_instance_id === "string",
+    "Installed serve lock owner lacked a service identity",
+  );
+  return owner;
+}
+
+async function assertMissing(candidate, label) {
+  try {
+    await lstat(candidate);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return;
+    throw error;
+  }
+  throw new Error(`${label} remained after installed serve shutdown`);
+}
+
+async function requestInstalledStatus(socketPath, canonicalJson) {
+  const requestId = randomUUID();
+  const request = {
+    schema_version: "service-control-request.v1",
+    document_type: "service-control-request",
+    request_id: requestId,
+    command: "status",
+  };
+  const response = await new Promise((resolve, reject) => {
+    const client = net.createConnection({ path: socketPath });
+    let output = "";
+    let settled = false;
+    const finish = (operation, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      client.destroy();
+      operation(value);
+    };
+    const timer = setTimeout(
+      () => finish(reject, new Error("Installed control query timed out")),
+      CONTROL_TIMEOUT_MS,
+    );
+    client.setEncoding("utf8");
+    client.on("data", (chunk) => {
+      output += chunk;
+      if (Buffer.byteLength(output, "utf8") > 65_537) {
+        finish(reject, new Error("Installed control response exceeded its bound"));
+      }
+    });
+    client.once("connect", () => client.end(`${canonicalJson(request)}\n`));
+    client.once("end", () => finish(resolve, output));
+    client.once("error", (error) => finish(reject, error));
+  });
+  return { requestId, response };
+}
+
+async function assertDuplicateServeFails(executable, configPath, canonicalJson) {
+  let failure;
+  try {
+    await execFile(process.execPath, [executable, "serve", "--json", "--config", configPath], {
+      cwd: path.dirname(configPath),
+      encoding: "utf8",
+      shell: false,
+      timeout: PROCESS_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+    throw new Error("Second installed serve unexpectedly started");
+  } catch (error) {
+    failure = error;
+  }
+  assert(failure.code === 6, "Second installed serve returned an unstable conflict exit code");
+  assert(failure.killed !== true, "Second installed serve reached the hard timeout");
+  assert(failure.signal == null, "Second installed serve exited from a signal");
+  assert(failure.stderr === "", "Second installed serve wrote to stderr");
+  const result = parseCanonicalDocument(
+    failure.stdout,
+    canonicalJson,
+    "Second installed serve result",
+  );
+  assert(result.command === "serve", "Second installed serve returned the wrong command result");
+  assert(
+    result.ok === false && result.exit_code === 6,
+    "Second installed serve did not report a conflict",
+  );
+  assert(
+    result.error?.code === "RUNTIME_SERVICE_ALREADY_RUNNING",
+    "Second installed serve returned the wrong stable error code",
+  );
+}
+
+async function assertInstalledSupervisionCycle(options) {
+  const { executable, configPath, paths, signal, checkConflict, api } = options;
+  const run = startInstalledServe(executable, configPath);
+  try {
+    await waitForReadiness(run);
+    assert(run.spawnError === undefined, "Installed serve emitted a spawn error");
+    assert(run.child.pid !== undefined, "Installed serve did not expose a pid");
+    const owner = await assertPrivateRuntime(paths, run, api.canonicalJson);
+
+    if (checkConflict) {
+      await assertDuplicateServeFails(executable, configPath, api.canonicalJson);
+      assert(
+        run.child.exitCode === null && run.child.signalCode === null,
+        "Second installed serve harmed the first instance",
+      );
+    }
+
+    const control = await requestInstalledStatus(paths.socket, api.canonicalJson);
+    const responseDocument = parseCanonicalDocument(
+      control.response,
+      api.canonicalJson,
+      "Installed control response",
+    );
+    const parsedResponse = api.parseServiceControlResponse(control.response);
+    assert(parsedResponse.ok, "Installed control response failed its packaged schema parser");
+    const response = parsedResponse.value;
+    assert(
+      response.request_id === control.requestId,
+      "Installed control response changed the request id",
+    );
+    assert(
+      response.ok === true && response.error === null,
+      "Installed control response was not successful",
+    );
+    assert(
+      response.status?.pid === run.child.pid,
+      "Installed control response returned the wrong pid",
+    );
+    assert(
+      response.status?.service_instance_id === owner.service_instance_id,
+      "Installed control and lock identities differed",
+    );
+    assert(
+      response.status?.package_version === "0.0.0-development",
+      "Installed control response returned the wrong package version",
+    );
+    assert(
+      response.status?.health === "healthy" && response.status.accepting === true,
+      "Installed control response was not healthy and accepting",
+    );
+    assert(
+      responseDocument.status?.service_instance_id === owner.service_instance_id,
+      "Installed control wire response returned the wrong identity",
+    );
+
+    assert(run.child.kill(signal), `${signal} could not be delivered to installed serve`);
+    const outcome = await waitForExit(run, `${signal} installed serve shutdown`);
+    assert(
+      outcome.code === 0 && outcome.signal === null,
+      `${signal} shutdown was not graceful: ${JSON.stringify(outcome)}; stderr=${JSON.stringify(run.stderr)}`,
+    );
+    assert(run.stderr === "", `${signal} shutdown wrote to stderr`);
+    const result = parseCanonicalDocument(run.stdout, api.canonicalJson, `${signal} serve result`);
+    assert(
+      result.command === "serve" && result.ok === true && result.exit_code === 0,
+      `${signal} result was not successful`,
+    );
+    await assertMissing(paths.socket, `${signal} socket`);
+    await assertMissing(paths.lock, `${signal} lock`);
+    assert(
+      (await readdir(paths.runtime)).length === 0,
+      `${signal} left unexpected runtime entries behind`,
+    );
+    assertReaped(run.child.pid, signal);
+  } finally {
+    await forceReap(run);
   }
 }
 
@@ -160,7 +476,7 @@ try {
   tarballPath = path.join(root, packageReport.filename);
   assertPackageFiles(packageReport.files);
 
-  temporaryDirectory = await mkdtemp(path.join(tmpdir(), "toss-runtime-package-"));
+  temporaryDirectory = await mkdtemp(path.join(await realpath("/tmp"), "toss-runtime-package-"));
   await execFile(npmCommand, ["init", "--yes"], {
     cwd: temporaryDirectory,
     encoding: "utf8",
@@ -187,19 +503,29 @@ try {
     ".bin",
     process.platform === "win32" ? "toss-runtime.cmd" : "toss-runtime",
   );
-  const help = await execFile(executable, ["--help"], {
+  const installedRoot = path.join(
+    temporaryDirectory,
+    "node_modules",
+    "@toss-software",
+    "agent-runtime",
+  );
+  const api = await import(pathToFileURL(path.join(installedRoot, "dist", "src", "index.js")).href);
+  const help = await execFile(process.execPath, [executable, "--help"], {
     cwd: temporaryDirectory,
     encoding: "utf8",
+    shell: false,
   });
   assert(help.stdout.includes("toss-runtime capabilities"), "Installed executable help failed");
-  const version = await execFile(executable, ["--version"], {
+  const version = await execFile(process.execPath, [executable, "--version"], {
     cwd: temporaryDirectory,
     encoding: "utf8",
+    shell: false,
   });
   assert(version.stdout.trim() === "0.0.0-development", "Installed executable version failed");
-  const capabilities = await execFile(executable, ["capabilities", "--json"], {
+  const capabilities = await execFile(process.execPath, [executable, "capabilities", "--json"], {
     cwd: temporaryDirectory,
     encoding: "utf8",
+    shell: false,
   });
   const capabilityResult = JSON.parse(capabilities.stdout);
   assert(capabilityResult.ok === true, "Installed executable capability command failed");
@@ -208,28 +534,66 @@ try {
     "Installed executable returned an unexpected capability document",
   );
 
-  const installedRoot = path.join(
-    temporaryDirectory,
-    "node_modules",
-    "@toss-software",
-    "agent-runtime",
+  const supervisionPaths = {
+    state: path.join(temporaryDirectory, "service-state"),
+    logs: path.join(temporaryDirectory, "service-logs"),
+    runtime: path.join(temporaryDirectory, "service-runtime"),
+  };
+  supervisionPaths.socket = path.join(supervisionPaths.runtime, "runtime.sock");
+  supervisionPaths.lock = path.join(supervisionPaths.runtime, "instance.lock");
+  supervisionPaths.owner = path.join(supervisionPaths.lock, "owner.json");
+  const installedConfig = path.join(temporaryDirectory, "runtime.development.json");
+  await writeFile(
+    installedConfig,
+    api.canonicalJson({
+      schema_version: "runtime-config.v1",
+      document_type: "runtime-config",
+      mode: "development",
+      paths: {
+        state: supervisionPaths.state,
+        logs: supervisionPaths.logs,
+        socket: supervisionPaths.socket,
+      },
+      shutdown_timeout_ms: 5_000,
+      logs: { level: "info", retention_days: 7, max_bytes: 104_857_600 },
+      gateway_profile: null,
+      provider_profiles: [],
+      mcp_profiles: [],
+      secret_references: {},
+    }),
+    { mode: 0o600 },
   );
-  const installedConfig = path.join(
-    installedRoot,
-    "examples",
-    "config",
-    "runtime.development.yaml",
-  );
-  await assertExecutableSignalShutdown(executable, installedConfig, "SIGTERM");
-  await assertExecutableSignalShutdown(executable, installedConfig, "SIGINT");
+  await assertInstalledSupervisionCycle({
+    executable,
+    configPath: installedConfig,
+    paths: supervisionPaths,
+    signal: "SIGTERM",
+    checkConflict: true,
+    api,
+  });
+  await assertInstalledSupervisionCycle({
+    executable,
+    configPath: installedConfig,
+    paths: supervisionPaths,
+    signal: "SIGINT",
+    checkConflict: false,
+    api,
+  });
 
   const missingConfigPath = path.join(temporaryDirectory, "missing-runtime.yaml");
   let missingConfigFailure;
   try {
-    await execFile(executable, ["serve", "--json", "--config", missingConfigPath], {
-      cwd: temporaryDirectory,
-      encoding: "utf8",
-    });
+    await execFile(
+      process.execPath,
+      [executable, "serve", "--json", "--config", missingConfigPath],
+      {
+        cwd: temporaryDirectory,
+        encoding: "utf8",
+        shell: false,
+        timeout: PROCESS_TIMEOUT_MS,
+        killSignal: "SIGKILL",
+      },
+    );
     throw new Error("Installed executable accepted a missing serve config");
   } catch (error) {
     missingConfigFailure = error;
@@ -256,6 +620,7 @@ try {
     `Verified ${packageReport.filename} (${packageReport.files.length} files)\n`,
   );
 } finally {
+  await Promise.all([...activeServes].map((run) => forceReap(run)));
   if (temporaryDirectory !== undefined)
     await rm(temporaryDirectory, { recursive: true, force: true });
   if (tarballPath !== undefined) await rm(tarballPath, { force: true });
