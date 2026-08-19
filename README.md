@@ -1,8 +1,8 @@
 # TOSS Agent Runtime
 
-`@toss-software/agent-runtime` is the governed, provider-neutral execution runtime for TOSS. This development baseline publishes Runtime Contract Protocol v1, strict configuration loading, a truthful capability handshake, and the `toss-runtime` CLI/lifecycle shell.
+`@toss-software/agent-runtime` is the governed, provider-neutral execution runtime for TOSS. This development baseline publishes Runtime Contract Protocol v1, strict configuration loading, a truthful capability handshake, and the explicit per-user `toss-runtime` service-supervision foundation.
 
-> Status: the package remains `0.0.0-development` until all v1 release waves and protected live-provider gates pass. This baseline does not execute agents, call providers, run tools, or expose a local control socket.
+> Status: the package remains `0.0.0-development` until all v1 release waves and protected live-provider gates pass. The issue #28 service foundation is implemented, but #28 remains open until issue #1 supplies production-durable `INTERRUPTED` journal persistence. Issues #1, #29, and #30 and npm `1.0.0` remain incomplete. This baseline does not execute agents, call providers, run tools, or expose remote control.
 
 ## Requirements
 
@@ -17,6 +17,8 @@ The public installation command becomes available when the first release is publ
 ```sh
 npm install @toss-software/agent-runtime
 ```
+
+Package installation and `prepack` have no service-manager side effect: they do not write a launchd/systemd definition, enable login startup, or start a daemon. Service installation is always the separate, explicit `toss-runtime service install` operation.
 
 For repository development:
 
@@ -33,9 +35,19 @@ toss-runtime --version
 toss-runtime capabilities --json
 toss-runtime doctor --json
 toss-runtime serve --config /absolute/path/to/runtime.yaml
+toss-runtime service install [--config /absolute/path/to/runtime.yaml] [--json]
+toss-runtime service start [--json]
+toss-runtime service stop [--json]
+toss-runtime service restart [--json]
+toss-runtime service status [--json]
+toss-runtime service uninstall [--json]
 ```
 
-`capabilities` is deliberately fail-closed: an empty or unavailable capability is not an implementation promise. `doctor` checks the package, platform, Node version, and configuration. `serve` currently exercises only graceful process lifecycle and signal handling.
+Only `service install` accepts `--config`. It validates or materializes a private configuration, writes the current user's native service definition, and enables automatic startup at login. It does not start the service in the current session; run `toss-runtime service start` for that explicit activation. `service status` is read-only and returns success with `installed: false` when no compatible definition exists. `service stop` and `service uninstall` are idempotent when absent, while absent `start` or `restart` returns unavailable.
+
+`doctor` checks package, platform, Node, configuration, native manager state, restart backoff, and private socket health. A healthy active service with a matching socket identity passes the service check. Missing or stopped service state warns in development and fails in production; backoff, unsafe state, unavailable/degraded control, or identity mismatch fails. See the [Local Service Control v1 contract](docs/contracts/local-service-control-v1.md) for exact native commands, permissions, protocol bounds, stable failures, and shutdown ordering.
+
+`capabilities` remains deliberately fail-closed: an empty or unavailable capability is not an implementation promise. The supervised `serve` process owns the single-instance lock and private local status socket, but agent execution and durable run journals are not implemented in this foundation.
 
 Stable exit codes are `0` success, `2` usage, `3` invalid input, `4` blocked/policy, `5` validation, `6` conflict/stale revision, `69` unavailable capability, and `70` internal failure.
 
@@ -55,6 +67,7 @@ The public parser returns either a validated, deeply frozen domain value or a no
 ## Contracts and examples
 
 - [Runtime Contract Protocol v1](docs/contracts/runtime-contract-protocol-v1.md)
+- [Local Service Control v1](docs/contracts/local-service-control-v1.md)
 - [TOSS CLI v2.2 compatibility](docs/contracts/toss-cli-v2.2-compatibility.md)
 - [Schema manifest](docs/contracts/runtime-contract-v1.manifest.json)
 - [Complete example chain](examples/runtime-contract-v1)

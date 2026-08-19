@@ -64,4 +64,15 @@ describe("published protocol artifacts", () => {
       expect(schema.$id).toBe(entry.id);
     }
   });
+
+  it("documents explicit service installation and the package side-effect boundary", async () => {
+    const readme = await readFile("README.md", "utf8");
+    const contract = await readFile("docs/contracts/local-service-control-v1.md", "utf8");
+
+    expect(readme).toContain("toss-runtime service install");
+    expect(readme).toContain("does not start the service");
+    expect(contract).toContain("0600");
+    expect(contract).toContain("RUNTIME_SERVICE_ALREADY_RUNNING");
+    expect(contract).toContain("Uninstall preserves");
+  });
 });

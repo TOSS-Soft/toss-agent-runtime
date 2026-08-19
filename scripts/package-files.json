@@ -167,6 +167,7 @@
   "dist/src/version.d.ts.map",
   "dist/src/version.js",
   "dist/src/version.js.map",
+  "docs/contracts/local-service-control-v1.md",
   "docs/contracts/runtime-contract-protocol-v1.md",
   "docs/contracts/runtime-contract-v1.manifest.json",
   "docs/contracts/toss-cli-v2.2-compatibility.md",

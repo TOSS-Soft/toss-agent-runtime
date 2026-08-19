@@ -73,6 +73,7 @@ const REQUIRED_FILES = Object.freeze([
   "dist/src/service/paths.js",
   "dist/src/service/supervisor.d.ts",
   "dist/src/service/supervisor.js",
+  "docs/contracts/local-service-control-v1.md",
   "docs/contracts/runtime-contract-protocol-v1.md",
   "docs/contracts/runtime-contract-v1.manifest.json",
   "docs/contracts/toss-cli-v2.2-compatibility.md",

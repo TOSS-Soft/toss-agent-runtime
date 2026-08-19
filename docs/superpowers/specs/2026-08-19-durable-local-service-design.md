@@ -2,6 +2,13 @@
 
 ## Status and scope
 
+Implementation status: the issue #28 foundation is implemented through the
+explicit service CLI, native per-user definitions, single-instance lock,
+private local status socket, readiness boundary, and ordered bounded shutdown.
+This is not completion of Wave 2 or closure of #28. Production-durable
+`INTERRUPTED` persistence remains pending issue #1; #1, #29, and #30 are not
+implemented by this foundation, and npm `1.0.0` is not authorized.
+
 This document defines v1 Wave 2 for:
 
 - #28, per-user service installation and supervision;
