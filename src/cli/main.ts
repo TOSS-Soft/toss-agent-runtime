@@ -1,12 +1,21 @@
+import { createHash, randomUUID } from "node:crypto";
+import { createReadStream } from "node:fs";
+import { realpath } from "node:fs/promises";
 import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
 
 import { loadConfig as loadRuntimeConfig, RuntimeConfigError } from "../config/load.js";
-import type { LoadedConfig } from "../config/types.js";
+import type { LoadedConfig, RuntimeEnvironment } from "../config/types.js";
+import type { SignalSource } from "../platform/signals.js";
 import { createBaselineCapabilities } from "../protocol/capabilities.js";
-import type { JsonValue } from "../protocol/json.js";
+import { canonicalJson, type JsonValue } from "../protocol/json.js";
 import type { RuntimeError } from "../protocol/types.js";
 import { createProcessSignalSource } from "../platform/signals.js";
-import { runService, type ServiceOutcome } from "../service/lifecycle.js";
+import { createServiceControlServer, probeServiceIdentity } from "../service/control.js";
+import { RuntimeServiceError } from "../service/errors.js";
+import { acquireInstanceLock, type ProcessLiveness } from "../service/instance-lock.js";
+import type { ServiceOutcome } from "../service/lifecycle.js";
+import { runSupervisor } from "../service/supervisor.js";
 import { PACKAGE_VERSION } from "../version.js";
 import { CliUsageError, parseCli, type BaselineCommand } from "./grammar.js";
 import { commandResult, renderJson, type CommandResultV1, type ExitCode } from "./result.js";
@@ -41,6 +50,112 @@ export interface CliOutput {
   readonly exitCode: ExitCode;
   readonly stdout: string;
   readonly stderr: string;
+}
+
+export interface ExecutableHashOptions {
+  readonly nodePath: string;
+  readonly cliPath: string;
+}
+
+export interface CreateMainServicesOptions {
+  readonly platform: RuntimePlatform;
+  readonly env: RuntimeEnvironment;
+  readonly home: string;
+  readonly signals: SignalSource;
+  readonly pid: number;
+  readonly now: () => Date;
+  readonly createServiceInstanceId: () => string;
+  readonly resolveExecutableHash: () => Promise<string>;
+  readonly sendReady: () => void;
+}
+
+async function hashFile(filePath: string): Promise<string> {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(filePath) as AsyncIterable<Buffer>) {
+    hash.update(chunk);
+  }
+  return hash.digest("hex");
+}
+
+export async function computeExecutableHash(options: ExecutableHashOptions): Promise<string> {
+  try {
+    const [nodePath, cliPath] = await Promise.all([
+      realpath(options.nodePath),
+      realpath(options.cliPath),
+    ]);
+    const [nodeSha256, cliSha256] = await Promise.all([hashFile(nodePath), hashFile(cliPath)]);
+    return createHash("sha256")
+      .update(
+        canonicalJson({
+          node_sha256: nodeSha256,
+          cli_sha256: cliSha256,
+          package_version: PACKAGE_VERSION,
+        }),
+        "utf8",
+      )
+      .digest("hex");
+  } catch {
+    throw new RuntimeServiceError("RUNTIME_SERVICE_UNAVAILABLE");
+  }
+}
+
+function processLiveness(pid: number): ProcessLiveness {
+  try {
+    process.kill(pid, 0);
+    return "alive";
+  } catch (error) {
+    return typeof error === "object" && error !== null && "code" in error && error.code === "ESRCH"
+      ? "dead"
+      : "unknown";
+  }
+}
+
+export function createMainServices(options: CreateMainServicesOptions): CliServices {
+  return {
+    platform: options.platform,
+    serve: async ({ configPath }) => {
+      if (!isSupportedPlatform(options.platform)) {
+        throw new RuntimeServiceError("RUNTIME_SERVICE_UNAVAILABLE");
+      }
+      const loaded = await loadRuntimeConfig({
+        ...(configPath === undefined ? {} : { explicitPath: configPath }),
+        env: options.env,
+        platform: options.platform.os,
+        home: options.home,
+      });
+      const executableHash = await options.resolveExecutableHash();
+      return runSupervisor({
+        loaded,
+        signals: options.signals,
+        pid: options.pid,
+        now: options.now,
+        createServiceInstanceId: options.createServiceInstanceId,
+        executableHash,
+        processProbe: { liveness: processLiveness },
+        socketProbe: {
+          identify: (socketPath) => probeServiceIdentity({ socketPath }),
+        },
+        recoveryParticipants: [
+          {
+            recover: () => Promise.resolve(),
+            stopIntake: () => undefined,
+            flush: () => Promise.resolve(),
+          },
+        ],
+        // Durable interruption recording is introduced by the run-journal issue.
+        interruptionRecorder: { interruptActive: () => Promise.resolve() },
+        acquireLock: acquireInstanceLock,
+        createControlServer: createServiceControlServer,
+        onReady: () => {
+          try {
+            options.sendReady();
+          } catch {
+            // Readiness diagnostics cannot affect the supervised lifecycle.
+          }
+        },
+      });
+    },
+  };
 }
 
 function runtimeError(
@@ -281,34 +396,28 @@ export async function main(argv: readonly string[]): Promise<number> {
   const platform = { os: process.platform, arch: process.arch, node: process.versions.node };
   let output: CliOutput;
   try {
-    output = await runCli(argv, {
-      platform,
-      serve: async ({ configPath }) => {
-        if (platform.os !== "darwin" && platform.os !== "linux") {
-          throw new Error("Runtime service is unavailable on this platform");
-        }
-        const loaded = await loadRuntimeConfig({
-          ...(configPath === undefined ? {} : { explicitPath: configPath }),
-          env: process.env,
-          platform: platform.os,
-          home: homedir(),
-        });
-        const running = runService({
-          signals: createProcessSignalSource(),
-          stopAccepting: () => undefined,
-          drain: () => Promise.resolve(),
-          shutdownTimeoutMs: loaded.config.shutdown_timeout_ms,
-        });
-        if (process.connected && typeof process.send === "function") {
-          try {
+    output = await runCli(
+      argv,
+      createMainServices({
+        platform,
+        env: process.env,
+        home: homedir(),
+        signals: createProcessSignalSource(),
+        pid: process.pid,
+        now: () => new Date(),
+        createServiceInstanceId: randomUUID,
+        resolveExecutableHash: () =>
+          computeExecutableHash({
+            nodePath: process.execPath,
+            cliPath: process.argv[1] ?? fileURLToPath(import.meta.url),
+          }),
+        sendReady: () => {
+          if (process.connected && typeof process.send === "function") {
             process.send({ type: "toss-runtime-ready" }, () => undefined);
-          } catch {
-            // Readiness IPC is diagnostic-only and never changes service lifecycle.
           }
-        }
-        return running;
-      },
-    });
+        },
+      }),
+    );
   } catch {
     output = outputForResult(
       commandResult({
