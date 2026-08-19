@@ -20,7 +20,11 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { canonicalJson } from "../src/protocol/json.js";
 import type { ServiceLockV1 } from "../src/service/contracts.js";
 import { RuntimeServiceError } from "../src/service/errors.js";
-import { acquireInstanceLock, type ProcessLiveness } from "../src/service/instance-lock.js";
+import {
+  acquireInstanceLock,
+  fileIdentityMatches,
+  type ProcessLiveness,
+} from "../src/service/instance-lock.js";
 
 const oldId = "018f0f64-7b21-7d4f-8c3d-4a30413d5f41";
 const newId = "018f0f64-7b21-7d4f-8c3d-4a30413d5f42";
@@ -41,8 +45,10 @@ interface Fixture {
 
 interface FixtureOverrides {
   readonly isAlive?: () => boolean | "unknown";
+  readonly livenessForPid?: (pid: number) => ProcessLiveness;
   readonly identifySocket?: () => Promise<string | null>;
-  readonly isCurrentUser?: (userId: number, candidate?: string) => boolean;
+  readonly isCurrentUser?: (userId: bigint, candidate?: string) => boolean;
+  readonly isRootUser?: (userId: bigint, candidate?: string) => boolean;
   readonly executableHash?: string;
   readonly instanceId?: string;
   readonly now?: () => Date;
@@ -52,6 +58,7 @@ interface FixtureOverrides {
 
 interface TestOperationHooks {
   readonly beforeOwnerClaimRename?: (operation: "reclaim" | "release") => Promise<void>;
+  readonly afterOwnerClaimRename?: (operation: "reclaim" | "release") => Promise<void>;
   readonly afterOwnerlessSentinelCreate?: () => Promise<void>;
 }
 
@@ -89,6 +96,7 @@ function options(overrides: FixtureOverrides = {}): Parameters<typeof acquireIns
     processProbe: {
       liveness: (pid): ProcessLiveness => {
         livenessCalls.push(pid);
+        if (overrides.livenessForPid !== undefined) return overrides.livenessForPid(pid);
         const liveness = overrides.isAlive?.() ?? false;
         return liveness === "unknown" ? "unknown" : liveness ? "alive" : "dead";
       },
@@ -97,6 +105,7 @@ function options(overrides: FixtureOverrides = {}): Parameters<typeof acquireIns
       identify: overrides.identifySocket ?? (() => Promise.resolve(null)),
     },
     isCurrentUser: overrides.isCurrentUser ?? (() => true),
+    ...(overrides.isRootUser === undefined ? {} : { isRootUser: overrides.isRootUser }),
     ...(overrides.operationHooks === undefined ? {} : { operationHooks: overrides.operationHooks }),
   };
 }
@@ -241,6 +250,67 @@ describe("runtime supervisor instance lock", () => {
     await expect(acquireInstanceLock(options())).rejects.toMatchObject({
       code: "RUNTIME_SERVICE_PATH_UNSAFE",
     });
+  });
+
+  it("rejects a modeled root-owned writable ancestor without the sticky bit", async () => {
+    const modeledRoot = await mkdtemp(path.join(await realpath("/tmp"), "toss-modeled-root-"));
+    temporaryDirectories.push(modeledRoot);
+    await chmod(modeledRoot, 0o777);
+    const runtimePath = path.join(modeledRoot, "runtime");
+    await mkdir(runtimePath, { mode: 0o700 });
+    fixture = {
+      runtimePath,
+      lockPath: path.join(runtimePath, "instance.lock"),
+      ownerPath: path.join(runtimePath, "instance.lock", "owner.json"),
+      socketPath: path.join(runtimePath, "runtime.sock"),
+    };
+    const currentUid = BigInt(process.getuid?.() ?? 0);
+
+    await expect(
+      acquireInstanceLock(
+        options({
+          isCurrentUser: (uid, candidate) => uid === currentUid && candidate !== modeledRoot,
+          isRootUser: (uid, candidate) => uid === 0n || candidate === modeledRoot,
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_PATH_UNSAFE" });
+  });
+
+  it("accepts a real sticky directory modeled as a root-owned leading ancestor", async () => {
+    const modeledRoot = await mkdtemp(path.join(await realpath("/tmp"), "toss-modeled-root-"));
+    temporaryDirectories.push(modeledRoot);
+    await chmod(modeledRoot, 0o1777);
+    expect((await lstat(modeledRoot)).mode & 0o1777).toBe(0o1777);
+    const runtimePath = path.join(modeledRoot, "runtime");
+    await mkdir(runtimePath, { mode: 0o700 });
+    fixture = {
+      runtimePath,
+      lockPath: path.join(runtimePath, "instance.lock"),
+      ownerPath: path.join(runtimePath, "instance.lock", "owner.json"),
+      socketPath: path.join(runtimePath, "runtime.sock"),
+    };
+    const currentUid = BigInt(process.getuid?.() ?? 0);
+
+    const lock = await acquireInstanceLock(
+      options({
+        isCurrentUser: (uid, candidate) => uid === currentUid && candidate !== modeledRoot,
+        isRootUser: (uid, candidate) => uid === 0n || candidate === modeledRoot,
+      }),
+    );
+
+    expect(lock.owner.service_instance_id).toBe(newId);
+    await lock.release();
+  });
+
+  it("keeps bigint filesystem identities distinct above Number.MAX_SAFE_INTEGER", () => {
+    const common = 9_007_199_254_740_992n;
+
+    expect(
+      fileIdentityMatches(
+        { device: common, inode: common },
+        { device: common, inode: common + 1n },
+      ),
+    ).toBe(false);
   });
 
   it.each(["runtime", "lock", "owner"] as const)(
@@ -470,7 +540,7 @@ describe("runtime supervisor instance lock", () => {
     await lock.release();
   });
 
-  it("preserves an old ownerless lock when a socket listener exists", async () => {
+  it("cleans its exact ownerless sentinel when a socket listener exists", async () => {
     await mkdir(fixture.lockPath, { mode: 0o700 });
     await chmod(fixture.lockPath, 0o700);
     const stale = new Date(now.getTime() - 30_001);
@@ -479,7 +549,29 @@ describe("runtime supervisor instance lock", () => {
     await expect(
       acquireInstanceLock(options({ identifySocket: () => Promise.resolve(otherId) })),
     ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
-    expect(await readdir(fixture.lockPath)).toEqual([`.ownerless-reclaim.${newId}`]);
+    expect(await readdir(fixture.lockPath)).toEqual([]);
+  });
+
+  it("retries an ownerless lock after a listener disappears", async () => {
+    await mkdir(fixture.lockPath, { mode: 0o700 });
+    await chmod(fixture.lockPath, 0o700);
+    const stale = new Date(now.getTime() - 30_001);
+    await utimes(fixture.lockPath, stale, stale);
+
+    await expect(
+      acquireInstanceLock(options({ identifySocket: () => Promise.resolve(otherId) })),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+
+    const later = new Date(now.getTime() + 86_400_000);
+    const lock = await acquireInstanceLock(
+      options({
+        instanceId: otherId,
+        now: () => later,
+        identifySocket: () => Promise.resolve(null),
+      }),
+    );
+    expect(lock.owner.service_instance_id).toBe(otherId);
+    await lock.release();
   });
 
   it("reports an accepting socket with the recorded identity as already running", async () => {
@@ -539,10 +631,158 @@ describe("runtime supervisor instance lock", () => {
       ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
 
       const claim = `.owner-claim.${newId}.json`;
-      expect(await readdir(fixture.lockPath)).toEqual([claim]);
-      expect(JSON.parse(await readFile(path.join(fixture.lockPath, claim), "utf8"))).toEqual(
-        changedOwner,
-      );
+      expect(await readdir(fixture.lockPath)).toEqual([claim, "owner.json"]);
+      expect(JSON.parse(await readFile(fixture.ownerPath, "utf8"))).toEqual(changedOwner);
+    },
+  );
+
+  it("recovers a dead interrupted owner claim after the owner rename", async () => {
+    await writeOwner();
+
+    await expect(
+      acquireInstanceLock(
+        options({
+          operationHooks: {
+            afterOwnerClaimRename: () =>
+              Promise.reject(new Error("simulated-crash-after-owner-rename")),
+          },
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+    expect(await readdir(fixture.lockPath)).toEqual([
+      `.owner-claim.${newId}.json`,
+      `.owner-claim.${newId}.owner.json`,
+    ]);
+    expect(
+      JSON.parse(await readFile(path.join(fixture.lockPath, `.owner-claim.${newId}.json`), "utf8")),
+    ).toMatchObject({
+      claim_kind: "owner",
+      claimant: {
+        service_instance_id: newId,
+        pid: 4200,
+        executable_hash: executableHash,
+        created_at: now.toISOString(),
+      },
+      original_owner: { service_instance_id: oldId, pid: 4100 },
+    });
+
+    const recovered = await acquireInstanceLock(
+      options({
+        instanceId: otherId,
+        livenessForPid: () => "dead",
+      }),
+    );
+    expect(recovered.owner.service_instance_id).toBe(otherId);
+    await recovered.release();
+  });
+
+  it.each(["alive", "unknown"] as const)(
+    "does not recover an interrupted owner claim whose claimant is %s",
+    async (claimantLiveness) => {
+      await writeOwner();
+      await expect(
+        acquireInstanceLock(
+          options({
+            operationHooks: {
+              afterOwnerClaimRename: () =>
+                Promise.reject(new Error("simulated-crash-after-owner-rename")),
+            },
+          }),
+        ),
+      ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+      const entries = await readdir(fixture.lockPath);
+
+      await expect(
+        acquireInstanceLock(
+          options({
+            instanceId: otherId,
+            livenessForPid: (pid) => (pid === 4200 ? claimantLiveness : "dead"),
+          }),
+        ),
+      ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+      expect(await readdir(fixture.lockPath)).toEqual(entries);
+    },
+  );
+
+  it("fails closed when the original owner liveness is unknown during claim recovery", async () => {
+    await writeOwner();
+    await expect(
+      acquireInstanceLock(
+        options({
+          operationHooks: {
+            afterOwnerClaimRename: () =>
+              Promise.reject(new Error("simulated-crash-after-owner-rename")),
+          },
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+
+    await expect(
+      acquireInstanceLock(
+        options({
+          instanceId: otherId,
+          livenessForPid: (pid) => (pid === 4100 ? "unknown" : "dead"),
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+  });
+
+  it.each(["malformed", "replaced", "multiple"] as const)(
+    "fails closed when an owned claim is %s after rename",
+    async (mutation) => {
+      await writeOwner();
+      const claimPath = path.join(fixture.lockPath, `.owner-claim.${newId}.json`);
+
+      await expect(
+        acquireInstanceLock(
+          options({
+            operationHooks: {
+              afterOwnerClaimRename: async () => {
+                if (mutation === "malformed") {
+                  await writeFile(claimPath, "{}", { mode: 0o600 });
+                } else if (mutation === "replaced") {
+                  const replacement = path.join(fixture.lockPath, ".replacement-claim");
+                  await writePrivate(replacement, await readFile(claimPath, "utf8"));
+                  await rename(replacement, claimPath);
+                } else {
+                  await writePrivate(path.join(fixture.lockPath, ".unexpected-claim"), "preserve");
+                }
+              },
+            },
+          }),
+        ),
+      ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+      expect((await lstat(fixture.lockPath)).isDirectory()).toBe(true);
+    },
+  );
+
+  it.each(["duplicate-key", "noncanonical"] as const)(
+    "fails closed for %s interrupted-claim bytes",
+    async (mutation) => {
+      await writeOwner();
+      await expect(
+        acquireInstanceLock(
+          options({
+            operationHooks: {
+              afterOwnerClaimRename: () =>
+                Promise.reject(new Error("simulated-crash-after-owner-rename")),
+            },
+          }),
+        ),
+      ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+      const claimPath = path.join(fixture.lockPath, `.owner-claim.${newId}.json`);
+      const claimBytes = await readFile(claimPath, "utf8");
+      const changed =
+        mutation === "duplicate-key"
+          ? claimBytes.replace("{", '{"claim_kind":"owner",')
+          : JSON.stringify(JSON.parse(claimBytes), null, 2);
+      await writeFile(claimPath, changed, { mode: 0o600 });
+      await chmod(claimPath, 0o600);
+
+      await expect(
+        acquireInstanceLock(options({ instanceId: otherId, livenessForPid: () => "dead" })),
+      ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+      expect(await readFile(claimPath, "utf8")).toBe(changed);
     },
   );
 
@@ -561,9 +801,8 @@ describe("runtime supervisor instance lock", () => {
       ),
     ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
 
-    const claim = `.owner-claim.${newId}.json`;
-    expect(await readdir(fixture.lockPath)).toEqual([claim]);
-    expect(JSON.parse(await readFile(path.join(fixture.lockPath, claim), "utf8"))).toMatchObject({
+    expect(await readdir(fixture.lockPath)).toEqual(["owner.json"]);
+    expect(JSON.parse(await readFile(fixture.ownerPath, "utf8"))).toMatchObject({
       service_instance_id: otherId,
     });
   });
@@ -589,6 +828,7 @@ describe("runtime supervisor instance lock", () => {
     expect(await readdir(fixture.lockPath)).toEqual([
       `.owner-claim.${newId}.json`,
       `.owner-claim.${otherId}.json`,
+      "owner.json",
     ]);
   });
 
@@ -597,7 +837,7 @@ describe("runtime supervisor instance lock", () => {
     await chmod(fixture.lockPath, 0o700);
     const stale = new Date(now.getTime() - 30_001);
     await utimes(fixture.lockPath, stale, stale);
-    const competingSentinel = path.join(fixture.lockPath, `.ownerless-reclaim.${otherId}`);
+    const competingSentinel = path.join(fixture.lockPath, `.ownerless-reclaim.${otherId}.json`);
 
     await expect(
       acquireInstanceLock(
@@ -612,9 +852,89 @@ describe("runtime supervisor instance lock", () => {
     ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
 
     expect(await readdir(fixture.lockPath)).toEqual([
-      `.ownerless-reclaim.${newId}`,
-      `.ownerless-reclaim.${otherId}`,
+      `.ownerless-reclaim.${newId}.json`,
+      `.ownerless-reclaim.${otherId}.json`,
     ]);
+  });
+
+  it("recovers a dead interrupted ownerless sentinel after creation", async () => {
+    await mkdir(fixture.lockPath, { mode: 0o700 });
+    await chmod(fixture.lockPath, 0o700);
+    const stale = new Date(now.getTime() - 30_001);
+    await utimes(fixture.lockPath, stale, stale);
+
+    await expect(
+      acquireInstanceLock(
+        options({
+          operationHooks: {
+            afterOwnerlessSentinelCreate: () =>
+              Promise.reject(new Error("simulated-crash-after-sentinel-create")),
+          },
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+    expect(await readdir(fixture.lockPath)).toEqual([`.ownerless-reclaim.${newId}.json`]);
+    expect(
+      JSON.parse(
+        await readFile(path.join(fixture.lockPath, `.ownerless-reclaim.${newId}.json`), "utf8"),
+      ),
+    ).toMatchObject({
+      claim_kind: "ownerless",
+      claimant: {
+        service_instance_id: newId,
+        pid: 4200,
+        executable_hash: executableHash,
+        created_at: now.toISOString(),
+      },
+      original_owner: null,
+    });
+
+    const recovered = await acquireInstanceLock(
+      options({ instanceId: otherId, livenessForPid: () => "dead" }),
+    );
+    expect(recovered.owner.service_instance_id).toBe(otherId);
+    await recovered.release();
+  });
+
+  it.each(["alive", "unknown"] as const)(
+    "does not recover an interrupted ownerless sentinel whose claimant is %s",
+    async (claimantLiveness) => {
+      await mkdir(fixture.lockPath, { mode: 0o700 });
+      await chmod(fixture.lockPath, 0o700);
+      const stale = new Date(now.getTime() - 30_001);
+      await utimes(fixture.lockPath, stale, stale);
+      await expect(
+        acquireInstanceLock(
+          options({
+            operationHooks: {
+              afterOwnerlessSentinelCreate: () =>
+                Promise.reject(new Error("simulated-crash-after-sentinel-create")),
+            },
+          }),
+        ),
+      ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+
+      await expect(
+        acquireInstanceLock(
+          options({ instanceId: otherId, livenessForPid: () => claimantLiveness }),
+        ),
+      ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+      expect(await readdir(fixture.lockPath)).toEqual([`.ownerless-reclaim.${newId}.json`]);
+    },
+  );
+
+  it("cleans an unmodified ownerless sentinel after a socket-probe failure", async () => {
+    await mkdir(fixture.lockPath, { mode: 0o700 });
+    await chmod(fixture.lockPath, 0o700);
+    const stale = new Date(now.getTime() - 30_001);
+    await utimes(fixture.lockPath, stale, stale);
+
+    await expect(
+      acquireInstanceLock(
+        options({ identifySocket: () => Promise.reject(new Error("sensitive-listener-detail")) }),
+      ),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+    expect(await readdir(fixture.lockPath)).toEqual([]);
   });
 
   it("does not release a lock whose owner identity was replaced", async () => {
@@ -657,9 +977,8 @@ describe("runtime supervisor instance lock", () => {
       code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS",
     });
 
-    const claim = `.owner-claim.${newId}.json`;
-    expect(await readdir(fixture.lockPath)).toEqual([claim]);
-    expect(JSON.parse(await readFile(path.join(fixture.lockPath, claim), "utf8"))).toMatchObject({
+    expect(await readdir(fixture.lockPath)).toEqual(["owner.json"]);
+    expect(JSON.parse(await readFile(fixture.ownerPath, "utf8"))).toMatchObject({
       service_instance_id: otherId,
     });
   });
