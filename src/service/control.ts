@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, rename, rmdir, unlink } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, rmdir, unlink } from "node:fs/promises";
 import { createConnection, createServer, type Socket } from "node:net";
 import path from "node:path";
 
@@ -41,6 +41,17 @@ export interface CreateServiceControlServerOptions {
   readonly idleTimeoutMs: 5_000;
   readonly maxConnections: 32;
   readonly cacheSize: 256;
+  readonly classifyPathOwner?: PathOwnerClassifier;
+  readonly operationHooks?: ServiceControlOperationHooks;
+}
+
+export type PathOwner = "root" | "current-user" | "other";
+export type PathOwnerClassifier = (userId: number, candidate: string) => PathOwner;
+
+export interface ServiceControlOperationHooks {
+  readonly beforePublish?: () => Promise<void>;
+  readonly onConnectionCountChanged?: (count: number) => void;
+  readonly onConnectionClosed?: () => void;
 }
 
 export interface RequestServiceStatusOptions {
@@ -84,8 +95,26 @@ function errorCode(error: unknown): string | undefined {
     : undefined;
 }
 
-function currentUserOwns(userId: number): boolean {
-  return typeof process.getuid === "function" && process.getuid() === userId;
+function defaultPathOwner(userId: number): PathOwner {
+  if (userId === 0) return "root";
+  return typeof process.getuid === "function" && process.getuid() === userId
+    ? "current-user"
+    : "other";
+}
+
+function classifyPathOwner(
+  classifier: PathOwnerClassifier | undefined,
+  userId: number,
+  candidate: string,
+): PathOwner {
+  try {
+    const owner = classifier?.(userId, candidate) ?? defaultPathOwner(userId);
+    if (owner !== "root" && owner !== "current-user" && owner !== "other") pathUnsafe();
+    return owner;
+  } catch (error) {
+    if (error instanceof RuntimeServiceError && internalServiceErrors.has(error)) throw error;
+    return pathUnsafe();
+  }
 }
 
 function identityOf(metadata: { readonly dev: number; readonly ino: number }): FileIdentity {
@@ -107,43 +136,60 @@ function assertSocketPath(candidate: string): void {
   }
 }
 
-async function assertPrivateRuntimeDirectory(socketPath: string): Promise<void> {
+async function assertPrivateRuntimeDirectory(
+  socketPath: string,
+  classifier?: PathOwnerClassifier,
+): Promise<FileIdentity> {
   assertSocketPath(socketPath);
   const runtimePath = path.dirname(socketPath);
   const parsed = path.parse(runtimePath);
   const relative = runtimePath.slice(parsed.root.length);
   const segments = relative.length === 0 ? [] : relative.split(path.sep);
+  const candidates = [parsed.root];
   let current = parsed.root;
   let reachedCurrentUserDirectory = false;
 
-  for (const [index, segment] of segments.entries()) {
+  for (const segment of segments) {
     if (segment.length === 0 || segment === "." || segment === "..") pathUnsafe();
     current = path.join(current, segment);
+    candidates.push(current);
+  }
+
+  let runtimeIdentity: FileIdentity | undefined;
+  for (const [index, candidate] of candidates.entries()) {
     let metadata;
     try {
-      metadata = await lstat(current);
+      metadata = await lstat(candidate);
     } catch {
       pathUnsafe();
     }
     if (metadata.isSymbolicLink() || !metadata.isDirectory()) pathUnsafe();
 
-    const ownedByCurrentUser = currentUserOwns(metadata.uid);
-    const trustedSystemAncestor = metadata.uid === 0 && !reachedCurrentUserDirectory;
-    if (!trustedSystemAncestor) {
-      if (!ownedByCurrentUser || (metadata.mode & 0o022) !== 0) pathUnsafe();
+    const owner = classifyPathOwner(classifier, metadata.uid, candidate);
+    if (owner === "root" && !reachedCurrentUserDirectory) {
+      if ((metadata.mode & 0o022) !== 0 && (metadata.mode & 0o1000) === 0) pathUnsafe();
+    } else if (owner === "current-user") {
+      if ((metadata.mode & 0o022) !== 0) pathUnsafe();
       reachedCurrentUserDirectory = true;
+    } else {
+      pathUnsafe();
     }
     if (
-      index === segments.length - 1 &&
-      (!ownedByCurrentUser || (metadata.mode & 0o777) !== 0o700)
+      index === candidates.length - 1 &&
+      (owner !== "current-user" || (metadata.mode & 0o777) !== 0o700)
     ) {
       pathUnsafe();
     }
+    if (index === candidates.length - 1) runtimeIdentity = identityOf(metadata);
   }
-  if (segments.length === 0) pathUnsafe();
+  if (segments.length === 0 || runtimeIdentity === undefined) pathUnsafe();
+  return runtimeIdentity;
 }
 
-async function privateSocketIdentity(socketPath: string): Promise<FileIdentity | undefined> {
+async function privateSocketIdentity(
+  socketPath: string,
+  classifier?: PathOwnerClassifier,
+): Promise<FileIdentity | undefined> {
   let metadata;
   try {
     metadata = await lstat(socketPath);
@@ -154,7 +200,7 @@ async function privateSocketIdentity(socketPath: string): Promise<FileIdentity |
   if (
     metadata.isSymbolicLink() ||
     !metadata.isSocket() ||
-    !currentUserOwns(metadata.uid) ||
+    classifyPathOwner(classifier, metadata.uid, socketPath) !== "current-user" ||
     (metadata.mode & 0o777) !== 0o600
   ) {
     pathUnsafe();
@@ -183,13 +229,16 @@ async function socketHasListener(socketPath: string): Promise<boolean> {
   });
 }
 
-async function removeStaleSocket(socketPath: string): Promise<void> {
-  const expected = await privateSocketIdentity(socketPath);
+async function removeStaleSocket(
+  socketPath: string,
+  classifier?: PathOwnerClassifier,
+): Promise<void> {
+  const expected = await privateSocketIdentity(socketPath, classifier);
   if (expected === undefined) return;
   if (await socketHasListener(socketPath)) {
     throw serviceError("RUNTIME_SERVICE_ALREADY_RUNNING");
   }
-  const current = await privateSocketIdentity(socketPath);
+  const current = await privateSocketIdentity(socketPath, classifier);
   if (current === undefined || !sameIdentity(current, expected)) pathUnsafe();
   try {
     await unlink(socketPath);
@@ -232,7 +281,6 @@ function framedResponse(response: ServiceControlResponseV1): string {
 }
 
 const INVALID_RESPONSE = framedResponse(failureResponse(null, "RUNTIME_SERVICE_CONTROL_INVALID"));
-const UNAVAILABLE_RESPONSE = framedResponse(failureResponse(null, "RUNTIME_SERVICE_UNAVAILABLE"));
 
 function isJsonObject(value: JsonValue): value is { readonly [key: string]: JsonValue } {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -285,7 +333,6 @@ export function createServiceControlServer(
   options: CreateServiceControlServerOptions,
 ): ServiceControlServer {
   const connections = new Set<Socket>();
-  const rejectedConnections = new Set<Socket>();
   const drainWaiters = new Set<() => void>();
   const cache = new Map<string, CacheEntry>();
   const stagingSocketPath = path.join(
@@ -301,6 +348,22 @@ export function createServiceControlServer(
   let closing = false;
   let stopRequested = false;
 
+  const notifyConnectionCount = (): void => {
+    try {
+      options.operationHooks?.onConnectionCountChanged?.(connections.size);
+    } catch {
+      // Observability hooks cannot affect the transport lifecycle.
+    }
+  };
+
+  const notifyConnectionClosed = (): void => {
+    try {
+      options.operationHooks?.onConnectionClosed?.();
+    } catch {
+      // Observability hooks cannot affect the transport lifecycle.
+    }
+  };
+
   const resolveDrains = (): void => {
     if (connections.size !== 0) return;
     for (const resolve of drainWaiters) resolve();
@@ -309,7 +372,9 @@ export function createServiceControlServer(
 
   const writeOnce = (socket: Socket, response: string): void => {
     if (socket.destroyed || socket.writableEnded) return;
-    socket.end(response);
+    const forceClose = setTimeout(() => socket.destroy(), options.idleTimeoutMs);
+    socket.once("close", () => clearTimeout(forceClose));
+    socket.end(response, () => socket.destroy());
   };
 
   const storeResponse = (requestId: string, requestHash: string, response: string): void => {
@@ -374,18 +439,11 @@ export function createServiceControlServer(
 
   const handleConnection = (socket: Socket): void => {
     if (closing || stopRequested || connections.size >= options.maxConnections) {
-      rejectedConnections.add(socket);
-      const rejectionTimer = setTimeout(() => socket.destroy(), options.idleTimeoutMs);
-      socket.once("error", () => socket.destroy());
-      socket.once("close", () => {
-        clearTimeout(rejectionTimer);
-        rejectedConnections.delete(socket);
-      });
-      socket.resume();
-      socket.end(UNAVAILABLE_RESPONSE, () => socket.destroy());
+      socket.destroy();
       return;
     }
     connections.add(socket);
+    notifyConnectionCount();
     const chunks: Buffer[] = [];
     let totalBytes = 0;
     let oversized = false;
@@ -424,11 +482,14 @@ export function createServiceControlServer(
     socket.once("close", () => {
       clearTimeout(idleTimer);
       connections.delete(socket);
+      notifyConnectionCount();
+      notifyConnectionClosed();
       resolveDrains();
     });
   };
 
   const nativeServer = createServer({ allowHalfOpen: true }, handleConnection);
+  nativeServer.maxConnections = options.maxConnections;
   nativeServer.on("error", () => {
     // Listening failures are handled by listen(); later transport failures are contained.
   });
@@ -455,7 +516,8 @@ export function createServiceControlServer(
     }
     if (
       metadata.isSocket() &&
-      currentUserOwns(metadata.uid) &&
+      classifyPathOwner(options.classifyPathOwner, metadata.uid, options.socketPath) ===
+        "current-user" &&
       sameIdentity(identityOf(metadata), ownedSocket)
     ) {
       try {
@@ -476,7 +538,8 @@ export function createServiceControlServer(
     }
     if (
       metadata.isDirectory() &&
-      currentUserOwns(metadata.uid) &&
+      classifyPathOwner(options.classifyPathOwner, metadata.uid, stagingSocketPath) ===
+        "current-user" &&
       sameIdentity(identityOf(metadata), stagingGuard)
     ) {
       try {
@@ -491,8 +554,11 @@ export function createServiceControlServer(
     if (listenPromise !== undefined) return listenPromise;
     listenPromise = (async () => {
       if (closing || !validatedConfiguration(options)) unavailable();
-      await assertPrivateRuntimeDirectory(options.socketPath);
-      await removeStaleSocket(options.socketPath);
+      const runtimeIdentity = await assertPrivateRuntimeDirectory(
+        options.socketPath,
+        options.classifyPathOwner,
+      );
+      await removeStaleSocket(options.socketPath, options.classifyPathOwner);
       try {
         await lstat(stagingSocketPath);
         pathUnsafe();
@@ -520,7 +586,12 @@ export function createServiceControlServer(
       let created;
       try {
         created = await lstat(stagingSocketPath);
-        if (created.isSymbolicLink() || !created.isSocket() || !currentUserOwns(created.uid)) {
+        if (
+          created.isSymbolicLink() ||
+          !created.isSocket() ||
+          classifyPathOwner(options.classifyPathOwner, created.uid, stagingSocketPath) !==
+            "current-user"
+        ) {
           pathUnsafe();
         }
         const createdIdentity = identityOf(created);
@@ -529,31 +600,58 @@ export function createServiceControlServer(
         if (
           stagedSocket.isSymbolicLink() ||
           !stagedSocket.isSocket() ||
-          !currentUserOwns(stagedSocket.uid) ||
+          classifyPathOwner(options.classifyPathOwner, stagedSocket.uid, stagingSocketPath) !==
+            "current-user" ||
           (stagedSocket.mode & 0o777) !== 0o600 ||
           !sameIdentity(identityOf(stagedSocket), createdIdentity)
         ) {
           pathUnsafe();
         }
-        await rename(stagingSocketPath, options.socketPath);
+
+        try {
+          await options.operationHooks?.beforePublish?.();
+        } catch {
+          pathUnsafe();
+        }
+        const beforePublishRuntime = await assertPrivateRuntimeDirectory(
+          options.socketPath,
+          options.classifyPathOwner,
+        );
+        if (!sameIdentity(beforePublishRuntime, runtimeIdentity)) pathUnsafe();
+
+        await link(stagingSocketPath, options.socketPath);
         ownedSocket = createdIdentity;
-        await chmod(options.socketPath, 0o600);
         const privateSocket = await lstat(options.socketPath);
         if (
           privateSocket.isSymbolicLink() ||
           !privateSocket.isSocket() ||
-          !currentUserOwns(privateSocket.uid) ||
+          classifyPathOwner(options.classifyPathOwner, privateSocket.uid, options.socketPath) !==
+            "current-user" ||
           (privateSocket.mode & 0o777) !== 0o600 ||
           !sameIdentity(identityOf(privateSocket), createdIdentity)
         ) {
           pathUnsafe();
         }
+
+        const linkedStage = await lstat(stagingSocketPath);
+        if (
+          linkedStage.isSymbolicLink() ||
+          !linkedStage.isSocket() ||
+          classifyPathOwner(options.classifyPathOwner, linkedStage.uid, stagingSocketPath) !==
+            "current-user" ||
+          (linkedStage.mode & 0o777) !== 0o600 ||
+          !sameIdentity(identityOf(linkedStage), createdIdentity)
+        ) {
+          pathUnsafe();
+        }
+        await unlink(stagingSocketPath);
         await mkdir(stagingSocketPath, { mode: 0o700 });
         const createdGuard = await lstat(stagingSocketPath);
         if (
           createdGuard.isSymbolicLink() ||
           !createdGuard.isDirectory() ||
-          !currentUserOwns(createdGuard.uid)
+          classifyPathOwner(options.classifyPathOwner, createdGuard.uid, stagingSocketPath) !==
+            "current-user"
         ) {
           pathUnsafe();
         }
@@ -563,12 +661,18 @@ export function createServiceControlServer(
         if (
           guard.isSymbolicLink() ||
           !guard.isDirectory() ||
-          !currentUserOwns(guard.uid) ||
+          classifyPathOwner(options.classifyPathOwner, guard.uid, stagingSocketPath) !==
+            "current-user" ||
           (guard.mode & 0o777) !== 0o700 ||
           !sameIdentity(identityOf(guard), stagingGuard)
         ) {
           pathUnsafe();
         }
+        const readyRuntime = await assertPrivateRuntimeDirectory(
+          options.socketPath,
+          options.classifyPathOwner,
+        );
+        if (!sameIdentity(readyRuntime, runtimeIdentity)) pathUnsafe();
         listening = true;
         if (stopRequested) stopAccepting();
       } catch (error) {
@@ -614,7 +718,6 @@ export function createServiceControlServer(
         }
       }
       stopAccepting();
-      for (const socket of rejectedConnections) socket.destroy();
       for (const socket of connections) socket.destroy();
       if (connections.size !== 0) {
         await new Promise<void>((resolve) => drainWaiters.add(resolve));

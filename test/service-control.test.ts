@@ -5,6 +5,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readlink,
   readdir,
   realpath,
   rename,
@@ -12,7 +13,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { createConnection, createServer, type Server, type Socket } from "node:net";
+import { createConnection, createServer, type Server, Socket } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -97,6 +98,59 @@ async function openClient(candidate: string = socketPath): Promise<Socket> {
   socket.once("close", () => clientSockets.delete(socket));
   await once(socket, "connect");
   return socket;
+}
+
+async function openHalfOpenClient(candidate: string = socketPath): Promise<Socket> {
+  const socket = new Socket({ allowHalfOpen: true });
+  clientSockets.add(socket);
+  socket.once("close", () => clientSockets.delete(socket));
+  socket.connect({ path: candidate });
+  await once(socket, "connect");
+  return socket;
+}
+
+async function connectUntilClosed(candidate: string = socketPath): Promise<void> {
+  const socket = new Socket();
+  clientSockets.add(socket);
+  socket.once("close", () => clientSockets.delete(socket));
+  await new Promise<void>((resolve) => {
+    socket.once("error", () => undefined);
+    socket.once("close", resolve);
+    socket.connect({ path: candidate });
+  });
+}
+
+interface PathSnapshot {
+  readonly device: number;
+  readonly inode: number;
+  readonly mode: number;
+  readonly kind: "file" | "socket" | "symlink";
+  readonly content: string | null;
+}
+
+async function snapshotPath(candidate: string): Promise<PathSnapshot> {
+  const metadata = await lstat(candidate);
+  const kind = metadata.isFile() ? "file" : metadata.isSocket() ? "socket" : "symlink";
+  const content =
+    kind === "file"
+      ? await readFile(candidate, "utf8")
+      : kind === "symlink"
+        ? await readlink(candidate)
+        : null;
+  return {
+    device: metadata.dev,
+    inode: metadata.ino,
+    mode: metadata.mode,
+    kind,
+    content,
+  };
+}
+
+function classifyActualOwner(userId: number): "root" | "current-user" | "other" {
+  if (userId === 0) return "root";
+  return typeof process.getuid === "function" && process.getuid() === userId
+    ? "current-user"
+    : "other";
 }
 
 async function sendRaw(bytes: string | Uint8Array): Promise<string> {
@@ -206,6 +260,78 @@ describe("private service control socket", () => {
     expect(await pathIsMissing(path.join(actualRuntime, "runtime.sock"))).toBe(true);
   });
 
+  it("rejects an injected non-root, non-current owner in the runtime ancestry", async () => {
+    const filesystemRoot = path.parse(runtimePath).root;
+    const server = createServiceControlServer(
+      options({
+        classifyPathOwner: (userId: number, candidate: string) =>
+          candidate === filesystemRoot ? "other" : classifyActualOwner(userId),
+      }),
+    );
+    controlServers.push(server);
+
+    await expect(server.listen()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_PATH_UNSAFE",
+    });
+    expect(await pathIsMissing(socketPath)).toBe(true);
+  });
+
+  it("allows writable leading root ancestry only when the injected root directory is sticky", async () => {
+    const classifyLeadingAncestorsAsRoot = (_userId: number, candidate: string) => {
+      if (candidate === runtimePath || path.dirname(candidate) === runtimePath) {
+        return "current-user" as const;
+      }
+      return "root" as const;
+    };
+    await chmod(temporaryRoot, 0o777);
+    const unsafe = createServiceControlServer(
+      options({ classifyPathOwner: classifyLeadingAncestorsAsRoot }),
+    );
+    controlServers.push(unsafe);
+    await expect(unsafe.listen()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_PATH_UNSAFE",
+    });
+
+    await chmod(temporaryRoot, 0o1777);
+    const sticky = createServiceControlServer(
+      options({ classifyPathOwner: classifyLeadingAncestorsAsRoot }),
+    );
+    controlServers.push(sticky);
+    await sticky.listen();
+
+    expect((await lstat(socketPath)).isSocket()).toBe(true);
+  });
+
+  it.each([
+    [
+      "mode",
+      async () => {
+        await chmod(runtimePath, 0o755);
+      },
+    ],
+    [
+      "identity",
+      async () => {
+        await rename(runtimePath, `${runtimePath}.displaced`);
+        await mkdir(runtimePath, { mode: 0o700 });
+        await chmod(runtimePath, 0o700);
+      },
+    ],
+  ] as const)(
+    "revalidates runtime directory %s immediately before publication",
+    async (_name, mutate) => {
+      const server = createServiceControlServer(
+        options({ operationHooks: { beforePublish: mutate } }),
+      );
+      controlServers.push(server);
+
+      await expect(server.listen()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_PATH_UNSAFE",
+      });
+      expect(await pathIsMissing(socketPath)).toBe(true);
+    },
+  );
+
   it("removes a stale private socket only after proving it has no listener", async () => {
     const stagingPath = path.join(runtimePath, "staging.sock");
     const staleServer = await listenNative(stagingPath);
@@ -245,6 +371,36 @@ describe("private service control socket", () => {
     });
     expect(await pathIsMissing(socketPath)).toBe(false);
   });
+
+  it.each(["regular file", "symlink", "foreign socket"] as const)(
+    "atomically preserves a publish-time %s winner",
+    async (kind) => {
+      let winner: PathSnapshot | undefined;
+      const beforePublish = async () => {
+        if (kind === "regular file") {
+          await writeFile(socketPath, "publish-winner", { mode: 0o600 });
+          await chmod(socketPath, 0o600);
+        } else if (kind === "symlink") {
+          const target = path.join(runtimePath, "winner-target");
+          await writeFile(target, "symlink-winner", { mode: 0o600 });
+          await symlink(target, socketPath);
+        } else {
+          await listenNative(socketPath);
+          await chmod(socketPath, 0o600);
+        }
+        winner = await snapshotPath(socketPath);
+      };
+      const server = createServiceControlServer(options({ operationHooks: { beforePublish } }));
+      controlServers.push(server);
+
+      await expect(server.listen()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_PATH_UNSAFE",
+      });
+
+      expect(winner).toBeDefined();
+      expect(await snapshotPath(socketPath)).toEqual(winner);
+    },
+  );
 
   it("returns one cached response for a duplicate canonical request id", async () => {
     await listenControl();
@@ -396,26 +552,63 @@ describe("private service control socket", () => {
     });
   });
 
-  it("accepts at most 32 concurrent client connections", async () => {
-    await listenControl();
-    const held = await Promise.all(Array.from({ length: 32 }, () => openClient()));
-
-    const overflow = await openClient();
-    const response = responseFrom(overflow);
-    overflow.end(statusRequest(fixedRequestId));
-
-    expect(JSON.parse(await response)).toMatchObject({
-      request_id: null,
-      ok: false,
-      error: { code: "RUNTIME_SERVICE_UNAVAILABLE" },
+  it("hard-caps live server connections at 32 during an overflow flood and recovers capacity", async () => {
+    let liveConnections = 0;
+    let maximumLiveConnections = 0;
+    let capacityReached = false;
+    let resolveCapacityReached: (() => void) | undefined;
+    let resolveCapacityFreed: (() => void) | undefined;
+    const capacityReachedPromise = new Promise<void>((resolve) => {
+      resolveCapacityReached = resolve;
     });
-    for (const socket of held) socket.destroy();
-  });
+    const capacityFreedPromise = new Promise<void>((resolve) => {
+      resolveCapacityFreed = resolve;
+    });
+    await listenControl({
+      operationHooks: {
+        onConnectionCountChanged: (count: number) => {
+          liveConnections = count;
+          maximumLiveConnections = Math.max(maximumLiveConnections, count);
+          if (count === 32) {
+            capacityReached = true;
+            resolveCapacityReached?.();
+          } else if (capacityReached && count === 31) {
+            resolveCapacityFreed?.();
+          }
+        },
+      },
+    });
+    const held = await Promise.all(Array.from({ length: 32 }, () => openClient()));
+    await capacityReachedPromise;
+    expect(liveConnections).toBe(32);
 
-  it("closes an idle connection after exactly five seconds", async () => {
+    await Promise.all(Array.from({ length: 256 }, () => connectUntilClosed()));
+
+    expect(maximumLiveConnections).toBe(32);
+    expect(liveConnections).toBe(32);
+    const firstClosed = once(held[0]!, "close");
+    held[0]!.destroy();
+    await firstClosed;
+    await capacityFreedPromise;
+    expect(JSON.parse(await sendRaw(statusRequest(fixedRequestId)))).toMatchObject({ ok: true });
+    for (const socket of held.slice(1)) socket.destroy();
+  }, 10_000);
+
+  it("fully closes and releases an idle half-open client after exactly five seconds", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    await listenControl();
-    const socket = await openClient();
+    let liveConnections = 0;
+    let serverCloseEvents = 0;
+    await listenControl({
+      operationHooks: {
+        onConnectionCountChanged: (count: number) => {
+          liveConnections = count;
+        },
+        onConnectionClosed: () => {
+          serverCloseEvents += 1;
+        },
+      },
+    });
+    const socket = await openHalfOpenClient();
     const response = responseFrom(socket);
 
     await vi.advanceTimersByTimeAsync(4_999);
@@ -427,6 +620,13 @@ describe("private service control socket", () => {
       ok: false,
       error: { code: "RUNTIME_SERVICE_CONTROL_INVALID" },
     });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const held = await Promise.all(Array.from({ length: 31 }, () => openClient()));
+    expect(JSON.parse(await sendRaw(statusRequest(fixedRequestId)))).toMatchObject({ ok: true });
+    expect(serverCloseEvents).toBeGreaterThanOrEqual(1);
+    expect(liveConnections).toBe(31);
+    for (const heldSocket of held) heldSocket.destroy();
   });
 
   it("stops accepting and aborts a drain without leaving connected clients", async () => {
