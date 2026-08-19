@@ -2,7 +2,7 @@
 
 ## Scope and state
 
-This record covers Runtime Contract Protocol v1 (#2) and the package/CLI/daemon/CI baseline (#4). It verifies commit `0d29d714a97e4fc7a90c27d108c77bf3140c4e23` on 2026-08-19 before this evidence-only commit was updated.
+This record covers Runtime Contract Protocol v1 (#2) and the package/CLI/daemon/CI baseline (#4). It verifies commit `9cd153673d9c8a738d8b27c80c483315e338be4f` on 2026-08-19 before this evidence-only commit was updated.
 
 Local acceptance is complete. The GitHub branch and required Node 22/24 macOS/Linux CI matrix remain pending; issues MUST NOT close until that remote evidence is green. This record is internal repository evidence and is intentionally excluded from the npm package; public contract documentation remains under `docs/contracts`.
 
@@ -25,7 +25,7 @@ All commands below exited `0` against the verified commit.
 | ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
 | `git status --short`                           | Clean before acceptance                                                                                               |
 | `npm ci`                                       | 138 packages installed from lockfile; audit reported 0 vulnerabilities                                                |
-| `npm run verify`                               | Formatting, lint, strict typecheck, 11 test files / 108 tests, build, and installed-package test passed               |
+| `npm run verify`                               | Formatting, lint, strict typecheck, 11 test files / 119 tests, build, and installed-package test passed               |
 | `npm audit --audit-level=high`                 | 0 vulnerabilities                                                                                                     |
 | `node bin/toss-runtime.js --version`           | `0.0.0-development`                                                                                                   |
 | `node bin/toss-runtime.js capabilities --json` | Valid `command-result.v1`; protocol v1 advertised and all future subsystems truthfully `unavailable`                  |
@@ -39,9 +39,9 @@ CI defines the same locked verification plus production dependency audit for Nod
 | ------------- | ------------------------------------------------------------------ |
 | Filename      | `toss-software-agent-runtime-0.0.0-development.tgz`                |
 | Packed files  | 131                                                                |
-| Packed size   | 50,029 bytes                                                       |
-| Unpacked size | 247,920 bytes                                                      |
-| SHA-256       | `003a494f39dc38357dc8a423e2784b1cedb07027392b0803c9cc02066a0ac2f9` |
+| Packed size   | 50,133 bytes                                                       |
+| Unpacked size | 248,515 bytes                                                      |
+| SHA-256       | `f1661a328229f782d7192429e0f7384cbd0e849dfcf385f8a0ed86375bd9943a` |
 
 `scripts/package-test.mjs` independently creates the tarball, compares every path to the committed exact package manifest, rejects test/fixture/credential-shaped paths, installs into a new temporary project, imports the public API, runs help/version/capabilities, waits for explicit readiness before sending real SIGTERM and SIGINT to installed `serve` processes, verifies safe missing-config output, reads the installed contract manifest, and removes its temporary artifacts.
 
@@ -70,5 +70,7 @@ CI defines the same locked verification plus production dependency audit for Nod
 The first independent review initially returned “not ready” with eight important findings. Commit `1bee569e03b4dfa0a43cc81bdea8ca6076d9a042` closes them with tests for: event/error sensitive metadata keys; safe routed service failures and forced shutdown; inline credential option redaction; coherent feature/exact MCP profile negotiation; terminal/timestamp chain integrity; absolute XDG defaults; no-follow production config/private root isolation; and real installed-process signals. It also replaces category-based package acceptance with `scripts/package-files.json`.
 
 The follow-up review found four remaining gaps. Commit `0d29d714a97e4fc7a90c27d108c77bf3140c4e23` closes them with coverage for compact/uppercase sensitive keys and direct runtime-error fragment validation; bidirectional capability/resource coherence; field-specific production config/state/log/runtime roots; synchronous lifecycle cleanup; and readiness-synchronized installed-process signal tests.
+
+The final adversarial pass found three narrower invariant gaps. Commit `9cd153673d9c8a738d8b27c80c483315e338be4f` closes them with uppercase token-compound coverage across fragments/events/results, a mixed provider/routing capability matrix, and a negative Linux log-root sibling test.
 
 The dependency wave is ready to push for review. After the required remote CI matrix is green, #2 and #4 may be closed and later waves may treat `runtime-contract.v1` as their frozen input boundary. This is not authorization to publish npm version `1.0.0`, create a GitHub release, or close the v1 epic.
