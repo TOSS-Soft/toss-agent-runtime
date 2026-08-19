@@ -209,6 +209,22 @@ describe("runtime configuration", () => {
     expect(result.config.paths.state).toBe(path.join(linuxStateRoot(home), "state"));
   });
 
+  it("rejects production logs in a sibling of the dedicated log root", async () => {
+    const home = await temporaryDirectory();
+    const stateRoot = linuxStateRoot(home);
+    const configPath = await writeProductionConfig(
+      home,
+      "production-log-sibling.yaml",
+      validYaml(stateRoot, "production").replace(
+        `logs: ${stateRoot}/logs`,
+        `logs: ${stateRoot}/not-the-log-root`,
+      ),
+    );
+    await expect(
+      loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home }),
+    ).rejects.toMatchObject({ code: "RUNTIME_CONFIG_UNSAFE" });
+  });
+
   it("rejects relative runtime paths", async () => {
     const root = await temporaryDirectory();
     const configPath = path.join(root, "relative.yaml");

@@ -166,11 +166,69 @@ describe("Runtime Contract Protocol v1 chain", () => {
     }
   });
 
+  it("accepts and rejects mixed provider/routing resource states independently", async () => {
+    const { capabilities } = await loadValidChain();
+    const modelClass = { logical_class: "implementation", capabilities: ["text"] };
+    const cases: readonly Readonly<{
+      name: string;
+      expected: boolean;
+      value: RuntimeCapabilitiesV1;
+    }>[] = [
+      {
+        name: "provider available before routing",
+        expected: true,
+        value: {
+          ...capabilities,
+          provider_transports: ["openai"],
+          features: { ...capabilities.features, providers: "available" },
+        },
+      },
+      {
+        name: "provider and routing available with their resources",
+        expected: true,
+        value: {
+          ...capabilities,
+          provider_transports: ["openai"],
+          model_classes: [modelClass],
+          features: {
+            ...capabilities.features,
+            providers: "available",
+            routing: "available",
+          },
+        },
+      },
+      {
+        name: "unavailable provider advertising a transport",
+        expected: false,
+        value: { ...capabilities, provider_transports: ["openai"] },
+      },
+      {
+        name: "unavailable routing advertising a model class",
+        expected: false,
+        value: {
+          ...capabilities,
+          provider_transports: ["openai"],
+          model_classes: [modelClass],
+          features: { ...capabilities.features, providers: "available" },
+        },
+      },
+    ];
+
+    for (const entry of cases) {
+      expect(parseRuntimeCapabilities(canonicalJson(entry.value)).ok, entry.name).toBe(
+        entry.expected,
+      );
+    }
+  });
+
   it.each([
     "apiKey",
     "APIKey",
     "APIKEY",
     "TOKEN",
+    "TOKENVALUE",
+    "ACCESSTOKENVALUE",
+    "CLIENTTOKENVALUE",
     "clientSecret",
     "CLIENTSECRET",
     "governanceApproval",
@@ -186,25 +244,28 @@ describe("Runtime Contract Protocol v1 chain", () => {
     });
   });
 
-  it("rejects sensitive keys in result error metadata", async () => {
-    const chain = await loadValidChain();
-    const result = {
-      ...chain.result,
-      status: "FAILED",
-      outputs: [],
-      error: {
-        code: "PROVIDER_FAILURE",
-        category: "unavailable",
-        retryable: false,
-        safe_message: "Provider unavailable",
-        metadata: { refreshToken: "must-not-persist" },
-      },
-    };
-    expect(parseExecutionResult(canonicalJson(result))).toMatchObject({
-      ok: false,
-      code: "RUNTIME_DOCUMENT_INVALID",
-    });
-  });
+  it.each(["refreshToken", "TOKENVALUE", "ACCESSTOKENVALUE", "CLIENTTOKENVALUE"])(
+    "rejects sensitive result error metadata key %s",
+    async (key) => {
+      const chain = await loadValidChain();
+      const result = {
+        ...chain.result,
+        status: "FAILED",
+        outputs: [],
+        error: {
+          code: "PROVIDER_FAILURE",
+          category: "unavailable",
+          retryable: false,
+          safe_message: "Provider unavailable",
+          metadata: { [key]: "must-not-persist" },
+        },
+      };
+      expect(parseExecutionResult(canonicalJson(result))).toMatchObject({
+        ok: false,
+        code: "RUNTIME_DOCUMENT_INVALID",
+      });
+    },
+  );
 
   it("requires the final terminal event to match the result status", async () => {
     const chain = await loadValidChain();

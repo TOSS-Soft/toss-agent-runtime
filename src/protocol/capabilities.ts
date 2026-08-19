@@ -94,15 +94,23 @@ export function parseRuntimeCapabilities(
 
   const issues: ValidationIssue[] = [];
   if (
-    (result.value.features.providers === "unavailable" ||
-      result.value.features.routing === "unavailable") &&
-    (result.value.provider_transports.length > 0 || result.value.model_classes.length > 0)
+    result.value.features.providers === "unavailable" &&
+    result.value.provider_transports.length > 0
   ) {
     issues.push(
       capabilityIssue(
         "/provider_transports",
         "featureCoherence",
-        "unavailable provider or routing features cannot advertise provider resources",
+        "unavailable providers cannot advertise provider transports",
+      ),
+    );
+  }
+  if (result.value.features.routing === "unavailable" && result.value.model_classes.length > 0) {
+    issues.push(
+      capabilityIssue(
+        "/model_classes",
+        "featureCoherence",
+        "unavailable routing cannot advertise model classes",
       ),
     );
   }

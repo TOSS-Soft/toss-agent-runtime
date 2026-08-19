@@ -206,7 +206,7 @@ function productionRoots(options: {
   return {
     config,
     state,
-    logs: state,
+    logs: path.join(state, "logs"),
     runtime:
       runtimeEnvironment === undefined ? state : path.join(runtimeEnvironment, "toss", "runtime"),
   };

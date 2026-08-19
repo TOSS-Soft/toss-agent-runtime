@@ -141,7 +141,7 @@ For a successful completion, `error` is `null`. Failure details use a stable cod
 
 `blocked` means the implementation exists but policy or environment prevents its use. `unavailable` means the runtime cannot supply it. Neither state may be treated as success.
 
-Feature state and resource declarations MUST agree in both directions. A consumer rejects an available feature with no usable supporting resource, as well as an unavailable feature that advertises one.
+Feature state and resource declarations MUST agree in both directions. A consumer rejects an available feature with no usable supporting resource, as well as an unavailable feature that advertises one. Provider and routing state are independent: provider transports correspond to the provider feature, while model classes correspond to routing, so a provider transport may be advertised before routing becomes available.
 
 ## 10. Secrets and logging
 

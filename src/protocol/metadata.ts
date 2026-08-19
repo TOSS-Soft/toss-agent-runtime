@@ -26,7 +26,7 @@ function isSensitiveKey(key: string): boolean {
     compact.includes("apikey") ||
     compact.includes("privatekey") ||
     compact.includes("governanceapproval") ||
-    compact.endsWith("token")
+    compact.includes("token")
   ) {
     return true;
   }

@@ -95,7 +95,7 @@ TOSS CLI queries `runtime-capabilities.v1` before dispatch and checks:
 
 Unknown major versions fail closed. Unknown exact schema versions fail closed. Newly added model classes, transports, skills, topologies, and feature values are additive declarations, but are usable only after explicit negotiation. The runtime must not infer that an omitted requirement is optional, and the CLI must not infer that an omitted capability exists.
 
-Feature availability and supporting resources are checked in both directions. For example, an available provider feature without a provider transport, or an available skill feature without an Agent Skills host and Superpowers capability, fails before dispatch.
+Feature availability and supporting resources are checked in both directions. For example, an available provider feature without a provider transport, or an available skill feature without an Agent Skills host and Superpowers capability, fails before dispatch. Provider transports map to provider availability independently of routing; model classes map to routing availability.
 
 ## Error and process mapping
 
