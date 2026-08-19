@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toss.software/schemas/runtime/v1/execution-event.v1.schema.json",
+  "title": "TOSS Runtime execution event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "schema_version",
+    "document_type",
+    "run_id",
+    "request_hash",
+    "sequence",
+    "run_revision",
+    "previous_event_hash",
+    "event_hash",
+    "event_type",
+    "timestamp",
+    "producer",
+    "trace",
+    "input_reference",
+    "payload"
+  ],
+  "properties": {
+    "protocol_version": { "const": "runtime-contract.v1" },
+    "schema_version": { "const": "execution-event.v1" },
+    "document_type": { "const": "execution-event" },
+    "run_id": {
+      "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/identifier"
+    },
+    "request_hash": {
+      "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/sha256"
+    },
+    "sequence": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "run_revision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "previous_event_hash": {
+      "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/sha256"
+    },
+    "event_hash": {
+      "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/sha256"
+    },
+    "event_type": {
+      "type": "string",
+      "enum": [
+        "CREATED",
+        "ROUTED",
+        "RUNNING",
+        "MODEL_STARTED",
+        "MODEL_DELTA",
+        "MODEL_COMPLETED",
+        "TOOL_PENDING",
+        "APPROVAL_PENDING",
+        "APPROVAL_RECORDED",
+        "TOOL_COMPLETED",
+        "REVIEW_PENDING",
+        "REVIEW_COMPLETED",
+        "COMPLETED",
+        "FAILED",
+        "BLOCKED",
+        "CANCELLED",
+        "INTERRUPTED"
+      ]
+    },
+    "timestamp": {
+      "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/utc_timestamp"
+    },
+    "producer": {
+      "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/producer_identity"
+    },
+    "trace": {
+      "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/trace_context"
+    },
+    "input_reference": {
+      "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/artifact_reference"
+    },
+    "payload": {
+      "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/safe_json"
+    }
+  }
+}
