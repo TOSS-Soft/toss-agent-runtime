@@ -30,7 +30,7 @@ const otherExecutableHash = "b".repeat(64);
 const now = new Date("2026-08-19T12:00:00.000Z");
 
 const temporaryDirectories: string[] = [];
-const killCalls: number[] = [];
+const livenessCalls: number[] = [];
 
 interface Fixture {
   readonly runtimePath: string;
@@ -87,7 +87,8 @@ function options(overrides: FixtureOverrides = {}): Parameters<typeof acquireIns
       overrides.createServiceInstanceId ?? (() => overrides.instanceId ?? newId),
     executableHash: overrides.executableHash ?? executableHash,
     processProbe: {
-      liveness: (): ProcessLiveness => {
+      liveness: (pid): ProcessLiveness => {
+        livenessCalls.push(pid);
         const liveness = overrides.isAlive?.() ?? false;
         return liveness === "unknown" ? "unknown" : liveness ? "alive" : "dead";
       },
@@ -140,7 +141,7 @@ beforeEach(async () => {
     ownerPath: path.join(runtimePath, "instance.lock", "owner.json"),
     socketPath: path.join(runtimePath, "runtime.sock"),
   };
-  killCalls.splice(0);
+  livenessCalls.splice(0);
 });
 
 afterEach(async () => {
@@ -152,13 +153,14 @@ afterEach(async () => {
 });
 
 describe("runtime supervisor instance lock", () => {
-  it("rejects a second live owner without killing it", async () => {
+  it("rejects a second live owner after probing the recorded pid", async () => {
     const first = await acquireInstanceLock(options({ isAlive: () => true }));
 
     await expect(acquireInstanceLock(options({ isAlive: () => true }))).rejects.toMatchObject({
       code: "RUNTIME_SERVICE_ALREADY_RUNNING",
     });
-    expect(killCalls).toEqual([]);
+    expect(livenessCalls).toEqual([first.owner.pid]);
+    expect(JSON.parse(await readFile(fixture.ownerPath, "utf8"))).toEqual(first.owner);
 
     await first.release();
   });
