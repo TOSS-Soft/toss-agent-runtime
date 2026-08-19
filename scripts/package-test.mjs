@@ -89,7 +89,7 @@ function assertPackageFiles(files) {
 async function assertExecutableSignalShutdown(executable, configPath, signal) {
   const child = spawn(executable, ["serve", "--json", "--config", configPath], {
     cwd: path.dirname(configPath),
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
   });
   let stdout = "";
   let stderr = "";
@@ -103,22 +103,25 @@ async function assertExecutableSignalShutdown(executable, configPath, signal) {
   });
 
   const outcome = await new Promise((resolve, reject) => {
-    const signalTimer = setTimeout(() => child.kill(signal), 300);
     const forceTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+    let ready = false;
+    child.once("message", (message) => {
+      if (message?.type !== "toss-runtime-ready") return;
+      ready = true;
+      child.kill(signal);
+    });
     child.once("error", (error) => {
-      clearTimeout(signalTimer);
       clearTimeout(forceTimer);
       reject(error);
     });
     child.once("close", (code, closeSignal) => {
-      clearTimeout(signalTimer);
       clearTimeout(forceTimer);
-      resolve({ code, signal: closeSignal });
+      resolve({ code, signal: closeSignal, ready });
     });
   });
 
   assert(
-    outcome.code === 0 && outcome.signal === null,
+    outcome.ready && outcome.code === 0 && outcome.signal === null,
     `${signal} shutdown was not graceful: ${JSON.stringify(outcome)}; stderr=${JSON.stringify(stderr)}`,
   );
   assert(stderr === "", `${signal} shutdown wrote to stderr`);

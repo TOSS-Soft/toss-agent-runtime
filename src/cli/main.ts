@@ -293,12 +293,20 @@ export async function main(argv: readonly string[]): Promise<number> {
           platform: platform.os,
           home: homedir(),
         });
-        return runService({
+        const running = runService({
           signals: createProcessSignalSource(),
           stopAccepting: () => undefined,
           drain: () => Promise.resolve(),
           shutdownTimeoutMs: loaded.config.shutdown_timeout_ms,
         });
+        if (process.connected && typeof process.send === "function") {
+          try {
+            process.send({ type: "toss-runtime-ready" }, () => undefined);
+          } catch {
+            // Readiness IPC is diagnostic-only and never changes service lifecycle.
+          }
+        }
+        return running;
       },
     });
   } catch {

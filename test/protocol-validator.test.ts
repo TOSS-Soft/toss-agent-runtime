@@ -61,6 +61,25 @@ describe("runtime common schema", () => {
     }
   });
 
+  it.each(["APIKey", "APIKEY", "CLIENTSECRET", "GOVERNANCEAPPROVAL"])(
+    "rejects compact sensitive runtime-error metadata key %s",
+    (key) => {
+      const result = createProtocolValidator().validateFragment("runtime-error", {
+        code: "PROVIDER_UNAVAILABLE",
+        category: "unavailable",
+        retryable: true,
+        safe_message: "Provider unavailable",
+        metadata: { [key]: "must-not-persist" },
+      });
+
+      expect(result).toMatchObject({ ok: false });
+      if (!result.ok) {
+        expect(result.issues.some((issue) => issue.keyword === "sensitiveMetadata")).toBe(true);
+        expect(JSON.stringify(result)).not.toContain("must-not-persist");
+      }
+    },
+  );
+
   it("rejects accessors without evaluating them", () => {
     let invoked = false;
     const value = Object.defineProperty({ ...VALID_ARTIFACT_REFERENCE }, "location", {

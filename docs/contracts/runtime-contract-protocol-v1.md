@@ -48,7 +48,7 @@ Before execution, the consumer obtains `runtime-capabilities.v1` and negotiates 
 
 Unknown major protocol versions MUST fail closed. Unknown schema versions MUST fail closed. Additive capability values are usable only after explicit negotiation; absence means unavailable. New optional fields require a new schema version because v1 objects are closed. A breaking field or semantic change requires a new major protocol family.
 
-The baseline capability document truthfully marks later subsystems unavailable. A producer MUST NOT advertise a provider, transport, model class, skill host, MCP transport, topology, or feature before it can satisfy that contract.
+The baseline capability document truthfully marks later subsystems unavailable. A producer MUST NOT advertise a provider, transport, model class, skill host, MCP transport, topology, or feature before it can satisfy that contract. Availability and resources are bidirectionally coherent: an `available` provider feature requires at least one provider transport; routing requires an available provider plus a model class; skills require a host version and Superpowers capability; MCP requires a transport and the exact requested profile; and agent-loop or review availability requires a topology. Conversely, a subsystem marked `unavailable` cannot advertise its corresponding resources.
 
 ## 6. `execution-request.v1`
 
@@ -140,6 +140,8 @@ For a successful completion, `error` is `null`. Failure details use a stable cod
 | `features`                 | `available`, `unavailable`, or `blocked` state for each subsystem |
 
 `blocked` means the implementation exists but policy or environment prevents its use. `unavailable` means the runtime cannot supply it. Neither state may be treated as success.
+
+Feature state and resource declarations MUST agree in both directions. A consumer rejects an available feature with no usable supporting resource, as well as an unavailable feature that advertises one.
 
 ## 10. Secrets and logging
 

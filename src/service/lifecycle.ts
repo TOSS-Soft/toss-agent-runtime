@@ -29,18 +29,18 @@ export function runService(options: {
     const stop = (reason: RuntimeSignal): void => {
       if (stopPromise !== undefined) return;
       stopPromise = (async () => {
-        options.stopAccepting();
         const controller = new AbortController();
-        const drainPromise = options.drain(controller.signal);
         let timer: NodeJS.Timeout | undefined;
-        const timeoutPromise = new Promise<"forced">((resolveTimeout) => {
-          timer = setTimeout(() => {
-            controller.abort();
-            resolveTimeout("forced");
-          }, options.shutdownTimeoutMs);
-        });
 
         try {
+          options.stopAccepting();
+          const drainPromise = options.drain(controller.signal);
+          const timeoutPromise = new Promise<"forced">((resolveTimeout) => {
+            timer = setTimeout(() => {
+              controller.abort();
+              resolveTimeout("forced");
+            }, options.shutdownTimeoutMs);
+          });
           const outcome = await Promise.race([
             drainPromise.then(() => "drained" as const),
             timeoutPromise,
@@ -57,9 +57,12 @@ export function runService(options: {
       void stopPromise.then(resolve, reject);
     };
 
-    unsubscribe.push(
-      options.signals.subscribe("SIGINT", () => stop("SIGINT")),
-      options.signals.subscribe("SIGTERM", () => stop("SIGTERM")),
-    );
+    try {
+      unsubscribe.push(options.signals.subscribe("SIGINT", () => stop("SIGINT")));
+      unsubscribe.push(options.signals.subscribe("SIGTERM", () => stop("SIGTERM")));
+    } catch (error) {
+      cleanup();
+      reject(error instanceof Error ? error : new Error("Signal subscription failed"));
+    }
   });
 }

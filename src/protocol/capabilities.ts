@@ -144,6 +144,68 @@ export function parseRuntimeCapabilities(
       ),
     );
   }
+  if (
+    result.value.features.providers === "available" &&
+    result.value.provider_transports.length === 0
+  ) {
+    issues.push(
+      capabilityIssue(
+        "/provider_transports",
+        "featureCoherence",
+        "available providers require at least one provider transport",
+      ),
+    );
+  }
+  if (
+    result.value.features.routing === "available" &&
+    (result.value.features.providers !== "available" || result.value.model_classes.length === 0)
+  ) {
+    issues.push(
+      capabilityIssue(
+        "/model_classes",
+        "featureCoherence",
+        "available routing requires available providers and at least one model class",
+      ),
+    );
+  }
+  if (
+    result.value.features.skills === "available" &&
+    (result.value.skill_host_versions.length === 0 ||
+      result.value.superpowers_capabilities.length === 0)
+  ) {
+    issues.push(
+      capabilityIssue(
+        "/skill_host_versions",
+        "featureCoherence",
+        "available skills require a host version and declared Superpowers capabilities",
+      ),
+    );
+  }
+  if (
+    result.value.features.mcp === "available" &&
+    (result.value.mcp_transports.length === 0 || result.value.mcp_profiles.length === 0)
+  ) {
+    issues.push(
+      capabilityIssue(
+        "/mcp_transports",
+        "featureCoherence",
+        "available MCP requires a transport and an exact profile identity",
+      ),
+    );
+  }
+  if (
+    (result.value.features.agent_loop === "available" ||
+      result.value.features.review === "available") &&
+    result.value.execution_topologies.length === 0
+  ) {
+    issues.push(
+      capabilityIssue(
+        "/execution_topologies",
+        "featureCoherence",
+        "available execution or review requires an execution topology",
+      ),
+    );
+  }
   if (issues.length === 0) return result;
   issues.sort((left, right) =>
     `${left.path}\u0000${left.keyword}\u0000${left.message}`.localeCompare(
@@ -186,6 +248,18 @@ export function negotiateRequest(
   }
   if (!capabilities.supported_schemas.includes(request.schema_version)) {
     issues.push(capabilityIssue("/schema_version", "schema", "request schema is unsupported"));
+  }
+  if (capabilities.provider_transports.length === 0) {
+    issues.push(
+      capabilityIssue(
+        "/provider_transports",
+        "providerTransport",
+        "provider transport is unavailable",
+      ),
+    );
+  }
+  if (capabilities.skill_host_versions.length === 0) {
+    issues.push(capabilityIssue("/skill_host_versions", "skillHost", "skill host is unavailable"));
   }
 
   const modelClass = capabilities.model_classes.find(

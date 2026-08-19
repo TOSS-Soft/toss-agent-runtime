@@ -125,6 +125,34 @@ describe("Runtime Contract Protocol v1 chain", () => {
       value: { protocol: "runtime-contract.v1" },
     });
 
+    const withoutProviderTransport = {
+      ...exactProfile,
+      provider_transports: [],
+    } as RuntimeCapabilitiesV1;
+    expect(parseRuntimeCapabilities(canonicalJson(withoutProviderTransport))).toMatchObject({
+      ok: false,
+      code: "RUNTIME_DOCUMENT_INVALID",
+    });
+    const noProviderResult = negotiateRequest(chain.request, withoutProviderTransport);
+    expect(noProviderResult).toMatchObject({ ok: false });
+    if (!noProviderResult.ok) {
+      expect(noProviderResult.issues.map((issue) => issue.keyword)).toContain("providerTransport");
+    }
+
+    const withoutSkillHost = {
+      ...exactProfile,
+      skill_host_versions: [],
+    } as RuntimeCapabilitiesV1;
+    expect(parseRuntimeCapabilities(canonicalJson(withoutSkillHost))).toMatchObject({
+      ok: false,
+      code: "RUNTIME_DOCUMENT_INVALID",
+    });
+    const noSkillHostResult = negotiateRequest(chain.request, withoutSkillHost);
+    expect(noSkillHostResult).toMatchObject({ ok: false });
+    if (!noSkillHostResult.ok) {
+      expect(noSkillHostResult.issues.map((issue) => issue.keyword)).toContain("skillHost");
+    }
+
     const unavailable = {
       ...exactProfile,
       features: { ...exactProfile.features, mcp: "unavailable" },
@@ -138,18 +166,25 @@ describe("Runtime Contract Protocol v1 chain", () => {
     }
   });
 
-  it.each(["apiKey", "TOKEN", "clientSecret", "governanceApproval", "acceptedBy"])(
-    "rejects sensitive or authority-shaped event metadata key %s",
-    async (key) => {
-      const chain = await loadValidChain();
-      const hashable = withoutEventHash(chain.events[0]!);
-      const event = eventWithHash({ ...hashable, payload: { [key]: "must-not-persist" } });
-      expect(parseExecutionEvent(canonicalJson(event))).toMatchObject({
-        ok: false,
-        code: "RUNTIME_DOCUMENT_INVALID",
-      });
-    },
-  );
+  it.each([
+    "apiKey",
+    "APIKey",
+    "APIKEY",
+    "TOKEN",
+    "clientSecret",
+    "CLIENTSECRET",
+    "governanceApproval",
+    "GOVERNANCEAPPROVAL",
+    "acceptedBy",
+  ])("rejects sensitive or authority-shaped event metadata key %s", async (key) => {
+    const chain = await loadValidChain();
+    const hashable = withoutEventHash(chain.events[0]!);
+    const event = eventWithHash({ ...hashable, payload: { [key]: "must-not-persist" } });
+    expect(parseExecutionEvent(canonicalJson(event))).toMatchObject({
+      ok: false,
+      code: "RUNTIME_DOCUMENT_INVALID",
+    });
+  });
 
   it("rejects sensitive keys in result error metadata", async () => {
     const chain = await loadValidChain();

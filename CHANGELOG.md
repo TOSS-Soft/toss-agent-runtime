@@ -15,11 +15,12 @@ All notable changes to this project are documented here. The format follows Keep
 
 ### Security
 
-- Reject case/camelCase secret- and governance-shaped metadata keys in event/error free-form fields while documenting the producer redaction boundary.
-- Require coherent `available` feature declarations and exact MCP profile identity during capability negotiation.
+- Reject separator-free, case/camelCase, and uppercase secret- and governance-shaped metadata keys in event/error free-form fields while documenting the producer redaction boundary.
+- Require bidirectional coherence between `available` features and their provider, model, skill, MCP, and topology resources during capability parsing and negotiation.
 - Preserve JSON/exit-code safety for inline secret options, missing service configuration, failed drains, and forced shutdown.
-- Read configuration through one no-follow file descriptor and isolate production files/paths to private per-user roots.
-- Validate exact npm package contents and real installed-process SIGINT/SIGTERM behavior.
+- Read configuration through one no-follow file descriptor and isolate each production file/path class to its private per-user config, state, log, or runtime root.
+- Validate exact npm package contents and readiness-synchronized real installed-process SIGINT/SIGTERM behavior.
+- Clean up lifecycle listeners and timers when signal registration, stop-accepting, or drain startup fails synchronously.
 
 ### Known limitations
 

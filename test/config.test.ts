@@ -34,6 +34,26 @@ secret_references: {}
 `;
 }
 
+function linuxConfigRoot(home: string): string {
+  return path.join(home, ".config", "toss", "runtime");
+}
+
+function linuxStateRoot(home: string): string {
+  return path.join(home, ".local", "state", "toss", "runtime");
+}
+
+async function writeProductionConfig(
+  home: string,
+  name: string,
+  yaml = validYaml(linuxStateRoot(home), "production"),
+): Promise<string> {
+  const configRoot = linuxConfigRoot(home);
+  await mkdir(configRoot, { recursive: true, mode: 0o700 });
+  const configPath = path.join(configRoot, name);
+  await writeFile(configPath, yaml, { mode: 0o600 });
+  return configPath;
+}
+
 afterEach(async () => {
   await Promise.all(
     temporaryDirectories
@@ -115,8 +135,7 @@ describe("runtime configuration", () => {
 
   it("rejects group/world-writable production configuration", async () => {
     const root = await temporaryDirectory();
-    const configPath = path.join(root, "production.yaml");
-    await writeFile(configPath, validYaml(root, "production"), { mode: 0o600 });
+    const configPath = await writeProductionConfig(root, "production.yaml");
     await chmod(configPath, 0o666);
     await expect(
       loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home: root }),
@@ -125,8 +144,7 @@ describe("runtime configuration", () => {
 
   it("rejects group/world-readable production configuration", async () => {
     const root = await temporaryDirectory();
-    const configPath = path.join(root, "production-readable.yaml");
-    await writeFile(configPath, validYaml(root, "production"), { mode: 0o600 });
+    const configPath = await writeProductionConfig(root, "production-readable.yaml");
     await chmod(configPath, 0o644);
     await expect(
       loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home: root }),
@@ -136,8 +154,11 @@ describe("runtime configuration", () => {
   it("rejects production runtime paths outside approved per-user roots", async () => {
     const home = await temporaryDirectory();
     const shared = await temporaryDirectory();
-    const configPath = path.join(home, "production-outside.yaml");
-    await writeFile(configPath, validYaml(shared, "production"), { mode: 0o600 });
+    const configPath = await writeProductionConfig(
+      home,
+      "production-outside.yaml",
+      validYaml(shared, "production"),
+    );
     await expect(
       loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home }),
     ).rejects.toMatchObject({ code: "RUNTIME_CONFIG_UNSAFE" });
@@ -145,11 +166,10 @@ describe("runtime configuration", () => {
 
   it("rejects unsafe existing directories in a production runtime path", async () => {
     const home = await temporaryDirectory();
-    const shared = path.join(home, "shared");
-    await mkdir(shared, { mode: 0o700 });
-    await chmod(shared, 0o777);
-    const configPath = path.join(home, "production-shared.yaml");
-    await writeFile(configPath, validYaml(shared, "production"), { mode: 0o600 });
+    const stateRoot = linuxStateRoot(home);
+    await mkdir(stateRoot, { recursive: true, mode: 0o700 });
+    await chmod(stateRoot, 0o777);
+    const configPath = await writeProductionConfig(home, "production-shared.yaml");
     await expect(
       loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home }),
     ).rejects.toMatchObject({ code: "RUNTIME_CONFIG_UNSAFE" });
@@ -159,10 +179,34 @@ describe("runtime configuration", () => {
     const home = await temporaryDirectory();
     const outside = await temporaryDirectory();
     const configPath = path.join(outside, "production.yaml");
-    await writeFile(configPath, validYaml(home, "production"), { mode: 0o600 });
+    await writeFile(configPath, validYaml(linuxStateRoot(home), "production"), { mode: 0o600 });
     await expect(
       loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home }),
     ).rejects.toMatchObject({ code: "RUNTIME_CONFIG_UNSAFE" });
+  });
+
+  it("rejects project-local production config and runtime paths inside home", async () => {
+    const home = await temporaryDirectory();
+    const project = path.join(home, "project");
+    await mkdir(project, { mode: 0o700 });
+    const configPath = path.join(project, "runtime.yaml");
+    await writeFile(configPath, validYaml(project, "production"), { mode: 0o600 });
+    await expect(
+      loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home }),
+    ).rejects.toMatchObject({ code: "RUNTIME_CONFIG_UNSAFE" });
+  });
+
+  it("accepts private production config and paths under field-specific roots", async () => {
+    const home = await temporaryDirectory();
+    const configPath = await writeProductionConfig(home, "production-safe.yaml");
+    const result = await loadConfig({
+      explicitPath: configPath,
+      env: {},
+      platform: "linux",
+      home,
+    });
+    expect(result.config.mode).toBe("production");
+    expect(result.config.paths.state).toBe(path.join(linuxStateRoot(home), "state"));
   });
 
   it("rejects relative runtime paths", async () => {

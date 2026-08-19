@@ -14,6 +14,22 @@ function keyWords(key: string): readonly string[] {
 }
 
 function isSensitiveKey(key: string): boolean {
+  const compact = key.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
+  if (
+    compact.includes("authorization") ||
+    compact.includes("authority") ||
+    compact.includes("accepted") ||
+    compact.includes("approved") ||
+    compact.includes("credential") ||
+    compact.includes("password") ||
+    compact.includes("secret") ||
+    compact.includes("apikey") ||
+    compact.includes("privatekey") ||
+    compact.includes("governanceapproval") ||
+    compact.endsWith("token")
+  ) {
+    return true;
+  }
   const words = keyWords(key);
   if (
     words.some((word) =>

@@ -7,6 +7,7 @@ import executionRequestSchema from "../../contracts/runtime/execution-request.v1
 import executionResultSchema from "../../contracts/runtime/execution-result.v1.schema.json" with { type: "json" };
 import runtimeCapabilitiesSchema from "../../contracts/runtime/runtime-capabilities.v1.schema.json" with { type: "json" };
 import { canonicalJson, deepFreezeJson, parseJsonBytes, type JsonValue } from "./json.js";
+import { sensitiveMetadataIssues } from "./metadata.js";
 import type {
   RuntimeDocument,
   ValidationFailure,
@@ -116,6 +117,12 @@ export function createProtocolValidator(): ProtocolValidator {
           code: "RUNTIME_DOCUMENT_INVALID",
           issues: normalizeIssues(validate.errors),
         };
+      }
+      if (name === "runtime-error") {
+        const issues = sensitiveMetadataIssues(candidate, "");
+        if (issues.length > 0) {
+          return { ok: false, code: "RUNTIME_DOCUMENT_INVALID", issues };
+        }
       }
       return { ok: true, value: candidate };
     },

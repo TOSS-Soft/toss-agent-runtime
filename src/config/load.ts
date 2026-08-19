@@ -45,6 +45,13 @@ function xdgPath(env: Environment, key: string, fallback: string): string {
     : path.normalize(value);
 }
 
+function absoluteEnvironmentPath(env: Environment, key: string): string | undefined {
+  const value = env[key];
+  return value !== undefined && value.length > 0 && path.isAbsolute(value)
+    ? path.normalize(value)
+    : undefined;
+}
+
 export function defaultConfig(
   platform: PlatformName,
   home: string,
@@ -62,9 +69,13 @@ export function defaultConfig(
     platform === "darwin"
       ? path.join(home, "Library", "Logs", "TOSS", "runtime")
       : path.join(state, "logs");
+  const runtimeEnvironment =
+    platform === "linux" ? absoluteEnvironmentPath(env, "XDG_RUNTIME_DIR") : undefined;
   const runtimeRoot =
     platform === "linux"
-      ? xdgPath(env, "XDG_RUNTIME_DIR", state)
+      ? runtimeEnvironment === undefined
+        ? state
+        : path.join(runtimeEnvironment, "toss", "runtime")
       : path.join(home, "Library", "Application Support", "TOSS", "runtime");
 
   const config: RuntimeConfigV1 = {
@@ -159,19 +170,46 @@ function isWithin(root: string, candidate: string): boolean {
   );
 }
 
-function approvedRoots(options: {
+interface ProductionRoots {
+  readonly config: string;
+  readonly state: string;
+  readonly logs: string;
+  readonly runtime: string;
+}
+
+function productionRoots(options: {
   readonly env: Environment;
   readonly home: string;
   readonly platform: PlatformName;
-}): readonly string[] {
-  const roots = [path.normalize(options.home)];
-  if (options.platform === "linux") {
-    for (const key of ["XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR"]) {
-      const value = options.env[key];
-      if (value !== undefined && path.isAbsolute(value)) roots.push(path.normalize(value));
-    }
+}): ProductionRoots {
+  if (options.platform === "darwin") {
+    const runtime = path.join(options.home, "Library", "Application Support", "TOSS", "runtime");
+    return {
+      config: runtime,
+      state: path.join(runtime, "state"),
+      logs: path.join(options.home, "Library", "Logs", "TOSS", "runtime"),
+      runtime,
+    };
   }
-  return [...new Set(roots)].sort((left, right) => right.length - left.length);
+
+  const config = path.join(
+    xdgPath(options.env, "XDG_CONFIG_HOME", path.join(options.home, ".config")),
+    "toss",
+    "runtime",
+  );
+  const state = path.join(
+    xdgPath(options.env, "XDG_STATE_HOME", path.join(options.home, ".local", "state")),
+    "toss",
+    "runtime",
+  );
+  const runtimeEnvironment = absoluteEnvironmentPath(options.env, "XDG_RUNTIME_DIR");
+  return {
+    config,
+    state,
+    logs: state,
+    runtime:
+      runtimeEnvironment === undefined ? state : path.join(runtimeEnvironment, "toss", "runtime"),
+  };
 }
 
 function selectApprovedRoot(candidate: string, roots: readonly string[]): string {
@@ -192,13 +230,11 @@ function currentUserOwns(userId: number): boolean {
 async function assertPrivateDirectoryPath(
   candidate: string,
   roots: readonly string[],
-  home: string,
 ): Promise<void> {
   const root = selectApprovedRoot(candidate, roots);
   const relative = path.relative(root, candidate);
   const segments = relative === "" ? [] : relative.split(path.sep);
-  const pathsToCheck: string[] = [];
-  if (root !== path.normalize(home)) pathsToCheck.push(root);
+  const pathsToCheck: string[] = [root];
   let current = root;
   for (const segment of segments) {
     current = path.join(current, segment);
@@ -235,11 +271,11 @@ async function assertProductionIsolation(
   selectedPath: string,
   options: { readonly env: Environment; readonly home: string; readonly platform: PlatformName },
 ): Promise<void> {
-  const roots = approvedRoots(options);
-  await assertPrivateDirectoryPath(path.dirname(selectedPath), roots, options.home);
-  await assertPrivateDirectoryPath(config.paths.state, roots, options.home);
-  await assertPrivateDirectoryPath(config.paths.logs, roots, options.home);
-  await assertPrivateDirectoryPath(path.dirname(config.paths.socket), roots, options.home);
+  const roots = productionRoots(options);
+  await assertPrivateDirectoryPath(path.dirname(selectedPath), [roots.config]);
+  await assertPrivateDirectoryPath(config.paths.state, [roots.state]);
+  await assertPrivateDirectoryPath(config.paths.logs, [roots.logs]);
+  await assertPrivateDirectoryPath(path.dirname(config.paths.socket), [roots.runtime]);
 }
 
 export async function loadConfig(options: {

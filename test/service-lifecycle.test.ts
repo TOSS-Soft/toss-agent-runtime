@@ -85,4 +85,58 @@ describe("service lifecycle", () => {
     await expect(running).rejects.toThrow("drain failed");
     expect(signals.count()).toBe(0);
   });
+
+  it.each([
+    [
+      "stop accepting",
+      () => {
+        throw new Error("stop accepting failed");
+      },
+      () => Promise.resolve(),
+    ],
+    [
+      "starting drain",
+      () => undefined,
+      () => {
+        throw new Error("drain start failed");
+      },
+    ],
+  ])("cleans listeners and keepalive when %s throws synchronously", async (_name, stop, drain) => {
+    vi.useFakeTimers();
+    const signals = new FakeSignals();
+    const running = runService({
+      signals,
+      stopAccepting: stop,
+      drain,
+      shutdownTimeoutMs: 1000,
+    });
+    signals.emit("SIGTERM");
+    await expect(running).rejects.toThrow();
+    expect(signals.count()).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("cleans the first listener and keepalive when second subscription fails", async () => {
+    vi.useFakeTimers();
+    let firstListenerActive = false;
+    const running = runService({
+      signals: {
+        subscribe(signal) {
+          if (signal === "SIGINT") {
+            firstListenerActive = true;
+            return () => {
+              firstListenerActive = false;
+            };
+          }
+          throw new Error("subscription failed");
+        },
+      },
+      stopAccepting: () => undefined,
+      drain: () => Promise.resolve(),
+      shutdownTimeoutMs: 1000,
+    });
+    await expect(running).rejects.toThrow("subscription failed");
+    expect(firstListenerActive).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+  });
 });
