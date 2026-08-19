@@ -4,7 +4,7 @@
 
 This record covers Runtime Contract Protocol v1 (#2) and the package/CLI/daemon/CI baseline (#4). It verifies commit `9cd153673d9c8a738d8b27c80c483315e338be4f` on 2026-08-19 before this evidence-only commit was updated.
 
-Local acceptance is complete. The GitHub branch and required Node 22/24 macOS/Linux CI matrix remain pending; issues MUST NOT close until that remote evidence is green. This record is internal repository evidence and is intentionally excluded from the npm package; public contract documentation remains under `docs/contracts`.
+Local acceptance is complete. GitHub Actions run [32244157742](https://github.com/TOSS-Soft/toss-agent-runtime/actions/runs/32244157742) passed the required Node 22/24 macOS/Linux matrix against evidence head `ce72c39932a23be96a08f4eea0c86a701c40d423`. Issues MUST NOT close until the pull request merges. This record is internal repository evidence and is intentionally excluded from the npm package; public contract documentation remains under `docs/contracts`.
 
 ## Environment
 
@@ -31,7 +31,7 @@ All commands below exited `0` against the verified commit.
 | `node bin/toss-runtime.js capabilities --json` | Valid `command-result.v1`; protocol v1 advertised and all future subsystems truthfully `unavailable`                  |
 | `node bin/toss-runtime.js doctor --json`       | Package, Node/OS, and default config passed; unavailable execution features reported as a warning; no secrets emitted |
 
-CI defines the same locked verification plus production dependency audit for Node `22.23.1` and Node `24` on Ubuntu and macOS in `.github/workflows/ci.yml`.
+CI defines the same locked verification plus production dependency audit for Node `22.23.1` and Node `24` on Ubuntu and macOS in `.github/workflows/ci.yml`. All four jobs passed in GitHub Actions run `32244157742`.
 
 ## Package evidence
 
@@ -73,4 +73,4 @@ The follow-up review found four remaining gaps. Commit `0d29d714a97e4fc7a90c27d1
 
 The final adversarial pass found three narrower invariant gaps. Commit `9cd153673d9c8a738d8b27c80c483315e338be4f` closes them with uppercase token-compound coverage across fragments/events/results, a mixed provider/routing capability matrix, and a negative Linux log-root sibling test.
 
-The dependency wave is ready to push for review. After the required remote CI matrix is green, #2 and #4 may be closed and later waves may treat `runtime-contract.v1` as their frozen input boundary. This is not authorization to publish npm version `1.0.0`, create a GitHub release, or close the v1 epic.
+The dependency wave is ready to merge. After pull request #33 merges with its required checks green, #2 and #4 may close and later waves may treat `runtime-contract.v1` as their frozen input boundary. This is not authorization to publish npm version `1.0.0`, create a GitHub release, or close the v1 epic.
