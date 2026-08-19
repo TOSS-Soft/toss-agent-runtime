@@ -23,8 +23,32 @@ function invalidDefinition(): never {
   throw new Error("Invalid service definition input");
 }
 
+function hasInvalidXml10Character(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    if (
+      codePoint === undefined ||
+      !(
+        codePoint === 0x9 ||
+        codePoint === 0xa ||
+        codePoint === 0xd ||
+        (codePoint >= 0x20 && codePoint <= 0xd7ff) ||
+        (codePoint >= 0xe000 && codePoint <= 0xfffd) ||
+        (codePoint >= 0x10000 && codePoint <= 0x10ffff)
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function assertAbsoluteDefinitionPath(value: string): void {
-  if (!path.isAbsolute(value) || CONTROL_CHARACTER_PATTERN.test(value)) {
+  if (
+    !path.isAbsolute(value) ||
+    CONTROL_CHARACTER_PATTERN.test(value) ||
+    hasInvalidXml10Character(value)
+  ) {
     invalidDefinition();
   }
 }

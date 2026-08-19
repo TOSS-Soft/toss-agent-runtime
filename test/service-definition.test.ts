@@ -120,6 +120,32 @@ WantedBy=default.target
   });
 
   it.each([
+    ["lone high surrogate", { ...common, nodePath: "/opt/\ud800/node" }],
+    ["lone low surrogate", { ...common, cliPath: "/opt/toss/\udc00/runtime.js" }],
+    ["U+FFFE", { ...common, configPath: "/home/test/config\ufffe.yaml" }],
+    ["U+FFFF", { ...common, configPath: "/home/test/config\uffff.yaml" }],
+  ])("rejects XML-invalid %s in a rendered path", (_name, input) => {
+    expect(() => renderLaunchAgent({ ...input, platform: "darwin", uid: 501 })).toThrow(
+      "Invalid service definition input",
+    );
+  });
+
+  it("retains valid astral Unicode in launchd program paths", () => {
+    const definition = renderLaunchAgent({
+      ...common,
+      platform: "darwin",
+      uid: 501,
+      nodePath: "/opt/🚀/node",
+      cliPath: "/opt/toss/🛰️/runtime.js",
+      configPath: "/home/test/config-😀.yaml",
+    });
+
+    expect(definition).toContain("<string>/opt/🚀/node</string>");
+    expect(definition).toContain("<string>/opt/toss/🛰️/runtime.js</string>");
+    expect(definition).toContain("<string>/home/test/config-😀.yaml</string>");
+  });
+
+  it.each([
     ["non-allowlisted key", { ...common, environment: { API_TOKEN: "must-not-persist" } }],
     ["credential-looking key", { ...common, environment: { credential: "must-not-persist" } }],
     ["locale with a slash", { ...common, environment: { LANG: "en_US/UTF-8" } }],
