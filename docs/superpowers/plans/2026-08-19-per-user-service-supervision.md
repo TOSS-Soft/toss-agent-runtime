@@ -597,7 +597,7 @@ Use these exact native commands, with no shell:
   `--user daemon-reload`, then
   `--user enable toss-agent-runtime.service`; start/stop/restart use the
   corresponding `--user` verb; status uses
-  `--user show toss-agent-runtime.service --property=LoadState,UnitFileState,ActiveState,SubState,NRestarts,ExecMainStatus --no-pager`.
+  `--user show toss-agent-runtime.service --property=LoadState,UnitFileState,ActiveState,SubState,Result,NRestarts,ExecMainStatus --no-pager`.
 - Linux uninstall: idempotent stop, disable, safe definition removal, then daemon-reload. Darwin uninstall: idempotent bootout followed by safe definition removal.
 
 Map command-not-found to `RUNTIME_SERVICE_MANAGER_UNAVAILABLE`; unsafe definition content/path to `RUNTIME_SERVICE_DEFINITION_UNSAFE`; nonzero manager operations to `RUNTIME_SERVICE_MANAGER_FAILED` with no raw stderr reflection. Status treats absent definitions/services as a successful `installed:false` result.

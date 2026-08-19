@@ -91,6 +91,9 @@ toss-runtime service uninstall [--json]`;
 
     expect(contract).toContain(grammar);
     expect(contract).toContain("Only `service install` accepts `--config`");
+    expect(contract).toContain(
+      "/usr/bin/systemctl --user show toss-agent-runtime.service --property=LoadState,UnitFileState,ActiveState,SubState,Result,NRestarts,ExecMainStatus --no-pager",
+    );
     for (const action of ["start", "stop", "restart", "status", "uninstall"]) {
       expect(grammar).toContain(`toss-runtime service ${action} [--json]`);
       expect(grammar).not.toContain(`service ${action} [--config`);

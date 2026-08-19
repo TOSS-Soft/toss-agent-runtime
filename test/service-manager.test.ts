@@ -405,7 +405,7 @@ describe("native per-user service manager", () => {
       {
         exitCode: 0,
         stdout:
-          "LoadState=loaded\nUnitFileState=enabled\nActiveState=activating\nSubState=auto-restart\nNRestarts=7\nExecMainStatus=23\n",
+          "LoadState=loaded\nUnitFileState=enabled\nActiveState=activating\nSubState=auto-restart\nResult=success\nNRestarts=7\nExecMainStatus=23\n",
         stderr: "",
       },
     ]);
@@ -428,7 +428,42 @@ describe("native per-user service manager", () => {
           "--user",
           "show",
           "toss-agent-runtime.service",
-          "--property=LoadState,UnitFileState,ActiveState,SubState,NRestarts,ExecMainStatus",
+          "--property=LoadState,UnitFileState,ActiveState,SubState,Result,NRestarts,ExecMainStatus",
+          "--no-pager",
+        ],
+      },
+    ]);
+  });
+
+  it("parses terminal systemd start-limit failures as actionable restart backoff", async () => {
+    const runner = new RecordingRunner([
+      {
+        exitCode: 0,
+        stdout:
+          "LoadState=loaded\nUnitFileState=enabled\nActiveState=failed\nSubState=failed\nResult=start-limit-hit\nNRestarts=5\nExecMainStatus=70\n",
+        stderr: "",
+      },
+    ]);
+    const { manager } = await linuxFixture(runner);
+    await manager.install();
+    runner.calls.splice(0);
+
+    await expect(manager.status()).resolves.toEqual({
+      installed: true,
+      enabled: true,
+      active: false,
+      backoff: true,
+      restartCount: 5,
+      lastExitCode: 70,
+    });
+    expect(runner.calls).toEqual([
+      {
+        file: "/usr/bin/systemctl",
+        args: [
+          "--user",
+          "show",
+          "toss-agent-runtime.service",
+          "--property=LoadState,UnitFileState,ActiveState,SubState,Result,NRestarts,ExecMainStatus",
           "--no-pager",
         ],
       },

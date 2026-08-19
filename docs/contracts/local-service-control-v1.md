@@ -62,15 +62,15 @@ absolute selected configuration path. Native management uses an `execFile`-style
 absolute executable plus argument array and never invokes a shell or constructs
 a command string.
 
-| Operation  | macOS launchd                                                       | Linux `systemd --user`                                                                                                                                  |
-| ---------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Definition | `~/Library/LaunchAgents/software.toss.agent-runtime.plist`          | `~/.config/systemd/user/toss-agent-runtime.service`                                                                                                     |
-| Install    | Atomically write the definition; no `/bin/launchctl` command        | `/usr/bin/systemctl --user daemon-reload`, then `/usr/bin/systemctl --user enable toss-agent-runtime.service`                                           |
-| Start      | `/bin/launchctl bootstrap gui/<uid> <absolute-definition-path>`     | `/usr/bin/systemctl --user start toss-agent-runtime.service`                                                                                            |
-| Stop       | `/bin/launchctl bootout gui/<uid>/software.toss.agent-runtime`      | `/usr/bin/systemctl --user stop toss-agent-runtime.service`                                                                                             |
-| Restart    | `/bin/launchctl kickstart -k gui/<uid>/software.toss.agent-runtime` | `/usr/bin/systemctl --user restart toss-agent-runtime.service`                                                                                          |
-| Status     | `/bin/launchctl print gui/<uid>/software.toss.agent-runtime`        | `/usr/bin/systemctl --user show toss-agent-runtime.service --property=LoadState,UnitFileState,ActiveState,SubState,NRestarts,ExecMainStatus --no-pager` |
-| Uninstall  | Idempotent `bootout`, then remove only the validated definition     | Idempotent `stop`, `disable`, remove only the validated definition, then `daemon-reload`                                                                |
+| Operation  | macOS launchd                                                       | Linux `systemd --user`                                                                                                                                         |
+| ---------- | ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Definition | `~/Library/LaunchAgents/software.toss.agent-runtime.plist`          | `~/.config/systemd/user/toss-agent-runtime.service`                                                                                                            |
+| Install    | Atomically write the definition; no `/bin/launchctl` command        | `/usr/bin/systemctl --user daemon-reload`, then `/usr/bin/systemctl --user enable toss-agent-runtime.service`                                                  |
+| Start      | `/bin/launchctl bootstrap gui/<uid> <absolute-definition-path>`     | `/usr/bin/systemctl --user start toss-agent-runtime.service`                                                                                                   |
+| Stop       | `/bin/launchctl bootout gui/<uid>/software.toss.agent-runtime`      | `/usr/bin/systemctl --user stop toss-agent-runtime.service`                                                                                                    |
+| Restart    | `/bin/launchctl kickstart -k gui/<uid>/software.toss.agent-runtime` | `/usr/bin/systemctl --user restart toss-agent-runtime.service`                                                                                                 |
+| Status     | `/bin/launchctl print gui/<uid>/software.toss.agent-runtime`        | `/usr/bin/systemctl --user show toss-agent-runtime.service --property=LoadState,UnitFileState,ActiveState,SubState,Result,NRestarts,ExecMainStatus --no-pager` |
+| Uninstall  | Idempotent `bootout`, then remove only the validated definition     | Idempotent `stop`, `disable`, remove only the validated definition, then `daemon-reload`                                                                       |
 
 The launchd definition has label `software.toss.agent-runtime`,
 `RunAtLoad=true`, unsuccessful-exit-only `KeepAlive`,

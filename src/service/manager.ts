@@ -198,11 +198,15 @@ function linuxStatus(result: CommandResult): ServiceManagerStatus {
   const properties = parseProperties(result.stdout);
   if (properties.get("LoadState") === "not-found") return EMPTY_STATUS;
   const subState = properties.get("SubState") ?? "";
+  const unitResult = properties.get("Result") ?? "";
   return {
     installed: properties.get("LoadState") === "loaded",
     enabled: properties.get("UnitFileState") === "enabled",
     active: properties.get("ActiveState") === "active",
-    backoff: subState === "auto-restart" || subState === "start-limit-hit",
+    backoff:
+      subState === "auto-restart" ||
+      subState === "start-limit-hit" ||
+      unitResult === "start-limit-hit",
     restartCount: parseNonnegativeInteger(properties.get("NRestarts")),
     lastExitCode: parseExitCode(properties.get("ExecMainStatus")),
   };
@@ -413,7 +417,7 @@ class NativeServiceManager implements ServiceManager {
           "--user",
           "show",
           SYSTEMD_UNIT,
-          "--property=LoadState,UnitFileState,ActiveState,SubState,NRestarts,ExecMainStatus",
+          "--property=LoadState,UnitFileState,ActiveState,SubState,Result,NRestarts,ExecMainStatus",
           "--no-pager",
         ],
         "linux-show",

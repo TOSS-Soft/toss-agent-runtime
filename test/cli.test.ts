@@ -8,7 +8,7 @@ import { createMainServices, runCli, type CliServices } from "../src/cli/main.js
 import { defaultConfig, RuntimeConfigError } from "../src/config/load.js";
 import type { ServiceStatusV1 } from "../src/service/contracts.js";
 import { RuntimeServiceError, type RuntimeServiceErrorCode } from "../src/service/errors.js";
-import type { ServiceManagerStatus } from "../src/service/manager.js";
+import { createServiceManager, type ServiceManagerStatus } from "../src/service/manager.js";
 
 const platform = { os: "linux" as const, arch: "x64", node: "22.23.1" };
 
@@ -688,6 +688,86 @@ describe("baseline CLI", () => {
       status: "FAIL",
       message: "Runtime service restart backoff is active; inspect service status",
     });
+  });
+
+  it("turns terminal systemd start-limit output into a blocking doctor check", async () => {
+    const root = await realpath(
+      await mkdtemp(path.join(tmpdir(), "toss-runtime-cli-start-limit-")),
+    );
+    const cliPath = path.join(root, "cli.js");
+    const configPath = path.join(root, ".config", "toss", "runtime", "config.yaml");
+    await writeFile(cliPath, "", { mode: 0o600 });
+    const runner = {
+      calls: [] as { file: string; args: readonly string[] }[],
+      run(file: string, args: readonly string[]) {
+        this.calls.push({ file, args: [...args] });
+        return Promise.resolve({
+          exitCode: 0,
+          stdout:
+            "LoadState=loaded\nUnitFileState=enabled\nActiveState=failed\nSubState=failed\nResult=start-limit-hit\nNRestarts=5\nExecMainStatus=70\n",
+          stderr: "",
+        });
+      },
+    };
+    try {
+      const installer = createServiceManager({
+        platform: "linux",
+        home: root,
+        env: {},
+        uid: 501,
+        currentUid: () => 501,
+        nodePath: process.execPath,
+        cliPath,
+        configPath,
+        randomSuffix: () => "definition",
+        runner,
+      });
+      await installer.install();
+      runner.calls.splice(0);
+
+      const mainServices = createMainServices({
+        platform,
+        env: {},
+        home: root,
+        signals: { subscribe: () => () => undefined },
+        pid: 4217,
+        now: () => new Date("2026-08-20T10:00:00.000Z"),
+        createServiceInstanceId: () => healthySocketStatus.service_instance_id,
+        resolveExecutableHash: () => Promise.resolve("a".repeat(64)),
+        sendReady: () => undefined,
+        nodePath: process.execPath,
+        cliPath,
+        uid: 501,
+        loadConfig: () =>
+          Promise.resolve({ config: defaultConfig("linux", root), source: "systemd-format-test" }),
+        createServiceManager: (options) =>
+          createServiceManager({ ...options, currentUid: () => 501, runner }),
+      });
+
+      const output = await runCli(["doctor", "--json"], mainServices);
+
+      expect(output.exitCode).toBe(5);
+      expect(doctorChecks(output)).toContainEqual({
+        id: "service",
+        status: "FAIL",
+        message: "Runtime service restart backoff is active; inspect service status",
+      });
+      expect(output.stdout).not.toContain("Result=start-limit-hit");
+      expect(runner.calls).toEqual([
+        {
+          file: "/usr/bin/systemctl",
+          args: [
+            "--user",
+            "show",
+            "toss-agent-runtime.service",
+            "--property=LoadState,UnitFileState,ActiveState,SubState,Result,NRestarts,ExecMainStatus",
+            "--no-pager",
+          ],
+        },
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it.each([
