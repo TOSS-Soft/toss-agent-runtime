@@ -1,5 +1,14 @@
 import { constants } from "node:fs";
-import { lstat, mkdir, open, readdir, rmdir, unlink, type FileHandle } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  rename,
+  rmdir,
+  unlink,
+  type FileHandle,
+} from "node:fs/promises";
 import path from "node:path";
 
 import { canonicalJson } from "../protocol/json.js";
@@ -21,6 +30,11 @@ export interface InstanceLock {
   release(): Promise<void>;
 }
 
+export interface InstanceLockOperationHooks {
+  readonly beforeOwnerClaimRename?: (operation: "reclaim" | "release") => Promise<void>;
+  readonly afterOwnerlessSentinelCreate?: () => Promise<void>;
+}
+
 type CurrentUserCheck = (userId: number, candidate?: string) => boolean;
 
 export interface AcquireInstanceLockOptions {
@@ -33,6 +47,7 @@ export interface AcquireInstanceLockOptions {
   readonly processProbe: ProcessProbe;
   readonly socketProbe: SocketIdentityProbe;
   readonly isCurrentUser?: CurrentUserCheck;
+  readonly operationHooks?: InstanceLockOperationHooks;
 }
 
 interface FileIdentity {
@@ -58,17 +73,36 @@ interface AcquiredIdentity {
 
 const OWNER_FILE_NAME = "owner.json";
 const OWNERLESS_STALE_AFTER_MS = 30_000;
+const internalServiceErrors = new WeakSet<RuntimeServiceError>();
+
+function ownerClaimName(serviceInstanceId: string): string {
+  return `.owner-claim.${serviceInstanceId}.json`;
+}
+
+function ownerlessSentinelName(serviceInstanceId: string): string {
+  return `.ownerless-reclaim.${serviceInstanceId}`;
+}
 
 function servicePathUnsafe(): never {
-  throw new RuntimeServiceError("RUNTIME_SERVICE_PATH_UNSAFE");
+  const error = new RuntimeServiceError("RUNTIME_SERVICE_PATH_UNSAFE");
+  internalServiceErrors.add(error);
+  throw error;
 }
 
 function lockAmbiguous(): never {
-  throw new RuntimeServiceError("RUNTIME_SERVICE_LOCK_AMBIGUOUS");
+  const error = new RuntimeServiceError("RUNTIME_SERVICE_LOCK_AMBIGUOUS");
+  internalServiceErrors.add(error);
+  throw error;
 }
 
 function alreadyRunning(): never {
-  throw new RuntimeServiceError("RUNTIME_SERVICE_ALREADY_RUNNING");
+  const error = new RuntimeServiceError("RUNTIME_SERVICE_ALREADY_RUNNING");
+  internalServiceErrors.add(error);
+  throw error;
+}
+
+function isInternalServiceError(error: unknown): error is RuntimeServiceError {
+  return error instanceof RuntimeServiceError && internalServiceErrors.has(error);
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -126,8 +160,7 @@ function createOwnerDocument(
     const validated = parseServiceLock(bytes);
     if (!validated.ok || bytes.byteLength > MAX_CONTROL_MESSAGE_BYTES) lockAmbiguous();
     return { owner: validated.value, bytes };
-  } catch (error) {
-    if (error instanceof RuntimeServiceError) throw error;
+  } catch {
     lockAmbiguous();
   }
 }
@@ -187,6 +220,7 @@ async function assertCurrentIdentity(
   kind: "directory" | "file",
   mode: 0o700 | 0o600,
   isCurrentUser: CurrentUserCheck,
+  identityMismatchIsAmbiguous = false,
 ): Promise<void> {
   let metadata;
   try {
@@ -198,9 +232,12 @@ async function assertCurrentIdentity(
     metadata.isSymbolicLink() ||
     (kind === "directory" ? !metadata.isDirectory() : !metadata.isFile()) ||
     !currentUserOwns(isCurrentUser, metadata.uid, candidate) ||
-    (metadata.mode & 0o777) !== mode ||
-    !sameIdentity(identityOf(metadata), expected)
+    (metadata.mode & 0o777) !== mode
   ) {
+    servicePathUnsafe();
+  }
+  if (!sameIdentity(identityOf(metadata), expected)) {
+    if (identityMismatchIsAmbiguous) lockAmbiguous();
     servicePathUnsafe();
   }
 }
@@ -235,7 +272,7 @@ async function openPrivateDirectory(
     return { handle, identity, modifiedAtMs: metadata.mtimeMs };
   } catch (error) {
     await handle.close();
-    if (error instanceof RuntimeServiceError) throw error;
+    if (isInternalServiceError(error)) throw error;
     servicePathUnsafe();
   }
 }
@@ -276,14 +313,14 @@ async function readPrivateOwner(
     }
     if (metadata.size > MAX_CONTROL_MESSAGE_BYTES) lockAmbiguous();
     const bytes = await readBounded(handle);
-    await assertCurrentIdentity(ownerPath, identity, "file", 0o600, isCurrentUser);
+    await assertCurrentIdentity(ownerPath, identity, "file", 0o600, isCurrentUser, true);
     const parsed = parseServiceLock(bytes);
     if (!parsed.ok) lockAmbiguous();
     const canonicalBytes = Buffer.from(canonicalJson(parsed.value), "utf8");
     if (!Buffer.from(bytes).equals(canonicalBytes)) lockAmbiguous();
     return { owner: parsed.value, identity };
   } catch (error) {
-    if (error instanceof RuntimeServiceError) throw error;
+    if (isInternalServiceError(error)) throw error;
     lockAmbiguous();
   } finally {
     await handle.close();
@@ -306,57 +343,249 @@ async function exactEntries(directoryPath: string, expected: readonly string[]):
 }
 
 async function identifySocket(
-  probe: SocketIdentityProbe,
+  probe: () => SocketIdentityProbe,
   socketPath: string,
 ): Promise<string | null> {
   try {
-    return await probe.identify(socketPath);
+    return await probe().identify(socketPath);
   } catch {
     lockAmbiguous();
   }
 }
 
-function processLiveness(probe: ProcessProbe, pid: number): ProcessLiveness {
+function processLiveness(probe: () => ProcessProbe, pid: number): ProcessLiveness {
   try {
-    const liveness = probe.liveness(pid);
+    const liveness = probe().liveness(pid);
     if (liveness !== "alive" && liveness !== "dead" && liveness !== "unknown") {
       lockAmbiguous();
     }
     return liveness;
-  } catch (error) {
-    if (error instanceof RuntimeServiceError) throw error;
+  } catch {
     lockAmbiguous();
   }
 }
 
-async function removeValidatedLock(options: {
+async function runOperationHook(hook: (() => Promise<void>) | undefined): Promise<void> {
+  try {
+    await hook?.();
+  } catch {
+    lockAmbiguous();
+  }
+}
+
+function readOperationHooks(
+  options: AcquireInstanceLockOptions,
+): InstanceLockOperationHooks | undefined {
+  try {
+    return options.operationHooks;
+  } catch {
+    lockAmbiguous();
+  }
+}
+
+async function assertRemovalContext(options: {
   readonly lockPath: string;
-  readonly ownerPath: string;
   readonly directory: OpenedDirectory;
-  readonly owner?: OpenedOwner;
   readonly isCurrentUser: CurrentUserCheck;
   readonly runtimeIdentity: FileIdentity;
 }): Promise<void> {
-  const { directory, isCurrentUser, lockPath, owner, ownerPath, runtimeIdentity } = options;
-  await exactEntries(lockPath, owner === undefined ? [] : [OWNER_FILE_NAME]);
-  await assertCurrentIdentity(lockPath, directory.identity, "directory", 0o700, isCurrentUser);
+  const { directory, isCurrentUser, lockPath, runtimeIdentity } = options;
+  await assertCurrentIdentity(
+    lockPath,
+    directory.identity,
+    "directory",
+    0o700,
+    isCurrentUser,
+    true,
+  );
   await assertCurrentIdentity(
     path.dirname(lockPath),
     runtimeIdentity,
     "directory",
     0o700,
     isCurrentUser,
+    true,
   );
-  if (owner !== undefined) {
-    await assertCurrentIdentity(ownerPath, owner.identity, "file", 0o600, isCurrentUser);
-    try {
-      await unlink(ownerPath);
-    } catch {
-      lockAmbiguous();
-    }
+}
+
+function sameOwner(actual: OpenedOwner, expected: OpenedOwner): boolean {
+  return (
+    sameIdentity(actual.identity, expected.identity) &&
+    canonicalJson(actual.owner) === canonicalJson(expected.owner)
+  );
+}
+
+function assertSameOwner(actual: OpenedOwner, expected: OpenedOwner): void {
+  if (!sameOwner(actual, expected)) lockAmbiguous();
+}
+
+async function claimOwnerForRemoval(options: {
+  readonly operation: "reclaim" | "release";
+  readonly lockPath: string;
+  readonly ownerPath: string;
+  readonly claimPath: string;
+  readonly directory: OpenedDirectory;
+  readonly owner: OpenedOwner;
+  readonly isCurrentUser: CurrentUserCheck;
+  readonly runtimeIdentity: FileIdentity;
+  readonly hooks?: InstanceLockOperationHooks;
+}): Promise<OpenedOwner> {
+  const {
+    claimPath,
+    directory,
+    hooks,
+    isCurrentUser,
+    lockPath,
+    operation,
+    owner,
+    ownerPath,
+    runtimeIdentity,
+  } = options;
+  await exactEntries(lockPath, [OWNER_FILE_NAME]);
+  await assertRemovalContext({ lockPath, directory, isCurrentUser, runtimeIdentity });
+  const hook = hooks?.beforeOwnerClaimRename;
+  await runOperationHook(hook === undefined ? undefined : () => hook(operation));
+  try {
+    await rename(ownerPath, claimPath);
+  } catch {
+    lockAmbiguous();
+  }
+
+  const claimed = await readPrivateOwner(claimPath, isCurrentUser);
+  if (claimed === undefined) lockAmbiguous();
+  assertSameOwner(claimed, owner);
+  await assertRemovalContext({ lockPath, directory, isCurrentUser, runtimeIdentity });
+  await exactEntries(lockPath, [path.basename(claimPath)]);
+  return claimed;
+}
+
+async function removeClaimedLock(options: {
+  readonly lockPath: string;
+  readonly claimPath: string;
+  readonly directory: OpenedDirectory;
+  readonly claimedOwner: OpenedOwner;
+  readonly isCurrentUser: CurrentUserCheck;
+  readonly runtimeIdentity: FileIdentity;
+}): Promise<void> {
+  const { claimPath, claimedOwner, directory, isCurrentUser, lockPath, runtimeIdentity } = options;
+  const revalidated = await readPrivateOwner(claimPath, isCurrentUser);
+  if (revalidated === undefined) lockAmbiguous();
+  assertSameOwner(revalidated, claimedOwner);
+  await assertRemovalContext({ lockPath, directory, isCurrentUser, runtimeIdentity });
+  await exactEntries(lockPath, [path.basename(claimPath)]);
+  try {
+    await unlink(claimPath);
+  } catch {
+    lockAmbiguous();
   }
   try {
     await rmdir(lockPath);
+  } catch {
+    lockAmbiguous();
+  }
+}
+
+async function createOwnerlessSentinel(options: {
+  readonly sentinelPath: string;
+  readonly isCurrentUser: CurrentUserCheck;
+}): Promise<FileIdentity> {
+  const { isCurrentUser, sentinelPath } = options;
+  let handle: FileHandle;
+  try {
+    handle = await open(
+      sentinelPath,
+      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
+      0o600,
+    );
+  } catch {
+    lockAmbiguous();
+  }
+
+  try {
+    const metadata = await handle.stat();
+    const identity = identityOf(metadata);
+    if (
+      !metadata.isFile() ||
+      !currentUserOwns(isCurrentUser, metadata.uid, sentinelPath) ||
+      (metadata.mode & 0o777) !== 0o600
+    ) {
+      servicePathUnsafe();
+    }
+    await handle.sync();
+    await assertCurrentIdentity(sentinelPath, identity, "file", 0o600, isCurrentUser, true);
+    return identity;
+  } finally {
+    await handle.close();
+  }
+}
+
+function assertOwnerlessStale(directory: OpenedDirectory, nowMs: number): void {
+  if (
+    !Number.isFinite(directory.modifiedAtMs) ||
+    nowMs - directory.modifiedAtMs < OWNERLESS_STALE_AFTER_MS
+  ) {
+    lockAmbiguous();
+  }
+}
+
+async function reclaimOwnerlessLock(options: {
+  readonly acquire: AcquireInstanceLockOptions;
+  readonly directory: OpenedDirectory;
+  readonly nowMs: number;
+  readonly claimServiceInstanceId: string;
+  readonly isCurrentUser: CurrentUserCheck;
+  readonly runtimeIdentity: FileIdentity;
+  readonly hooks?: InstanceLockOperationHooks;
+}): Promise<void> {
+  const {
+    acquire,
+    claimServiceInstanceId,
+    directory,
+    hooks,
+    isCurrentUser,
+    nowMs,
+    runtimeIdentity,
+  } = options;
+  await exactEntries(acquire.lockPath, []);
+  assertOwnerlessStale(directory, nowMs);
+  await assertRemovalContext({
+    lockPath: acquire.lockPath,
+    directory,
+    isCurrentUser,
+    runtimeIdentity,
+  });
+
+  const sentinelPath = path.join(acquire.lockPath, ownerlessSentinelName(claimServiceInstanceId));
+  const sentinelIdentity = await createOwnerlessSentinel({ sentinelPath, isCurrentUser });
+  await runOperationHook(hooks?.afterOwnerlessSentinelCreate);
+  assertOwnerlessStale(directory, nowMs);
+  await assertRemovalContext({
+    lockPath: acquire.lockPath,
+    directory,
+    isCurrentUser,
+    runtimeIdentity,
+  });
+  await assertCurrentIdentity(sentinelPath, sentinelIdentity, "file", 0o600, isCurrentUser, true);
+  await exactEntries(acquire.lockPath, [path.basename(sentinelPath)]);
+  if ((await identifySocket(() => acquire.socketProbe, acquire.socketPath)) !== null) {
+    lockAmbiguous();
+  }
+
+  await assertRemovalContext({
+    lockPath: acquire.lockPath,
+    directory,
+    isCurrentUser,
+    runtimeIdentity,
+  });
+  await assertCurrentIdentity(sentinelPath, sentinelIdentity, "file", 0o600, isCurrentUser, true);
+  await exactEntries(acquire.lockPath, [path.basename(sentinelPath)]);
+  try {
+    await unlink(sentinelPath);
+  } catch {
+    lockAmbiguous();
+  }
+  try {
+    await rmdir(acquire.lockPath);
   } catch {
     lockAmbiguous();
   }
@@ -366,77 +595,70 @@ async function inspectAndReclaim(options: {
   readonly acquire: AcquireInstanceLockOptions;
   readonly ownerPath: string;
   readonly nowMs: number;
+  readonly claimServiceInstanceId: string;
   readonly isCurrentUser: CurrentUserCheck;
   readonly runtimeIdentity: FileIdentity;
+  readonly hooks?: InstanceLockOperationHooks;
 }): Promise<void> {
-  const { acquire, isCurrentUser, nowMs, ownerPath, runtimeIdentity } = options;
+  const {
+    acquire,
+    claimServiceInstanceId,
+    hooks,
+    isCurrentUser,
+    nowMs,
+    ownerPath,
+    runtimeIdentity,
+  } = options;
   const directory = await openPrivateDirectory(acquire.lockPath, isCurrentUser);
   if (directory === undefined) lockAmbiguous();
   try {
     const owner = await readPrivateOwner(ownerPath, isCurrentUser);
     if (owner === undefined) {
-      await exactEntries(acquire.lockPath, []);
-      if (
-        !Number.isFinite(directory.modifiedAtMs) ||
-        nowMs - directory.modifiedAtMs < OWNERLESS_STALE_AFTER_MS
-      ) {
-        lockAmbiguous();
-      }
-      if ((await identifySocket(acquire.socketProbe, acquire.socketPath)) !== null) {
-        lockAmbiguous();
-      }
-      await removeValidatedLock({
-        lockPath: acquire.lockPath,
-        ownerPath,
+      await reclaimOwnerlessLock({
+        acquire,
         directory,
+        nowMs,
+        claimServiceInstanceId,
         isCurrentUser,
         runtimeIdentity,
+        ...(hooks === undefined ? {} : { hooks }),
       });
       return;
     }
 
     await exactEntries(acquire.lockPath, [OWNER_FILE_NAME]);
-    const liveness = processLiveness(acquire.processProbe, owner.owner.pid);
+    const liveness = processLiveness(() => acquire.processProbe, owner.owner.pid);
     if (liveness === "unknown") lockAmbiguous();
     if (liveness === "alive") {
       if (owner.owner.executable_hash === acquire.executableHash) alreadyRunning();
       lockAmbiguous();
     }
 
-    const socketIdentity = await identifySocket(acquire.socketProbe, acquire.socketPath);
+    const socketIdentity = await identifySocket(() => acquire.socketProbe, acquire.socketPath);
     if (socketIdentity === owner.owner.service_instance_id) alreadyRunning();
     if (socketIdentity !== null) lockAmbiguous();
-    await removeValidatedLock({
+    const claimPath = path.join(acquire.lockPath, ownerClaimName(claimServiceInstanceId));
+    const claimedOwner = await claimOwnerForRemoval({
+      operation: "reclaim",
       lockPath: acquire.lockPath,
       ownerPath,
+      claimPath,
       directory,
       owner,
+      isCurrentUser,
+      runtimeIdentity,
+      ...(hooks === undefined ? {} : { hooks }),
+    });
+    await removeClaimedLock({
+      lockPath: acquire.lockPath,
+      claimPath,
+      directory,
+      claimedOwner,
       isCurrentUser,
       runtimeIdentity,
     });
   } finally {
     await directory.handle.close();
-  }
-}
-
-async function cleanupFailedClaim(options: {
-  readonly lockPath: string;
-  readonly ownerPath: string;
-  readonly directoryIdentity: FileIdentity;
-  readonly ownerIdentity?: FileIdentity;
-  readonly isCurrentUser: CurrentUserCheck;
-}): Promise<void> {
-  const { directoryIdentity, isCurrentUser, lockPath, ownerIdentity, ownerPath } = options;
-  try {
-    await exactEntries(lockPath, ownerIdentity === undefined ? [] : [OWNER_FILE_NAME]);
-    await assertCurrentIdentity(lockPath, directoryIdentity, "directory", 0o700, isCurrentUser);
-    if (ownerIdentity !== undefined) {
-      await assertCurrentIdentity(ownerPath, ownerIdentity, "file", 0o600, isCurrentUser);
-      await unlink(ownerPath);
-    }
-    await rmdir(lockPath);
-  } catch {
-    // Cleanup is limited to the exact private objects created by this acquisition.
   }
 }
 
@@ -502,16 +724,7 @@ async function createClaim(options: {
     }
     return { directory: directory.identity, owner: ownerIdentity };
   } catch (error) {
-    if (directory !== undefined) {
-      await cleanupFailedClaim({
-        lockPath: acquire.lockPath,
-        ownerPath,
-        directoryIdentity: directory.identity,
-        ...(ownerIdentity === undefined ? {} : { ownerIdentity }),
-        isCurrentUser,
-      });
-    }
-    if (error instanceof RuntimeServiceError) throw error;
+    if (isInternalServiceError(error)) throw error;
     return servicePathUnsafe();
   } finally {
     await directory?.handle.close();
@@ -524,8 +737,9 @@ async function releaseAcquiredLock(options: {
   readonly expectedOwner: ServiceLockV1;
   readonly acquiredIdentity: AcquiredIdentity;
   readonly isCurrentUser: CurrentUserCheck;
+  readonly hooks?: InstanceLockOperationHooks;
 }): Promise<void> {
-  const { acquiredIdentity, expectedOwner, isCurrentUser, lockPath, ownerPath } = options;
+  const { acquiredIdentity, expectedOwner, hooks, isCurrentUser, lockPath, ownerPath } = options;
   const runtimePath = path.dirname(lockPath);
   const runtimeIdentity = await assertPrivateRuntimePath(runtimePath, isCurrentUser);
   const directory = await openPrivateDirectory(lockPath, isCurrentUser, true);
@@ -534,18 +748,31 @@ async function releaseAcquiredLock(options: {
     if (!sameIdentity(directory.identity, acquiredIdentity.directory)) return;
     const owner = await readPrivateOwner(ownerPath, isCurrentUser);
     if (owner === undefined) return;
-    if (
-      owner.owner.service_instance_id !== expectedOwner.service_instance_id ||
-      canonicalJson(owner.owner) !== canonicalJson(expectedOwner) ||
-      !sameIdentity(owner.identity, acquiredIdentity.owner)
-    ) {
+    const expectedOpenedOwner: OpenedOwner = {
+      owner: expectedOwner,
+      identity: acquiredIdentity.owner,
+    };
+    if (owner.owner.service_instance_id !== expectedOwner.service_instance_id) {
       return;
     }
-    await removeValidatedLock({
+    if (!sameOwner(owner, expectedOpenedOwner)) return;
+    const claimPath = path.join(lockPath, ownerClaimName(expectedOwner.service_instance_id));
+    const claimedOwner = await claimOwnerForRemoval({
+      operation: "release",
       lockPath,
       ownerPath,
+      claimPath,
       directory,
       owner,
+      isCurrentUser,
+      runtimeIdentity,
+      ...(hooks === undefined ? {} : { hooks }),
+    });
+    await removeClaimedLock({
+      lockPath,
+      claimPath,
+      directory,
+      claimedOwner,
       isCurrentUser,
       runtimeIdentity,
     });
@@ -578,6 +805,7 @@ async function acquireInstanceLockInternal(
 
   const { owner, bytes: ownerBytes } = createOwnerDocument(options, createdAt);
   const ownerPath = path.join(options.lockPath, OWNER_FILE_NAME);
+  const operationHooks = readOperationHooks(options);
 
   let acquiredIdentity = await createClaim({
     acquire: options,
@@ -591,8 +819,10 @@ async function acquireInstanceLockInternal(
       acquire: options,
       ownerPath,
       nowMs,
+      claimServiceInstanceId: owner.service_instance_id,
       isCurrentUser,
       runtimeIdentity,
+      ...(operationHooks === undefined ? {} : { hooks: operationHooks }),
     });
     acquiredIdentity = await createClaim({
       acquire: options,
@@ -616,10 +846,11 @@ async function acquireInstanceLockInternal(
           expectedOwner: owner,
           acquiredIdentity,
           isCurrentUser,
+          ...(operationHooks === undefined ? {} : { hooks: operationHooks }),
         });
         released = true;
       } catch (error) {
-        if (error instanceof RuntimeServiceError) throw error;
+        if (isInternalServiceError(error)) throw error;
         lockAmbiguous();
       }
     },
@@ -632,7 +863,7 @@ export async function acquireInstanceLock(
   try {
     return await acquireInstanceLockInternal(options);
   } catch (error) {
-    if (error instanceof RuntimeServiceError) throw error;
+    if (isInternalServiceError(error)) throw error;
     return servicePathUnsafe();
   }
 }

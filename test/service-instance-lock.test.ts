@@ -6,6 +6,7 @@ import {
   readFile,
   realpath,
   readdir,
+  rename,
   rm,
   symlink,
   utimes,
@@ -18,6 +19,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { canonicalJson } from "../src/protocol/json.js";
 import type { ServiceLockV1 } from "../src/service/contracts.js";
+import { RuntimeServiceError } from "../src/service/errors.js";
 import { acquireInstanceLock, type ProcessLiveness } from "../src/service/instance-lock.js";
 
 const oldId = "018f0f64-7b21-7d4f-8c3d-4a30413d5f41";
@@ -43,6 +45,14 @@ interface FixtureOverrides {
   readonly isCurrentUser?: (userId: number, candidate?: string) => boolean;
   readonly executableHash?: string;
   readonly instanceId?: string;
+  readonly now?: () => Date;
+  readonly createServiceInstanceId?: () => string;
+  readonly operationHooks?: TestOperationHooks;
+}
+
+interface TestOperationHooks {
+  readonly beforeOwnerClaimRename?: (operation: "reclaim" | "release") => Promise<void>;
+  readonly afterOwnerlessSentinelCreate?: () => Promise<void>;
 }
 
 let fixture: Fixture;
@@ -68,22 +78,42 @@ async function writeOwner(owner: ServiceLockV1 = serviceOwner()): Promise<void> 
 }
 
 function options(overrides: FixtureOverrides = {}): Parameters<typeof acquireInstanceLock>[0] {
-  const liveness = overrides.isAlive?.() ?? false;
-  const normalizedLiveness: ProcessLiveness =
-    liveness === "unknown" ? "unknown" : liveness ? "alive" : "dead";
   return {
     lockPath: fixture.lockPath,
     socketPath: fixture.socketPath,
     pid: 4200,
-    now: () => now,
-    createServiceInstanceId: () => overrides.instanceId ?? newId,
+    now: overrides.now ?? (() => now),
+    createServiceInstanceId:
+      overrides.createServiceInstanceId ?? (() => overrides.instanceId ?? newId),
     executableHash: overrides.executableHash ?? executableHash,
-    processProbe: { liveness: () => normalizedLiveness },
+    processProbe: {
+      liveness: (): ProcessLiveness => {
+        const liveness = overrides.isAlive?.() ?? false;
+        return liveness === "unknown" ? "unknown" : liveness ? "alive" : "dead";
+      },
+    },
     socketProbe: {
       identify: overrides.identifySocket ?? (() => Promise.resolve(null)),
     },
     isCurrentUser: overrides.isCurrentUser ?? (() => true),
+    ...(overrides.operationHooks === undefined ? {} : { operationHooks: overrides.operationHooks }),
   };
+}
+
+function sensitiveRuntimeError(secret: string): RuntimeServiceError {
+  const error = new RuntimeServiceError("RUNTIME_SERVICE_ALREADY_RUNNING");
+  error.message = secret;
+  return error;
+}
+
+async function writePrivate(candidate: string, bytes: string): Promise<void> {
+  await writeFile(candidate, bytes, { mode: 0o600 });
+  await chmod(candidate, 0o600);
+}
+
+async function reacquireAfterMovingCurrentLock(instanceId: string): Promise<void> {
+  await rename(fixture.lockPath, `${fixture.lockPath}.displaced`);
+  await acquireInstanceLock(options({ instanceId }));
 }
 
 async function missing(candidate: string): Promise<boolean> {
@@ -276,6 +306,23 @@ describe("runtime supervisor instance lock", () => {
     expect(await readFile(fixture.ownerPath, "utf8")).toBe(bytes);
   });
 
+  it.each([
+    [
+      "duplicate-key",
+      `{"created_at":"2026-08-19T11:00:00.000Z","document_type":"service-lock","executable_hash":"${executableHash}","pid":4100,"pid":4101,"schema_version":"service-lock.v1","service_instance_id":"${oldId}"}`,
+    ],
+    ["noncanonical", JSON.stringify(serviceOwner(), null, 2)],
+  ])("fails closed for a %s owner document without rewriting it", async (_name, bytes) => {
+    await mkdir(fixture.lockPath, { mode: 0o700 });
+    await chmod(fixture.lockPath, 0o700);
+    await writePrivate(fixture.ownerPath, bytes);
+
+    await expect(acquireInstanceLock(options())).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS",
+    });
+    expect(await readFile(fixture.ownerPath, "utf8")).toBe(bytes);
+  });
+
   it("redacts owner-construction dependency failures before touching the lock path", async () => {
     const secret = "sensitive-id-generator-detail";
     const unsafeOptions = {
@@ -293,6 +340,87 @@ describe("runtime supervisor instance lock", () => {
     });
     expect(String(error)).not.toContain(secret);
     expect(await missing(fixture.lockPath)).toBe(true);
+  });
+
+  it.each(["id", "clock", "owner"] as const)(
+    "normalizes a RuntimeServiceError thrown by the %s dependency",
+    async (dependency) => {
+      const secret = `sensitive-${dependency}-runtime-error`;
+      const thrown = sensitiveRuntimeError(secret);
+      let unsafeOptions = options();
+      if (dependency === "id") {
+        unsafeOptions = {
+          ...unsafeOptions,
+          createServiceInstanceId: (): string => {
+            throw thrown;
+          },
+        };
+      } else if (dependency === "clock") {
+        unsafeOptions = {
+          ...unsafeOptions,
+          now: (): Date => {
+            throw thrown;
+          },
+        };
+      } else {
+        Object.defineProperty(unsafeOptions, "executableHash", {
+          configurable: true,
+          enumerable: true,
+          get(): string {
+            throw thrown;
+          },
+        });
+      }
+
+      const error = await acquireInstanceLock(unsafeOptions).catch((caught: unknown) => caught);
+
+      expect(error).toMatchObject({
+        code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS",
+        message: "Runtime service lock state is ambiguous",
+      });
+      expect(String(error)).not.toContain(secret);
+      expect(await missing(fixture.lockPath)).toBe(true);
+    },
+  );
+
+  it.each(["plain", "runtime"] as const)(
+    "normalizes a %s process-probe exception",
+    async (kind) => {
+      await writeOwner();
+      const secret = `sensitive-${kind}-process-probe-detail`;
+
+      const error = await acquireInstanceLock(
+        options({
+          isAlive: () => {
+            throw kind === "plain" ? new Error(secret) : sensitiveRuntimeError(secret);
+          },
+        }),
+      ).catch((caught: unknown) => caught);
+
+      expect(error).toMatchObject({
+        code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS",
+        message: "Runtime service lock state is ambiguous",
+      });
+      expect(String(error)).not.toContain(secret);
+    },
+  );
+
+  it.each(["plain", "runtime"] as const)("normalizes a %s socket-probe exception", async (kind) => {
+    await writeOwner();
+    const secret = `sensitive-${kind}-socket-probe-detail`;
+
+    const error = await acquireInstanceLock(
+      options({
+        identifySocket: () =>
+          Promise.reject(kind === "plain" ? new Error(secret) : sensitiveRuntimeError(secret)),
+      }),
+    ).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS",
+      message: "Runtime service lock state is ambiguous",
+    });
+    expect(String(error)).not.toContain(secret);
   });
 
   it("redacts ownership-probe failures before touching the lock path", async () => {
@@ -349,7 +477,7 @@ describe("runtime supervisor instance lock", () => {
     await expect(
       acquireInstanceLock(options({ identifySocket: () => Promise.resolve(otherId) })),
     ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
-    expect(await readdir(fixture.lockPath)).toEqual([]);
+    expect(await readdir(fixture.lockPath)).toEqual([`.ownerless-reclaim.${newId}`]);
   });
 
   it("reports an accepting socket with the recorded identity as already running", async () => {
@@ -384,6 +512,109 @@ describe("runtime supervisor instance lock", () => {
     });
   });
 
+  it.each(["rewritten", "replaced"] as const)(
+    "does not reclaim an owner %s during the asynchronous socket probe",
+    async (mutation) => {
+      await writeOwner();
+      const changedOwner = serviceOwner({ pid: 4101 });
+
+      await expect(
+        acquireInstanceLock(
+          options({
+            identifySocket: async () => {
+              if (mutation === "rewritten") {
+                await writeFile(fixture.ownerPath, canonicalJson(changedOwner), { mode: 0o600 });
+                await chmod(fixture.ownerPath, 0o600);
+              } else {
+                const replacement = path.join(fixture.lockPath, ".replacement-owner");
+                await writePrivate(replacement, canonicalJson(changedOwner));
+                await rename(replacement, fixture.ownerPath);
+              }
+              return null;
+            },
+          }),
+        ),
+      ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+
+      const claim = `.owner-claim.${newId}.json`;
+      expect(await readdir(fixture.lockPath)).toEqual([claim]);
+      expect(JSON.parse(await readFile(path.join(fixture.lockPath, claim), "utf8"))).toEqual(
+        changedOwner,
+      );
+    },
+  );
+
+  it("does not delete a new actor that reacquires before stale-owner claim", async () => {
+    await writeOwner();
+
+    await expect(
+      acquireInstanceLock(
+        options({
+          operationHooks: {
+            beforeOwnerClaimRename: async (operation) => {
+              if (operation === "reclaim") await reacquireAfterMovingCurrentLock(otherId);
+            },
+          },
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+
+    const claim = `.owner-claim.${newId}.json`;
+    expect(await readdir(fixture.lockPath)).toEqual([claim]);
+    expect(JSON.parse(await readFile(path.join(fixture.lockPath, claim), "utf8"))).toMatchObject({
+      service_instance_id: otherId,
+    });
+  });
+
+  it("fails closed when a concurrent reclaimer inserts another owner claim", async () => {
+    await writeOwner();
+    const competingClaim = path.join(fixture.lockPath, `.owner-claim.${otherId}.json`);
+
+    await expect(
+      acquireInstanceLock(
+        options({
+          operationHooks: {
+            beforeOwnerClaimRename: async (operation) => {
+              if (operation === "reclaim") {
+                await writePrivate(competingClaim, canonicalJson(serviceOwner()));
+              }
+            },
+          },
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+
+    expect(await readdir(fixture.lockPath)).toEqual([
+      `.owner-claim.${newId}.json`,
+      `.owner-claim.${otherId}.json`,
+    ]);
+  });
+
+  it("fails closed when a concurrent reclaimer inserts another ownerless sentinel", async () => {
+    await mkdir(fixture.lockPath, { mode: 0o700 });
+    await chmod(fixture.lockPath, 0o700);
+    const stale = new Date(now.getTime() - 30_001);
+    await utimes(fixture.lockPath, stale, stale);
+    const competingSentinel = path.join(fixture.lockPath, `.ownerless-reclaim.${otherId}`);
+
+    await expect(
+      acquireInstanceLock(
+        options({
+          operationHooks: {
+            afterOwnerlessSentinelCreate: async () => {
+              await writePrivate(competingSentinel, "");
+            },
+          },
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+
+    expect(await readdir(fixture.lockPath)).toEqual([
+      `.ownerless-reclaim.${newId}`,
+      `.ownerless-reclaim.${otherId}`,
+    ]);
+  });
+
   it("does not release a lock whose owner identity was replaced", async () => {
     const lock = await acquireInstanceLock(options());
     await writeFile(fixture.ownerPath, canonicalJson(serviceOwner()), { mode: 0o600 });
@@ -407,6 +638,28 @@ describe("runtime supervisor instance lock", () => {
 
     expect(JSON.parse(await readFile(fixture.ownerPath, "utf8"))).toEqual(changedOwner);
     expect((await lstat(fixture.lockPath)).isDirectory()).toBe(true);
+  });
+
+  it("does not delete a new actor that reacquires before release claim", async () => {
+    const lock = await acquireInstanceLock(
+      options({
+        operationHooks: {
+          beforeOwnerClaimRename: async (operation) => {
+            if (operation === "release") await reacquireAfterMovingCurrentLock(otherId);
+          },
+        },
+      }),
+    );
+
+    await expect(lock.release()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS",
+    });
+
+    const claim = `.owner-claim.${newId}.json`;
+    expect(await readdir(fixture.lockPath)).toEqual([claim]);
+    expect(JSON.parse(await readFile(path.join(fixture.lockPath, claim), "utf8"))).toMatchObject({
+      service_instance_id: otherId,
+    });
   });
 
   it("reports release failure without partially deleting a non-empty lock", async () => {
