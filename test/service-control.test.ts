@@ -1,0 +1,553 @@
+import { once } from "node:events";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import { createConnection, createServer, type Server, type Socket } from "node:net";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { canonicalJson } from "../src/protocol/json.js";
+import type { ServiceStatusV1 } from "../src/service/contracts.js";
+import {
+  createServiceControlServer,
+  probeServiceIdentity,
+  requestServiceStatus,
+  type ServiceControlServer,
+} from "../src/service/control.js";
+
+const serviceInstanceId = "018f0f64-7b21-7d4f-8c3d-4a30413d5f41";
+const fixedRequestId = "018f0f64-7b21-7d4f-8c3d-4a30413d5f42";
+const otherRequestId = "018f0f64-7b21-7d4f-8c3d-4a30413d5f43";
+const temporaryDirectories: string[] = [];
+const controlServers: ServiceControlServer[] = [];
+const nativeServers: Server[] = [];
+const clientSockets = new Set<Socket>();
+
+let runtimePath: string;
+let temporaryRoot: string;
+let socketPath: string;
+let statusCalls: number;
+
+function status(): ServiceStatusV1 {
+  statusCalls += 1;
+  return {
+    package_version: "1.2.3",
+    service_instance_id: serviceInstanceId,
+    pid: 4200,
+    started_at: "2026-08-19T12:00:00.000Z",
+    health: "healthy",
+    accepting: true,
+  };
+}
+
+function options(
+  overrides: Partial<Parameters<typeof createServiceControlServer>[0]> = {},
+): Parameters<typeof createServiceControlServer>[0] {
+  return {
+    socketPath,
+    serviceInstanceId,
+    status,
+    idleTimeoutMs: 5_000,
+    maxConnections: 32,
+    cacheSize: 256,
+    ...overrides,
+  };
+}
+
+function statusRequest(requestId: string): string {
+  return `${canonicalJson({
+    schema_version: "service-control-request.v1",
+    document_type: "service-control-request",
+    request_id: requestId,
+    command: "status",
+  })}\n`;
+}
+
+function numberedRequestId(index: number): string {
+  return `018f0f64-7b21-7d4f-8c3d-${index.toString(16).padStart(12, "0")}`;
+}
+
+function responseFrom(socket: Socket): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let response = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk: string) => {
+      response += chunk;
+    });
+    socket.once("end", () => resolve(response));
+    socket.once("error", reject);
+  });
+}
+
+async function openClient(candidate: string = socketPath): Promise<Socket> {
+  const socket = createConnection({ path: candidate });
+  clientSockets.add(socket);
+  socket.once("close", () => clientSockets.delete(socket));
+  await once(socket, "connect");
+  return socket;
+}
+
+async function sendRaw(bytes: string | Uint8Array): Promise<string> {
+  const socket = await openClient();
+  const response = responseFrom(socket);
+  socket.end(bytes);
+  return response;
+}
+
+async function listenControl(
+  overrides: Partial<Parameters<typeof createServiceControlServer>[0]> = {},
+): Promise<ServiceControlServer> {
+  const server = createServiceControlServer(options(overrides));
+  controlServers.push(server);
+  await server.listen();
+  return server;
+}
+
+async function listenNative(candidate: string, allowHalfOpen = false): Promise<Server> {
+  const server = createServer({ allowHalfOpen });
+  nativeServers.push(server);
+  server.listen(candidate);
+  await once(server, "listening");
+  return server;
+}
+
+async function closeNative(server: Server): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => (error === undefined ? resolve() : reject(error)));
+  });
+  const index = nativeServers.indexOf(server);
+  if (index >= 0) nativeServers.splice(index, 1);
+}
+
+async function pathIsMissing(candidate: string): Promise<boolean> {
+  try {
+    await lstat(candidate);
+    return false;
+  } catch (error) {
+    return (
+      typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT"
+    );
+  }
+}
+
+beforeEach(async () => {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), "trc-")));
+  temporaryDirectories.push(root);
+  await chmod(root, 0o700);
+  temporaryRoot = root;
+  runtimePath = path.join(root, "runtime");
+  await mkdir(runtimePath, { mode: 0o700 });
+  await chmod(runtimePath, 0o700);
+  socketPath = path.join(runtimePath, "runtime.sock");
+  statusCalls = 0;
+});
+
+afterEach(async () => {
+  vi.useRealTimers();
+  for (const socket of clientSockets) socket.destroy();
+  clientSockets.clear();
+  await Promise.allSettled(controlServers.splice(0).map((server) => server.close()));
+  await Promise.allSettled(nativeServers.splice(0).map((server) => closeNative(server)));
+  await Promise.all(
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { force: true, recursive: true })),
+  );
+});
+
+describe("private service control socket", () => {
+  it("announces listening only after the Unix socket is mode 0600", async () => {
+    const server = createServiceControlServer(options());
+    controlServers.push(server);
+
+    await server.listen();
+
+    const metadata = await lstat(socketPath);
+    expect(metadata.isSocket()).toBe(true);
+    expect(metadata.mode & 0o777).toBe(0o600);
+  });
+
+  it("requires a current-user-owned runtime directory with exact mode 0700", async () => {
+    await chmod(runtimePath, 0o755);
+    const server = createServiceControlServer(options());
+    controlServers.push(server);
+
+    await expect(server.listen()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_PATH_UNSAFE",
+    });
+    expect(await pathIsMissing(socketPath)).toBe(true);
+  });
+
+  it("fails closed when an ancestor of the private runtime directory is a symlink", async () => {
+    const actualRoot = path.join(temporaryRoot, "actual");
+    const actualRuntime = path.join(actualRoot, "runtime");
+    await mkdir(actualRoot, { mode: 0o700 });
+    await mkdir(actualRuntime, { mode: 0o700 });
+    await symlink(actualRoot, path.join(temporaryRoot, "linked"));
+    socketPath = path.join(temporaryRoot, "linked", "runtime", "runtime.sock");
+    const server = createServiceControlServer(options());
+    controlServers.push(server);
+
+    await expect(server.listen()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_PATH_UNSAFE",
+    });
+    expect(await pathIsMissing(path.join(actualRuntime, "runtime.sock"))).toBe(true);
+  });
+
+  it("removes a stale private socket only after proving it has no listener", async () => {
+    const stagingPath = path.join(runtimePath, "staging.sock");
+    const staleServer = await listenNative(stagingPath);
+    await chmod(stagingPath, 0o600);
+    await rename(stagingPath, socketPath);
+    await closeNative(staleServer);
+    expect((await lstat(socketPath)).isSocket()).toBe(true);
+
+    await listenControl();
+
+    expect(JSON.parse(await sendRaw(statusRequest(fixedRequestId)))).toMatchObject({ ok: true });
+  });
+
+  it("does not remove a private socket with an active listener", async () => {
+    await listenNative(socketPath);
+    await chmod(socketPath, 0o600);
+    const server = createServiceControlServer(options());
+    controlServers.push(server);
+
+    await expect(server.listen()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_ALREADY_RUNNING",
+    });
+    expect((await lstat(socketPath)).isSocket()).toBe(true);
+  });
+
+  it.each(["symlink", "regular file"])("fails closed for an existing %s target", async (kind) => {
+    if (kind === "symlink") {
+      await symlink(path.join(runtimePath, "missing"), socketPath);
+    } else {
+      await writeFile(socketPath, "do-not-delete", { mode: 0o600 });
+    }
+    const server = createServiceControlServer(options());
+    controlServers.push(server);
+
+    await expect(server.listen()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_PATH_UNSAFE",
+    });
+    expect(await pathIsMissing(socketPath)).toBe(false);
+  });
+
+  it("returns one cached response for a duplicate canonical request id", async () => {
+    await listenControl();
+    const request = statusRequest(fixedRequestId);
+
+    const first = await sendRaw(request);
+    const second = await sendRaw(request);
+
+    expect(second).toBe(first);
+    expect(first.endsWith("\n")).toBe(true);
+    expect(first.trim().split("\n")).toHaveLength(1);
+    expect(statusCalls).toBe(1);
+  });
+
+  it("returns a fixed conflict when an existing request id has different canonical bytes", async () => {
+    await listenControl();
+    await sendRaw(statusRequest(fixedRequestId));
+    const conflicting = `${canonicalJson({
+      schema_version: "service-control-request.v1",
+      document_type: "service-control-request",
+      request_id: fixedRequestId,
+      command: "restart",
+    })}\n`;
+
+    const response = JSON.parse(await sendRaw(conflicting)) as Record<string, unknown>;
+
+    expect(response).toMatchObject({
+      request_id: fixedRequestId,
+      ok: false,
+      error: { code: "RUNTIME_SERVICE_CONTROL_CONFLICT" },
+    });
+    expect(statusCalls).toBe(1);
+  });
+
+  it("refreshes and evicts least-recently-used entries within the 256-entry cache", async () => {
+    await listenControl();
+    for (let index = 0; index < 256; index += 1) {
+      await sendRaw(statusRequest(numberedRequestId(index)));
+    }
+    expect(statusCalls).toBe(256);
+
+    await sendRaw(statusRequest(numberedRequestId(0)));
+    await sendRaw(statusRequest(numberedRequestId(256)));
+    await sendRaw(statusRequest(numberedRequestId(0)));
+    expect(statusCalls).toBe(257);
+
+    await sendRaw(statusRequest(numberedRequestId(1)));
+
+    expect(statusCalls).toBe(258);
+  });
+
+  it("rejects oversize input without reflecting its bytes", async () => {
+    await listenControl();
+    const response = await sendRaw(`${"x".repeat(65_537)}\n`);
+
+    expect(response).not.toContain("x".repeat(64));
+    expect(JSON.parse(response)).toMatchObject({
+      request_id: null,
+      ok: false,
+      error: { code: "RUNTIME_SERVICE_CONTROL_INVALID" },
+    });
+  });
+
+  it.each([
+    ["EOF before newline", statusRequest(fixedRequestId).slice(0, -1)],
+    ["an extra line", `${statusRequest(fixedRequestId)}${statusRequest(otherRequestId)}`],
+    [
+      "noncanonical JSON",
+      `${JSON.stringify({ command: "status", request_id: fixedRequestId, document_type: "service-control-request", schema_version: "service-control-request.v1" })}\n`,
+    ],
+    ["malformed JSON", "{not-json}\n"],
+    [
+      "a duplicate JSON key",
+      `{"schema_version":"service-control-request.v1","document_type":"service-control-request","request_id":"${fixedRequestId}","request_id":"${otherRequestId}","command":"status"}\n`,
+    ],
+  ])("rejects %s before accepting a request id", async (_name, bytes) => {
+    await listenControl();
+
+    const response = await sendRaw(bytes);
+
+    expect(JSON.parse(response)).toMatchObject({
+      request_id: null,
+      ok: false,
+      error: { code: "RUNTIME_SERVICE_CONTROL_INVALID" },
+    });
+    expect(statusCalls).toBe(0);
+  });
+
+  it.each([
+    ["unknown command", { command: "restart" }],
+    ["unknown version", { schema_version: "service-control-request.v2" }],
+    ["unknown field", { unexpected: true }],
+  ])("rejects an %s with only its independently valid request id", async (_name, patch) => {
+    await listenControl();
+    const request = {
+      schema_version: "service-control-request.v1",
+      document_type: "service-control-request",
+      request_id: fixedRequestId,
+      command: "status",
+      ...patch,
+    };
+
+    const response = JSON.parse(await sendRaw(`${canonicalJson(request)}\n`)) as Record<
+      string,
+      unknown
+    >;
+
+    expect(response).toMatchObject({
+      request_id: fixedRequestId,
+      ok: false,
+      error: { code: "RUNTIME_SERVICE_CONTROL_INVALID" },
+    });
+    expect(statusCalls).toBe(0);
+  });
+
+  it("rejects secret-shaped metadata without reflecting its key or value", async () => {
+    await listenControl();
+    const secretValue = "sensitive-control-value";
+    const request = `${canonicalJson({
+      schema_version: "service-control-request.v1",
+      document_type: "service-control-request",
+      request_id: fixedRequestId,
+      command: "status",
+      api_key: secretValue,
+    })}\n`;
+
+    const response = await sendRaw(request);
+
+    expect(response).not.toContain("api_key");
+    expect(response).not.toContain(secretValue);
+    expect(JSON.parse(response)).toMatchObject({ ok: false });
+  });
+
+  it("does not reflect status supplier failures", async () => {
+    const secret = "sensitive-status-supplier-detail";
+    await listenControl({
+      status: () => {
+        throw new Error(secret);
+      },
+    });
+
+    const response = await sendRaw(statusRequest(fixedRequestId));
+
+    expect(response).not.toContain(secret);
+    expect(JSON.parse(response)).toMatchObject({
+      request_id: fixedRequestId,
+      ok: false,
+      error: { code: "RUNTIME_SERVICE_UNAVAILABLE" },
+    });
+  });
+
+  it("accepts at most 32 concurrent client connections", async () => {
+    await listenControl();
+    const held = await Promise.all(Array.from({ length: 32 }, () => openClient()));
+
+    const overflow = await openClient();
+    const response = responseFrom(overflow);
+    overflow.end(statusRequest(fixedRequestId));
+
+    expect(JSON.parse(await response)).toMatchObject({
+      request_id: null,
+      ok: false,
+      error: { code: "RUNTIME_SERVICE_UNAVAILABLE" },
+    });
+    for (const socket of held) socket.destroy();
+  });
+
+  it("closes an idle connection after exactly five seconds", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    await listenControl();
+    const socket = await openClient();
+    const response = responseFrom(socket);
+
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(socket.destroyed).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(JSON.parse(await response)).toMatchObject({
+      request_id: null,
+      ok: false,
+      error: { code: "RUNTIME_SERVICE_CONTROL_INVALID" },
+    });
+  });
+
+  it("stops accepting and aborts a drain without leaving connected clients", async () => {
+    const server = await listenControl();
+    const socket = await openClient();
+    const closed = once(socket, "close");
+    server.stopAccepting();
+    const controller = new AbortController();
+    const draining = server.drain(controller.signal);
+
+    controller.abort();
+    await draining;
+    await closed;
+
+    await expect(openClient()).rejects.toBeDefined();
+  });
+
+  it("server close destroys connected clients and removes its owned socket", async () => {
+    const server = await listenControl();
+    const socket = await openClient();
+    const closed = once(socket, "close");
+
+    await server.close();
+    await closed;
+
+    expect(await pathIsMissing(socketPath)).toBe(true);
+    expect(await readdir(runtimePath)).toEqual([]);
+  });
+
+  it("does not clean a replacement at the owned socket path", async () => {
+    const server = await listenControl();
+    const displaced = path.join(runtimePath, "displaced.sock");
+    await rename(socketPath, displaced);
+    await writeFile(socketPath, "replacement", { mode: 0o600 });
+
+    await server.close();
+
+    expect(await readFile(socketPath, "utf8")).toBe("replacement");
+  });
+
+  it("requests one validated status over a real Unix socket", async () => {
+    await listenControl();
+
+    const result = await requestServiceStatus({
+      socketPath,
+      requestId: fixedRequestId,
+      idleTimeoutMs: 5_000,
+    });
+
+    expect(result).toEqual({
+      package_version: "1.2.3",
+      service_instance_id: serviceInstanceId,
+      pid: 4200,
+      started_at: "2026-08-19T12:00:00.000Z",
+      health: "healthy",
+      accepting: true,
+    });
+    expect(statusCalls).toBe(1);
+  });
+
+  it("fails closed when the socket path changes while a status response is in flight", async () => {
+    const nativeServer = await listenNative(socketPath, true);
+    await chmod(socketPath, 0o600);
+    nativeServer.once("connection", (socket) => {
+      socket.resume();
+      socket.once("end", () => {
+        void (async () => {
+          const displaced = path.join(runtimePath, "original.sock");
+          await rename(socketPath, displaced);
+          await writeFile(socketPath, "replacement", { mode: 0o600 });
+          socket.end(
+            `${canonicalJson({
+              schema_version: "service-control-response.v1",
+              document_type: "service-control-response",
+              request_id: fixedRequestId,
+              ok: true,
+              status: {
+                package_version: "1.2.3",
+                service_instance_id: serviceInstanceId,
+                pid: 4200,
+                started_at: "2026-08-19T12:00:00.000Z",
+                health: "healthy",
+                accepting: true,
+              },
+              error: null,
+            })}\n`,
+          );
+        })();
+      });
+    });
+
+    await expect(
+      requestServiceStatus({ socketPath, requestId: fixedRequestId, idleTimeoutMs: 5_000 }),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_PATH_UNSAFE" });
+  });
+
+  it("probes with a fresh request id and maps every failure to null", async () => {
+    await listenControl();
+    const ids = [fixedRequestId, otherRequestId];
+    const createRequestId = () => {
+      const id = ids.shift();
+      if (id === undefined) throw new Error("no request id");
+      return id;
+    };
+
+    await expect(
+      probeServiceIdentity({ socketPath, createRequestId, idleTimeoutMs: 5_000 }),
+    ).resolves.toBe(serviceInstanceId);
+    await expect(
+      probeServiceIdentity({ socketPath, createRequestId, idleTimeoutMs: 5_000 }),
+    ).resolves.toBe(serviceInstanceId);
+    expect(statusCalls).toBe(2);
+
+    await expect(
+      probeServiceIdentity({
+        socketPath: path.join(runtimePath, "missing.sock"),
+        createRequestId: () => {
+          throw new Error("sensitive-id-error");
+        },
+        idleTimeoutMs: 5_000,
+      }),
+    ).resolves.toBeNull();
+  });
+});
