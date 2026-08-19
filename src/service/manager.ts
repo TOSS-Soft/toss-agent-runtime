@@ -104,6 +104,11 @@ function commandOutput(result: CommandResult): string {
   return `${result.stdout}\n${result.stderr}`.slice(0, MAX_STATUS_OUTPUT_CHARS);
 }
 
+function exactIdentityTokenPattern(identity: string): string {
+  const escaped = identity.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return `(?<![A-Za-z0-9._-])${escaped}(?![A-Za-z0-9._-])`;
+}
+
 function isIdempotentResult(
   idempotentState: IdempotentCommandState,
   result: CommandResult,
@@ -121,18 +126,16 @@ function isIdempotentResult(
       `\\b(?:Unit|Unit file) ${SYSTEMD_UNIT.replace(".", "\\.")} (?:could not be found|does not exist)\\b`,
     ).test(output);
   }
-  const identity = nativeIdentity(uid).replaceAll(".", "\\.").replaceAll("/", "\\/");
-  const tokenBoundary = "(?=$|[^A-Za-z0-9._-])";
+  const serviceLabel = exactIdentityTokenPattern(SERVICE_LABEL);
+  const identity = exactIdentityTokenPattern(nativeIdentity(uid));
   if (idempotentState === "darwin-bootstrap") {
     return new RegExp(
-      `(?:${SERVICE_LABEL.replaceAll(".", "\\.")}${tokenBoundary}.*already loaded|already loaded.*${SERVICE_LABEL.replaceAll(".", "\\.")}${tokenBoundary})`,
+      `(?:${serviceLabel}.*already loaded|already loaded.*${serviceLabel})`,
       "i",
     ).test(output);
   }
   if (idempotentState === "darwin-bootout" || idempotentState === "darwin-print") {
-    return new RegExp(`could not find service\\s+["']?${identity}${tokenBoundary}`, "i").test(
-      output,
-    );
+    return new RegExp(`could not find service\\s+["']?${identity}`, "i").test(output);
   }
   return false;
 }

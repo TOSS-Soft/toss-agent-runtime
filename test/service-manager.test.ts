@@ -617,6 +617,24 @@ describe("native per-user service manager", () => {
     },
   );
 
+  it.each([
+    ["bootstrap service-first", "start", "service evilsoftware.toss.agent-runtime already loaded"],
+    ["bootstrap loaded-first", "start", "already loaded evilsoftware.toss.agent-runtime"],
+    ["bootout", "stop", "Could not find service evilgui/501/software.toss.agent-runtime"],
+    ["print", "status", "Could not find service evilgui/501/software.toss.agent-runtime"],
+  ] as const)(
+    "does not accept a Darwin %s failure for a leading-prefix service identity",
+    async (_operation, action, stderr) => {
+      const runner = new RecordingRunner([{ exitCode: 1, stdout: "", stderr }]);
+      const { manager } = await darwinFixture(runner);
+      await manager.install();
+
+      await expect(manager[action]()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_MANAGER_FAILED",
+      });
+    },
+  );
+
   it.each(["linux", "darwin"] as const)(
     "returns absent without native mutation for missing %s definitions",
     async (platform) => {
