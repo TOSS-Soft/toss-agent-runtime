@@ -222,6 +222,7 @@ export async function runSupervisor(options: RunSupervisorOptions): Promise<Supe
   let accepting = false;
   let health: ServiceStatusV1["health"] = "healthy";
   let primaryError: SupervisorError | undefined;
+  let finalizerError: SupervisorError | undefined;
   let outcome: ServiceOutcome | undefined;
 
   const closeOwnedServer = async (): Promise<void> => {
@@ -238,6 +239,10 @@ export async function runSupervisor(options: RunSupervisorOptions): Promise<Supe
 
   const capture = (error: unknown): void => {
     primaryError = firstError(primaryError, safeError(error));
+  };
+
+  const captureFinalizer = (error: unknown): void => {
+    finalizerError = firstError(finalizerError, safeError(error));
   };
 
   try {
@@ -334,13 +339,13 @@ export async function runSupervisor(options: RunSupervisorOptions): Promise<Supe
                 try {
                   await closeOwnedServer();
                 } catch (error) {
-                  capture(error);
+                  captureFinalizer(error);
                 }
               } finally {
                 try {
                   await releaseOwnedLock();
                 } catch (error) {
-                  capture(error);
+                  captureFinalizer(error);
                 }
               }
             }
@@ -358,7 +363,7 @@ export async function runSupervisor(options: RunSupervisorOptions): Promise<Supe
       try {
         await closeOwnedServer();
       } catch (error) {
-        capture(error);
+        captureFinalizer(error);
       }
     }
     if (!shutdownSequenceStarted) {
@@ -382,19 +387,20 @@ export async function runSupervisor(options: RunSupervisorOptions): Promise<Supe
       try {
         await releaseOwnedLock();
       } catch (error) {
-        capture(error);
+        captureFinalizer(error);
       }
     }
     if (previousUmask !== undefined) {
       try {
         setUmask.set(previousUmask);
       } catch (error) {
-        capture(error);
+        captureFinalizer(error);
       }
     }
   }
 
   if (primaryError !== undefined) throw primaryError;
+  if (finalizerError !== undefined && outcome?.forced !== true) throw finalizerError;
   if (outcome === undefined || lock === undefined) {
     throw new RuntimeServiceError("RUNTIME_SERVICE_UNAVAILABLE");
   }

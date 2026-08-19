@@ -440,6 +440,79 @@ describe("runtime service supervisor", () => {
     ]);
   });
 
+  it.each([
+    ["socket close", true, false, false],
+    ["lock release", false, true, false],
+    ["umask restore", false, false, true],
+    ["all finalizers", true, true, true],
+  ] as const)(
+    "preserves the forced shutdown outcome when %s fails",
+    async (_failure, failClose, failRelease, failRestore) => {
+      vi.useFakeTimers();
+      const events: string[] = [];
+      const privateDetails = [
+        "private socket /var/run/runtime.sock stack",
+        "private lock /tmp/instance.lock stack",
+        "private umask /Users/operator stack",
+      ];
+      const running = runSupervisor({
+        ...shutdownOptions(events),
+        loaded: {
+          ...fixture.loaded,
+          config: { ...fixture.loaded.config, shutdown_timeout_ms: 25 },
+        },
+        interruptionRecorder: {
+          interruptActive: () => new Promise<void>(() => undefined),
+        },
+        acquireLock: () =>
+          Promise.resolve(
+            fakeLock(() => {
+              events.push("release-lock");
+              return failRelease ? Promise.reject(new Error(privateDetails[1])) : Promise.resolve();
+            }),
+          ),
+        createControlServer: () =>
+          fakeServer({
+            stopAccepting: () => events.push("stop-accepting"),
+            close: () => {
+              events.push("close-socket");
+              return failClose ? Promise.reject(new Error(privateDetails[0])) : Promise.resolve();
+            },
+          }),
+        umask: {
+          set(mask) {
+            if (mask === 0o022) {
+              events.push("restore-umask");
+              if (failRestore) throw new Error(privateDetails[2]);
+            }
+            const previous = activeMask;
+            activeMask = mask;
+            return previous;
+          },
+        },
+      });
+      const completion = running.then(
+        (result) => ({ result, error: undefined }),
+        (error: unknown) => ({ result: undefined, error }),
+      );
+      await readyObserved;
+
+      signals.emit("SIGTERM");
+      await vi.advanceTimersByTimeAsync(25);
+
+      const { result, error } = await completion;
+      expect(error).toBeUndefined();
+      expect(result).toEqual({
+        reason: "SIGTERM",
+        forced: true,
+        serviceInstanceId,
+      });
+      expect(events.slice(-3)).toEqual(["close-socket", "release-lock", "restore-umask"]);
+      expect(JSON.stringify(result)).not.toContain("private");
+      for (const detail of privateDetails) expect(JSON.stringify(result)).not.toContain(detail);
+    },
+  );
+
   it("finishes socket close before releasing the lock after a deadline abort", async () => {
     vi.useFakeTimers();
     const events: string[] = [];
@@ -540,6 +613,54 @@ describe("runtime service supervisor", () => {
     const error = await running.catch((caught: unknown) => caught);
     expect(error).toMatchObject({ code: "RUNTIME_SERVICE_UNAVAILABLE" });
     expect(String(error)).not.toMatch(/private (socket|lock) detail/u);
+    expect(events.slice(-3)).toEqual(["close-socket", "release-lock", "restore-umask"]);
+  });
+
+  it("preserves a non-forced primary shutdown error across finalizer failures", async () => {
+    const events: string[] = [];
+    const running = runSupervisor({
+      ...shutdownOptions(events),
+      interruptionRecorder: {
+        interruptActive: () =>
+          Promise.reject(new RuntimeServiceError("RUNTIME_SERVICE_PATH_UNSAFE")),
+      },
+      acquireLock: () =>
+        Promise.resolve(
+          fakeLock(() => {
+            events.push("release-lock");
+            return Promise.reject(new Error("private lock /tmp/instance.lock stack"));
+          }),
+        ),
+      createControlServer: () =>
+        fakeServer({
+          stopAccepting: () => events.push("stop-accepting"),
+          drain: () => {
+            events.push("drain-control");
+            return Promise.resolve();
+          },
+          close: () => {
+            events.push("close-socket");
+            return Promise.reject(new Error("private socket /var/run/runtime.sock stack"));
+          },
+        }),
+      umask: {
+        set(mask) {
+          if (mask === 0o022) {
+            events.push("restore-umask");
+            throw new Error("private umask /Users/operator stack");
+          }
+          const previous = activeMask;
+          activeMask = mask;
+          return previous;
+        },
+      },
+    });
+    await readyObserved;
+    signals.emit("SIGTERM");
+
+    const error = await running.catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ code: "RUNTIME_SERVICE_PATH_UNSAFE" });
+    expect(String(error)).not.toMatch(/private|\/tmp|\/var|\/Users|stack/u);
     expect(events.slice(-3)).toEqual(["close-socket", "release-lock", "restore-umask"]);
   });
 
