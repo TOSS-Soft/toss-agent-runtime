@@ -11,6 +11,7 @@ All notable changes to this project are documented here. The format follows Keep
 - Secret-reference-only JSON/YAML configuration with filesystem permission checks.
 - `toss-runtime` CLI, diagnostics, and graceful SIGINT/SIGTERM lifecycle shell.
 - Deterministic package-content tests and credential-free Node.js 22/24 CI baseline.
+- Commit-bound acceptance evidence for the Runtime Contract Protocol/package baseline (#2 and #4).
 
 ### Known limitations
 
