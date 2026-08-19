@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toss.software/schemas/runtime/v1/service-control-response.v1.schema.json",
+  "title": "TOSS local runtime service control response v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "document_type", "request_id", "ok", "status", "error"],
+  "properties": {
+    "schema_version": { "const": "service-control-response.v1" },
+    "document_type": { "const": "service-control-response" },
+    "request_id": { "type": ["string", "null"], "format": "uuid" },
+    "ok": { "type": "boolean" },
+    "status": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": [
+        "package_version",
+        "service_instance_id",
+        "pid",
+        "started_at",
+        "health",
+        "accepting"
+      ],
+      "properties": {
+        "package_version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "service_instance_id": { "type": "string", "format": "uuid" },
+        "pid": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+        "started_at": { "type": "string", "format": "date-time", "pattern": "Z$" },
+        "health": { "type": "string", "enum": ["healthy", "degraded", "stopping"] },
+        "accepting": { "type": "boolean" }
+      }
+    },
+    "error": {
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/service_error" }]
+    }
+  },
+  "$defs": {
+    "service_error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "category", "retryable", "safe_message"],
+      "properties": {
+        "code": { "type": "string" },
+        "category": { "type": "string" },
+        "retryable": { "type": "boolean" },
+        "safe_message": { "type": "string", "minLength": 1, "maxLength": 1024 }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_SERVICE_ALREADY_RUNNING" },
+            "category": { "const": "unavailable" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Runtime service is already running" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_SERVICE_LOCK_AMBIGUOUS" },
+            "category": { "const": "integrity" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Runtime service lock state is ambiguous" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_SERVICE_PATH_UNSAFE" },
+            "category": { "const": "integrity" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Runtime service path is unsafe" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_SERVICE_DEFINITION_UNSAFE" },
+            "category": { "const": "integrity" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Runtime service definition is unsafe" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_SERVICE_MANAGER_UNAVAILABLE" },
+            "category": { "const": "unavailable" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Runtime service manager is unavailable" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_SERVICE_MANAGER_FAILED" },
+            "category": { "const": "unavailable" },
+            "retryable": { "const": true },
+            "safe_message": { "const": "Runtime service manager failed" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_SERVICE_CONTROL_INVALID" },
+            "category": { "const": "invalid-input" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Runtime service control request is invalid" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_SERVICE_CONTROL_CONFLICT" },
+            "category": { "const": "stale-revision" },
+            "retryable": { "const": false },
+            "safe_message": {
+              "const": "Runtime service control request conflicts with an existing request"
+            }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_SERVICE_UNAVAILABLE" },
+            "category": { "const": "unavailable" },
+            "retryable": { "const": true },
+            "safe_message": { "const": "Runtime service is unavailable" }
+          }
+        }
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "request_id": { "type": "string", "format": "uuid" },
+        "ok": { "const": true },
+        "status": { "type": "object" },
+        "error": { "type": "null" }
+      }
+    },
+    {
+      "properties": {
+        "ok": { "const": false },
+        "status": { "type": "null" },
+        "error": { "type": "object" }
+      }
+    }
+  ]
+}

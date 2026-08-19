@@ -40,6 +40,17 @@ export {
   type ExecutionResultV1,
   type TerminalStatus,
 } from "./protocol/result.js";
+export {
+  MAX_CONTROL_MESSAGE_BYTES,
+  parseServiceControlRequest,
+  parseServiceControlResponse,
+  parseServiceLock,
+  type ServiceControlRequestV1,
+  type ServiceControlResponseV1,
+  type ServiceLockV1,
+  type ServiceStatusV1,
+} from "./service/contracts.js";
+export { RuntimeServiceError, type RuntimeServiceErrorCode } from "./service/errors.js";
 export type {
   ArtifactReference,
   ProducerIdentity,

@@ -36,6 +36,21 @@
       "schema_version": "runtime-config.v1",
       "path": "contracts/runtime/runtime-config.v1.schema.json",
       "id": "https://toss.software/schemas/runtime/v1/runtime-config.v1.schema.json"
+    },
+    {
+      "schema_version": "service-lock.v1",
+      "path": "contracts/runtime/service-lock.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/service-lock.v1.schema.json"
+    },
+    {
+      "schema_version": "service-control-request.v1",
+      "path": "contracts/runtime/service-control-request.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/service-control-request.v1.schema.json"
+    },
+    {
+      "schema_version": "service-control-response.v1",
+      "path": "contracts/runtime/service-control-response.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/service-control-response.v1.schema.json"
     }
   ]
 }

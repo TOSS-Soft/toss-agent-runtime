@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toss.software/schemas/runtime/v1/service-control-request.v1.schema.json",
+  "title": "TOSS local runtime service control request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "document_type", "request_id", "command"],
+  "properties": {
+    "schema_version": { "const": "service-control-request.v1" },
+    "document_type": { "const": "service-control-request" },
+    "request_id": { "type": "string", "format": "uuid" },
+    "command": { "const": "status" }
+  }
+}

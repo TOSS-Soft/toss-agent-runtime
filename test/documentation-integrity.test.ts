@@ -55,6 +55,9 @@ describe("published protocol artifacts", () => {
       "runtime-capabilities.v1",
       "runtime-common.v1",
       "runtime-config.v1",
+      "service-lock.v1",
+      "service-control-request.v1",
+      "service-control-response.v1",
     ]);
     for (const entry of manifest.schemas) {
       const schema = JSON.parse(await readFile(entry.path, "utf8")) as { readonly $id?: string };
