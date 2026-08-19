@@ -250,6 +250,34 @@ describe("runtime supervisor instance lock", () => {
     expect(await missing(fixture.lockPath)).toBe(true);
   });
 
+  it("rejects an uppercase artifact identity before creating lock state", async () => {
+    const incompatibleId = newId.toUpperCase();
+
+    const error = await acquireInstanceLock(options({ instanceId: incompatibleId })).catch(
+      (caught: unknown) => caught,
+    );
+    expect(error).toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+    expect(String(error)).not.toContain(incompatibleId);
+    expect(await missing(fixture.lockPath)).toBe(true);
+
+    const lock = await acquireInstanceLock(options({ instanceId: otherId }));
+    expect(lock.owner.service_instance_id).toBe(otherId);
+    await lock.release();
+  });
+
+  it("rejects a pre-epoch clock before creating lock state", async () => {
+    const preEpoch = new Date(-1);
+
+    await expect(acquireInstanceLock(options({ now: () => preEpoch }))).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS",
+    });
+    expect(await missing(fixture.lockPath)).toBe(true);
+
+    const lock = await acquireInstanceLock(options({ instanceId: otherId }));
+    expect(lock.owner.service_instance_id).toBe(otherId);
+    await lock.release();
+  });
+
   it.each([
     ["owner", "open"],
     ["owner", "partial"],

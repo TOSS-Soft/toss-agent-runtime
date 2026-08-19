@@ -114,6 +114,7 @@ interface OpenedStage {
 const OWNER_FILE_NAME = "owner.json";
 const OWNERLESS_STALE_AFTER_NS = 30_000_000_000n;
 const UUID_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const ARTIFACT_SERVICE_INSTANCE_ID_PATTERN = new RegExp(`^${UUID_PATTERN}$`);
 const OWNER_CLAIM_PATTERN = new RegExp(`^\\.owner-claim\\.(${UUID_PATTERN})\\.json$`);
 const OWNERLESS_CLAIM_PATTERN = new RegExp(`^\\.ownerless-reclaim\\.(${UUID_PATTERN})\\.json$`);
 const STAGE_PATTERN = new RegExp(
@@ -121,15 +122,22 @@ const STAGE_PATTERN = new RegExp(
 );
 const internalServiceErrors = new WeakSet<RuntimeServiceError>();
 
+function assertArtifactServiceInstanceId(serviceInstanceId: string): void {
+  if (!ARTIFACT_SERVICE_INSTANCE_ID_PATTERN.test(serviceInstanceId)) lockAmbiguous();
+}
+
 function ownerClaimName(serviceInstanceId: string): string {
+  assertArtifactServiceInstanceId(serviceInstanceId);
   return `.owner-claim.${serviceInstanceId}.json`;
 }
 
 function displacedOwnerName(serviceInstanceId: string): string {
+  assertArtifactServiceInstanceId(serviceInstanceId);
   return `.owner-claim.${serviceInstanceId}.owner.json`;
 }
 
 function ownerlessSentinelName(serviceInstanceId: string): string {
+  assertArtifactServiceInstanceId(serviceInstanceId);
   return `.ownerless-reclaim.${serviceInstanceId}.json`;
 }
 
@@ -142,6 +150,7 @@ function stageName(
   claimant: ServiceLockV1,
   ownerlessSinceNs?: bigint,
 ): string {
+  assertArtifactServiceInstanceId(claimant.service_instance_id);
   const createdAtNs = ownerTimestampNs(claimant);
   if (createdAtNs % 1_000_000n !== 0n) lockAmbiguous();
   const base = `${stagePrefix(kind)}${claimant.service_instance_id}.${claimant.pid}.${claimant.executable_hash}.${createdAtNs / 1_000_000n}`;
@@ -229,6 +238,7 @@ function createOwnerDocument(
     const bytes = Buffer.from(canonicalJson(candidate), "utf8");
     const validated = parseServiceLock(bytes);
     if (!validated.ok || bytes.byteLength > MAX_CONTROL_MESSAGE_BYTES) lockAmbiguous();
+    assertArtifactServiceInstanceId(validated.value.service_instance_id);
     return { owner: validated.value, bytes };
   } catch {
     lockAmbiguous();
@@ -1643,6 +1653,7 @@ async function acquireInstanceLockInternal(
     const numericNow = current.getTime();
     if (!Number.isSafeInteger(numericNow)) lockAmbiguous();
     nowNs = BigInt(numericNow) * 1_000_000n;
+    if (nowNs < 0n) lockAmbiguous();
     createdAt = current.toISOString();
   } catch {
     lockAmbiguous();
