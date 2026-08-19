@@ -160,16 +160,64 @@ describe("private service definition storage", () => {
     });
     expect(await readFile(target, "utf8")).toBe("unit");
 
+    await writePrivateAtomic({
+      target,
+      bytes: new TextEncoder().encode("replacement"),
+      randomSuffix: () => "fixed-2",
+      parentPolicy: "owned-not-writable",
+    });
+    expect(await readFile(target, "utf8")).toBe("replacement");
+
     await chmod(parent, 0o775);
     await expect(
       writePrivateAtomic({
         target,
-        bytes: new TextEncoder().encode("replacement"),
-        randomSuffix: () => "fixed-2",
+        bytes: new TextEncoder().encode("unsafe-replacement"),
+        randomSuffix: () => "fixed-3",
         parentPolicy: "owned-not-writable",
       }),
     ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_PATH_UNSAFE" });
-    expect(await readFile(target, "utf8")).toBe("unit");
+    expect(await readFile(target, "utf8")).toBe("replacement");
+  });
+
+  it("rejects a group-writable existing intermediate directory", async () => {
+    const root = await temporaryDirectory();
+    const intermediate = path.join(root, "unsafe-intermediate");
+    const parent = path.join(intermediate, "manager");
+    const target = path.join(parent, "definition.service");
+    await mkdir(parent, { recursive: true, mode: 0o700 });
+    await chmod(intermediate, 0o770);
+
+    await expect(
+      writePrivateAtomic({
+        target,
+        bytes: new TextEncoder().encode("unit"),
+        randomSuffix: () => "fixed",
+        parentPolicy: "owned-not-writable",
+      }),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_PATH_UNSAFE" });
+    await expect(lstat(target)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects an existing intermediate directory treated as third-party-owned", async () => {
+    const root = await temporaryDirectory();
+    const intermediate = path.join(root, "cross-owner-intermediate");
+    const parent = path.join(intermediate, "manager");
+    const target = path.join(parent, "definition.service");
+    await mkdir(parent, { recursive: true, mode: 0o700 });
+    const injectedOwnership = (_userId: number, candidate?: string): boolean =>
+      candidate !== intermediate;
+
+    await expect(
+      writePrivateAtomic({
+        target,
+        bytes: new TextEncoder().encode("unit"),
+        randomSuffix: () => "fixed",
+        parentPolicy: "owned-not-writable",
+        isCurrentUser: injectedOwnership,
+      }),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_PATH_UNSAFE" });
+    await expect(lstat(target)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("rejects a parent or target that is not owned by the current user", async () => {
@@ -187,14 +235,13 @@ describe("private service definition storage", () => {
 
     const target = path.join(root, "existing.service");
     await privateFile(target, "old");
-    let checks = 0;
     await expect(
       writePrivateAtomic({
         target,
         bytes: new TextEncoder().encode("new"),
         randomSuffix: () => "fixed-2",
         parentPolicy: "owned-not-writable",
-        isCurrentUser: () => ++checks === 1,
+        isCurrentUser: (_userId, candidate) => candidate !== target,
       }),
     ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_PATH_UNSAFE" });
     expect(await readFile(target, "utf8")).toBe("old");
@@ -364,6 +411,30 @@ describe("private service definition storage", () => {
     ).resolves.toBe(environmentPath);
     expect(await readFile(environmentPath, "utf8")).toBe(validYaml(home));
     await expect(lstat(path.join(home, ".config"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("reloads a valid config that appears immediately before atomic publication", async () => {
+    const home = await temporaryDirectory();
+    const configPath = path.join(home, ".config", "toss", "runtime", "config.yaml");
+    const competingConfig = validYaml(home).replace("level: info", "level: warn");
+    let publicationHooks = 0;
+
+    await expect(
+      ensureServiceConfig({
+        platform: "linux",
+        home,
+        env: {},
+        randomSuffix: () => "fixed",
+        beforeConfigPublish: async () => {
+          publicationHooks += 1;
+          await privateFile(configPath, competingConfig);
+        },
+      }),
+    ).resolves.toBe(configPath);
+
+    expect(publicationHooks).toBe(1);
+    expect(await readFile(configPath, "utf8")).toBe(competingConfig);
+    expect(await readdir(path.dirname(configPath))).toEqual(["config.yaml"]);
   });
 
   it("reads and removes only private owned regular definition files", async () => {

@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { lstat, mkdir, open, rename, unlink, type FileHandle } from "node:fs/promises";
+import { link, lstat, mkdir, open, rename, unlink, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 
 import { stringify } from "yaml";
@@ -14,7 +14,7 @@ import type { RuntimeEnvironment, RuntimePlatform } from "../config/types.js";
 import { RuntimeServiceError } from "./errors.js";
 
 type ParentPolicy = "private" | "owned-not-writable";
-type CurrentUserCheck = (userId: number) => boolean;
+type CurrentUserCheck = (userId: number, candidate?: string) => boolean;
 
 interface StoreOperations {
   readonly lstat: typeof lstat;
@@ -38,6 +38,10 @@ function servicePathUnsafe(): never {
 
 function isMissing(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
+function hasErrorCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
 function defaultCurrentUserCheck(userId: number): boolean {
@@ -64,6 +68,7 @@ async function inspectDirectoryPath(
   const relative = directory.slice(parsed.root.length);
   const segments = relative.length === 0 ? [] : relative.split(path.sep);
   let current = parsed.root;
+  let reachedCurrentUserDirectory = false;
 
   for (const [index, segment] of segments.entries()) {
     if (segment.length === 0 || segment === "." || segment === "..") servicePathUnsafe();
@@ -87,11 +92,17 @@ async function inspectDirectoryPath(
 
     if (metadata.isSymbolicLink()) servicePathUnsafe();
     if (!metadata.isDirectory()) servicePathUnsafe();
-    if (created && (!isCurrentUser(metadata.uid) || (metadata.mode & 0o777) !== 0o700)) {
+    const ownedByCurrentUser = isCurrentUser(metadata.uid, current);
+    const trustedSystemAncestor = metadata.uid === 0 && !reachedCurrentUserDirectory;
+    if (!trustedSystemAncestor) {
+      if (!ownedByCurrentUser || (metadata.mode & 0o022) !== 0) servicePathUnsafe();
+      reachedCurrentUserDirectory = true;
+    }
+    if (created && (!ownedByCurrentUser || (metadata.mode & 0o777) !== 0o700)) {
       servicePathUnsafe();
     }
     if (final) {
-      if (!isCurrentUser(metadata.uid)) servicePathUnsafe();
+      if (!ownedByCurrentUser) servicePathUnsafe();
       const mode = metadata.mode & 0o777;
       if (policy === "private" ? mode !== 0o700 : (mode & 0o022) !== 0) {
         servicePathUnsafe();
@@ -105,21 +116,34 @@ async function inspectReplaceableTarget(
   target: string,
   operations: StoreOperations,
   isCurrentUser: CurrentUserCheck,
-): Promise<void> {
+): Promise<boolean> {
   let metadata;
   try {
     metadata = await operations.lstat(target);
   } catch (error) {
-    if (isMissing(error)) return;
+    if (isMissing(error)) return false;
     servicePathUnsafe();
   }
   if (
     metadata.isSymbolicLink() ||
     !metadata.isFile() ||
-    !isCurrentUser(metadata.uid) ||
+    !isCurrentUser(metadata.uid, target) ||
     !isPrivateFileMode(metadata.mode)
   ) {
     servicePathUnsafe();
+  }
+  return true;
+}
+
+async function syncDirectory(parent: string, operations: StoreOperations): Promise<void> {
+  const directory = await operations.open(
+    parent,
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  );
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
   }
 }
 
@@ -135,7 +159,7 @@ async function removeCreatedTemporary(
     if (
       metadata.isFile() &&
       !metadata.isSymbolicLink() &&
-      isCurrentUser(metadata.uid) &&
+      isCurrentUser(metadata.uid, temporary) &&
       isPrivateFileMode(metadata.mode) &&
       metadata.dev === identity.device &&
       metadata.ino === identity.inode
@@ -147,14 +171,20 @@ async function removeCreatedTemporary(
   }
 }
 
-export async function writePrivateAtomic(options: {
+interface WritePrivateAtomicOptions {
   readonly target: string;
   readonly bytes: Uint8Array;
   readonly randomSuffix: () => string;
   readonly parentPolicy: ParentPolicy;
   readonly isCurrentUser?: CurrentUserCheck;
   readonly operations?: StoreOperations;
-}): Promise<void> {
+}
+
+async function publishPrivateAtomic(
+  options: WritePrivateAtomicOptions,
+  publication: "replace" | "create-if-missing",
+  beforePublish?: () => Promise<void>,
+): Promise<"published" | "existing"> {
   const { target, bytes, randomSuffix, parentPolicy } = options;
   const operations = options.operations ?? DEFAULT_OPERATIONS;
   const isCurrentUser = options.isCurrentUser ?? defaultCurrentUserCheck;
@@ -165,7 +195,8 @@ export async function writePrivateAtomic(options: {
     assertAbsoluteTarget(target);
     const parent = path.dirname(target);
     await inspectDirectoryPath(parent, parentPolicy, true, operations, isCurrentUser);
-    await inspectReplaceableTarget(target, operations, isCurrentUser);
+    const targetExists = await inspectReplaceableTarget(target, operations, isCurrentUser);
+    if (publication === "create-if-missing" && targetExists) return "existing";
 
     const suffix = randomSuffix();
     if (!SAFE_SUFFIX.test(suffix)) servicePathUnsafe();
@@ -177,7 +208,11 @@ export async function writePrivateAtomic(options: {
     );
     try {
       const metadata = await handle.stat();
-      if (!metadata.isFile() || !isCurrentUser(metadata.uid) || !isPrivateFileMode(metadata.mode)) {
+      if (
+        !metadata.isFile() ||
+        !isCurrentUser(metadata.uid, temporary) ||
+        !isPrivateFileMode(metadata.mode)
+      ) {
         servicePathUnsafe();
       }
       temporaryIdentity = { device: metadata.dev, inode: metadata.ino };
@@ -187,24 +222,38 @@ export async function writePrivateAtomic(options: {
       await handle.close();
     }
 
-    await inspectReplaceableTarget(target, operations, isCurrentUser);
-    await operations.rename(temporary, target);
-    temporaryIdentity = undefined;
-
-    const directory = await operations.open(
-      parent,
-      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-    );
-    try {
-      await directory.sync();
-    } finally {
-      await directory.close();
+    await beforePublish?.();
+    if (publication === "replace") {
+      await inspectReplaceableTarget(target, operations, isCurrentUser);
+      await operations.rename(temporary, target);
+      temporaryIdentity = undefined;
+    } else {
+      try {
+        await link(temporary, target);
+      } catch (error) {
+        if (!hasErrorCode(error, "EEXIST")) throw error;
+        if (!(await inspectReplaceableTarget(target, operations, isCurrentUser))) {
+          servicePathUnsafe();
+        }
+        await removeCreatedTemporary(temporary, temporaryIdentity, operations, isCurrentUser);
+        temporaryIdentity = undefined;
+        await syncDirectory(parent, operations);
+        return "existing";
+      }
+      await operations.unlink(temporary);
+      temporaryIdentity = undefined;
     }
+    await syncDirectory(parent, operations);
+    return "published";
   } catch (error) {
     await removeCreatedTemporary(temporary, temporaryIdentity, operations, isCurrentUser);
     if (error instanceof RuntimeServiceError) throw error;
     servicePathUnsafe();
   }
+}
+
+export async function writePrivateAtomic(options: WritePrivateAtomicOptions): Promise<void> {
+  await publishPrivateAtomic(options, "replace");
 }
 
 async function openPrivateRegularFile(filePath: string): Promise<FileHandle | undefined> {
@@ -300,6 +349,7 @@ export async function ensureServiceConfig(options: {
   readonly home: string;
   readonly env: RuntimeEnvironment;
   readonly randomSuffix: () => string;
+  readonly beforeConfigPublish?: () => Promise<void>;
 }): Promise<string> {
   if (options.explicitPath !== undefined) {
     if (!path.isAbsolute(options.explicitPath)) {
@@ -315,12 +365,16 @@ export async function ensureServiceConfig(options: {
 
   const config = defaultConfig(options.platform, options.home, options.env);
   const bytes = new TextEncoder().encode(stringify(config, { sortMapEntries: true }));
-  await writePrivateAtomic({
-    target: configPath,
-    bytes,
-    randomSuffix: options.randomSuffix,
-    parentPolicy: "private",
-  });
+  await publishPrivateAtomic(
+    {
+      target: configPath,
+      bytes,
+      randomSuffix: options.randomSuffix,
+      parentPolicy: "private",
+    },
+    "create-if-missing",
+    options.beforeConfigPublish,
+  );
   const loaded = await loadConfig({ ...options, explicitPath: configPath });
   return path.resolve(loaded.source);
 }
