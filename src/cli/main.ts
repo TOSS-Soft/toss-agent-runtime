@@ -5,6 +5,8 @@ import type { LoadedConfig } from "../config/types.js";
 import { createBaselineCapabilities } from "../protocol/capabilities.js";
 import type { JsonValue } from "../protocol/json.js";
 import type { RuntimeError } from "../protocol/types.js";
+import { createProcessSignalSource } from "../platform/signals.js";
+import { runService } from "../service/lifecycle.js";
 import { PACKAGE_VERSION } from "../version.js";
 import { CliUsageError, parseCli, type BaselineCommand } from "./grammar.js";
 import { commandResult, renderJson, type CommandResultV1, type ExitCode } from "./result.js";
@@ -227,8 +229,26 @@ export async function runCli(argv: readonly string[], services: CliServices): Pr
 }
 
 export async function main(argv: readonly string[]): Promise<number> {
+  const platform = { os: process.platform, arch: process.arch, node: process.versions.node };
   const output = await runCli(argv, {
-    platform: { os: process.platform, arch: process.arch, node: process.versions.node },
+    platform,
+    serve: async ({ configPath }) => {
+      if (platform.os !== "darwin" && platform.os !== "linux") {
+        throw new Error("Runtime service is unavailable on this platform");
+      }
+      const loaded = await loadRuntimeConfig({
+        ...(configPath === undefined ? {} : { explicitPath: configPath }),
+        env: process.env,
+        platform: platform.os,
+        home: homedir(),
+      });
+      await runService({
+        signals: createProcessSignalSource(),
+        stopAccepting: () => undefined,
+        drain: () => Promise.resolve(),
+        shutdownTimeoutMs: loaded.config.shutdown_timeout_ms,
+      });
+    },
   });
   if (output.stdout.length > 0) process.stdout.write(output.stdout);
   if (output.stderr.length > 0) process.stderr.write(output.stderr);
