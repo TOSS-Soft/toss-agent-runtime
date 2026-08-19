@@ -1,6 +1,16 @@
 import { execFile as execFileCallback, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { lstat, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdtemp,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -9,6 +19,14 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const execFile = promisify(execFileCallback);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+const inheritedPath = process.env.PATH ?? "";
+const installedLauncherEnvironment = Object.freeze({
+  ...process.env,
+  PATH:
+    inheritedPath.length === 0
+      ? path.dirname(process.execPath)
+      : `${path.dirname(process.execPath)}${path.delimiter}${inheritedPath}`,
+});
 const expectedPackageFiles = JSON.parse(
   await readFile(path.join(root, "scripts", "package-files.json"), "utf8"),
 );
@@ -119,6 +137,22 @@ const PROCESS_TIMEOUT_MS = 10_000;
 const CONTROL_TIMEOUT_MS = 5_000;
 const activeServes = new Set();
 
+function execInstalledLauncher(executable, args, options) {
+  return execFile(executable, args, {
+    ...options,
+    env: installedLauncherEnvironment,
+    shell: false,
+  });
+}
+
+function spawnInstalledLauncher(executable, args, options) {
+  return spawn(executable, args, {
+    ...options,
+    env: installedLauncherEnvironment,
+    shell: false,
+  });
+}
+
 function parseCanonicalDocument(output, canonicalJson, label) {
   assert(output.endsWith("\n"), `${label} did not end with one newline`);
   const lines = output.split("\n");
@@ -132,9 +166,8 @@ function parseCanonicalDocument(output, canonicalJson, label) {
 }
 
 function startInstalledServe(executable, configPath) {
-  const child = spawn(process.execPath, [executable, "serve", "--json", "--config", configPath], {
+  const child = spawnInstalledLauncher(executable, ["serve", "--json", "--config", configPath], {
     cwd: path.dirname(configPath),
-    shell: false,
     stdio: ["ignore", "pipe", "pipe", "ipc"],
   });
   const run = {
@@ -217,6 +250,48 @@ async function forceReap(run) {
   if (run.closed) return;
   run.child.kill("SIGKILL");
   await waitForExit(run, "Forced installed serve cleanup");
+}
+
+async function runCleanupSteps(steps) {
+  let firstFailure;
+  for (const step of steps) {
+    try {
+      await step();
+    } catch (error) {
+      firstFailure ??= error;
+    }
+  }
+  if (firstFailure !== undefined) throw firstFailure;
+}
+
+async function reapActiveServes() {
+  const outcomes = await Promise.allSettled([...activeServes].map((run) => forceReap(run)));
+  const firstFailure = outcomes.find((outcome) => outcome.status === "rejected");
+  if (firstFailure !== undefined) throw firstFailure.reason;
+}
+
+async function assertCleanupContinuesAfterFailure() {
+  const attempts = [];
+  const firstFailure = new Error("injected reap failure");
+  const observed = await runCleanupSteps([
+    () => {
+      attempts.push("reap");
+      return Promise.reject(firstFailure);
+    },
+    () => {
+      attempts.push("temporary-root");
+      return Promise.resolve();
+    },
+    () => {
+      attempts.push("tarball");
+      return Promise.resolve();
+    },
+  ]).catch((error) => error);
+  assert(observed === firstFailure, "Cleanup did not preserve its first failure");
+  assert(
+    JSON.stringify(attempts) === JSON.stringify(["reap", "temporary-root", "tarball"]),
+    "Cleanup stopped before attempting every independent resource",
+  );
 }
 
 function assertReaped(pid, label) {
@@ -350,10 +425,9 @@ async function requestInstalledStatus(socketPath, canonicalJson) {
 async function assertDuplicateServeFails(executable, configPath, canonicalJson) {
   let failure;
   try {
-    await execFile(process.execPath, [executable, "serve", "--json", "--config", configPath], {
+    await execInstalledLauncher(executable, ["serve", "--json", "--config", configPath], {
       cwd: path.dirname(configPath),
       encoding: "utf8",
-      shell: false,
       timeout: PROCESS_TIMEOUT_MS,
       killSignal: "SIGKILL",
     });
@@ -379,6 +453,23 @@ async function assertDuplicateServeFails(executable, configPath, canonicalJson) 
     result.error?.code === "RUNTIME_SERVICE_ALREADY_RUNNING",
     "Second installed serve returned the wrong stable error code",
   );
+}
+
+async function assertInstalledLauncherEnforcesExecuteMode(executable, cwd) {
+  const originalMode = (await stat(executable)).mode & 0o777;
+  let failure;
+  await chmod(executable, originalMode & ~0o111);
+  try {
+    await execInstalledLauncher(executable, ["--version"], {
+      cwd,
+      encoding: "utf8",
+    });
+  } catch (error) {
+    failure = error;
+  } finally {
+    await chmod(executable, originalMode);
+  }
+  assert(failure?.code === "EACCES", "Installed launcher invocation bypassed its executable mode");
 }
 
 async function assertInstalledSupervisionCycle(options) {
@@ -462,6 +553,8 @@ async function assertInstalledSupervisionCycle(options) {
 
 let temporaryDirectory;
 let tarballPath;
+let primaryFailure;
+await assertCleanupContinuesAfterFailure();
 try {
   const packed = await execFile(npmCommand, ["pack", "--json", "--ignore-scripts"], {
     cwd: root,
@@ -510,22 +603,20 @@ try {
     "agent-runtime",
   );
   const api = await import(pathToFileURL(path.join(installedRoot, "dist", "src", "index.js")).href);
-  const help = await execFile(process.execPath, [executable, "--help"], {
+  await assertInstalledLauncherEnforcesExecuteMode(executable, temporaryDirectory);
+  const help = await execInstalledLauncher(executable, ["--help"], {
     cwd: temporaryDirectory,
     encoding: "utf8",
-    shell: false,
   });
   assert(help.stdout.includes("toss-runtime capabilities"), "Installed executable help failed");
-  const version = await execFile(process.execPath, [executable, "--version"], {
+  const version = await execInstalledLauncher(executable, ["--version"], {
     cwd: temporaryDirectory,
     encoding: "utf8",
-    shell: false,
   });
   assert(version.stdout.trim() === "0.0.0-development", "Installed executable version failed");
-  const capabilities = await execFile(process.execPath, [executable, "capabilities", "--json"], {
+  const capabilities = await execInstalledLauncher(executable, ["capabilities", "--json"], {
     cwd: temporaryDirectory,
     encoding: "utf8",
-    shell: false,
   });
   const capabilityResult = JSON.parse(capabilities.stdout);
   assert(capabilityResult.ok === true, "Installed executable capability command failed");
@@ -583,17 +674,12 @@ try {
   const missingConfigPath = path.join(temporaryDirectory, "missing-runtime.yaml");
   let missingConfigFailure;
   try {
-    await execFile(
-      process.execPath,
-      [executable, "serve", "--json", "--config", missingConfigPath],
-      {
-        cwd: temporaryDirectory,
-        encoding: "utf8",
-        shell: false,
-        timeout: PROCESS_TIMEOUT_MS,
-        killSignal: "SIGKILL",
-      },
-    );
+    await execInstalledLauncher(executable, ["serve", "--json", "--config", missingConfigPath], {
+      cwd: temporaryDirectory,
+      encoding: "utf8",
+      timeout: PROCESS_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
     throw new Error("Installed executable accepted a missing serve config");
   } catch (error) {
     missingConfigFailure = error;
@@ -619,9 +705,32 @@ try {
   process.stdout.write(
     `Verified ${packageReport.filename} (${packageReport.files.length} files)\n`,
   );
-} finally {
-  await Promise.all([...activeServes].map((run) => forceReap(run)));
-  if (temporaryDirectory !== undefined)
-    await rm(temporaryDirectory, { recursive: true, force: true });
-  if (tarballPath !== undefined) await rm(tarballPath, { force: true });
+} catch (error) {
+  primaryFailure = error;
 }
+
+let cleanupFailure;
+try {
+  await runCleanupSteps([
+    () => reapActiveServes(),
+    () =>
+      temporaryDirectory === undefined
+        ? Promise.resolve()
+        : rm(temporaryDirectory, { recursive: true, force: true }),
+    () => (tarballPath === undefined ? Promise.resolve() : rm(tarballPath, { force: true })),
+  ]);
+} catch (error) {
+  cleanupFailure = error;
+}
+
+if (primaryFailure !== undefined) {
+  if (
+    cleanupFailure !== undefined &&
+    primaryFailure instanceof Error &&
+    primaryFailure.cause === undefined
+  ) {
+    primaryFailure.cause = cleanupFailure;
+  }
+  throw primaryFailure;
+}
+if (cleanupFailure !== undefined) throw cleanupFailure;
