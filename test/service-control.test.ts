@@ -334,6 +334,33 @@ describe("private service control socket", () => {
     expect((await lstat(socketPath)).isSocket()).toBe(true);
   });
 
+  it("fails closed for distinct bigint identities that collapse to the same number", async () => {
+    const firstInode = 9_007_199_254_740_992n;
+    const replacementInode = 9_007_199_254_740_993n;
+    expect(Number(firstInode)).toBe(Number(replacementInode));
+    let runtimeObservations = 0;
+    const server = createServiceControlServer(
+      options({
+        operationHooks: {
+          modelRuntimeIdentity: (candidatePath, observed) => {
+            if (candidatePath !== runtimePath) return observed;
+            runtimeObservations += 1;
+            return {
+              device: 9_007_199_254_740_994n,
+              inode: runtimeObservations === 1 ? firstInode : replacementInode,
+            };
+          },
+        },
+      }),
+    );
+    controlServers.push(server);
+
+    await expect(server.listen()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_PATH_UNSAFE",
+    });
+    expect(await pathIsMissing(socketPath)).toBe(true);
+  });
+
   it("reclaims legacy, full-hash, and interrupted-claim guards before publishing one current guard", async () => {
     const staleGuards = [`.c${"1".repeat(8)}`, `.c${"2".repeat(64)}`, `.r${"3".repeat(64)}`];
     for (const name of staleGuards) {
@@ -790,6 +817,40 @@ describe("private service control socket", () => {
 
     await server.close();
     await closed;
+
+    expect(await pathIsMissing(socketPath)).toBe(true);
+    expect(await readdir(runtimePath)).toEqual([]);
+  });
+
+  it("keeps repeated and interleaved stop, drain, and close calls idempotent", async () => {
+    const server = await listenControl();
+    const firstClient = await openClient();
+    const secondClient = await openClient();
+    const firstClosed = once(firstClient, "close");
+    const secondClosed = once(secondClient, "close");
+    const firstDrainController = new AbortController();
+    const secondDrainController = new AbortController();
+
+    server.stopAccepting();
+    server.stopAccepting();
+    const firstDrain = server.drain(firstDrainController.signal);
+    const secondDrain = server.drain(secondDrainController.signal);
+    const firstClose = server.close();
+    const repeatedClose = server.close();
+    server.stopAccepting();
+
+    expect(repeatedClose).toBe(firstClose);
+    await Promise.all([
+      firstDrain,
+      secondDrain,
+      firstClose,
+      repeatedClose,
+      firstClosed,
+      secondClosed,
+    ]);
+    await server.close();
+    server.stopAccepting();
+    await server.drain(new AbortController().signal);
 
     expect(await pathIsMissing(socketPath)).toBe(true);
     expect(await readdir(runtimePath)).toEqual([]);

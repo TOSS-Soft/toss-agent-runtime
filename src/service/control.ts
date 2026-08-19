@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants, lstatSync, unlinkSync, type Stats } from "node:fs";
+import { constants, lstatSync, unlinkSync, type BigIntStats } from "node:fs";
 import { chmod, link, lstat, mkdir, open, readdir, rename, rmdir, unlink } from "node:fs/promises";
 import { createConnection, createServer, type Socket } from "node:net";
 import path from "node:path";
@@ -22,8 +22,8 @@ const PUBLICATION_CLAIM_PATTERN = /^\.r[0-9a-f]{64}$/u;
 const internalServiceErrors = new WeakSet<RuntimeServiceError>();
 
 interface FileIdentity {
-  readonly device: number;
-  readonly inode: number;
+  readonly device: bigint;
+  readonly inode: bigint;
 }
 
 interface CacheEntry {
@@ -56,6 +56,8 @@ export type PathOwnerClassifier = (userId: number, candidate: string) => PathOwn
 
 export interface ServiceControlOperationHooks {
   readonly beforePublish?: () => Promise<void>;
+  /** @internal Test seam for modeling lossless runtime-directory identities. */
+  readonly modelRuntimeIdentity?: (candidatePath: string, observed: FileIdentity) => FileIdentity;
   /** @internal Test seam for deterministic publication-guard races. */
   readonly afterPublicationGuardClaim?: (candidatePath: string, claimPath: string) => Promise<void>;
   /** @internal Test seam for deterministic native-close publication races. */
@@ -136,12 +138,38 @@ function classifyPathOwner(
   }
 }
 
-function identityOf(metadata: { readonly dev: number; readonly ino: number }): FileIdentity {
+function identityOf(metadata: { readonly dev: bigint; readonly ino: bigint }): FileIdentity {
   return { device: metadata.dev, inode: metadata.ino };
 }
 
 function sameIdentity(left: FileIdentity, right: FileIdentity): boolean {
   return left.device === right.device && left.inode === right.inode;
+}
+
+function safeUserId(userId: bigint): number {
+  if (userId < 0n || userId > BigInt(Number.MAX_SAFE_INTEGER)) pathUnsafe();
+  return Number(userId);
+}
+
+async function lstatBigInt(candidate: string): Promise<BigIntStats> {
+  return lstat(candidate, { bigint: true });
+}
+
+function runtimeIdentityOf(
+  metadata: BigIntStats,
+  candidate: string,
+  model?: ServiceControlOperationHooks["modelRuntimeIdentity"],
+): FileIdentity {
+  const observed = identityOf(metadata);
+  if (model === undefined) return observed;
+  try {
+    const modeled = model(candidate, observed);
+    if (typeof modeled.device !== "bigint" || typeof modeled.inode !== "bigint") pathUnsafe();
+    return { device: modeled.device, inode: modeled.inode };
+  } catch (error) {
+    if (error instanceof RuntimeServiceError && internalServiceErrors.has(error)) throw error;
+    return pathUnsafe();
+  }
 }
 
 function assertSocketPath(candidate: string): void {
@@ -159,6 +187,7 @@ async function assertPrivateRuntimeDirectory(
   socketPath: string,
   classifier?: PathOwnerClassifier,
   currentUid?: () => number,
+  modelRuntimeIdentity?: ServiceControlOperationHooks["modelRuntimeIdentity"],
 ): Promise<FileIdentity> {
   assertSocketPath(socketPath);
   const runtimePath = path.dirname(socketPath);
@@ -179,28 +208,30 @@ async function assertPrivateRuntimeDirectory(
   for (const [index, candidate] of candidates.entries()) {
     let metadata;
     try {
-      metadata = await lstat(candidate);
+      metadata = await lstatBigInt(candidate);
     } catch {
       pathUnsafe();
     }
     if (metadata.isSymbolicLink() || !metadata.isDirectory()) pathUnsafe();
 
-    const owner = classifyPathOwner(classifier, currentUid, metadata.uid, candidate);
+    const owner = classifyPathOwner(classifier, currentUid, safeUserId(metadata.uid), candidate);
     if (owner === "root" && !reachedCurrentUserDirectory) {
-      if ((metadata.mode & 0o022) !== 0 && (metadata.mode & 0o1000) === 0) pathUnsafe();
+      if ((metadata.mode & 0o022n) !== 0n && (metadata.mode & 0o1000n) === 0n) pathUnsafe();
     } else if (owner === "current-user") {
-      if ((metadata.mode & 0o022) !== 0) pathUnsafe();
+      if ((metadata.mode & 0o022n) !== 0n) pathUnsafe();
       reachedCurrentUserDirectory = true;
     } else {
       pathUnsafe();
     }
     if (
       index === candidates.length - 1 &&
-      (owner !== "current-user" || (metadata.mode & 0o777) !== 0o700)
+      (owner !== "current-user" || (metadata.mode & 0o777n) !== 0o700n)
     ) {
       pathUnsafe();
     }
-    if (index === candidates.length - 1) runtimeIdentity = identityOf(metadata);
+    if (index === candidates.length - 1) {
+      runtimeIdentity = runtimeIdentityOf(metadata, candidate, modelRuntimeIdentity);
+    }
   }
   if (segments.length === 0 || runtimeIdentity === undefined) pathUnsafe();
   return runtimeIdentity;
@@ -226,9 +257,9 @@ function publicationClaimName(serviceInstanceId: string, candidateName: string):
     .digest("hex")}`;
 }
 
-async function requiredMetadata(candidate: string): Promise<Stats> {
+async function requiredMetadata(candidate: string): Promise<BigIntStats> {
   try {
-    return await lstat(candidate);
+    return await lstatBigInt(candidate);
   } catch {
     return pathUnsafe();
   }
@@ -243,7 +274,7 @@ async function requiredEntries(candidate: string): Promise<readonly string[]> {
 }
 
 function assertPrivatePublicationGuard(
-  metadata: Stats,
+  metadata: BigIntStats,
   candidate: string,
   classifier: PathOwnerClassifier | undefined,
   currentUid: (() => number) | undefined,
@@ -253,8 +284,9 @@ function assertPrivatePublicationGuard(
   if (
     metadata.isSymbolicLink() ||
     !metadata.isDirectory() ||
-    classifyPathOwner(classifier, currentUid, metadata.uid, candidate) !== "current-user" ||
-    (metadata.mode & 0o777) !== 0o700 ||
+    classifyPathOwner(classifier, currentUid, safeUserId(metadata.uid), candidate) !==
+      "current-user" ||
+    (metadata.mode & 0o777n) !== 0o700n ||
     (expectedIdentity !== undefined && !sameIdentity(identity, expectedIdentity))
   ) {
     pathUnsafe();
@@ -290,11 +322,13 @@ async function assertUnchangedRuntimeDirectory(options: {
   readonly expected: FileIdentity;
   readonly classifier?: PathOwnerClassifier | undefined;
   readonly currentUid?: (() => number) | undefined;
+  readonly modelRuntimeIdentity?: ServiceControlOperationHooks["modelRuntimeIdentity"] | undefined;
 }): Promise<void> {
   const current = await assertPrivateRuntimeDirectory(
     options.socketPath,
     options.classifier,
     options.currentUid,
+    options.modelRuntimeIdentity,
   );
   if (!sameIdentity(current, options.expected)) pathUnsafe();
 }
@@ -306,8 +340,17 @@ async function removeClaimedPublicationGuard(options: {
   readonly runtimeIdentity: FileIdentity;
   readonly classifier?: PathOwnerClassifier | undefined;
   readonly currentUid?: (() => number) | undefined;
+  readonly modelRuntimeIdentity?: ServiceControlOperationHooks["modelRuntimeIdentity"] | undefined;
 }): Promise<void> {
-  const { claimPath, classifier, currentUid, expectedGuard, runtimeIdentity, socketPath } = options;
+  const {
+    claimPath,
+    classifier,
+    currentUid,
+    expectedGuard,
+    modelRuntimeIdentity,
+    runtimeIdentity,
+    socketPath,
+  } = options;
   let handle;
   try {
     handle = await open(
@@ -319,7 +362,7 @@ async function removeClaimedPublicationGuard(options: {
   }
   try {
     assertPrivatePublicationGuard(
-      await handle.stat(),
+      await handle.stat({ bigint: true }),
       claimPath,
       classifier,
       currentUid,
@@ -338,9 +381,10 @@ async function removeClaimedPublicationGuard(options: {
       expected: runtimeIdentity,
       classifier,
       currentUid,
+      modelRuntimeIdentity,
     });
     assertPrivatePublicationGuard(
-      await handle.stat(),
+      await handle.stat({ bigint: true }),
       claimPath,
       classifier,
       currentUid,
@@ -391,6 +435,7 @@ async function reclaimStalePublicationGuards(options: {
       expected: runtimeIdentity,
       classifier,
       currentUid,
+      modelRuntimeIdentity: hooks?.modelRuntimeIdentity,
     });
 
     const claimPath = path.join(
@@ -398,7 +443,7 @@ async function reclaimStalePublicationGuards(options: {
       publicationClaimName(serviceInstanceId, candidateName),
     );
     try {
-      await lstat(claimPath);
+      await lstatBigInt(claimPath);
       pathUnsafe();
     } catch (error) {
       if (!isMissing(error)) {
@@ -423,6 +468,7 @@ async function reclaimStalePublicationGuards(options: {
       runtimeIdentity,
       classifier,
       currentUid,
+      modelRuntimeIdentity: hooks?.modelRuntimeIdentity,
     });
   }
 
@@ -431,6 +477,7 @@ async function reclaimStalePublicationGuards(options: {
     expected: runtimeIdentity,
     classifier,
     currentUid,
+    modelRuntimeIdentity: hooks?.modelRuntimeIdentity,
   });
   if ((await requiredEntries(runtimePath)).some(isPublicationArtifactName)) pathUnsafe();
 }
@@ -442,7 +489,7 @@ async function privateSocketIdentity(
 ): Promise<FileIdentity | undefined> {
   let metadata;
   try {
-    metadata = await lstat(socketPath);
+    metadata = await lstatBigInt(socketPath);
   } catch (error) {
     if (isMissing(error)) return undefined;
     pathUnsafe();
@@ -450,8 +497,9 @@ async function privateSocketIdentity(
   if (
     metadata.isSymbolicLink() ||
     !metadata.isSocket() ||
-    classifyPathOwner(classifier, currentUid, metadata.uid, socketPath) !== "current-user" ||
-    (metadata.mode & 0o777) !== 0o600
+    classifyPathOwner(classifier, currentUid, safeUserId(metadata.uid), socketPath) !==
+      "current-user" ||
+    (metadata.mode & 0o777n) !== 0o600n
   ) {
     pathUnsafe();
   }
@@ -772,7 +820,7 @@ export function createServiceControlServer(
     if (ownedSocket === undefined) return;
     let metadata;
     try {
-      metadata = await lstat(options.socketPath);
+      metadata = await lstatBigInt(options.socketPath);
     } catch (error) {
       if (isMissing(error)) return;
       return;
@@ -782,7 +830,7 @@ export function createServiceControlServer(
       classifyPathOwner(
         options.classifyPathOwner,
         options.currentUid,
-        metadata.uid,
+        safeUserId(metadata.uid),
         options.socketPath,
       ) === "current-user" &&
       sameIdentity(identityOf(metadata), ownedSocket)
@@ -798,9 +846,9 @@ export function createServiceControlServer(
   function unpublishOwnedSocket(): void {
     if (publicSocketUnpublished) return;
     if (ownedSocket === undefined) pathUnsafe();
-    let metadata: Stats;
+    let metadata: BigIntStats;
     try {
-      metadata = lstatSync(options.socketPath);
+      metadata = lstatSync(options.socketPath, { bigint: true });
     } catch (error) {
       if (isMissing(error)) {
         publicSocketUnpublished = true;
@@ -814,10 +862,10 @@ export function createServiceControlServer(
       classifyPathOwner(
         options.classifyPathOwner,
         options.currentUid,
-        metadata.uid,
+        safeUserId(metadata.uid),
         options.socketPath,
       ) === "current-user" &&
-      (metadata.mode & 0o777) === 0o600 &&
+      (metadata.mode & 0o777n) === 0o600n &&
       sameIdentity(identityOf(metadata), ownedSocket);
     if (!exactOwnedSocket) {
       publicSocketUnpublished = true;
@@ -835,7 +883,7 @@ export function createServiceControlServer(
     if (publicationGuard === undefined) return;
     let metadata;
     try {
-      metadata = await lstat(ownedGuardPath);
+      metadata = await lstatBigInt(ownedGuardPath);
     } catch {
       return;
     }
@@ -844,10 +892,10 @@ export function createServiceControlServer(
       classifyPathOwner(
         options.classifyPathOwner,
         options.currentUid,
-        metadata.uid,
+        safeUserId(metadata.uid),
         ownedGuardPath,
       ) === "current-user" &&
-      (metadata.mode & 0o777) === 0o700 &&
+      (metadata.mode & 0o777n) === 0o700n &&
       sameIdentity(identityOf(metadata), publicationGuard)
     ) {
       try {
@@ -872,6 +920,7 @@ export function createServiceControlServer(
         expected: ownedRuntime,
         classifier: options.classifyPathOwner,
         currentUid: options.currentUid,
+        modelRuntimeIdentity: options.operationHooks?.modelRuntimeIdentity,
       });
       return;
     }
@@ -887,6 +936,7 @@ export function createServiceControlServer(
       expected: ownedRuntime,
       classifier: options.classifyPathOwner,
       currentUid: options.currentUid,
+      modelRuntimeIdentity: options.operationHooks?.modelRuntimeIdentity,
     });
     try {
       await options.operationHooks?.beforePublicationGuardCloseClaim?.(stagingSocketPath);
@@ -894,7 +944,7 @@ export function createServiceControlServer(
       pathUnsafe();
     }
     try {
-      await lstat(stagingSocketPath);
+      await lstatBigInt(stagingSocketPath);
       pathUnsafe();
     } catch (error) {
       if (!isMissing(error)) {
@@ -919,6 +969,7 @@ export function createServiceControlServer(
       expected: ownedRuntime,
       classifier: options.classifyPathOwner,
       currentUid: options.currentUid,
+      modelRuntimeIdentity: options.operationHooks?.modelRuntimeIdentity,
     });
   }
 
@@ -950,6 +1001,7 @@ export function createServiceControlServer(
         options.socketPath,
         options.classifyPathOwner,
         options.currentUid,
+        options.operationHooks?.modelRuntimeIdentity,
       );
       ownedRuntime = runtimeIdentity;
       await removeStaleSocket(options.socketPath, options.classifyPathOwner, options.currentUid);
@@ -962,7 +1014,7 @@ export function createServiceControlServer(
         hooks: options.operationHooks,
       });
       try {
-        await lstat(stagingSocketPath);
+        await lstatBigInt(stagingSocketPath);
         pathUnsafe();
       } catch (error) {
         if (!isMissing(error)) {
@@ -987,14 +1039,14 @@ export function createServiceControlServer(
 
       let created;
       try {
-        created = await lstat(stagingSocketPath);
+        created = await lstatBigInt(stagingSocketPath);
         if (
           created.isSymbolicLink() ||
           !created.isSocket() ||
           classifyPathOwner(
             options.classifyPathOwner,
             options.currentUid,
-            created.uid,
+            safeUserId(created.uid),
             stagingSocketPath,
           ) !== "current-user"
         ) {
@@ -1002,17 +1054,17 @@ export function createServiceControlServer(
         }
         const createdIdentity = identityOf(created);
         await chmod(stagingSocketPath, 0o600);
-        const stagedSocket = await lstat(stagingSocketPath);
+        const stagedSocket = await lstatBigInt(stagingSocketPath);
         if (
           stagedSocket.isSymbolicLink() ||
           !stagedSocket.isSocket() ||
           classifyPathOwner(
             options.classifyPathOwner,
             options.currentUid,
-            stagedSocket.uid,
+            safeUserId(stagedSocket.uid),
             stagingSocketPath,
           ) !== "current-user" ||
-          (stagedSocket.mode & 0o777) !== 0o600 ||
+          (stagedSocket.mode & 0o777n) !== 0o600n ||
           !sameIdentity(identityOf(stagedSocket), createdIdentity)
         ) {
           pathUnsafe();
@@ -1027,52 +1079,53 @@ export function createServiceControlServer(
           options.socketPath,
           options.classifyPathOwner,
           options.currentUid,
+          options.operationHooks?.modelRuntimeIdentity,
         );
         if (!sameIdentity(beforePublishRuntime, runtimeIdentity)) pathUnsafe();
 
         await link(stagingSocketPath, options.socketPath);
         ownedSocket = createdIdentity;
-        const privateSocket = await lstat(options.socketPath);
+        const privateSocket = await lstatBigInt(options.socketPath);
         if (
           privateSocket.isSymbolicLink() ||
           !privateSocket.isSocket() ||
           classifyPathOwner(
             options.classifyPathOwner,
             options.currentUid,
-            privateSocket.uid,
+            safeUserId(privateSocket.uid),
             options.socketPath,
           ) !== "current-user" ||
-          (privateSocket.mode & 0o777) !== 0o600 ||
+          (privateSocket.mode & 0o777n) !== 0o600n ||
           !sameIdentity(identityOf(privateSocket), createdIdentity)
         ) {
           pathUnsafe();
         }
 
-        const linkedStage = await lstat(stagingSocketPath);
+        const linkedStage = await lstatBigInt(stagingSocketPath);
         if (
           linkedStage.isSymbolicLink() ||
           !linkedStage.isSocket() ||
           classifyPathOwner(
             options.classifyPathOwner,
             options.currentUid,
-            linkedStage.uid,
+            safeUserId(linkedStage.uid),
             stagingSocketPath,
           ) !== "current-user" ||
-          (linkedStage.mode & 0o777) !== 0o600 ||
+          (linkedStage.mode & 0o777n) !== 0o600n ||
           !sameIdentity(identityOf(linkedStage), createdIdentity)
         ) {
           pathUnsafe();
         }
         await unlink(stagingSocketPath);
         await mkdir(publicationGuardPath, { mode: 0o700 });
-        const createdGuard = await lstat(publicationGuardPath);
+        const createdGuard = await lstatBigInt(publicationGuardPath);
         if (
           createdGuard.isSymbolicLink() ||
           !createdGuard.isDirectory() ||
           classifyPathOwner(
             options.classifyPathOwner,
             options.currentUid,
-            createdGuard.uid,
+            safeUserId(createdGuard.uid),
             publicationGuardPath,
           ) !== "current-user"
         ) {
@@ -1081,17 +1134,17 @@ export function createServiceControlServer(
         publicationGuard = identityOf(createdGuard);
         ownedGuardPath = publicationGuardPath;
         await chmod(publicationGuardPath, 0o700);
-        const guard = await lstat(publicationGuardPath);
+        const guard = await lstatBigInt(publicationGuardPath);
         if (
           guard.isSymbolicLink() ||
           !guard.isDirectory() ||
           classifyPathOwner(
             options.classifyPathOwner,
             options.currentUid,
-            guard.uid,
+            safeUserId(guard.uid),
             publicationGuardPath,
           ) !== "current-user" ||
-          (guard.mode & 0o777) !== 0o700 ||
+          (guard.mode & 0o777n) !== 0o700n ||
           !sameIdentity(identityOf(guard), publicationGuard)
         ) {
           pathUnsafe();
@@ -1100,6 +1153,7 @@ export function createServiceControlServer(
           options.socketPath,
           options.classifyPathOwner,
           options.currentUid,
+          options.operationHooks?.modelRuntimeIdentity,
         );
         if (!sameIdentity(readyRuntime, runtimeIdentity)) pathUnsafe();
         listening = true;
