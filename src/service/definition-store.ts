@@ -13,7 +13,7 @@ import {
 import type { RuntimeEnvironment, RuntimePlatform } from "../config/types.js";
 import { RuntimeServiceError } from "./errors.js";
 
-type ParentPolicy = "private" | "owned-not-writable";
+export type ParentPolicy = "private" | "owned-not-writable";
 type CurrentUserCheck = (userId: number, candidate?: string) => boolean;
 
 interface StoreOperations {
@@ -171,7 +171,7 @@ async function removeCreatedTemporary(
   }
 }
 
-interface WritePrivateAtomicOptions {
+export interface WritePrivateAtomicOptions {
   readonly target: string;
   readonly bytes: Uint8Array;
   readonly randomSuffix: () => string;
@@ -254,6 +254,17 @@ async function publishPrivateAtomic(
 
 export async function writePrivateAtomic(options: WritePrivateAtomicOptions): Promise<void> {
   await publishPrivateAtomic(options, "replace");
+}
+
+export interface CreatePrivateAtomicIfMissingOptions extends WritePrivateAtomicOptions {
+  readonly beforePublish?: () => Promise<void>;
+}
+
+export async function createPrivateAtomicIfMissing(
+  options: CreatePrivateAtomicIfMissingOptions,
+): Promise<"created" | "existing"> {
+  const result = await publishPrivateAtomic(options, "create-if-missing", options.beforePublish);
+  return result === "published" ? "created" : "existing";
 }
 
 async function openPrivateRegularFile(filePath: string): Promise<FileHandle | undefined> {

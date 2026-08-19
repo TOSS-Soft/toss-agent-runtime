@@ -15,6 +15,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { CommandResult, CommandRunner } from "../src/platform/commands.js";
+import { renderServiceDefinition } from "../src/service/definition.js";
 import { ensureServiceConfig } from "../src/service/definition-store.js";
 import { createServiceManager, type ServiceManager } from "../src/service/manager.js";
 
@@ -47,6 +48,13 @@ interface ManagerFixture {
   readonly operationalLog: string;
 }
 
+interface FixtureOptions {
+  readonly beforeDefinitionPublish?: (input: {
+    readonly definition: string;
+    readonly config: string;
+  }) => Promise<void>;
+}
+
 async function temporaryDirectory(): Promise<string> {
   const directory = await realpath(await mkdtemp(path.join(tmpdir(), "toss-runtime-manager-")));
   temporaryDirectories.push(directory);
@@ -56,6 +64,7 @@ async function temporaryDirectory(): Promise<string> {
 async function fixture(
   platform: "darwin" | "linux",
   runner: CommandRunner,
+  options: FixtureOptions = {},
 ): Promise<ManagerFixture> {
   const home = await temporaryDirectory();
   const config = await ensureServiceConfig({
@@ -82,6 +91,11 @@ async function fixture(
     ),
   );
 
+  const definition =
+    platform === "linux"
+      ? path.join(home, ".config", "systemd", "user", "toss-agent-runtime.service")
+      : path.join(home, "Library", "LaunchAgents", "software.toss.agent-runtime.plist");
+  const beforeDefinitionPublish = options.beforeDefinitionPublish;
   const manager = createServiceManager({
     platform,
     home,
@@ -92,11 +106,10 @@ async function fixture(
     configPath: config,
     randomSuffix: () => "definition",
     runner,
+    ...(beforeDefinitionPublish === undefined
+      ? {}
+      : { beforeDefinitionPublish: () => beforeDefinitionPublish({ definition, config }) }),
   });
-  const definition =
-    platform === "linux"
-      ? path.join(home, ".config", "systemd", "user", "toss-agent-runtime.service")
-      : path.join(home, "Library", "LaunchAgents", "software.toss.agent-runtime.plist");
   return {
     manager,
     definition,
@@ -109,12 +122,12 @@ async function fixture(
   };
 }
 
-function linuxFixture(runner: CommandRunner): Promise<ManagerFixture> {
-  return fixture("linux", runner);
+function linuxFixture(runner: CommandRunner, options?: FixtureOptions): Promise<ManagerFixture> {
+  return fixture("linux", runner, options);
 }
 
-function darwinFixture(runner: CommandRunner): Promise<ManagerFixture> {
-  return fixture("darwin", runner);
+function darwinFixture(runner: CommandRunner, options?: FixtureOptions): Promise<ManagerFixture> {
+  return fixture("darwin", runner, options);
 }
 
 afterEach(async () => {
@@ -276,7 +289,11 @@ describe("native per-user service manager", () => {
 
   it("returns an absent status when Darwin reports no registered service", async () => {
     const runner = new RecordingRunner([
-      { exitCode: 1, stdout: "", stderr: "Could not find service" },
+      {
+        exitCode: 1,
+        stdout: "",
+        stderr: "Could not find service gui/501/software.toss.agent-runtime",
+      },
     ]);
     const { manager } = await darwinFixture(runner);
     await manager.install();
@@ -294,7 +311,7 @@ describe("native per-user service manager", () => {
   it("treats a repeated Darwin bootstrap as an idempotent start", async () => {
     const runner = new RecordingRunner([
       { exitCode: 0, stdout: "", stderr: "" },
-      { exitCode: 1, stdout: "", stderr: "service already loaded" },
+      { exitCode: 1, stdout: "", stderr: "service software.toss.agent-runtime already loaded" },
     ]);
     const { manager } = await darwinFixture(runner);
     await manager.install();
@@ -307,8 +324,8 @@ describe("native per-user service manager", () => {
     const runner = new RecordingRunner([
       { exitCode: 0, stdout: "", stderr: "" },
       { exitCode: 0, stdout: "", stderr: "" },
-      { exitCode: 1, stdout: "LoadState=not-found\n", stderr: "" },
-      { exitCode: 1, stdout: "LoadState=not-found\n", stderr: "" },
+      { exitCode: 1, stdout: "", stderr: "Unit toss-agent-runtime.service not loaded" },
+      { exitCode: 1, stdout: "", stderr: "Unit file toss-agent-runtime.service does not exist" },
       { exitCode: 0, stdout: "", stderr: "" },
     ]);
     const { manager, definition } = await linuxFixture(runner);
@@ -347,9 +364,6 @@ describe("native per-user service manager", () => {
       { file: "/usr/bin/systemctl", args: ["--user", "start", "toss-agent-runtime.service"] },
       { file: "/usr/bin/systemctl", args: ["--user", "stop", "toss-agent-runtime.service"] },
       { file: "/usr/bin/systemctl", args: ["--user", "stop", "toss-agent-runtime.service"] },
-      { file: "/usr/bin/systemctl", args: ["--user", "stop", "toss-agent-runtime.service"] },
-      { file: "/usr/bin/systemctl", args: ["--user", "disable", "toss-agent-runtime.service"] },
-      { file: "/usr/bin/systemctl", args: ["--user", "daemon-reload"] },
       { file: "/usr/bin/systemctl", args: ["--user", "stop", "toss-agent-runtime.service"] },
       { file: "/usr/bin/systemctl", args: ["--user", "disable", "toss-agent-runtime.service"] },
       { file: "/usr/bin/systemctl", args: ["--user", "daemon-reload"] },
@@ -428,4 +442,179 @@ describe("native per-user service manager", () => {
     expect(String(error)).not.toContain("private/runtime");
     expect(String(error)).not.toContain("must-not-leak");
   });
+
+  it.each([
+    ["linux", "stop", "incompatible"],
+    ["linux", "uninstall", "incompatible"],
+    ["darwin", "stop", "incompatible"],
+    ["darwin", "uninstall", "incompatible"],
+    ["linux", "stop", "symlink"],
+    ["linux", "uninstall", "symlink"],
+    ["darwin", "stop", "symlink"],
+    ["darwin", "uninstall", "symlink"],
+  ] as const)(
+    "refuses %s %s before native mutation when its definition is %s",
+    async (platform, action, unsafeKind) => {
+      const runner = new RecordingRunner();
+      const fixtureForPlatform = platform === "linux" ? linuxFixture : darwinFixture;
+      const { manager, definition } = await fixtureForPlatform(runner);
+      await manager.install();
+      runner.calls.splice(0);
+
+      const target = path.join(path.dirname(definition), "preserved-definition");
+      if (unsafeKind === "incompatible") {
+        await writeFile(definition, "untrusted-definition", { mode: 0o600 });
+        await chmod(definition, 0o600);
+      } else {
+        await writeFile(target, "preserve", { mode: 0o600 });
+        await chmod(target, 0o600);
+        await rm(definition);
+        await symlink(target, definition);
+      }
+
+      await expect(manager[action]()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      expect(runner.calls).toEqual([]);
+      if (unsafeKind === "incompatible") {
+        expect(await readFile(definition, "utf8")).toBe("untrusted-definition");
+      } else {
+        expect(await readFile(target, "utf8")).toBe("preserve");
+      }
+    },
+  );
+
+  it("uses the Darwin bootout boundary while preserving config, state, intake, and logs", async () => {
+    const runner = new RecordingRunner();
+    const artifacts = await darwinFixture(runner);
+    await artifacts.manager.install();
+
+    await artifacts.manager.uninstall();
+
+    expect(runner.calls).toEqual([
+      { file: "/bin/launchctl", args: ["bootout", "gui/501/software.toss.agent-runtime"] },
+    ]);
+    await expect(lstat(artifacts.definition)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(artifacts.config, "utf8")).resolves.toContain("schema_version");
+    await expect(readFile(artifacts.canonicalRunArtifact, "utf8")).resolves.toBe("preserve");
+    await expect(readFile(artifacts.journal, "utf8")).resolves.toBe("preserve");
+    await expect(readFile(artifacts.registry, "utf8")).resolves.toBe("preserve");
+    await expect(readFile(artifacts.pendingIntake, "utf8")).resolves.toBe("preserve");
+    await expect(readFile(artifacts.operationalLog, "utf8")).resolves.toBe("preserve");
+  });
+
+  it("keeps repeated Darwin stop and uninstall operations idempotent", async () => {
+    const runner = new RecordingRunner([
+      { exitCode: 0, stdout: "", stderr: "" },
+      {
+        exitCode: 1,
+        stdout: "",
+        stderr: "Could not find service gui/501/software.toss.agent-runtime",
+      },
+      { exitCode: 0, stdout: "", stderr: "" },
+    ]);
+    const { manager } = await darwinFixture(runner);
+    await manager.install();
+
+    await manager.stop();
+    await manager.stop();
+    await manager.uninstall();
+    await manager.uninstall();
+
+    expect(runner.calls).toEqual([
+      { file: "/bin/launchctl", args: ["bootout", "gui/501/software.toss.agent-runtime"] },
+      { file: "/bin/launchctl", args: ["bootout", "gui/501/software.toss.agent-runtime"] },
+      { file: "/bin/launchctl", args: ["bootout", "gui/501/software.toss.agent-runtime"] },
+    ]);
+  });
+
+  it("preserves and rejects an incompatible definition that wins the install publication race", async () => {
+    const runner = new RecordingRunner();
+    const { manager, definition } = await linuxFixture(runner, {
+      beforeDefinitionPublish: async () => {
+        await writeFile(definition, "raced-untrusted-definition", { mode: 0o600 });
+        await chmod(definition, 0o600);
+      },
+    });
+
+    await expect(manager.install()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+    });
+    expect(runner.calls).toEqual([]);
+    expect(await readFile(definition, "utf8")).toBe("raced-untrusted-definition");
+  });
+
+  it("accepts a byte-compatible definition that wins the install publication race", async () => {
+    const runner = new RecordingRunner();
+    const { manager, definition, config } = await linuxFixture(runner, {
+      beforeDefinitionPublish: async () => {
+        const definitionBytes = renderServiceDefinition({
+          platform: "linux",
+          uid: 501,
+          nodePath: "/opt/toss/node/bin/node",
+          cliPath: "/opt/toss/bin/toss-runtime.js",
+          configPath: config,
+          environment: {},
+        });
+        await writeFile(definition, definitionBytes, { mode: 0o600 });
+        await chmod(definition, 0o600);
+      },
+    });
+
+    await expect(manager.install()).resolves.toMatchObject({ installed: true, enabled: true });
+    expect(runner.calls).toEqual([
+      { file: "/usr/bin/systemctl", args: ["--user", "daemon-reload"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "enable", "toss-agent-runtime.service"] },
+    ]);
+    expect(await readFile(definition, "utf8")).toBe(
+      renderServiceDefinition({
+        platform: "linux",
+        uid: 501,
+        nodePath: "/opt/toss/node/bin/node",
+        cliPath: "/opt/toss/bin/toss-runtime.js",
+        configPath: config,
+        environment: {},
+      }),
+    );
+  });
+
+  it("does not accept unrelated idempotent-looking Linux or Darwin manager failures", async () => {
+    const linuxRunner = new RecordingRunner([
+      { exitCode: 0, stdout: "", stderr: "" },
+      { exitCode: 0, stdout: "", stderr: "" },
+      { exitCode: 1, stdout: "", stderr: "Unit unrelated.service not loaded" },
+    ]);
+    const { manager: linuxManager } = await linuxFixture(linuxRunner);
+    await linuxManager.install();
+    await expect(linuxManager.stop()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_MANAGER_FAILED",
+    });
+
+    const darwinRunner = new RecordingRunner([
+      { exitCode: 1, stdout: "", stderr: "Could not find service gui/501/unrelated" },
+    ]);
+    const { manager: darwinManager } = await darwinFixture(darwinRunner);
+    await darwinManager.install();
+    await expect(darwinManager.stop()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_MANAGER_FAILED",
+    });
+  });
+
+  it.each(["linux", "darwin"] as const)(
+    "returns absent without native mutation for missing %s definitions",
+    async (platform) => {
+      const runner = new RecordingRunner();
+      const fixtureForPlatform = platform === "linux" ? linuxFixture : darwinFixture;
+      const { manager } = await fixtureForPlatform(runner);
+
+      await expect(manager.start()).resolves.toMatchObject({ installed: false, enabled: false });
+      await expect(manager.stop()).resolves.toMatchObject({ installed: false, enabled: false });
+      await expect(manager.restart()).resolves.toMatchObject({ installed: false, enabled: false });
+      await expect(manager.uninstall()).resolves.toMatchObject({
+        installed: false,
+        enabled: false,
+      });
+      expect(runner.calls).toEqual([]);
+    },
+  );
 });

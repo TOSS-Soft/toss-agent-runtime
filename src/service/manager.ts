@@ -8,9 +8,9 @@ import {
 import type { RuntimeEnvironment, RuntimePlatform } from "../config/types.js";
 import { renderServiceDefinition } from "./definition.js";
 import {
+  createPrivateAtomicIfMissing,
   readPrivateRegularFile,
   removeOwnedDefinition,
-  writePrivateAtomic,
 } from "./definition-store.js";
 import { RuntimeServiceError } from "./errors.js";
 import { resolveServicePaths, SERVICE_LABEL, SYSTEMD_UNIT } from "./paths.js";
@@ -43,6 +43,7 @@ export interface CreateServiceManagerOptions {
   readonly configPath: string;
   readonly randomSuffix: () => string;
   readonly runner?: CommandRunner;
+  readonly beforeDefinitionPublish?: () => Promise<void>;
 }
 
 const EMPTY_STATUS: ServiceManagerStatus = {
@@ -90,22 +91,47 @@ function isUnavailable(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
 }
 
-type IdempotentCommandState = "none" | "absent" | "already-loaded";
+type IdempotentCommandState =
+  | "none"
+  | "linux-stop"
+  | "linux-disable"
+  | "linux-show"
+  | "darwin-bootstrap"
+  | "darwin-bootout"
+  | "darwin-print";
 
-function hasKnownAbsentService(result: CommandResult): boolean {
-  const output = `${result.stdout}\n${result.stderr}`.slice(0, MAX_STATUS_OUTPUT_CHARS);
-  return (
-    /(?:^|\n)LoadState=not-found(?:\n|$)/.test(output) ||
-    /(?:could not find service|unit .* could not be found|service not found|not loaded)/i.test(
-      output,
-    )
-  );
+function commandOutput(result: CommandResult): string {
+  return `${result.stdout}\n${result.stderr}`.slice(0, MAX_STATUS_OUTPUT_CHARS);
 }
 
-function hasAlreadyLoadedService(result: CommandResult): boolean {
-  return /service already loaded/i.test(
-    `${result.stdout}\n${result.stderr}`.slice(0, MAX_STATUS_OUTPUT_CHARS),
-  );
+function isIdempotentResult(
+  idempotentState: IdempotentCommandState,
+  result: CommandResult,
+  uid: number,
+): boolean {
+  const output = commandOutput(result);
+  if (idempotentState === "linux-show") {
+    return /(?:^|\n)LoadState=not-found(?:\n|$)/.test(output);
+  }
+  if (idempotentState === "linux-stop") {
+    return new RegExp(`\\bUnit ${SYSTEMD_UNIT.replace(".", "\\.")} not loaded\\b`).test(output);
+  }
+  if (idempotentState === "linux-disable") {
+    return new RegExp(
+      `\\b(?:Unit|Unit file) ${SYSTEMD_UNIT.replace(".", "\\.")} (?:could not be found|does not exist)\\b`,
+    ).test(output);
+  }
+  const identity = nativeIdentity(uid).replaceAll(".", "\\.").replaceAll("/", "\\/");
+  if (idempotentState === "darwin-bootstrap") {
+    return new RegExp(
+      `(?:${SERVICE_LABEL.replaceAll(".", "\\.")}.*already loaded|already loaded.*${SERVICE_LABEL.replaceAll(".", "\\.")})`,
+      "i",
+    ).test(output);
+  }
+  if (idempotentState === "darwin-bootout" || idempotentState === "darwin-print") {
+    return new RegExp(`could not find service\\s+["']?${identity}`, "i").test(output);
+  }
+  return false;
 }
 
 function parseProperties(output: string): ReadonlyMap<string, string> {
@@ -190,7 +216,7 @@ class NativeServiceManager implements ServiceManager {
     return this.options.runner ?? new ProcessCommandRunner();
   }
 
-  private async installedDefinition(required: boolean): Promise<boolean> {
+  private async installedDefinition(): Promise<boolean> {
     let existing: Uint8Array | undefined;
     try {
       existing = await readPrivateRegularFile(this.paths.definition);
@@ -198,7 +224,6 @@ class NativeServiceManager implements ServiceManager {
       definitionError(error);
     }
     if (existing === undefined) {
-      if (required) definitionUnsafe();
       return false;
     }
     if (!Buffer.from(existing).equals(this.definition)) definitionUnsafe();
@@ -206,17 +231,22 @@ class NativeServiceManager implements ServiceManager {
   }
 
   private async ensureDefinition(): Promise<void> {
-    if (await this.installedDefinition(false)) return;
+    if (await this.installedDefinition()) return;
+    let result: "created" | "existing";
     try {
-      await writePrivateAtomic({
+      result = await createPrivateAtomicIfMissing({
         target: this.paths.definition,
         bytes: this.definition,
         randomSuffix: this.options.randomSuffix,
         parentPolicy: "owned-not-writable",
+        ...(this.options.beforeDefinitionPublish === undefined
+          ? {}
+          : { beforePublish: this.options.beforeDefinitionPublish }),
       });
     } catch (error) {
       definitionError(error);
     }
+    if (result === "existing" && !(await this.installedDefinition())) definitionUnsafe();
   }
 
   private async command(
@@ -233,10 +263,7 @@ class NativeServiceManager implements ServiceManager {
       throw new RuntimeServiceError("RUNTIME_SERVICE_MANAGER_FAILED");
     }
     if (result.exitCode === 0) return result;
-    if (
-      (idempotentState === "absent" && hasKnownAbsentService(result)) ||
-      (idempotentState === "already-loaded" && hasAlreadyLoadedService(result))
-    ) {
+    if (isIdempotentResult(idempotentState, result, this.options.uid)) {
       return undefined;
     }
     throw new RuntimeServiceError("RUNTIME_SERVICE_MANAGER_FAILED");
@@ -252,34 +279,35 @@ class NativeServiceManager implements ServiceManager {
   }
 
   async start(): Promise<ServiceManagerStatus> {
-    await this.installedDefinition(true);
+    if (!(await this.installedDefinition())) return EMPTY_STATUS;
     if (this.options.platform === "linux") {
       await this.command(LINUX_EXECUTABLE, ["--user", "start", SYSTEMD_UNIT]);
     } else {
       await this.command(
         DARWIN_EXECUTABLE,
         ["bootstrap", `gui/${this.options.uid}`, this.paths.definition],
-        "already-loaded",
+        "darwin-bootstrap",
       );
     }
     return fixedStatus(true, true, true);
   }
 
   async stop(): Promise<ServiceManagerStatus> {
+    if (!(await this.installedDefinition())) return EMPTY_STATUS;
     if (this.options.platform === "linux") {
-      await this.command(LINUX_EXECUTABLE, ["--user", "stop", SYSTEMD_UNIT], "absent");
+      await this.command(LINUX_EXECUTABLE, ["--user", "stop", SYSTEMD_UNIT], "linux-stop");
     } else {
       await this.command(
         DARWIN_EXECUTABLE,
         ["bootout", nativeIdentity(this.options.uid)],
-        "absent",
+        "darwin-bootout",
       );
     }
     return fixedStatus(true, true, false);
   }
 
   async restart(): Promise<ServiceManagerStatus> {
-    await this.installedDefinition(true);
+    if (!(await this.installedDefinition())) return EMPTY_STATUS;
     if (this.options.platform === "linux") {
       await this.command(LINUX_EXECUTABLE, ["--user", "restart", SYSTEMD_UNIT]);
     } else {
@@ -289,7 +317,7 @@ class NativeServiceManager implements ServiceManager {
   }
 
   async status(): Promise<ServiceManagerStatus> {
-    if (!(await this.installedDefinition(false))) return EMPTY_STATUS;
+    if (!(await this.installedDefinition())) return EMPTY_STATUS;
     if (this.options.platform === "linux") {
       const result = await this.command(
         LINUX_EXECUTABLE,
@@ -300,27 +328,28 @@ class NativeServiceManager implements ServiceManager {
           "--property=LoadState,UnitFileState,ActiveState,SubState,NRestarts,ExecMainStatus",
           "--no-pager",
         ],
-        "absent",
+        "linux-show",
       );
       return result === undefined ? EMPTY_STATUS : linuxStatus(result);
     }
     const result = await this.command(
       DARWIN_EXECUTABLE,
       ["print", nativeIdentity(this.options.uid)],
-      "absent",
+      "darwin-print",
     );
     return result === undefined ? EMPTY_STATUS : darwinStatus(result);
   }
 
   async uninstall(): Promise<ServiceManagerStatus> {
+    if (!(await this.installedDefinition())) return EMPTY_STATUS;
     if (this.options.platform === "linux") {
-      await this.command(LINUX_EXECUTABLE, ["--user", "stop", SYSTEMD_UNIT], "absent");
-      await this.command(LINUX_EXECUTABLE, ["--user", "disable", SYSTEMD_UNIT], "absent");
+      await this.command(LINUX_EXECUTABLE, ["--user", "stop", SYSTEMD_UNIT], "linux-stop");
+      await this.command(LINUX_EXECUTABLE, ["--user", "disable", SYSTEMD_UNIT], "linux-disable");
     } else {
       await this.command(
         DARWIN_EXECUTABLE,
         ["bootout", nativeIdentity(this.options.uid)],
-        "absent",
+        "darwin-bootout",
       );
     }
     try {

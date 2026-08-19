@@ -19,6 +19,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  createPrivateAtomicIfMissing,
   ensureServiceConfig,
   readPrivateRegularFile,
   removeOwnedDefinition,
@@ -67,6 +68,41 @@ afterEach(async () => {
 });
 
 describe("private service definition storage", () => {
+  it("reports a missing private definition as atomically created", async () => {
+    const root = await temporaryDirectory();
+    const target = path.join(root, "manager", "definition.service");
+
+    await expect(
+      createPrivateAtomicIfMissing({
+        target,
+        bytes: new TextEncoder().encode("expected"),
+        randomSuffix: () => "fixed",
+        parentPolicy: "owned-not-writable",
+      }),
+    ).resolves.toBe("created");
+    expect(await readFile(target, "utf8")).toBe("expected");
+  });
+
+  it("reports an atomically raced private definition as existing without replacing it", async () => {
+    const root = await temporaryDirectory();
+    const parent = path.join(root, "manager");
+    const target = path.join(parent, "definition.service");
+
+    await expect(
+      createPrivateAtomicIfMissing({
+        target,
+        bytes: new TextEncoder().encode("expected"),
+        randomSuffix: () => "fixed",
+        parentPolicy: "owned-not-writable",
+        beforePublish: async () => {
+          await privateFile(target, "raced-winner");
+        },
+      }),
+    ).resolves.toBe("existing");
+    expect(await readFile(target, "utf8")).toBe("raced-winner");
+    expect(await readdir(parent)).toEqual(["definition.service"]);
+  });
+
   it("materializes a private validated default config without replacing an existing file", async () => {
     const home = await temporaryDirectory();
     const configPath = await ensureServiceConfig({
