@@ -2,6 +2,7 @@ import Ajv2020Module, { type ErrorObject, type ValidateFunction } from "ajv/dist
 import addFormatsModule from "ajv-formats";
 
 import commonSchema from "../../contracts/runtime/runtime-common.v1.schema.json" with { type: "json" };
+import executionRequestSchema from "../../contracts/runtime/execution-request.v1.schema.json" with { type: "json" };
 import { canonicalJson, deepFreezeJson, parseJsonBytes, type JsonValue } from "./json.js";
 import type {
   RuntimeDocument,
@@ -13,6 +14,11 @@ import type {
 const COMMON_SCHEMA_ID = "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json";
 const Ajv2020 = Ajv2020Module.default;
 const addFormats = addFormatsModule.default;
+
+const REGISTERED_SCHEMAS: Readonly<Record<string, string>> = {
+  "execution-request.v1":
+    "https://toss.software/schemas/runtime/v1/execution-request.v1.schema.json",
+};
 
 const FRAGMENTS = {
   "artifact-reference": "artifact_reference",
@@ -72,6 +78,7 @@ export function createProtocolValidator(): ProtocolValidator {
   });
   addFormats(ajv);
   ajv.addSchema(commonSchema);
+  ajv.addSchema(executionRequestSchema);
 
   const fragmentValidators = Object.fromEntries(
     Object.entries(FRAGMENTS).map(([name, definition]) => {
@@ -103,7 +110,10 @@ export function createProtocolValidator(): ProtocolValidator {
       return { ok: true, value: candidate };
     },
 
-    parse(input, expectedType) {
+    parse<T extends RuntimeDocument>(
+      input: string | Uint8Array,
+      expectedType: T["document_type"],
+    ): ValidationResult<T> {
       let candidate: JsonValue;
       try {
         candidate = deepFreezeJson(parseJsonBytes(input));
@@ -125,17 +135,43 @@ export function createProtocolValidator(): ProtocolValidator {
         };
       }
 
-      return {
-        ok: false,
-        code: "RUNTIME_DOCUMENT_UNSUPPORTED",
-        issues: [
-          {
-            path: "/schema_version",
-            keyword: "supported",
-            message: "schema version is not registered",
-          },
-        ],
-      };
+      const schemaVersion = candidate.schema_version;
+      if (typeof schemaVersion !== "string") {
+        return {
+          ok: false,
+          code: "RUNTIME_DOCUMENT_INVALID",
+          issues: [{ path: "/schema_version", keyword: "type", message: "must be string" }],
+        };
+      }
+
+      const schemaId = REGISTERED_SCHEMAS[schemaVersion];
+      if (schemaId === undefined) {
+        return {
+          ok: false,
+          code: "RUNTIME_DOCUMENT_UNSUPPORTED",
+          issues: [
+            {
+              path: "/schema_version",
+              keyword: "supported",
+              message: "schema version is not registered",
+            },
+          ],
+        };
+      }
+
+      const validate = ajv.getSchema(schemaId);
+      if (validate === undefined) {
+        throw new Error(`Registered schema is unavailable: ${schemaId}`);
+      }
+      if (!validate(candidate)) {
+        return {
+          ok: false,
+          code: "RUNTIME_DOCUMENT_INVALID",
+          issues: normalizeIssues(validate.errors),
+        };
+      }
+
+      return { ok: true, value: candidate as unknown as T };
     },
   };
 }

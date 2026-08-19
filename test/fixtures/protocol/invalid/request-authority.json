@@ -1,0 +1,6 @@
+{
+  "protocol_version": "runtime-contract.v1",
+  "schema_version": "execution-request.v1",
+  "document_type": "execution-request",
+  "governance_approval": true
+}
