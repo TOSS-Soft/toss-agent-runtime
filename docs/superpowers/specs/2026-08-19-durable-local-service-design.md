@@ -148,8 +148,9 @@ stable safe codes and remediation text.
 The socket accepts newline-delimited canonical JSON documents no larger than
 64 KiB. `service-control-request.v1` carries request ID, command, and only the
 closed fields required by service status, project registry, logs, and future
-run control. `service-control-response.v1` carries the same request ID, stable
-exit/error semantics, and safe data. Duplicate request IDs with the same
+run control. `service-control-response.v1` carries the same validated request
+ID, stable exit/error semantics, and safe data; failures produced before an ID
+can be validated carry `null`. Duplicate request IDs with the same
 canonical command return the recorded response; a duplicate ID with different
 content fails as a conflict. This request cache is bounded to the live service
 instance. Every state-changing command also carries a subsystem operation ID
