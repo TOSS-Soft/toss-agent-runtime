@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 
 import {
+  createBaselineCapabilities,
   parseExecutionEvent,
   parseExecutionRequest,
   parseExecutionResult,
@@ -24,6 +25,16 @@ async function readExample(name: string): Promise<Uint8Array> {
 }
 
 describe("published protocol artifacts", () => {
+  it("keeps the packaged capability example aligned with baseline schemas", async () => {
+    const result = parseRuntimeCapabilities(await readExample("runtime-capabilities"));
+    const baseline = createBaselineCapabilities({ os: "linux", arch: "x64", node: "22.23.1" });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.supported_schemas).toEqual(baseline.supported_schemas);
+    }
+  });
+
   it("loads the complete example chain through the public package API", async () => {
     const request = parseExecutionRequest(await readExample("execution-request"));
     const event = parseExecutionEvent(await readExample("execution-event"));
