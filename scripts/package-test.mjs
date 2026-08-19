@@ -21,6 +21,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
 const CONTENTS_ONLY_ARGUMENT = "--contents-only";
 const PREPACK_PROBE_ENV = "TOSS_RUNTIME_PREPACK_PROBE";
+const PACK_DESTINATION_ENV = "npm_config_pack_destination";
 const contentsOnly = process.argv.slice(2).includes(CONTENTS_ONLY_ARGUMENT);
 assertArguments();
 const inheritedPath = process.env.PATH ?? "";
@@ -118,6 +119,32 @@ function assertArguments() {
 
 function assertServiceSmokeAllowed(label) {
   assert(!contentsOnly, `Contents-only package acceptance reached service smoke: ${label}`);
+}
+
+function normalizedNpmEnvironmentKey(key) {
+  return key.toLowerCase().replaceAll("-", "_");
+}
+
+function isolatedPackEnvironment(inheritedPackDestination, prepackProbe) {
+  const candidate = {
+    ...process.env,
+    npm_config_pack_destination: inheritedPackDestination,
+    NPM_CONFIG_PACK_DESTINATION: inheritedPackDestination,
+    "npm_config_pack-destination": inheritedPackDestination,
+  };
+  const environment = Object.fromEntries(
+    Object.entries(candidate).filter(
+      ([key]) => normalizedNpmEnvironmentKey(key) !== PACK_DESTINATION_ENV,
+    ),
+  );
+  if (prepackProbe !== undefined) environment[PREPACK_PROBE_ENV] = prepackProbe;
+  assert(
+    Object.keys(environment).every(
+      (key) => normalizedNpmEnvironmentKey(key) !== PACK_DESTINATION_ENV,
+    ),
+    "Pack environment retained an inherited pack destination",
+  );
+  return environment;
 }
 
 function parsePackReport(output) {
@@ -644,19 +671,30 @@ async function assertInstalledCrashRestartCycle(options) {
 }
 
 let temporaryDirectory;
+let packDirectory;
+let inheritedPackDestination;
 let tarballPath;
 let primaryFailure;
 await assertCleanupContinuesAfterFailure();
 try {
+  const temporaryRoot = await realpath("/tmp");
+  packDirectory = await mkdtemp(path.join(temporaryRoot, "toss-runtime-pack-output-"));
+  inheritedPackDestination = await mkdtemp(
+    path.join(temporaryRoot, "toss-runtime-inherited-pack-output-"),
+  );
   const prepackProbe = contentsOnly ? undefined : randomUUID();
-  const packArguments = contentsOnly ? ["pack", "--json", "--ignore-scripts"] : ["pack", "--json"];
+  const packArguments = [
+    "pack",
+    "--json",
+    ...(contentsOnly ? ["--ignore-scripts"] : []),
+    "--pack-destination",
+    packDirectory,
+  ];
   const packed = await execFile(npmCommand, packArguments, {
     cwd: root,
     encoding: "utf8",
     maxBuffer: 4 * 1024 * 1024,
-    ...(prepackProbe === undefined
-      ? {}
-      : { env: { ...process.env, [PREPACK_PROBE_ENV]: prepackProbe } }),
+    env: isolatedPackEnvironment(inheritedPackDestination, prepackProbe),
   });
   if (prepackProbe !== undefined) {
     assert(
@@ -669,10 +707,24 @@ try {
   const packageReport = report[0];
   assert(typeof packageReport.filename === "string", "npm pack did not report a filename");
   assert(Array.isArray(packageReport.files), "npm pack did not report package files");
-  tarballPath = path.join(root, packageReport.filename);
+  assert(
+    packageReport.filename === path.basename(packageReport.filename),
+    "npm pack reported a non-local package filename",
+  );
+  tarballPath = path.join(packDirectory, packageReport.filename);
+  const tarballMetadata = await lstat(tarballPath);
+  assert(tarballMetadata.isFile(), "npm pack did not create its operation-owned tarball");
+  await assertMissing(
+    path.join(root, packageReport.filename),
+    "Package tarball in repository root",
+  );
+  assert(
+    (await readdir(inheritedPackDestination)).length === 0,
+    "npm pack wrote to the inherited pack destination",
+  );
   assertPackageFiles(packageReport.files);
 
-  temporaryDirectory = await mkdtemp(path.join(await realpath("/tmp"), "toss-runtime-package-"));
+  temporaryDirectory = await mkdtemp(path.join(temporaryRoot, "toss-runtime-package-"));
   await execFile(npmCommand, ["init", "--yes"], {
     cwd: temporaryDirectory,
     encoding: "utf8",
@@ -844,6 +896,14 @@ try {
         ? Promise.resolve()
         : rm(temporaryDirectory, { recursive: true, force: true }),
     () => (tarballPath === undefined ? Promise.resolve() : rm(tarballPath, { force: true })),
+    () =>
+      packDirectory === undefined
+        ? Promise.resolve()
+        : rm(packDirectory, { recursive: true, force: true }),
+    () =>
+      inheritedPackDestination === undefined
+        ? Promise.resolve()
+        : rm(inheritedPackDestination, { recursive: true, force: true }),
   ]);
 } catch (error) {
   cleanupFailure = error;
