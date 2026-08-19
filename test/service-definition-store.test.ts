@@ -1,4 +1,6 @@
+import type { Stats } from "node:fs";
 import {
+  appendFile,
   chmod,
   lstat,
   mkdir,
@@ -10,6 +12,7 @@ import {
   rename,
   rm,
   symlink,
+  truncate,
   unlink,
   writeFile,
 } from "node:fs/promises";
@@ -28,8 +31,8 @@ import {
 
 const temporaryDirectories: string[] = [];
 
-async function temporaryDirectory(): Promise<string> {
-  const directory = await realpath(await mkdtemp(path.join(tmpdir(), "toss-runtime-store-")));
+async function temporaryDirectory(parent = tmpdir()): Promise<string> {
+  const directory = await realpath(await mkdtemp(path.join(parent, "toss-runtime-store-")));
   temporaryDirectories.push(directory);
   return directory;
 }
@@ -57,6 +60,31 @@ provider_profiles: []
 mcp_profiles: []
 secret_references: {}
 `;
+}
+
+function modeledRootOwnedOperations(rootOwnedPath: string, permissions: number) {
+  return {
+    lstat: async (candidate: Parameters<typeof lstat>[0]) => {
+      const metadata = await lstat(candidate);
+      const candidatePath = String(candidate);
+      const relative = path.relative(candidatePath, rootOwnedPath);
+      const leadingAncestor =
+        relative === "" || (!path.isAbsolute(relative) && !relative.startsWith(`..${path.sep}`));
+      if (!leadingAncestor) return metadata;
+      const modeled = Object.create(metadata) as Stats;
+      Object.defineProperty(modeled, "uid", { value: 0 });
+      if (candidatePath === rootOwnedPath) {
+        Object.defineProperty(modeled, "mode", {
+          value: (metadata.mode & ~0o7777) | permissions,
+        });
+      }
+      return modeled;
+    },
+    mkdir,
+    open,
+    rename,
+    unlink,
+  };
 }
 
 afterEach(async () => {
@@ -235,6 +263,64 @@ describe("private service definition storage", () => {
     await expect(lstat(target)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("rejects a modeled root-owned world-writable non-sticky leading ancestor", async () => {
+    const root = await temporaryDirectory();
+    const rootOwned = path.join(root, "modeled-root-owned");
+    const parent = path.join(rootOwned, "user-owned", "manager");
+    const target = path.join(parent, "definition.service");
+    await mkdir(parent, { recursive: true, mode: 0o700 });
+    await chmod(rootOwned, 0o777);
+
+    await expect(
+      writePrivateAtomic({
+        target,
+        bytes: new TextEncoder().encode("unit"),
+        randomSuffix: () => "fixed",
+        parentPolicy: "owned-not-writable",
+        operations: modeledRootOwnedOperations(rootOwned, 0o777),
+      }),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_PATH_UNSAFE" });
+    await expect(lstat(target)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("allows a modeled root-owned world-writable sticky leading ancestor", async () => {
+    const root = await temporaryDirectory();
+    const rootOwned = path.join(root, "modeled-root-owned");
+    const parent = path.join(rootOwned, "user-owned", "manager");
+    const target = path.join(parent, "definition.service");
+    await mkdir(parent, { recursive: true, mode: 0o700 });
+    await chmod(rootOwned, 0o777);
+
+    await writePrivateAtomic({
+      target,
+      bytes: new TextEncoder().encode("unit"),
+      randomSuffix: () => "fixed",
+      parentPolicy: "owned-not-writable",
+      operations: modeledRootOwnedOperations(rootOwned, 0o1777),
+    });
+    expect(await readFile(target, "utf8")).toBe("unit");
+  });
+
+  it("allows a real root-owned world-writable sticky temporary ancestor", async () => {
+    const systemTemporaryRoot = await realpath("/tmp");
+    const metadata = await lstat(systemTemporaryRoot);
+    expect(metadata.uid).toBe(0);
+    expect(metadata.mode & 0o022).not.toBe(0);
+    expect(metadata.mode & 0o1000).not.toBe(0);
+    const root = await temporaryDirectory(systemTemporaryRoot);
+    const parent = path.join(root, "manager");
+    const target = path.join(parent, "definition.service");
+
+    await writePrivateAtomic({
+      target,
+      bytes: new TextEncoder().encode("unit"),
+      randomSuffix: () => "fixed",
+      parentPolicy: "owned-not-writable",
+    });
+
+    expect(await readFile(target, "utf8")).toBe("unit");
+  });
+
   it("rejects an existing intermediate directory treated as third-party-owned", async () => {
     const root = await temporaryDirectory();
     const intermediate = path.join(root, "cross-owner-intermediate");
@@ -376,6 +462,29 @@ describe("private service definition storage", () => {
     expect(await readdir(root)).toEqual(["definition.service"]);
   });
 
+  it("cleans its exact temporary inode when a restrictive umask prevents mode 0600", async () => {
+    const root = await temporaryDirectory();
+    const target = path.join(root, "definition.service");
+    await privateFile(target, "preserve");
+    const previousUmask = process.umask(0o777);
+
+    try {
+      await expect(
+        writePrivateAtomic({
+          target,
+          bytes: new TextEncoder().encode("replacement"),
+          randomSuffix: () => "fixed",
+          parentPolicy: "owned-not-writable",
+        }),
+      ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_PATH_UNSAFE" });
+    } finally {
+      process.umask(previousUmask);
+    }
+
+    expect(await readFile(target, "utf8")).toBe("preserve");
+    expect(await readdir(root)).toEqual(["definition.service"]);
+  });
+
   it("does not delete a colliding caller-owned temporary path", async () => {
     const root = await temporaryDirectory();
     const target = path.join(root, "definition.service");
@@ -493,6 +602,41 @@ describe("private service definition storage", () => {
       code: "RUNTIME_SERVICE_PATH_UNSAFE",
     });
     expect(await readFile(preserved, "utf8")).toBe("preserve");
+  });
+
+  it("accepts a private definition of exactly 65,536 bytes", async () => {
+    const root = await temporaryDirectory();
+    const target = path.join(root, "definition.service");
+    await writeFile(target, new Uint8Array(65_536), { mode: 0o600 });
+    await chmod(target, 0o600);
+
+    await expect(readPrivateRegularFile(target)).resolves.toHaveLength(65_536);
+  });
+
+  it("rejects a sparse private definition larger than 65,536 bytes", async () => {
+    const root = await temporaryDirectory();
+    const target = path.join(root, "definition.service");
+    await privateFile(target, "");
+    await truncate(target, 65_537);
+
+    await expect(readPrivateRegularFile(target)).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_PATH_UNSAFE",
+    });
+  });
+
+  it("rejects a private definition that grows after descriptor validation", async () => {
+    const root = await temporaryDirectory();
+    const target = path.join(root, "definition.service");
+    await writeFile(target, new Uint8Array(65_536), { mode: 0o600 });
+    await chmod(target, 0o600);
+
+    await expect(
+      readPrivateRegularFile(target, {
+        beforeRead: async () => {
+          await appendFile(target, new Uint8Array(65_536));
+        },
+      }),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_PATH_UNSAFE" });
   });
 
   it("refuses to read a definition through a symlinked parent", async () => {

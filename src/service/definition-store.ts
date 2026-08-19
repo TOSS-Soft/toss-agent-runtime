@@ -1,4 +1,4 @@
-import { constants } from "node:fs";
+import { constants, type PathLike, type Stats } from "node:fs";
 import { link, lstat, mkdir, open, rename, unlink, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 
@@ -17,7 +17,7 @@ export type ParentPolicy = "private" | "owned-not-writable";
 type CurrentUserCheck = (userId: number, candidate?: string) => boolean;
 
 interface StoreOperations {
-  readonly lstat: typeof lstat;
+  readonly lstat: (candidate: PathLike) => Promise<Stats>;
   readonly mkdir: typeof mkdir;
   readonly open: typeof open;
   readonly rename: typeof rename;
@@ -31,6 +31,7 @@ interface OwnedFileIdentity {
 
 const DEFAULT_OPERATIONS: StoreOperations = { lstat, mkdir, open, rename, unlink };
 const SAFE_SUFFIX = /^[A-Za-z0-9_-]{1,64}$/;
+const MAX_PRIVATE_REGULAR_FILE_BYTES = 65_536;
 
 function servicePathUnsafe(): never {
   throw new RuntimeServiceError("RUNTIME_SERVICE_PATH_UNSAFE");
@@ -94,7 +95,11 @@ async function inspectDirectoryPath(
     if (!metadata.isDirectory()) servicePathUnsafe();
     const ownedByCurrentUser = isCurrentUser(metadata.uid, current);
     const trustedSystemAncestor = metadata.uid === 0 && !reachedCurrentUserDirectory;
-    if (!trustedSystemAncestor) {
+    if (trustedSystemAncestor) {
+      if ((metadata.mode & 0o022) !== 0 && (metadata.mode & 0o1000) === 0) {
+        servicePathUnsafe();
+      }
+    } else {
       if (!ownedByCurrentUser || (metadata.mode & 0o022) !== 0) servicePathUnsafe();
       reachedCurrentUserDirectory = true;
     }
@@ -160,7 +165,6 @@ async function removeCreatedTemporary(
       metadata.isFile() &&
       !metadata.isSymbolicLink() &&
       isCurrentUser(metadata.uid, temporary) &&
-      isPrivateFileMode(metadata.mode) &&
       metadata.dev === identity.device &&
       metadata.ino === identity.inode
     ) {
@@ -208,14 +212,11 @@ async function publishPrivateAtomic(
     );
     try {
       const metadata = await handle.stat();
-      if (
-        !metadata.isFile() ||
-        !isCurrentUser(metadata.uid, temporary) ||
-        !isPrivateFileMode(metadata.mode)
-      ) {
+      if (!metadata.isFile() || !isCurrentUser(metadata.uid, temporary)) {
         servicePathUnsafe();
       }
       temporaryIdentity = { device: metadata.dev, inode: metadata.ino };
+      if (!isPrivateFileMode(metadata.mode)) servicePathUnsafe();
       await handle.writeFile(bytes);
       await handle.sync();
     } finally {
@@ -302,12 +303,34 @@ async function openPrivateRegularFile(filePath: string): Promise<FileHandle | un
   }
 }
 
-export async function readPrivateRegularFile(filePath: string): Promise<Uint8Array | undefined> {
+export interface ReadPrivateRegularFileOptions {
+  readonly beforeRead?: () => Promise<void>;
+}
+
+async function readBounded(handle: FileHandle): Promise<Uint8Array> {
+  const bytes = Buffer.allocUnsafe(MAX_PRIVATE_REGULAR_FILE_BYTES + 1);
+  let offset = 0;
+  while (offset < bytes.length) {
+    const result = await handle.read(bytes, offset, bytes.length - offset, offset);
+    if (result.bytesRead === 0) break;
+    offset += result.bytesRead;
+  }
+  if (offset > MAX_PRIVATE_REGULAR_FILE_BYTES) servicePathUnsafe();
+  return bytes.subarray(0, offset);
+}
+
+export async function readPrivateRegularFile(
+  filePath: string,
+  options: ReadPrivateRegularFileOptions = {},
+): Promise<Uint8Array | undefined> {
   try {
     const handle = await openPrivateRegularFile(filePath);
     if (handle === undefined) return undefined;
     try {
-      return await handle.readFile();
+      const metadata = await handle.stat();
+      if (metadata.size > MAX_PRIVATE_REGULAR_FILE_BYTES) servicePathUnsafe();
+      await options.beforeRead?.();
+      return await readBounded(handle);
     } finally {
       await handle.close();
     }

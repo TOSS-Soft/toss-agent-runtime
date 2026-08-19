@@ -7,6 +7,7 @@ import {
   realpath,
   rm,
   symlink,
+  truncate,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -615,6 +616,25 @@ describe("native per-user service manager", () => {
       code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
     });
     expect(await readFile(target, "utf8")).toBe("preserve");
+  });
+
+  it("normalizes an oversized definition before any native mutation without reflecting its path", async () => {
+    const runner = new RecordingRunner();
+    const { manager, definition } = await linuxFixture(runner);
+    await mkdir(path.dirname(definition), { recursive: true, mode: 0o700 });
+    await writeFile(definition, "", { mode: 0o600 });
+    await chmod(definition, 0o600);
+    await truncate(definition, 65_537);
+
+    let error: unknown;
+    try {
+      await manager.install();
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toMatchObject({ code: "RUNTIME_SERVICE_DEFINITION_UNSAFE" });
+    expect(String(error)).not.toContain(definition);
+    expect(runner.calls).toEqual([]);
   });
 
   it("maps a missing native manager executable to the fixed unavailable error", async () => {
