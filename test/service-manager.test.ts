@@ -600,6 +600,23 @@ describe("native per-user service manager", () => {
     });
   });
 
+  it.each([
+    ["bootstrap", "start", "service software.toss.agent-runtime.helper already loaded"],
+    ["bootout", "stop", "Could not find service gui/501/software.toss.agent-runtime-helper"],
+    ["print", "status", "Could not find service gui/501/software.toss.agent-runtime.helper"],
+  ] as const)(
+    "does not accept a Darwin %s failure for a target-prefix service identity",
+    async (_operation, action, stderr) => {
+      const runner = new RecordingRunner([{ exitCode: 1, stdout: "", stderr }]);
+      const { manager } = await darwinFixture(runner);
+      await manager.install();
+
+      await expect(manager[action]()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_MANAGER_FAILED",
+      });
+    },
+  );
+
   it.each(["linux", "darwin"] as const)(
     "returns absent without native mutation for missing %s definitions",
     async (platform) => {

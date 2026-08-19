@@ -122,14 +122,17 @@ function isIdempotentResult(
     ).test(output);
   }
   const identity = nativeIdentity(uid).replaceAll(".", "\\.").replaceAll("/", "\\/");
+  const tokenBoundary = "(?=$|[^A-Za-z0-9._-])";
   if (idempotentState === "darwin-bootstrap") {
     return new RegExp(
-      `(?:${SERVICE_LABEL.replaceAll(".", "\\.")}.*already loaded|already loaded.*${SERVICE_LABEL.replaceAll(".", "\\.")})`,
+      `(?:${SERVICE_LABEL.replaceAll(".", "\\.")}${tokenBoundary}.*already loaded|already loaded.*${SERVICE_LABEL.replaceAll(".", "\\.")}${tokenBoundary})`,
       "i",
     ).test(output);
   }
   if (idempotentState === "darwin-bootout" || idempotentState === "darwin-print") {
-    return new RegExp(`could not find service\\s+["']?${identity}`, "i").test(output);
+    return new RegExp(`could not find service\\s+["']?${identity}${tokenBoundary}`, "i").test(
+      output,
+    );
   }
   return false;
 }
