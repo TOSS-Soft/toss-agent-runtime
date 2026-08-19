@@ -12,7 +12,12 @@ import {
   parseJsonBytes,
   type JsonValue,
 } from "../protocol/json.js";
-import type { LoadedConfig, RuntimeConfigV1 } from "./types.js";
+import type {
+  LoadedConfig,
+  RuntimeConfigV1,
+  RuntimeEnvironment,
+  RuntimePlatform,
+} from "./types.js";
 
 const Ajv2020 = Ajv2020Module.default;
 const ajv = new Ajv2020({
@@ -35,17 +40,14 @@ export class RuntimeConfigError extends Error {
   }
 }
 
-type PlatformName = "darwin" | "linux";
-type Environment = Readonly<Record<string, string | undefined>>;
-
-function xdgPath(env: Environment, key: string, fallback: string): string {
+function xdgPath(env: RuntimeEnvironment, key: string, fallback: string): string {
   const value = env[key];
   return value === undefined || value.length === 0 || !path.isAbsolute(value)
     ? fallback
     : path.normalize(value);
 }
 
-function absoluteEnvironmentPath(env: Environment, key: string): string | undefined {
+function absoluteEnvironmentPath(env: RuntimeEnvironment, key: string): string | undefined {
   const value = env[key];
   return value !== undefined && value.length > 0 && path.isAbsolute(value)
     ? path.normalize(value)
@@ -53,9 +55,9 @@ function absoluteEnvironmentPath(env: Environment, key: string): string | undefi
 }
 
 export function defaultConfig(
-  platform: PlatformName,
+  platform: RuntimePlatform,
   home: string,
-  env: Environment = {},
+  env: RuntimeEnvironment = {},
 ): RuntimeConfigV1 {
   const state =
     platform === "darwin"
@@ -93,7 +95,11 @@ export function defaultConfig(
   return deepFreezeJson(config as unknown as JsonValue) as unknown as RuntimeConfigV1;
 }
 
-function defaultConfigPath(platform: PlatformName, home: string, env: Environment): string {
+export function resolveDefaultConfigPath(
+  platform: RuntimePlatform,
+  home: string,
+  env: RuntimeEnvironment,
+): string {
   if (platform === "darwin") {
     return path.join(home, "Library", "Application Support", "TOSS", "runtime", "config.yaml");
   }
@@ -178,9 +184,9 @@ interface ProductionRoots {
 }
 
 function productionRoots(options: {
-  readonly env: Environment;
+  readonly env: RuntimeEnvironment;
   readonly home: string;
-  readonly platform: PlatformName;
+  readonly platform: RuntimePlatform;
 }): ProductionRoots {
   if (options.platform === "darwin") {
     const runtime = path.join(options.home, "Library", "Application Support", "TOSS", "runtime");
@@ -269,7 +275,11 @@ async function assertPrivateDirectoryPath(
 async function assertProductionIsolation(
   config: RuntimeConfigV1,
   selectedPath: string,
-  options: { readonly env: Environment; readonly home: string; readonly platform: PlatformName },
+  options: {
+    readonly env: RuntimeEnvironment;
+    readonly home: string;
+    readonly platform: RuntimePlatform;
+  },
 ): Promise<void> {
   const roots = productionRoots(options);
   await assertPrivateDirectoryPath(path.dirname(selectedPath), [roots.config]);
@@ -280,15 +290,15 @@ async function assertProductionIsolation(
 
 export async function loadConfig(options: {
   readonly explicitPath?: string;
-  readonly env: Environment;
-  readonly platform: PlatformName;
+  readonly env: RuntimeEnvironment;
+  readonly platform: RuntimePlatform;
   readonly home: string;
 }): Promise<LoadedConfig> {
   const environmentPath = options.env.TOSS_RUNTIME_CONFIG;
   const selectedPath =
     options.explicitPath ??
     (environmentPath === undefined || environmentPath.length === 0
-      ? defaultConfigPath(options.platform, options.home, options.env)
+      ? resolveDefaultConfigPath(options.platform, options.home, options.env)
       : environmentPath);
   const required =
     options.explicitPath !== undefined ||

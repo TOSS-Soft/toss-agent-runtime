@@ -4,7 +4,7 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { defaultConfig, loadConfig } from "../src/config/load.js";
+import { defaultConfig, loadConfig, resolveDefaultConfigPath } from "../src/config/load.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -86,6 +86,22 @@ describe("runtime configuration", () => {
     expect(result.source).toBe("defaults");
     expect(result.config.logs).toEqual({ level: "info", retention_days: 7, max_bytes: 104857600 });
     expect(result.config.paths.state).toBe(path.join(root, ".local", "state", "toss", "runtime"));
+  });
+
+  it("resolves the standard config path from the platform-specific private root", () => {
+    expect(resolveDefaultConfigPath("darwin", "/Users/test", {})).toBe(
+      "/Users/test/Library/Application Support/TOSS/runtime/config.yaml",
+    );
+    expect(
+      resolveDefaultConfigPath("linux", "/home/test", {
+        XDG_CONFIG_HOME: "/private/config",
+      }),
+    ).toBe("/private/config/toss/runtime/config.yaml");
+    expect(
+      resolveDefaultConfigPath("linux", "/home/test", {
+        XDG_CONFIG_HOME: "relative-config",
+      }),
+    ).toBe("/home/test/.config/toss/runtime/config.yaml");
   });
 
   it("ignores relative XDG roots when constructing defaults", () => {
