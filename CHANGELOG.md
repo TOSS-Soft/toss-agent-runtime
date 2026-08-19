@@ -13,6 +13,14 @@ All notable changes to this project are documented here. The format follows Keep
 - Deterministic package-content tests and credential-free Node.js 22/24 CI baseline.
 - Commit-bound acceptance evidence for the Runtime Contract Protocol/package baseline (#2 and #4).
 
+### Security
+
+- Reject case/camelCase secret- and governance-shaped metadata keys in event/error free-form fields while documenting the producer redaction boundary.
+- Require coherent `available` feature declarations and exact MCP profile identity during capability negotiation.
+- Preserve JSON/exit-code safety for inline secret options, missing service configuration, failed drains, and forced shutdown.
+- Read configuration through one no-follow file descriptor and isolate production files/paths to private per-user roots.
+- Validate exact npm package contents and real installed-process SIGINT/SIGTERM behavior.
+
 ### Known limitations
 
 - Providers, routing, skills, MCP, agent execution, review, evidence capture, and the local control socket are intentionally unavailable until later v1 waves.

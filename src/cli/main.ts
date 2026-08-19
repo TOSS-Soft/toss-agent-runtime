@@ -1,12 +1,12 @@
 import { homedir } from "node:os";
 
-import { loadConfig as loadRuntimeConfig, type RuntimeConfigError } from "../config/load.js";
+import { loadConfig as loadRuntimeConfig, RuntimeConfigError } from "../config/load.js";
 import type { LoadedConfig } from "../config/types.js";
 import { createBaselineCapabilities } from "../protocol/capabilities.js";
 import type { JsonValue } from "../protocol/json.js";
 import type { RuntimeError } from "../protocol/types.js";
 import { createProcessSignalSource } from "../platform/signals.js";
-import { runService } from "../service/lifecycle.js";
+import { runService, type ServiceOutcome } from "../service/lifecycle.js";
 import { PACKAGE_VERSION } from "../version.js";
 import { CliUsageError, parseCli, type BaselineCommand } from "./grammar.js";
 import { commandResult, renderJson, type CommandResultV1, type ExitCode } from "./result.js";
@@ -34,7 +34,7 @@ export interface CliServices {
     readonly platform: "darwin" | "linux";
     readonly home: string;
   }) => Promise<LoadedConfig>;
-  readonly serve?: (options: { readonly configPath?: string }) => Promise<void>;
+  readonly serve?: (options: { readonly configPath?: string }) => Promise<ServiceOutcome>;
 }
 
 export interface CliOutput {
@@ -194,7 +194,56 @@ async function serve(
       "",
     );
   }
-  await services.serve(command.configPath === undefined ? {} : { configPath: command.configPath });
+  let outcome: ServiceOutcome;
+  try {
+    outcome = await services.serve(
+      command.configPath === undefined ? {} : { configPath: command.configPath },
+    );
+  } catch (error) {
+    if (error instanceof RuntimeConfigError) {
+      const safeMessage =
+        error.code === "RUNTIME_CONFIG_UNAVAILABLE"
+          ? "Runtime configuration is unavailable"
+          : "Runtime configuration is invalid or unsafe";
+      return outputForResult(
+        commandResult({
+          command: command.name,
+          exitCode: 5,
+          error: runtimeError(error.code, "invalid-input", safeMessage),
+        }),
+        command.json,
+        "",
+      );
+    }
+    return outputForResult(
+      commandResult({
+        command: command.name,
+        exitCode: 70,
+        error: runtimeError(
+          "RUNTIME_SERVE_FAILED",
+          "internal",
+          "Runtime service stopped unexpectedly",
+        ),
+      }),
+      command.json,
+      "",
+    );
+  }
+  if (outcome.forced) {
+    return outputForResult(
+      commandResult({
+        command: command.name,
+        exitCode: 70,
+        error: runtimeError(
+          "RUNTIME_SHUTDOWN_TIMEOUT",
+          "timeout",
+          "Runtime shutdown exceeded its deadline",
+        ),
+      }),
+      command.json,
+      "",
+    );
+  }
   return outputForResult(
     commandResult({ command: command.name, exitCode: 0 }),
     command.json,
@@ -230,26 +279,39 @@ export async function runCli(argv: readonly string[], services: CliServices): Pr
 
 export async function main(argv: readonly string[]): Promise<number> {
   const platform = { os: process.platform, arch: process.arch, node: process.versions.node };
-  const output = await runCli(argv, {
-    platform,
-    serve: async ({ configPath }) => {
-      if (platform.os !== "darwin" && platform.os !== "linux") {
-        throw new Error("Runtime service is unavailable on this platform");
-      }
-      const loaded = await loadRuntimeConfig({
-        ...(configPath === undefined ? {} : { explicitPath: configPath }),
-        env: process.env,
-        platform: platform.os,
-        home: homedir(),
-      });
-      await runService({
-        signals: createProcessSignalSource(),
-        stopAccepting: () => undefined,
-        drain: () => Promise.resolve(),
-        shutdownTimeoutMs: loaded.config.shutdown_timeout_ms,
-      });
-    },
-  });
+  let output: CliOutput;
+  try {
+    output = await runCli(argv, {
+      platform,
+      serve: async ({ configPath }) => {
+        if (platform.os !== "darwin" && platform.os !== "linux") {
+          throw new Error("Runtime service is unavailable on this platform");
+        }
+        const loaded = await loadRuntimeConfig({
+          ...(configPath === undefined ? {} : { explicitPath: configPath }),
+          env: process.env,
+          platform: platform.os,
+          home: homedir(),
+        });
+        return runService({
+          signals: createProcessSignalSource(),
+          stopAccepting: () => undefined,
+          drain: () => Promise.resolve(),
+          shutdownTimeoutMs: loaded.config.shutdown_timeout_ms,
+        });
+      },
+    });
+  } catch {
+    output = outputForResult(
+      commandResult({
+        command: argv[0] ?? "internal",
+        exitCode: 70,
+        error: runtimeError("RUNTIME_INTERNAL", "internal", "Runtime command failed internally"),
+      }),
+      argv.includes("--json"),
+      "",
+    );
+  }
   if (output.stdout.length > 0) process.stdout.write(output.stdout);
   if (output.stderr.length > 0) process.stderr.write(output.stderr);
   return output.exitCode;

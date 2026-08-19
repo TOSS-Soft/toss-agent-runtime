@@ -1,6 +1,7 @@
 import { PACKAGE_NAME, PACKAGE_VERSION, PROTOCOL_VERSION } from "../version.js";
 import type { ExecutionRequestV1 } from "./request.js";
 import type {
+  ArtifactReference,
   ProducerIdentity,
   RuntimeDocument,
   ValidationIssue,
@@ -27,6 +28,7 @@ export interface RuntimeCapabilitiesV1 extends RuntimeDocument {
   readonly skill_host_versions: readonly string[];
   readonly superpowers_capabilities: readonly string[];
   readonly mcp_transports: readonly string[];
+  readonly mcp_profiles: readonly ArtifactReference[];
   readonly execution_topologies: readonly "sequential-worker-reviewer"[];
   readonly features: Readonly<{
     providers: Availability;
@@ -67,6 +69,7 @@ export function createBaselineCapabilities(platform: {
     skill_host_versions: Object.freeze([]),
     superpowers_capabilities: Object.freeze([]),
     mcp_transports: Object.freeze([]),
+    mcp_profiles: Object.freeze([]),
     execution_topologies: Object.freeze([]),
     features: Object.freeze({
       providers: "unavailable",
@@ -83,7 +86,71 @@ export function createBaselineCapabilities(platform: {
 export function parseRuntimeCapabilities(
   input: string | Uint8Array,
 ): ValidationResult<RuntimeCapabilitiesV1> {
-  return createProtocolValidator().parse<RuntimeCapabilitiesV1>(input, "runtime-capabilities");
+  const result = createProtocolValidator().parse<RuntimeCapabilitiesV1>(
+    input,
+    "runtime-capabilities",
+  );
+  if (!result.ok) return result;
+
+  const issues: ValidationIssue[] = [];
+  if (
+    (result.value.features.providers === "unavailable" ||
+      result.value.features.routing === "unavailable") &&
+    (result.value.provider_transports.length > 0 || result.value.model_classes.length > 0)
+  ) {
+    issues.push(
+      capabilityIssue(
+        "/provider_transports",
+        "featureCoherence",
+        "unavailable provider or routing features cannot advertise provider resources",
+      ),
+    );
+  }
+  if (
+    result.value.features.skills === "unavailable" &&
+    (result.value.skill_host_versions.length > 0 ||
+      result.value.superpowers_capabilities.length > 0)
+  ) {
+    issues.push(
+      capabilityIssue(
+        "/skill_host_versions",
+        "featureCoherence",
+        "unavailable skills cannot advertise skill resources",
+      ),
+    );
+  }
+  if (
+    result.value.features.mcp === "unavailable" &&
+    (result.value.mcp_transports.length > 0 || result.value.mcp_profiles.length > 0)
+  ) {
+    issues.push(
+      capabilityIssue(
+        "/mcp_transports",
+        "featureCoherence",
+        "unavailable MCP cannot advertise transports or profiles",
+      ),
+    );
+  }
+  if (
+    (result.value.features.agent_loop === "unavailable" ||
+      result.value.features.review === "unavailable") &&
+    result.value.execution_topologies.length > 0
+  ) {
+    issues.push(
+      capabilityIssue(
+        "/execution_topologies",
+        "featureCoherence",
+        "unavailable execution or review cannot advertise topologies",
+      ),
+    );
+  }
+  if (issues.length === 0) return result;
+  issues.sort((left, right) =>
+    `${left.path}\u0000${left.keyword}\u0000${left.message}`.localeCompare(
+      `${right.path}\u0000${right.keyword}\u0000${right.message}`,
+    ),
+  );
+  return { ok: false, code: "RUNTIME_DOCUMENT_INVALID", issues };
 }
 
 function capabilityIssue(path: string, keyword: string, message: string): ValidationIssue {
@@ -95,6 +162,25 @@ export function negotiateRequest(
   capabilities: RuntimeCapabilitiesV1,
 ): ValidationResult<Readonly<{ protocol: "runtime-contract.v1" }>> {
   const issues: ValidationIssue[] = [];
+  for (const feature of [
+    "providers",
+    "routing",
+    "skills",
+    "mcp",
+    "agent_loop",
+    "review",
+    "evidence",
+  ] as const) {
+    if (capabilities.features[feature] !== "available") {
+      issues.push(
+        capabilityIssue(
+          `/features/${feature}`,
+          "featureAvailability",
+          `required feature is not available: ${feature}`,
+        ),
+      );
+    }
+  }
   if (!capabilities.supported_protocols.includes(request.protocol_version)) {
     issues.push(capabilityIssue("/protocol_version", "protocol", "protocol is unsupported"));
   }
@@ -136,6 +222,17 @@ export function negotiateRequest(
   }
   if (capabilities.mcp_transports.length === 0) {
     issues.push(capabilityIssue("/mcp/profile", "mcpTransport", "MCP is unavailable"));
+  }
+  const requestedProfile = request.mcp.profile;
+  const profileAvailable = capabilities.mcp_profiles.some(
+    (profile) =>
+      profile.document_type === requestedProfile.document_type &&
+      profile.artifact_id === requestedProfile.artifact_id &&
+      profile.revision === requestedProfile.revision &&
+      profile.hash === requestedProfile.hash,
+  );
+  if (!profileAvailable) {
+    issues.push(capabilityIssue("/mcp/profile", "mcpProfile", "exact MCP profile is unavailable"));
   }
   if (!capabilities.execution_topologies.includes("sequential-worker-reviewer")) {
     issues.push(

@@ -1,4 +1,4 @@
-import { execFile as execFileCallback } from "node:child_process";
+import { execFile as execFileCallback, spawn } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -8,6 +8,9 @@ import { fileURLToPath } from "node:url";
 const execFile = promisify(execFileCallback);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+const expectedPackageFiles = JSON.parse(
+  await readFile(path.join(root, "scripts", "package-files.json"), "utf8"),
+);
 
 const REQUIRED_FILES = Object.freeze([
   "CHANGELOG.md",
@@ -54,6 +57,10 @@ function assert(condition, message) {
 
 function assertPackageFiles(files) {
   const paths = files.map((entry) => entry.path).sort();
+  assert(
+    JSON.stringify(paths) === JSON.stringify(expectedPackageFiles),
+    "Published package file list differs from scripts/package-files.json",
+  );
   for (const required of REQUIRED_FILES) {
     assert(paths.includes(required), `Published package is missing ${required}`);
   }
@@ -76,6 +83,54 @@ function assertPackageFiles(files) {
       ),
       `Secret-shaped file name leaked: ${publishedPath}`,
     );
+  }
+}
+
+async function assertExecutableSignalShutdown(executable, configPath, signal) {
+  const child = spawn(executable, ["serve", "--json", "--config", configPath], {
+    cwd: path.dirname(configPath),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+
+  const outcome = await new Promise((resolve, reject) => {
+    const signalTimer = setTimeout(() => child.kill(signal), 300);
+    const forceTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+    child.once("error", (error) => {
+      clearTimeout(signalTimer);
+      clearTimeout(forceTimer);
+      reject(error);
+    });
+    child.once("close", (code, closeSignal) => {
+      clearTimeout(signalTimer);
+      clearTimeout(forceTimer);
+      resolve({ code, signal: closeSignal });
+    });
+  });
+
+  assert(
+    outcome.code === 0 && outcome.signal === null,
+    `${signal} shutdown was not graceful: ${JSON.stringify(outcome)}; stderr=${JSON.stringify(stderr)}`,
+  );
+  assert(stderr === "", `${signal} shutdown wrote to stderr`);
+  const result = JSON.parse(stdout);
+  assert(result.ok === true && result.exit_code === 0, `${signal} result was not successful`);
+  if (child.pid !== undefined) {
+    try {
+      process.kill(child.pid, 0);
+      throw new Error(`${signal} process survived terminal close`);
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code !== "ESRCH") throw error;
+    }
   }
 }
 
@@ -143,17 +198,46 @@ try {
     "Installed executable returned an unexpected capability document",
   );
 
+  const installedRoot = path.join(
+    temporaryDirectory,
+    "node_modules",
+    "@toss-software",
+    "agent-runtime",
+  );
+  const installedConfig = path.join(
+    installedRoot,
+    "examples",
+    "config",
+    "runtime.development.yaml",
+  );
+  await assertExecutableSignalShutdown(executable, installedConfig, "SIGTERM");
+  await assertExecutableSignalShutdown(executable, installedConfig, "SIGINT");
+
+  const missingConfigPath = path.join(temporaryDirectory, "missing-runtime.yaml");
+  let missingConfigFailure;
+  try {
+    await execFile(executable, ["serve", "--json", "--config", missingConfigPath], {
+      cwd: temporaryDirectory,
+      encoding: "utf8",
+    });
+    throw new Error("Installed executable accepted a missing serve config");
+  } catch (error) {
+    missingConfigFailure = error;
+  }
+  assert(missingConfigFailure.code === 5, "Missing serve config returned an unstable exit code");
+  assert(missingConfigFailure.stderr === "", "Missing serve config wrote to stderr");
+  assert(
+    !missingConfigFailure.stdout.includes(missingConfigPath),
+    "Missing serve config reflected a local path",
+  );
+  assert(
+    JSON.parse(missingConfigFailure.stdout).error?.code === "RUNTIME_CONFIG_UNAVAILABLE",
+    "Missing serve config did not return a safe command result",
+  );
+
   const installedManifest = JSON.parse(
     await readFile(
-      path.join(
-        temporaryDirectory,
-        "node_modules",
-        "@toss-software",
-        "agent-runtime",
-        "docs",
-        "contracts",
-        "runtime-contract-v1.manifest.json",
-      ),
+      path.join(installedRoot, "docs", "contracts", "runtime-contract-v1.manifest.json"),
       "utf8",
     ),
   );

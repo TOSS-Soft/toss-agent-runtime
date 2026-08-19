@@ -19,8 +19,10 @@ export function runService(options: {
   return new Promise<ServiceOutcome>((resolve, reject) => {
     let stopPromise: Promise<ServiceOutcome> | undefined;
     const unsubscribe: (() => void)[] = [];
+    const keepAlive = setInterval(() => undefined, 86_400_000);
 
     const cleanup = (): void => {
+      clearInterval(keepAlive);
       for (const remove of unsubscribe.splice(0)) remove();
     };
 

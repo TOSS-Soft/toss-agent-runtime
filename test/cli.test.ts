@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { defaultConfig } from "../src/config/load.js";
 import { runCli } from "../src/cli/main.js";
+import { defaultConfig, RuntimeConfigError } from "../src/config/load.js";
 
 const platform = { os: "linux" as const, arch: "x64", node: "22.23.1" };
 
@@ -37,6 +37,18 @@ describe("baseline CLI", () => {
     expect(output.stdout).not.toContain("must-not-persist");
     expect(output.stderr).not.toContain("must-not-persist");
     expect(output.stderr).toContain("--api-key");
+  });
+
+  it.each([
+    ["human", ["doctor", "--api-key=must-not-persist"]],
+    ["mixed case", ["doctor", "--ClientSecret=must-not-persist"]],
+    ["JSON", ["doctor", "--json", "--access-token=must-not-persist"]],
+  ])("redacts inline credential option values in %s mode", async (_name, argv) => {
+    const output = await runCli(argv, services);
+    expect(output.exitCode).toBe(2);
+    expect(output.stdout).not.toContain("must-not-persist");
+    expect(output.stderr).not.toContain("must-not-persist");
+    expect(`${output.stdout}${output.stderr}`).not.toContain("=");
   });
 
   it("keeps stderr empty for routed JSON failures", async () => {
@@ -88,6 +100,43 @@ describe("baseline CLI", () => {
       ok: false,
       error: { code: "RUNTIME_SERVE_UNAVAILABLE" },
     });
+  });
+
+  it("maps an unavailable serve config to one safe JSON result", async () => {
+    const output = await runCli(["serve", "--json"], {
+      ...services,
+      serve: () =>
+        Promise.reject(
+          new RuntimeConfigError(
+            "RUNTIME_CONFIG_UNAVAILABLE",
+            "Configuration file is unavailable at /private/path",
+          ),
+        ),
+    });
+    expect(output).toMatchObject({ exitCode: 5, stderr: "" });
+    expect(output.stdout).not.toContain("/private/path");
+    expect(JSON.parse(output.stdout)).toMatchObject({
+      ok: false,
+      exit_code: 5,
+      error: { code: "RUNTIME_CONFIG_UNAVAILABLE" },
+    });
+  });
+
+  it("maps forced and rejected shutdowns to safe internal failures", async () => {
+    const forced = await runCli(["serve", "--json"], {
+      ...services,
+      serve: () => Promise.resolve({ reason: "SIGTERM" as const, forced: true }),
+    });
+    const rejected = await runCli(["serve", "--json"], {
+      ...services,
+      serve: () => Promise.reject(new Error("internal path /private/path")),
+    });
+
+    for (const output of [forced, rejected]) {
+      expect(output).toMatchObject({ exitCode: 70, stderr: "" });
+      expect(output.stdout).not.toContain("/private/path");
+      expect(JSON.parse(output.stdout)).toMatchObject({ ok: false, exit_code: 70 });
+    }
   });
 
   it.each([

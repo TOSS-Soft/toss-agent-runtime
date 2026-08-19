@@ -81,8 +81,11 @@ The first wave publishes:
 
 Artifact references require document type, stable ID, positive revision,
 SHA-256 hash, and optional repository-relative location. They never contain
-artifact bodies. Secret values, raw provider tokens, credential material, and
-arbitrary environment maps have no schema representation.
+artifact bodies. Dedicated credential fields use secret references rather than
+values. Because generic JSON strings cannot prove that content is non-secret,
+producers must use event-specific allowlists, sensitivity tags, and structural
+redaction before serialization; parsers reject normalized secret- and
+authority-shaped metadata keys as defense in depth.
 
 ## Validation and trust boundary
 
@@ -116,7 +119,9 @@ enumeration is never serialized.
 The baseline config schema contains mode, state/log/config paths, shutdown
 deadline, log policy, provider/gateway profile names, MCP profile names, and
 secret references. A secret reference identifies a source and key; it never
-contains a secret. CLI arguments reject token/key/password options.
+contains a secret. CLI arguments reject token/key/password options. Production
+configuration is read through one no-follow file descriptor, must be private
+and user-owned, and may reference only private approved per-user roots.
 
 ## CLI and process behavior
 

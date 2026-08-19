@@ -1,5 +1,6 @@
 import { hashExecutionEvent, type ExecutionEventV1 } from "./event.js";
 import { hashExecutionRequest, type ExecutionRequestV1 } from "./request.js";
+import { sensitiveMetadataIssues } from "./metadata.js";
 import type {
   ArtifactReference,
   RuntimeDocument,
@@ -36,7 +37,10 @@ export interface ExecutionResultV1 extends RuntimeDocument {
 export function parseExecutionResult(
   input: string | Uint8Array,
 ): ValidationResult<ExecutionResultV1> {
-  return createProtocolValidator().parse<ExecutionResultV1>(input, "execution-result");
+  const result = createProtocolValidator().parse<ExecutionResultV1>(input, "execution-result");
+  if (!result.ok || result.value.error?.metadata === undefined) return result;
+  const issues = sensitiveMetadataIssues(result.value.error.metadata, "/error/metadata");
+  return issues.length === 0 ? result : { ok: false, code: "RUNTIME_DOCUMENT_INVALID", issues };
 }
 
 function chainIssue(path: string, keyword: string, message: string): ValidationIssue {
@@ -52,6 +56,7 @@ export function validateExecutionChain(input: {
   const requestHash = hashExecutionRequest(input.request);
   let previousHash = `sha256:${"0".repeat(64)}` as const;
   let previousRevision = 0;
+  let previousTimestamp = Date.parse(input.request.created_at);
 
   if (input.events.length === 0) {
     issues.push(chainIssue("/events", "minItems", "journal must contain at least one event"));
@@ -102,8 +107,18 @@ export function validateExecutionChain(input: {
           "event trace identity does not match",
         ),
       );
+    const eventTimestamp = Date.parse(event.timestamp);
+    if (!Number.isFinite(eventTimestamp) || eventTimestamp < previousTimestamp)
+      issues.push(
+        chainIssue(
+          `/events/${index}/timestamp`,
+          "eventOrdering",
+          "event timestamp must not precede request creation or the previous event",
+        ),
+      );
     previousHash = eventHash;
     previousRevision = event.run_revision;
+    previousTimestamp = eventTimestamp;
   }
 
   const last = input.events.at(-1);
@@ -125,6 +140,22 @@ export function validateExecutionChain(input: {
   ) {
     issues.push(
       chainIssue("/result/journal_head", "journalHead", "result journal head does not match"),
+    );
+  }
+  const terminalEventStatus: Partial<Record<ExecutionEventV1["event_type"], TerminalStatus>> = {
+    COMPLETED: "COMPLETED",
+    FAILED: "FAILED",
+    BLOCKED: "BLOCKED",
+    CANCELLED: "CANCELLED",
+    INTERRUPTED: "INTERRUPTED",
+  };
+  if (last !== undefined && terminalEventStatus[last.event_type] !== input.result.status) {
+    issues.push(
+      chainIssue(
+        "/result/status",
+        "terminalStatus",
+        "result status must match the final terminal event",
+      ),
     );
   }
   if (last !== undefined && Date.parse(input.result.finished_at) < Date.parse(last.timestamp)) {

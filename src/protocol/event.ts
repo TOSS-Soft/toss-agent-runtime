@@ -1,4 +1,5 @@
 import { sha256, type JsonValue } from "./json.js";
+import { sensitiveMetadataIssues } from "./metadata.js";
 import type {
   ArtifactReference,
   ProducerIdentity,
@@ -57,6 +58,11 @@ export function parseExecutionEvent(
   const result = createProtocolValidator().parse<ExecutionEventV1>(input, "execution-event");
   if (!result.ok) {
     return result;
+  }
+
+  const metadataIssues = sensitiveMetadataIssues(result.value.payload, "/payload");
+  if (metadataIssues.length > 0) {
+    return { ok: false, code: "RUNTIME_DOCUMENT_INVALID", issues: metadataIssues };
   }
 
   const { event_hash: eventHash, ...hashable } = result.value;

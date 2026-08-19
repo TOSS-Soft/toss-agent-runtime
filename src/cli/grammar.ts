@@ -41,7 +41,7 @@ function parseOptions(
       index += 1;
       continue;
     }
-    const safeOption = option?.startsWith("--") ? option : "<argument>";
+    const safeOption = option?.startsWith("--") ? option.split("=", 1)[0]! : "<argument>";
     throw new CliUsageError(`Unknown option for ${name}: ${safeOption}`);
   }
 

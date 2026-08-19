@@ -71,7 +71,7 @@ CLI MUST resolve policy precedence before constructing the request. The runtime 
 | `error.category`            | CLI retry/escalation classification input                                           |
 | `error.retryable`           | Runtime retry hint, still bounded by CLI policy and budget                          |
 | `error.safe_message`        | Operator-safe diagnostic text                                                       |
-| `error.metadata`            | Optional secret-free structured evidence                                            |
+| `error.metadata`            | Optional producer-allowlisted and structurally redacted evidence                    |
 | `usage.input_tokens`        | Usage/budget accounting input                                                       |
 | `usage.output_tokens`       | Usage/budget accounting output                                                      |
 | `usage.cost_microusd`       | Nullable provider-normalized cost accounting                                        |
@@ -110,4 +110,4 @@ CLI calls that use JSON mode receive one `command-result.v1` object. Runtime exi
 | `69` | Capability unavailable  | Renegotiate or select another runtime                 |
 | `70` | Internal failure        | Preserve safe evidence and apply bounded retry policy |
 
-Secret values are resolved outside the protocol. TOSS CLI v2.2.0 must send only approved secret references and must not serialize resolved values into requests, logs, results, evidence, or error metadata.
+Secret values are resolved outside the protocol. TOSS CLI v2.2.0 must send only approved secret references and must not serialize resolved values into requests, logs, results, evidence, or error metadata. Generic JSON validation cannot classify arbitrary string content; the producing boundary must apply field allowlists, sensitivity tags, and structural redaction before hashing or persistence.

@@ -18,7 +18,7 @@ describe("serve command lifecycle integration", () => {
           stopAccepting: () => undefined,
           drain: () => Promise.resolve(),
           shutdownTimeoutMs: 1000,
-        }).then(() => undefined),
+        }),
     });
     signals.emit("SIGTERM");
 

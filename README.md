@@ -63,7 +63,7 @@ Runtime output is execution evidence, not governance authority. Acceptance, poli
 
 ## Security
 
-Protocol documents carry references to secrets, never secret values. Do not put tokens, passwords, private keys, credential blobs, or arbitrary environment maps in requests, results, configuration files, logs, or bug reports. The CLI rejects secret-shaped options and redacts their values in diagnostics.
+Protocol fields intended for credentials carry named secret references, never resolved values. Free-form event/error JSON is not proof that a string is non-secret: producers must build it from event-specific allowlists and structurally redact tagged sensitive values before serialization. Parsers reject normalized secret- and governance-shaped metadata keys as defense in depth. Do not put tokens, passwords, private keys, credential blobs, or arbitrary environment maps in requests, results, configuration files, logs, or bug reports. The CLI rejects secret-shaped options and redacts inline or separate values in diagnostics.
 
 Report suspected vulnerabilities privately to the TOSS Software security contact. Do not open a public issue containing sensitive material.
 

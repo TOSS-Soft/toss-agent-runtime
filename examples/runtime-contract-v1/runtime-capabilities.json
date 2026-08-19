@@ -28,6 +28,7 @@
   "skill_host_versions": [],
   "superpowers_capabilities": [],
   "mcp_transports": [],
+  "mcp_profiles": [],
   "execution_topologies": [],
   "features": {
     "providers": "unavailable",

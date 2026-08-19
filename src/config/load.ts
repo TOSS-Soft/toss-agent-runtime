@@ -1,4 +1,5 @@
-import { lstat, readFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, open } from "node:fs/promises";
 import path from "node:path";
 
 import Ajv2020Module from "ajv/dist/2020.js";
@@ -39,7 +40,9 @@ type Environment = Readonly<Record<string, string | undefined>>;
 
 function xdgPath(env: Environment, key: string, fallback: string): string {
   const value = env[key];
-  return value === undefined || value.length === 0 ? fallback : value;
+  return value === undefined || value.length === 0 || !path.isAbsolute(value)
+    ? fallback
+    : path.normalize(value);
 }
 
 export function defaultConfig(
@@ -142,6 +145,103 @@ function isMissingFile(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
 }
 
+function errorCode(error: unknown): string | undefined {
+  return typeof error === "object" && error !== null && "code" in error
+    ? String(error.code)
+    : undefined;
+}
+
+function isWithin(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return (
+    relative === "" ||
+    (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`))
+  );
+}
+
+function approvedRoots(options: {
+  readonly env: Environment;
+  readonly home: string;
+  readonly platform: PlatformName;
+}): readonly string[] {
+  const roots = [path.normalize(options.home)];
+  if (options.platform === "linux") {
+    for (const key of ["XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR"]) {
+      const value = options.env[key];
+      if (value !== undefined && path.isAbsolute(value)) roots.push(path.normalize(value));
+    }
+  }
+  return [...new Set(roots)].sort((left, right) => right.length - left.length);
+}
+
+function selectApprovedRoot(candidate: string, roots: readonly string[]): string {
+  const root = roots.find((allowed) => isWithin(allowed, candidate));
+  if (root === undefined) {
+    throw new RuntimeConfigError(
+      "RUNTIME_CONFIG_UNSAFE",
+      "Production paths must stay within approved per-user roots",
+    );
+  }
+  return root;
+}
+
+function currentUserOwns(userId: number): boolean {
+  return typeof process.getuid !== "function" || userId === process.getuid();
+}
+
+async function assertPrivateDirectoryPath(
+  candidate: string,
+  roots: readonly string[],
+  home: string,
+): Promise<void> {
+  const root = selectApprovedRoot(candidate, roots);
+  const relative = path.relative(root, candidate);
+  const segments = relative === "" ? [] : relative.split(path.sep);
+  const pathsToCheck: string[] = [];
+  if (root !== path.normalize(home)) pathsToCheck.push(root);
+  let current = root;
+  for (const segment of segments) {
+    current = path.join(current, segment);
+    pathsToCheck.push(current);
+  }
+
+  for (const directoryPath of pathsToCheck) {
+    let metadata;
+    try {
+      metadata = await lstat(directoryPath);
+    } catch (error) {
+      if (isMissingFile(error)) break;
+      throw new RuntimeConfigError(
+        "RUNTIME_CONFIG_UNSAFE",
+        "Production runtime directory could not be inspected safely",
+      );
+    }
+    if (
+      metadata.isSymbolicLink() ||
+      !metadata.isDirectory() ||
+      !currentUserOwns(metadata.uid) ||
+      (metadata.mode & 0o077) !== 0
+    ) {
+      throw new RuntimeConfigError(
+        "RUNTIME_CONFIG_UNSAFE",
+        "Production runtime directories must be private and owned by the current user",
+      );
+    }
+  }
+}
+
+async function assertProductionIsolation(
+  config: RuntimeConfigV1,
+  selectedPath: string,
+  options: { readonly env: Environment; readonly home: string; readonly platform: PlatformName },
+): Promise<void> {
+  const roots = approvedRoots(options);
+  await assertPrivateDirectoryPath(path.dirname(selectedPath), roots, options.home);
+  await assertPrivateDirectoryPath(config.paths.state, roots, options.home);
+  await assertPrivateDirectoryPath(config.paths.logs, roots, options.home);
+  await assertPrivateDirectoryPath(path.dirname(config.paths.socket), roots, options.home);
+}
+
 export async function loadConfig(options: {
   readonly explicitPath?: string;
   readonly env: Environment;
@@ -158,9 +258,9 @@ export async function loadConfig(options: {
     options.explicitPath !== undefined ||
     (environmentPath !== undefined && environmentPath.length > 0);
 
-  let metadata;
+  let handle;
   try {
-    metadata = await lstat(selectedPath);
+    handle = await open(selectedPath, constants.O_RDONLY | constants.O_NOFOLLOW);
   } catch (error) {
     if (!required && isMissingFile(error)) {
       return {
@@ -168,19 +268,33 @@ export async function loadConfig(options: {
         source: "defaults",
       };
     }
+    if (["ELOOP", "EMLINK"].includes(errorCode(error) ?? "")) {
+      throw new RuntimeConfigError(
+        "RUNTIME_CONFIG_UNSAFE",
+        "Configuration must be a regular non-symlink file",
+      );
+    }
     throw new RuntimeConfigError("RUNTIME_CONFIG_UNAVAILABLE", "Configuration file is unavailable");
   }
 
-  if (!metadata.isFile() || metadata.isSymbolicLink()) {
-    throw new RuntimeConfigError(
-      "RUNTIME_CONFIG_UNSAFE",
-      "Configuration must be a regular non-symlink file",
-    );
+  let metadata;
+  let input: Buffer;
+  try {
+    metadata = await handle.stat();
+    if (!metadata.isFile()) {
+      throw new RuntimeConfigError(
+        "RUNTIME_CONFIG_UNSAFE",
+        "Configuration must be a regular non-symlink file",
+      );
+    }
+    input = await handle.readFile();
+  } finally {
+    await handle.close();
   }
 
   let config: RuntimeConfigV1;
   try {
-    config = assertConfig(parseConfigBytes(selectedPath, await readFile(selectedPath)));
+    config = assertConfig(parseConfigBytes(selectedPath, input));
   } catch (error) {
     if (error instanceof RuntimeConfigError) {
       throw error;
@@ -188,11 +302,14 @@ export async function loadConfig(options: {
     throw new RuntimeConfigError("RUNTIME_CONFIG_INVALID", "Configuration could not be parsed");
   }
 
-  if (config.mode === "production" && (metadata.mode & 0o022) !== 0) {
-    throw new RuntimeConfigError(
-      "RUNTIME_CONFIG_UNSAFE",
-      "Production configuration cannot be group/world writable",
-    );
+  if (config.mode === "production") {
+    if (!currentUserOwns(metadata.uid) || (metadata.mode & 0o077) !== 0) {
+      throw new RuntimeConfigError(
+        "RUNTIME_CONFIG_UNSAFE",
+        "Production configuration must be private and owned by the current user",
+      );
+    }
+    await assertProductionIsolation(config, selectedPath, options);
   }
 
   return { config, source: selectedPath };

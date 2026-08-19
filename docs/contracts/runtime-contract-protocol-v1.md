@@ -24,7 +24,7 @@ Untrusted input MUST pass these stages in order:
 
 1. Parse bounded UTF-8 JSON with comments and trailing commas disabled. Reject duplicate keys, excessive bytes, excessive depth, excessive members, invalid numbers, accessors, symbols, non-plain prototypes, and sparse arrays.
 2. Select the exact registered schema from `schema_version`. Unknown protocol or schema versions fail closed. Validate the closed JSON Schema without coercion, defaults, or removal of unknown fields.
-3. Apply semantic validation: time ordering, unique canonical input revisions, content hashes, journal continuity, run/trace identity, terminal linkage, and negotiated capabilities.
+3. Apply semantic validation: time ordering, unique canonical input revisions, content hashes, journal continuity, run/trace identity, terminal linkage, normalized sensitive-metadata keys, coherent capability availability, and exact negotiated profiles.
 
 Successful library parsing returns a deeply frozen value. A caller MUST NOT treat TypeScript types or an unchecked cast as validation.
 
@@ -44,7 +44,7 @@ Changing a request, event, or order invalidates the chain. Hash integrity proves
 
 ## 5. Capability handshake and compatibility
 
-Before execution, the consumer obtains `runtime-capabilities.v1` and negotiates the request. It MUST confirm the protocol, request schema, logical model class, every required model capability, every required Superpowers capability, an MCP transport, and the required execution topology.
+Before execution, the consumer obtains `runtime-capabilities.v1` and negotiates the request. It MUST confirm the protocol, request schema, logical model class, every required model capability, every required Superpowers capability, an MCP transport, the exact MCP profile identity, and the required execution topology. Every execution-critical feature state MUST be `available`; `blocked` and `unavailable` fail negotiation.
 
 Unknown major protocol versions MUST fail closed. Unknown schema versions MUST fail closed. Additive capability values are usable only after explicit negotiation; absence means unavailable. New optional fields require a new schema version because v1 objects are closed. A breaking field or semantic change requires a new major protocol family.
 
@@ -78,23 +78,23 @@ Request references constrain execution. They MUST NOT be interpreted as permissi
 
 ## 7. `execution-event.v1`
 
-| Field                 | Required semantics                                                  |
-| --------------------- | ------------------------------------------------------------------- |
-| `protocol_version`    | Exactly `runtime-contract.v1`                                       |
-| `schema_version`      | Exactly `execution-event.v1`                                        |
-| `document_type`       | Exactly `execution-event`                                           |
-| `run_id`              | Matches the request run identity                                    |
-| `request_hash`        | Matches the canonical request hash                                  |
-| `sequence`            | Contiguous one-based journal position                               |
-| `run_revision`        | Contiguous one-based optimistic revision                            |
-| `previous_event_hash` | Zero hash for the first event; otherwise previous event hash        |
-| `event_hash`          | Hash of canonical event content excluding this field                |
-| `event_type`          | One member of the v1 event vocabulary                               |
-| `timestamp`           | UTC event production time                                           |
-| `producer`            | Component kind, name, version, and optional exact revision/hash     |
-| `trace`               | Same trace identity as the request, with event span context         |
-| `input_reference`     | Exact input whose handling produced the event                       |
-| `payload`             | Bounded safe JSON whose interpretation is constrained by event type |
+| Field                 | Required semantics                                                                                   |
+| --------------------- | ---------------------------------------------------------------------------------------------------- |
+| `protocol_version`    | Exactly `runtime-contract.v1`                                                                        |
+| `schema_version`      | Exactly `execution-event.v1`                                                                         |
+| `document_type`       | Exactly `execution-event`                                                                            |
+| `run_id`              | Matches the request run identity                                                                     |
+| `request_hash`        | Matches the canonical request hash                                                                   |
+| `sequence`            | Contiguous one-based journal position                                                                |
+| `run_revision`        | Contiguous one-based optimistic revision                                                             |
+| `previous_event_hash` | Zero hash for the first event; otherwise previous event hash                                         |
+| `event_hash`          | Hash of canonical event content excluding this field                                                 |
+| `event_type`          | One member of the v1 event vocabulary                                                                |
+| `timestamp`           | UTC event production time                                                                            |
+| `producer`            | Component kind, name, version, and optional exact revision/hash                                      |
+| `trace`               | Same trace identity as the request, with event span context                                          |
+| `input_reference`     | Exact input whose handling produced the event                                                        |
+| `payload`             | Bounded canonical JSON; the producer must apply event-specific allowlisting and structural redaction |
 
 The event vocabulary is `CREATED`, `ROUTED`, `RUNNING`, `MODEL_STARTED`, `MODEL_DELTA`, `MODEL_COMPLETED`, `TOOL_PENDING`, `APPROVAL_PENDING`, `APPROVAL_RECORDED`, `TOOL_COMPLETED`, `REVIEW_PENDING`, `REVIEW_COMPLETED`, `COMPLETED`, `FAILED`, `BLOCKED`, `CANCELLED`, and `INTERRUPTED`. A valid event schema does not by itself prove a legal state transition; the versioned transition policy supplies that rule.
 
@@ -116,7 +116,7 @@ The event vocabulary is `CREATED`, `ROUTED`, `RUNNING`, `MODEL_STARTED`, `MODEL_
 | `evidence`         | Exact evidence artifact references                                        |
 | `trace`            | Same trace identity as the request                                        |
 
-For a successful completion, `error` is `null`. Failure details use a stable code, category, retryability flag, safe message, and optional safe JSON metadata. Error metadata MUST NOT contain secrets, raw provider bodies, or unrestricted environment data.
+For a successful completion, `error` is `null`. Failure details use a stable code, category, retryability flag, safe message, and optional canonical JSON metadata. Error metadata MUST NOT contain secrets, raw provider bodies, or unrestricted environment data. The producer, not JSON Schema, is responsible for classifying values before persistence.
 
 ## 9. `runtime-capabilities.v1`
 
@@ -135,6 +135,7 @@ For a successful completion, `error` is `null`. Failure details use a stable cod
 | `skill_host_versions`      | Implemented Agent Skills host versions                            |
 | `superpowers_capabilities` | Implemented Superpowers capabilities                              |
 | `mcp_transports`           | Implemented MCP transports                                        |
+| `mcp_profiles`             | Exact MCP profile identities available for negotiation            |
 | `execution_topologies`     | Implemented orchestration topologies                              |
 | `features`                 | `available`, `unavailable`, or `blocked` state for each subsystem |
 
@@ -142,7 +143,9 @@ For a successful completion, `error` is `null`. Failure details use a stable cod
 
 ## 10. Secrets and logging
 
-Protocol schemas have no representation for raw provider tokens, passwords, private keys, credential blobs, or arbitrary environment maps. Configuration uses named secret references only. Secret resolution occurs at the last responsible boundary and the resolved value MUST NOT enter protocol documents, canonical hashes, journals, command results, logs, evidence, or diagnostics.
+Dedicated credential fields have no representation for raw provider tokens, passwords, private keys, credential blobs, or arbitrary environment maps. Configuration uses named secret references only. Event payload and error metadata can contain generic JSON strings, so schema validation alone cannot prove that a value under an innocuous key is non-secret.
+
+Before serialization, every producer MUST construct free-form metadata from an event-specific field allowlist, tag secret-bearing values at resolution, and structurally replace or omit them. Parsers additionally normalize case, camelCase, and separators and reject secret- or governance-authority-shaped keys as defense in depth. A consumer MUST NOT interpret successful parsing as proof that an arbitrary string is safe to disclose. Secret resolution occurs at the last responsible boundary and resolved values MUST NOT enter protocol documents, canonical hashes, journals, command results, logs, evidence, or diagnostics.
 
 ## 11. Stable failures
 
