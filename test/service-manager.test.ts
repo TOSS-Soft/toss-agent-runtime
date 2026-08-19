@@ -1,0 +1,431 @@
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+import { afterEach, describe, expect, it } from "vitest";
+
+import type { CommandResult, CommandRunner } from "../src/platform/commands.js";
+import { ensureServiceConfig } from "../src/service/definition-store.js";
+import { createServiceManager, type ServiceManager } from "../src/service/manager.js";
+
+const temporaryDirectories: string[] = [];
+
+class RecordingRunner implements CommandRunner {
+  readonly calls: { file: string; args: readonly string[] }[] = [];
+
+  constructor(
+    private readonly results: readonly (CommandResult | Error)[] = [
+      { exitCode: 0, stdout: "", stderr: "" },
+    ],
+  ) {}
+
+  run(file: string, args: readonly string[]): Promise<CommandResult> {
+    this.calls.push({ file, args: [...args] });
+    const result = this.results[this.calls.length - 1] ?? { exitCode: 0, stdout: "", stderr: "" };
+    return result instanceof Error ? Promise.reject(result) : Promise.resolve(result);
+  }
+}
+
+interface ManagerFixture {
+  readonly manager: ServiceManager;
+  readonly definition: string;
+  readonly config: string;
+  readonly canonicalRunArtifact: string;
+  readonly journal: string;
+  readonly registry: string;
+  readonly pendingIntake: string;
+  readonly operationalLog: string;
+}
+
+async function temporaryDirectory(): Promise<string> {
+  const directory = await realpath(await mkdtemp(path.join(tmpdir(), "toss-runtime-manager-")));
+  temporaryDirectories.push(directory);
+  return directory;
+}
+
+async function fixture(
+  platform: "darwin" | "linux",
+  runner: CommandRunner,
+): Promise<ManagerFixture> {
+  const home = await temporaryDirectory();
+  const config = await ensureServiceConfig({
+    platform,
+    home,
+    env: {},
+    randomSuffix: () => "config",
+  });
+  const state = path.join(home, "state");
+  const logs = path.join(home, "logs");
+  await mkdir(state, { recursive: true, mode: 0o700 });
+  await mkdir(logs, { recursive: true, mode: 0o700 });
+  const canonicalRunArtifact = path.join(state, "canonical-run.json");
+  const journal = path.join(state, "journal.ndjson");
+  const registry = path.join(state, "registry.json");
+  const pendingIntake = path.join(state, "pending.ndjson");
+  const operationalLog = path.join(logs, "runtime.log");
+  await Promise.all(
+    [canonicalRunArtifact, journal, registry, pendingIntake, operationalLog].map(
+      async (filePath) => {
+        await writeFile(filePath, "preserve", { mode: 0o600 });
+        await chmod(filePath, 0o600);
+      },
+    ),
+  );
+
+  const manager = createServiceManager({
+    platform,
+    home,
+    env: {},
+    uid: 501,
+    nodePath: "/opt/toss/node/bin/node",
+    cliPath: "/opt/toss/bin/toss-runtime.js",
+    configPath: config,
+    randomSuffix: () => "definition",
+    runner,
+  });
+  const definition =
+    platform === "linux"
+      ? path.join(home, ".config", "systemd", "user", "toss-agent-runtime.service")
+      : path.join(home, "Library", "LaunchAgents", "software.toss.agent-runtime.plist");
+  return {
+    manager,
+    definition,
+    config,
+    canonicalRunArtifact,
+    journal,
+    registry,
+    pendingIntake,
+    operationalLog,
+  };
+}
+
+function linuxFixture(runner: CommandRunner): Promise<ManagerFixture> {
+  return fixture("linux", runner);
+}
+
+function darwinFixture(runner: CommandRunner): Promise<ManagerFixture> {
+  return fixture("darwin", runner);
+}
+
+afterEach(async () => {
+  await Promise.all(
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { recursive: true, force: true })),
+  );
+});
+
+describe("native per-user service manager", () => {
+  it("enables Linux login startup without starting during install", async () => {
+    const runner = new RecordingRunner();
+    const { manager } = await linuxFixture(runner);
+
+    await expect(manager.install()).resolves.toEqual({
+      installed: true,
+      enabled: true,
+      active: false,
+      backoff: false,
+      restartCount: 0,
+      lastExitCode: null,
+    });
+    expect(runner.calls).toEqual([
+      { file: "/usr/bin/systemctl", args: ["--user", "daemon-reload"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "enable", "toss-agent-runtime.service"] },
+    ]);
+    expect(runner.calls.flatMap((entry) => entry.args)).not.toContain("start");
+  });
+
+  it("writes a Darwin login definition without starting during install", async () => {
+    const runner = new RecordingRunner();
+    const { manager, definition } = await darwinFixture(runner);
+
+    await manager.install();
+
+    expect(runner.calls).toEqual([]);
+    expect(await readFile(definition, "utf8")).toContain("<key>RunAtLoad</key>");
+  });
+
+  it.each([
+    ["start", ["--user", "start", "toss-agent-runtime.service"]],
+    ["stop", ["--user", "stop", "toss-agent-runtime.service"]],
+    ["restart", ["--user", "restart", "toss-agent-runtime.service"]],
+  ] as const)("uses the exact Linux %s boundary", async (method, args) => {
+    const runner = new RecordingRunner();
+    const { manager } = await linuxFixture(runner);
+    await manager.install();
+    runner.calls.splice(0);
+
+    await manager[method]();
+
+    expect(runner.calls).toEqual([{ file: "/usr/bin/systemctl", args }]);
+  });
+
+  it.each([
+    ["start", ["bootstrap", "gui/501", "DEFINITION"]],
+    ["stop", ["bootout", "gui/501/software.toss.agent-runtime"]],
+    ["restart", ["kickstart", "-k", "gui/501/software.toss.agent-runtime"]],
+  ] as const)("uses the exact Darwin %s boundary", async (method, expectedArgs) => {
+    const runner = new RecordingRunner();
+    const { manager, definition } = await darwinFixture(runner);
+    await manager.install();
+
+    await manager[method]();
+
+    const args = expectedArgs.map((value) => (value === "DEFINITION" ? definition : value));
+    expect(runner.calls).toEqual([{ file: "/bin/launchctl", args }]);
+  });
+
+  it("parses every Linux manager status field from the native status output", async () => {
+    const runner = new RecordingRunner([
+      {
+        exitCode: 0,
+        stdout:
+          "LoadState=loaded\nUnitFileState=enabled\nActiveState=activating\nSubState=auto-restart\nNRestarts=7\nExecMainStatus=23\n",
+        stderr: "",
+      },
+    ]);
+    const { manager } = await linuxFixture(runner);
+    await manager.install();
+    runner.calls.splice(0);
+
+    await expect(manager.status()).resolves.toEqual({
+      installed: true,
+      enabled: true,
+      active: false,
+      backoff: true,
+      restartCount: 7,
+      lastExitCode: 23,
+    });
+    expect(runner.calls).toEqual([
+      {
+        file: "/usr/bin/systemctl",
+        args: [
+          "--user",
+          "show",
+          "toss-agent-runtime.service",
+          "--property=LoadState,UnitFileState,ActiveState,SubState,NRestarts,ExecMainStatus",
+          "--no-pager",
+        ],
+      },
+    ]);
+  });
+
+  it("returns an absent status without invoking a manager for a missing definition", async () => {
+    const runner = new RecordingRunner();
+    const { manager } = await linuxFixture(runner);
+
+    await expect(manager.status()).resolves.toEqual({
+      installed: false,
+      enabled: false,
+      active: false,
+      backoff: false,
+      restartCount: 0,
+      lastExitCode: null,
+    });
+    expect(runner.calls).toEqual([]);
+  });
+
+  it("returns an absent status when Linux reports an installed unit as not found", async () => {
+    const runner = new RecordingRunner([
+      { exitCode: 0, stdout: "", stderr: "" },
+      { exitCode: 0, stdout: "", stderr: "" },
+      { exitCode: 1, stdout: "LoadState=not-found\n", stderr: "" },
+    ]);
+    const { manager } = await linuxFixture(runner);
+    await manager.install();
+
+    await expect(manager.status()).resolves.toEqual({
+      installed: false,
+      enabled: false,
+      active: false,
+      backoff: false,
+      restartCount: 0,
+      lastExitCode: null,
+    });
+  });
+
+  it("parses a Darwin running status and uses the exact print boundary", async () => {
+    const runner = new RecordingRunner([
+      { exitCode: 0, stdout: "state = running\nruns = 4\nlast exit code = 0\n", stderr: "" },
+    ]);
+    const { manager } = await darwinFixture(runner);
+    await manager.install();
+
+    await expect(manager.status()).resolves.toEqual({
+      installed: true,
+      enabled: true,
+      active: true,
+      backoff: false,
+      restartCount: 4,
+      lastExitCode: 0,
+    });
+    expect(runner.calls).toEqual([
+      { file: "/bin/launchctl", args: ["print", "gui/501/software.toss.agent-runtime"] },
+    ]);
+  });
+
+  it("returns an absent status when Darwin reports no registered service", async () => {
+    const runner = new RecordingRunner([
+      { exitCode: 1, stdout: "", stderr: "Could not find service" },
+    ]);
+    const { manager } = await darwinFixture(runner);
+    await manager.install();
+
+    await expect(manager.status()).resolves.toEqual({
+      installed: false,
+      enabled: false,
+      active: false,
+      backoff: false,
+      restartCount: 0,
+      lastExitCode: null,
+    });
+  });
+
+  it("treats a repeated Darwin bootstrap as an idempotent start", async () => {
+    const runner = new RecordingRunner([
+      { exitCode: 0, stdout: "", stderr: "" },
+      { exitCode: 1, stdout: "", stderr: "service already loaded" },
+    ]);
+    const { manager } = await darwinFixture(runner);
+    await manager.install();
+
+    await manager.start();
+    await expect(manager.start()).resolves.toMatchObject({ installed: true, active: true });
+  });
+
+  it("remains idempotent when Linux stop and disable report an absent unit", async () => {
+    const runner = new RecordingRunner([
+      { exitCode: 0, stdout: "", stderr: "" },
+      { exitCode: 0, stdout: "", stderr: "" },
+      { exitCode: 1, stdout: "LoadState=not-found\n", stderr: "" },
+      { exitCode: 1, stdout: "LoadState=not-found\n", stderr: "" },
+      { exitCode: 0, stdout: "", stderr: "" },
+    ]);
+    const { manager, definition } = await linuxFixture(runner);
+    await manager.install();
+
+    await expect(manager.uninstall()).resolves.toMatchObject({ installed: false, enabled: false });
+    await expect(lstat(definition)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(runner.calls).toEqual([
+      { file: "/usr/bin/systemctl", args: ["--user", "daemon-reload"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "enable", "toss-agent-runtime.service"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "stop", "toss-agent-runtime.service"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "disable", "toss-agent-runtime.service"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "daemon-reload"] },
+    ]);
+  });
+
+  it("keeps repeated Linux install, start, stop, and uninstall operations within manager scope", async () => {
+    const runner = new RecordingRunner();
+    const { manager } = await linuxFixture(runner);
+
+    await manager.install();
+    await manager.install();
+    await manager.start();
+    await manager.start();
+    await manager.stop();
+    await manager.stop();
+    await manager.uninstall();
+    await manager.uninstall();
+
+    expect(runner.calls).toEqual([
+      { file: "/usr/bin/systemctl", args: ["--user", "daemon-reload"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "enable", "toss-agent-runtime.service"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "daemon-reload"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "enable", "toss-agent-runtime.service"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "start", "toss-agent-runtime.service"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "start", "toss-agent-runtime.service"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "stop", "toss-agent-runtime.service"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "stop", "toss-agent-runtime.service"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "stop", "toss-agent-runtime.service"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "disable", "toss-agent-runtime.service"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "daemon-reload"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "stop", "toss-agent-runtime.service"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "disable", "toss-agent-runtime.service"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "daemon-reload"] },
+    ]);
+  });
+
+  it("uninstalls only native manager artifacts and preserves state, intake, and logs", async () => {
+    const runner = new RecordingRunner();
+    const artifacts = await linuxFixture(runner);
+    await artifacts.manager.install();
+    runner.calls.splice(0);
+
+    await artifacts.manager.uninstall();
+
+    await expect(lstat(artifacts.definition)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(artifacts.config, "utf8")).resolves.toContain("schema_version");
+    await expect(readFile(artifacts.canonicalRunArtifact, "utf8")).resolves.toBe("preserve");
+    await expect(readFile(artifacts.journal, "utf8")).resolves.toBe("preserve");
+    await expect(readFile(artifacts.registry, "utf8")).resolves.toBe("preserve");
+    await expect(readFile(artifacts.pendingIntake, "utf8")).resolves.toBe("preserve");
+    await expect(readFile(artifacts.operationalLog, "utf8")).resolves.toBe("preserve");
+  });
+
+  it("rejects an incompatible installed definition without replacing it", async () => {
+    const runner = new RecordingRunner();
+    const { manager, definition } = await linuxFixture(runner);
+    await manager.install();
+    await writeFile(definition, "[Service]\nExecStart=/untrusted\n", { mode: 0o600 });
+    await chmod(definition, 0o600);
+
+    await expect(manager.install()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+    });
+    expect(await readFile(definition, "utf8")).toBe("[Service]\nExecStart=/untrusted\n");
+  });
+
+  it("rejects a symlinked installed definition without touching its target", async () => {
+    const runner = new RecordingRunner();
+    const { manager, definition } = await linuxFixture(runner);
+    await manager.install();
+    const target = path.join(path.dirname(definition), "target.service");
+    await writeFile(target, "preserve", { mode: 0o600 });
+    await chmod(target, 0o600);
+    await rm(definition);
+    await symlink(target, definition);
+
+    await expect(manager.install()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+    });
+    expect(await readFile(target, "utf8")).toBe("preserve");
+  });
+
+  it("maps a missing native manager executable to the fixed unavailable error", async () => {
+    const missing = Object.assign(new Error("ENOENT /untrusted/path"), { code: "ENOENT" });
+    const runner = new RecordingRunner([missing]);
+    const { manager } = await linuxFixture(runner);
+
+    await expect(manager.install()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_MANAGER_UNAVAILABLE",
+    });
+  });
+
+  it("maps nonzero manager results to a fixed error without reflecting command output", async () => {
+    const runner = new RecordingRunner([
+      { exitCode: 71, stdout: "secret=/private/runtime", stderr: "token=must-not-leak" },
+    ]);
+    const { manager } = await linuxFixture(runner);
+
+    let error: unknown;
+    try {
+      await manager.install();
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toMatchObject({ code: "RUNTIME_SERVICE_MANAGER_FAILED" });
+    expect(String(error)).not.toContain("private/runtime");
+    expect(String(error)).not.toContain("must-not-leak");
+  });
+});
