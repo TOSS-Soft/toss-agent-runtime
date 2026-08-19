@@ -10,7 +10,7 @@ All notable changes to this project are documented here. The format follows Keep
 - Truthful runtime capability discovery and fail-closed request negotiation.
 - Secret-reference-only JSON/YAML configuration with filesystem permission checks.
 - `toss-runtime` CLI, diagnostics, and graceful SIGINT/SIGTERM lifecycle shell.
-- Explicit macOS launchd and Linux `systemd --user` service lifecycle commands, login enablement, restart/backoff status, and actionable doctor checks (#28 foundation).
+- Explicit macOS launchd and Linux `systemd --user` service lifecycle commands, deterministic login-enablement command arrays, restart/backoff status, and actionable doctor checks (#28 foundation).
 - Closed, bounded local status contracts, a private Unix socket, conservative single-instance locking, and ordered bounded supervisor shutdown.
 - Native launchd/systemd definition validation and installed-package supervision smoke tests for duplicate instances, permissions, status, signals, cleanup, and process reaping.
 - Deterministic package-content tests and credential-free Node.js 22/24 CI baseline.
@@ -25,13 +25,16 @@ All notable changes to this project are documented here. The format follows Keep
 - Validate exact npm package contents and readiness-synchronized real installed-process SIGINT/SIGTERM behavior.
 - Clean up lifecycle listeners and timers when signal registration, stop-accepting, or drain startup fails synchronously.
 - Keep package installation and `prepack` free of service-manager writes, enablement, or startup; only explicit `toss-runtime service install` changes native service state.
+- Restrict `prepack` to non-service format, lint, typecheck, build, and contents-only package acceptance while retaining installed-supervisor smoke in explicit verification.
 - Restrict runtime and lock directories to `0700` and configuration, definitions, lock owners, and Unix sockets to `0600`; reject unsafe ownership, links, modes, and ambiguous stale state.
 - Render secret-free service definitions from absolute command/config paths and the `LANG`, `LC_ALL`, and `TZ` allowlist, with shell-free native command execution.
 - Bound local control requests and responses to 64 KiB canonical JSON and return only fixed, non-reflective service failures.
+- Return the forced shutdown outcome at its configured deadline even when socket close or lock release never settles, while continuing finalizers in fail-closed socket/lock/umask order.
 
 ### Known limitations
 
 - Production-durable `INTERRUPTED` journal persistence remains pending issue #1, so issue #28 is not closed by this service foundation.
+- Automatic login-session activation and actual native crash-loop observation remain platform-integration pending; deterministic definitions, syntax lint, exact manager arrays, parsers, doctor checks, and direct supervisor smoke do not replace those gates.
 - Issues #1 (run journals), #29 (project registration/watching), and #30 (structured operational logging) remain incomplete; the current local socket exposes only closed service status.
 - Providers, routing, skills, MCP, agent execution, review, and execution evidence capture remain unavailable until later v1 waves.
 - The package is not publishable as `1.0.0` until protected live-provider and agentgateway release gates are implemented and pass.

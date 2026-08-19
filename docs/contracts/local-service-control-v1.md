@@ -36,12 +36,16 @@ Installing the npm package or running its `prepack` lifecycle does not write a
 native definition, enable login startup, or start a service. Those package
 operations have no service-manager side effect. Only the explicit
 `toss-runtime service install` command may create and enable a definition.
+`prepack` runs only non-service format, lint, typecheck, build, and
+package-content acceptance. Its contents-only package path must not reach the
+installed-supervisor smoke or start `serve`; the full smoke runs only during an
+explicit `npm run verify` or its CI equivalent.
 
 `service install` validates an explicit configuration, uses an existing
 selected configuration, or creates the platform default as a current-user
 regular file with mode `0600`. It publishes a compatible native definition and
 enables automatic startup at the next login. It does not start the service in
-the current session and does not issue launchd bootstrap or systemd start.
+the current session. It does not issue launchd bootstrap or systemd start.
 `service start` is the explicit current-session activation.
 
 `service status` is read-only and returns exit `0` with `installed: false` when
@@ -82,6 +86,15 @@ An existing definition must be a private regular file and must round-trip to
 the exact expected renderer for the same platform, current UID, Node path, CLI
 path, allowed environment, and absolute configuration path. Unsafe, symlinked,
 cross-user, or incompatible definitions fail before a native manager mutation.
+
+Repository and ordinary CI acceptance do not install or start a definition in
+the real user's launchd or systemd manager. They verify deterministic
+definitions, host-native syntax lint, exact shell-free enable/start command
+arrays, manager status/backoff parsing, doctor remediation, and direct
+installed-supervisor behavior in temporary roots. Automatic login-session
+activation and native crash-loop observation remain platform-integration
+pending. Ordinary remote `npm run verify` syntax and package jobs do not close
+those real-manager integration gates.
 
 ## Environment and secret boundary
 
@@ -221,11 +234,22 @@ is fixed:
 7. release the exact owned lock; and
 8. restore the prior umask.
 
-Timeout aborts remaining participant work but still attempts socket close,
-lock release, and umask restoration in that security order. The implementation
-tests the durable `InterruptionRecorder` ordering with an injected durable test
-double. Production currently supplies a no-op recorder, so writing unfinished
-runs to durable state as `INTERRUPTED` remains pending issue #1.
+The forced outcome resolves at the configured deadline even if socket close or
+lock release never settles. Essential cleanup may continue best-effort after
+that return, but it must close the socket, then release the exact lock, then
+restore the prior umask. A pending earlier finalizer prevents every later stage,
+leaving resources fail-closed for conservative stale reclamation after process
+exit. Rejections from detached cleanup are handled. Graceful and other
+non-timeout shutdowns await the full sequence and preserve the first stable
+primary or finalizer failure.
+
+The supervisor test uses an injected durable `InterruptionRecorder` test double
+that creates a temporary `INTERRUPTED` marker, synchronizes its file, and
+synchronizes the parent directory publication before control drain,
+participant flush, socket close, or lock release can follow. Production
+currently supplies a no-op recorder. Production-durable `INTERRUPTED`
+persistence remains pending issue #1, and issue #28 remains open until that
+integration passes.
 
 ## Uninstall preservation
 

@@ -18,7 +18,7 @@ The public installation command becomes available when the first release is publ
 npm install @toss-software/agent-runtime
 ```
 
-Package installation and `prepack` have no service-manager side effect: they do not write a launchd/systemd definition, enable login startup, or start a daemon. Service installation is always the separate, explicit `toss-runtime service install` operation.
+Package installation and `prepack` have no service-manager side effect: they do not write a launchd/systemd definition, enable login startup, or start a daemon. `prepack` runs only formatting, lint, type checking, build, and contents-only package acceptance; the installed-supervisor smoke remains part of explicit `npm run verify`. Service installation is always the separate, explicit `toss-runtime service install` operation.
 
 For repository development:
 
@@ -44,6 +44,8 @@ toss-runtime service uninstall [--json]
 ```
 
 Only `service install` accepts `--config`. It validates or materializes a private configuration, writes the current user's native service definition, and enables automatic startup at login. It does not start the service in the current session; run `toss-runtime service start` for that explicit activation. `service status` is read-only and returns success with `installed: false` when no compatible definition exists. `service stop` and `service uninstall` are idempotent when absent, while absent `start` or `restart` returns unavailable.
+
+Repository acceptance verifies deterministic launchd/systemd definitions, native syntax lint on the host platform, exact enable/start command arrays, status/backoff parsing, doctor remediation, and a directly started installed-supervisor smoke. It deliberately does not mutate a real user's service manager. Automatic login-session activation and native crash-loop observation remain platform-integration pending; ordinary `npm run verify` jobs do not close those gates.
 
 `doctor` checks package, platform, Node, configuration, native manager state, restart backoff, and private socket health. A healthy active service with a matching socket identity passes the service check. Missing or stopped service state warns in development and fails in production; backoff, unsafe state, unavailable/degraded control, or identity mismatch fails. See the [Local Service Control v1 contract](docs/contracts/local-service-control-v1.md) for exact native commands, permissions, protocol bounds, stable failures, and shutdown ordering.
 

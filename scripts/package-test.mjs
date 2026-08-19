@@ -19,6 +19,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const execFile = promisify(execFileCallback);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+const CONTENTS_ONLY_ARGUMENT = "--contents-only";
+const PREPACK_PROBE_ENV = "TOSS_RUNTIME_PREPACK_PROBE";
+const contentsOnly = process.argv.slice(2).includes(CONTENTS_ONLY_ARGUMENT);
+assertArguments();
 const inheritedPath = process.env.PATH ?? "";
 const installedLauncherEnvironment = Object.freeze({
   ...process.env,
@@ -103,6 +107,32 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+function assertArguments() {
+  const argumentsAfterScript = process.argv.slice(2);
+  const expected = contentsOnly ? [CONTENTS_ONLY_ARGUMENT] : [];
+  assert(
+    JSON.stringify(argumentsAfterScript) === JSON.stringify(expected),
+    "Package acceptance received an unsupported mode",
+  );
+}
+
+function assertServiceSmokeAllowed(label) {
+  assert(!contentsOnly, `Contents-only package acceptance reached service smoke: ${label}`);
+}
+
+function parsePackReport(output) {
+  const lines = output.split("\n");
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (lines[index].trim() !== "[") continue;
+    try {
+      return JSON.parse(lines.slice(index).join("\n"));
+    } catch {
+      // Lifecycle output can precede npm's final JSON report; keep looking.
+    }
+  }
+  throw new Error("npm pack did not emit a trailing JSON report");
+}
+
 function assertPackageFiles(files) {
   const paths = files.map((entry) => entry.path).sort();
   assert(
@@ -147,6 +177,7 @@ function execInstalledLauncher(executable, args, options) {
 }
 
 function spawnInstalledLauncher(executable, args, options) {
+  assertServiceSmokeAllowed("spawnInstalledLauncher");
   return spawn(executable, args, {
     ...options,
     env: installedLauncherEnvironment,
@@ -167,6 +198,7 @@ function parseCanonicalDocument(output, canonicalJson, label) {
 }
 
 function startInstalledServe(executable, configPath) {
+  assertServiceSmokeAllowed("startInstalledServe");
   const child = spawnInstalledLauncher(executable, ["serve", "--json", "--config", configPath], {
     cwd: path.dirname(configPath),
     stdio: ["ignore", "pipe", "pipe", "ipc"],
@@ -306,6 +338,7 @@ function assertReaped(pid, label) {
 }
 
 async function assertPrivateRuntime(paths, run, canonicalJson) {
+  assertServiceSmokeAllowed("assertPrivateRuntime");
   const stateMetadata = await lstat(paths.state);
   const logsMetadata = await lstat(paths.logs);
   const runtimeMetadata = await lstat(paths.runtime);
@@ -387,6 +420,7 @@ async function assertMissing(candidate, label) {
 }
 
 async function requestInstalledStatus(socketPath, canonicalJson) {
+  assertServiceSmokeAllowed("requestInstalledStatus");
   const requestId = randomUUID();
   const request = {
     schema_version: "service-control-request.v1",
@@ -424,6 +458,7 @@ async function requestInstalledStatus(socketPath, canonicalJson) {
 }
 
 async function assertDuplicateServeFails(executable, configPath, canonicalJson) {
+  assertServiceSmokeAllowed("assertDuplicateServeFails");
   let failure;
   try {
     await execInstalledLauncher(executable, ["serve", "--json", "--config", configPath], {
@@ -474,6 +509,7 @@ async function assertInstalledLauncherEnforcesExecuteMode(executable, cwd) {
 }
 
 async function assertInstalledSupervisionCycle(options) {
+  assertServiceSmokeAllowed("assertInstalledSupervisionCycle");
   const { executable, configPath, paths, signal, checkConflict, api } = options;
   const run = startInstalledServe(executable, configPath);
   try {
@@ -557,12 +593,23 @@ let tarballPath;
 let primaryFailure;
 await assertCleanupContinuesAfterFailure();
 try {
-  const packed = await execFile(npmCommand, ["pack", "--json", "--ignore-scripts"], {
+  const prepackProbe = contentsOnly ? undefined : randomUUID();
+  const packArguments = contentsOnly ? ["pack", "--json", "--ignore-scripts"] : ["pack", "--json"];
+  const packed = await execFile(npmCommand, packArguments, {
     cwd: root,
     encoding: "utf8",
     maxBuffer: 4 * 1024 * 1024,
+    ...(prepackProbe === undefined
+      ? {}
+      : { env: { ...process.env, [PREPACK_PROBE_ENV]: prepackProbe } }),
   });
-  const report = JSON.parse(packed.stdout);
+  if (prepackProbe !== undefined) {
+    assert(
+      `${packed.stdout}\n${packed.stderr}`.includes(`Prepack contents-only probe ${prepackProbe}`),
+      "The real npm pack path did not complete contents-only prepack acceptance",
+    );
+  }
+  const report = parsePackReport(packed.stdout);
   assert(Array.isArray(report) && report.length === 1, "npm pack returned an unexpected report");
   const packageReport = report[0];
   assert(typeof packageReport.filename === "string", "npm pack did not report a filename");
@@ -626,76 +673,6 @@ try {
     "Installed executable returned an unexpected capability document",
   );
 
-  const supervisionPaths = {
-    state: path.join(temporaryDirectory, "service-state"),
-    logs: path.join(temporaryDirectory, "service-logs"),
-    runtime: path.join(temporaryDirectory, "service-runtime"),
-  };
-  supervisionPaths.socket = path.join(supervisionPaths.runtime, "runtime.sock");
-  supervisionPaths.lock = path.join(supervisionPaths.runtime, "instance.lock");
-  supervisionPaths.owner = path.join(supervisionPaths.lock, "owner.json");
-  const installedConfig = path.join(temporaryDirectory, "runtime.development.json");
-  await writeFile(
-    installedConfig,
-    api.canonicalJson({
-      schema_version: "runtime-config.v1",
-      document_type: "runtime-config",
-      mode: "development",
-      paths: {
-        state: supervisionPaths.state,
-        logs: supervisionPaths.logs,
-        socket: supervisionPaths.socket,
-      },
-      shutdown_timeout_ms: 5_000,
-      logs: { level: "info", retention_days: 7, max_bytes: 104_857_600 },
-      gateway_profile: null,
-      provider_profiles: [],
-      mcp_profiles: [],
-      secret_references: {},
-    }),
-    { mode: 0o600 },
-  );
-  await assertInstalledSupervisionCycle({
-    executable,
-    configPath: installedConfig,
-    paths: supervisionPaths,
-    signal: "SIGTERM",
-    checkConflict: true,
-    api,
-  });
-  await assertInstalledSupervisionCycle({
-    executable,
-    configPath: installedConfig,
-    paths: supervisionPaths,
-    signal: "SIGINT",
-    checkConflict: false,
-    api,
-  });
-
-  const missingConfigPath = path.join(temporaryDirectory, "missing-runtime.yaml");
-  let missingConfigFailure;
-  try {
-    await execInstalledLauncher(executable, ["serve", "--json", "--config", missingConfigPath], {
-      cwd: temporaryDirectory,
-      encoding: "utf8",
-      timeout: PROCESS_TIMEOUT_MS,
-      killSignal: "SIGKILL",
-    });
-    throw new Error("Installed executable accepted a missing serve config");
-  } catch (error) {
-    missingConfigFailure = error;
-  }
-  assert(missingConfigFailure.code === 5, "Missing serve config returned an unstable exit code");
-  assert(missingConfigFailure.stderr === "", "Missing serve config wrote to stderr");
-  assert(
-    !missingConfigFailure.stdout.includes(missingConfigPath),
-    "Missing serve config reflected a local path",
-  );
-  assert(
-    JSON.parse(missingConfigFailure.stdout).error?.code === "RUNTIME_CONFIG_UNAVAILABLE",
-    "Missing serve config did not return a safe command result",
-  );
-
   const installedManifest = JSON.parse(
     await readFile(
       path.join(installedRoot, "docs", "contracts", "runtime-contract-v1.manifest.json"),
@@ -703,9 +680,96 @@ try {
     ),
   );
   assert(installedManifest.protocol_version === "runtime-contract.v1", "Installed manifest failed");
-  process.stdout.write(
-    `Verified ${packageReport.filename} (${packageReport.files.length} files)\n`,
-  );
+
+  if (contentsOnly) {
+    const prepackProbe = process.env[PREPACK_PROBE_ENV];
+    if (prepackProbe !== undefined) {
+      assert(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(prepackProbe),
+        "Prepack probe was not a UUID",
+      );
+      process.stdout.write(`Prepack contents-only probe ${prepackProbe}\n`);
+    }
+    process.stdout.write(
+      `Verified ${packageReport.filename} (${packageReport.files.length} files, contents only)\n`,
+    );
+  } else {
+    assertServiceSmokeAllowed("installed supervision block");
+
+    const supervisionPaths = {
+      state: path.join(temporaryDirectory, "service-state"),
+      logs: path.join(temporaryDirectory, "service-logs"),
+      runtime: path.join(temporaryDirectory, "service-runtime"),
+    };
+    supervisionPaths.socket = path.join(supervisionPaths.runtime, "runtime.sock");
+    supervisionPaths.lock = path.join(supervisionPaths.runtime, "instance.lock");
+    supervisionPaths.owner = path.join(supervisionPaths.lock, "owner.json");
+    const installedConfig = path.join(temporaryDirectory, "runtime.development.json");
+    await writeFile(
+      installedConfig,
+      api.canonicalJson({
+        schema_version: "runtime-config.v1",
+        document_type: "runtime-config",
+        mode: "development",
+        paths: {
+          state: supervisionPaths.state,
+          logs: supervisionPaths.logs,
+          socket: supervisionPaths.socket,
+        },
+        shutdown_timeout_ms: 5_000,
+        logs: { level: "info", retention_days: 7, max_bytes: 104_857_600 },
+        gateway_profile: null,
+        provider_profiles: [],
+        mcp_profiles: [],
+        secret_references: {},
+      }),
+      { mode: 0o600 },
+    );
+    await assertInstalledSupervisionCycle({
+      executable,
+      configPath: installedConfig,
+      paths: supervisionPaths,
+      signal: "SIGTERM",
+      checkConflict: true,
+      api,
+    });
+    await assertInstalledSupervisionCycle({
+      executable,
+      configPath: installedConfig,
+      paths: supervisionPaths,
+      signal: "SIGINT",
+      checkConflict: false,
+      api,
+    });
+
+    const missingConfigPath = path.join(temporaryDirectory, "missing-runtime.yaml");
+    let missingConfigFailure;
+    try {
+      await execInstalledLauncher(executable, ["serve", "--json", "--config", missingConfigPath], {
+        cwd: temporaryDirectory,
+        encoding: "utf8",
+        timeout: PROCESS_TIMEOUT_MS,
+        killSignal: "SIGKILL",
+      });
+      throw new Error("Installed executable accepted a missing serve config");
+    } catch (error) {
+      missingConfigFailure = error;
+    }
+    assert(missingConfigFailure.code === 5, "Missing serve config returned an unstable exit code");
+    assert(missingConfigFailure.stderr === "", "Missing serve config wrote to stderr");
+    assert(
+      !missingConfigFailure.stdout.includes(missingConfigPath),
+      "Missing serve config reflected a local path",
+    );
+    assert(
+      JSON.parse(missingConfigFailure.stdout).error?.code === "RUNTIME_CONFIG_UNAVAILABLE",
+      "Missing serve config did not return a safe command result",
+    );
+
+    process.stdout.write(
+      `Verified ${packageReport.filename} (${packageReport.files.length} files)\n`,
+    );
+  }
 } catch (error) {
   primaryFailure = error;
 }

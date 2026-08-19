@@ -180,10 +180,12 @@ describe("service lifecycle", () => {
     expect(observedAbort).toBe(true);
   });
 
-  it("can wait for abort-responsive whole-drain cleanup before returning a timeout", async () => {
+  it("returns the forced outcome at the deadline while whole-drain cleanup is still pending", async () => {
     vi.useFakeTimers();
     const signals = new FakeSignals();
     const events: string[] = [];
+    let finishCleanup: (() => void) | undefined;
+    let observed: Awaited<ReturnType<typeof runService>> | undefined;
     const running = runService({
       signals,
       stopAccepting: () => events.push("stop"),
@@ -193,21 +195,29 @@ describe("service lifecycle", () => {
             "abort",
             () => {
               events.push("abort");
-              queueMicrotask(() => {
+              finishCleanup = () => {
                 events.push("cleanup");
                 resolve();
-              });
+              };
             },
             { once: true },
           );
         }),
       shutdownTimeoutMs: 250,
-      settleDrainAfterAbort: true,
+    });
+    void running.then((result) => {
+      observed = result;
     });
     signals.emit("SIGTERM");
     await vi.advanceTimersByTimeAsync(250);
 
-    await expect(running).resolves.toEqual({ reason: "SIGTERM", forced: true });
+    try {
+      expect(observed).toEqual({ reason: "SIGTERM", forced: true });
+      expect(events).toEqual(["stop", "abort"]);
+    } finally {
+      finishCleanup?.();
+      await running;
+    }
     expect(events).toEqual(["stop", "abort", "cleanup"]);
   });
 
@@ -224,7 +234,6 @@ describe("service lifecycle", () => {
           });
         }),
       shutdownTimeoutMs: 250,
-      settleDrainAfterAbort: true,
     });
     signals.emit("SIGTERM");
     await vi.advanceTimersByTimeAsync(250);

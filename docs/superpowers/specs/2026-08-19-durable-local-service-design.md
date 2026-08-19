@@ -7,7 +7,10 @@ explicit service CLI, native per-user definitions, single-instance lock,
 private local status socket, readiness boundary, and ordered bounded shutdown.
 This is not completion of Wave 2 or closure of #28. Production-durable
 `INTERRUPTED` persistence remains pending issue #1; #1, #29, and #30 are not
-implemented by this foundation, and npm `1.0.0` is not authorized.
+implemented by this foundation, and npm `1.0.0` is not authorized. Automatic
+login-session activation and actual native-manager crash-loop observation are
+still platform-integration gates; deterministic manager acceptance does not
+claim those real-session results.
 
 This document defines v1 Wave 2 for:
 
@@ -114,9 +117,12 @@ toss-runtime service uninstall [--json]
 `service install` resolves absolute Node, CLI, config, state, log, and runtime
 paths; writes a secret-free definition atomically; and enables login startup.
 It does not start or bootstrap the service in the current session. Package
-installation has no service side effect. `service start` performs the explicit
-current-session activation. Repeating install, start, stop, or uninstall is
-idempotent when the installed definition is byte-for-byte compatible.
+installation has no service side effect. `prepack` runs only non-service
+format, lint, typecheck, build, and contents-only package acceptance; it never
+invokes the installed-supervisor smoke or `serve`. `service start` performs the
+explicit current-session activation. Repeating install, start, stop, or
+uninstall is idempotent when the installed definition is byte-for-byte
+compatible.
 
 The macOS definition uses label `software.toss.agent-runtime`, `RunAtLoad`,
 `KeepAlive` only after unsuccessful exits, `ThrottleInterval=5`, and an
@@ -145,6 +151,11 @@ announce readiness. Shutdown order is: stop control intake, stop watchers,
 persist pending debounce windows, drain active commands, append `INTERRUPTED`
 for unfinished runs, flush journals/logs, close and remove the socket, and
 release the lock. The configured shutdown deadline bounds the whole sequence.
+At that deadline the forced result returns even if socket close or exact-lock
+release remains pending. Cleanup may continue after return only in socket-close,
+exact-lock-release, then umask-restore order; an uncooperative earlier stage
+keeps later resources fail-closed. Graceful shutdown still awaits the complete
+ordered cleanup.
 
 `doctor` reports definition presence, enablement, manager state, socket/lock
 coherence, crash-backoff state, recovery quarantine, and degraded logging with
@@ -365,7 +376,12 @@ Normal CI remains credential-free on Node `22.23.1` and Node `24`, Ubuntu and
 macOS. Tests never install definitions into the real user's service-manager
 directories; manager integrations render into temporary roots and validate
 with native syntax tools. Package smoke tests execute the installed supervisor
-and private socket but do not leave a background service behind.
+and private socket but do not leave a background service behind. Deterministic
+definitions, native syntax lint, exact manager command arrays, status/backoff
+parsing, doctor remediation, and direct supervisor smoke are distinct from
+automatic login-session activation and actual native crash-loop observation;
+those real-manager integration gates remain pending and are not closed by an
+ordinary remote `npm run verify` job.
 
 ## Delivery order and acceptance
 

@@ -68,11 +68,49 @@ describe("published protocol artifacts", () => {
   it("documents explicit service installation and the package side-effect boundary", async () => {
     const readme = await readFile("README.md", "utf8");
     const contract = await readFile("docs/contracts/local-service-control-v1.md", "utf8");
+    const packageManifest = JSON.parse(await readFile("package.json", "utf8")) as {
+      readonly scripts: Readonly<Record<string, string>>;
+    };
+    const grammar = `toss-runtime service install [--config <absolute-path>] [--json]
+toss-runtime service start [--json]
+toss-runtime service stop [--json]
+toss-runtime service restart [--json]
+toss-runtime service status [--json]
+toss-runtime service uninstall [--json]`;
 
-    expect(readme).toContain("toss-runtime service install");
-    expect(readme).toContain("does not start the service");
-    expect(contract).toContain("0600");
-    expect(contract).toContain("RUNTIME_SERVICE_ALREADY_RUNNING");
-    expect(contract).toContain("Uninstall preserves");
+    expect(contract).toContain(grammar);
+    expect(contract).toContain("Only `service install` accepts `--config`");
+    for (const action of ["start", "stop", "restart", "status", "uninstall"]) {
+      expect(grammar).toContain(`toss-runtime service ${action} [--json]`);
+      expect(grammar).not.toContain(`service ${action} [--config`);
+    }
+    expect(readme).toContain("It does not start the service in the current session");
+    expect(contract).toMatch(/It does not start the service in\s+the current session/u);
+
+    expect(packageManifest.scripts["test:package:contents"]).toBe(
+      "node scripts/package-test.mjs --contents-only",
+    );
+    expect(packageManifest.scripts.prepack).toBe(
+      "npm run format:check && npm run lint && npm run typecheck && npm run build && npm run test:package:contents",
+    );
+    expect(packageManifest.scripts.prepack).not.toMatch(/\bverify\b|npm test|\bserve\b/u);
+    expect(contract).toMatch(
+      /`prepack` runs only non-service format, lint, typecheck, build, and\s+package-content acceptance/u,
+    );
+    expect(contract).toMatch(/must not reach the\s+installed-supervisor smoke or start `serve`/u);
+
+    expect(contract).toMatch(
+      /The forced outcome resolves at the configured deadline even if socket close or\s+lock release never settles/u,
+    );
+    expect(contract).toMatch(
+      /close the socket, then release the exact lock, then\s+restore the prior umask/u,
+    );
+    expect(contract).toMatch(
+      /Automatic login-session\s+activation and native crash-loop observation remain platform-integration\s+pending/u,
+    );
+    expect(contract).toMatch(
+      /Production-durable `INTERRUPTED`\s+persistence remains pending issue #1/u,
+    );
+    expect(contract).toContain("issue #28 remains open");
   });
 });

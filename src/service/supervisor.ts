@@ -217,6 +217,8 @@ export async function runSupervisor(options: RunSupervisorOptions): Promise<Supe
   let server: ServiceControlServer | undefined;
   let closeAttempted = false;
   let releaseAttempted = false;
+  let restoreAttempted = false;
+  let finalizationPromise: Promise<void> | undefined;
   const recoveredParticipants: RecoveryParticipant[] = [];
   let shutdownSequenceStarted = false;
   let accepting = false;
@@ -237,12 +239,40 @@ export async function runSupervisor(options: RunSupervisorOptions): Promise<Supe
     await lock.release();
   };
 
+  const restoreUmask = (): void => {
+    if (previousUmask === undefined || restoreAttempted) return;
+    restoreAttempted = true;
+    setUmask.set(previousUmask);
+  };
+
   const capture = (error: unknown): void => {
     primaryError = firstError(primaryError, safeError(error));
   };
 
   const captureFinalizer = (error: unknown): void => {
     finalizerError = firstError(finalizerError, safeError(error));
+  };
+
+  const finalizeOwnedResources = (): Promise<void> => {
+    finalizationPromise ??= (async () => {
+      try {
+        await closeOwnedServer();
+      } catch (error) {
+        captureFinalizer(error);
+      }
+      try {
+        await releaseOwnedLock();
+      } catch (error) {
+        captureFinalizer(error);
+      }
+      try {
+        restoreUmask();
+      } catch (error) {
+        captureFinalizer(error);
+      }
+    })();
+    void finalizationPromise.catch(() => undefined);
+    return finalizationPromise;
   };
 
   try {
@@ -335,37 +365,17 @@ export async function runSupervisor(options: RunSupervisorOptions): Promise<Supe
                 if (flushed.error !== undefined) capture(flushed.error);
               }
             } finally {
-              try {
-                try {
-                  await closeOwnedServer();
-                } catch (error) {
-                  captureFinalizer(error);
-                }
-              } finally {
-                try {
-                  await releaseOwnedLock();
-                } catch (error) {
-                  captureFinalizer(error);
-                }
-              }
+              await finalizeOwnedResources();
             }
             if (primaryError !== undefined) throw primaryError;
           },
           shutdownTimeoutMs: options.loaded.config.shutdown_timeout_ms,
-          settleDrainAfterAbort: true,
         });
       } catch (error) {
         capture(error);
       }
     }
   } finally {
-    if (!closeAttempted) {
-      try {
-        await closeOwnedServer();
-      } catch (error) {
-        captureFinalizer(error);
-      }
-    }
     if (!shutdownSequenceStarted) {
       for (const participant of recoveredParticipants.toReversed()) {
         try {
@@ -383,20 +393,9 @@ export async function runSupervisor(options: RunSupervisorOptions): Promise<Supe
         }
       }
     }
-    if (!releaseAttempted) {
-      try {
-        await releaseOwnedLock();
-      } catch (error) {
-        captureFinalizer(error);
-      }
-    }
-    if (previousUmask !== undefined) {
-      try {
-        setUmask.set(previousUmask);
-      } catch (error) {
-        captureFinalizer(error);
-      }
-    }
+    const finalizing = finalizeOwnedResources();
+    if (outcome?.forced === true) void finalizing.catch(() => undefined);
+    else await finalizing;
   }
 
   if (primaryError !== undefined) throw primaryError;

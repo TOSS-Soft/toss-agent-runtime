@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdtemp, realpath, rm } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, open, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -330,18 +330,40 @@ describe("runtime service supervisor", () => {
     await running;
   });
 
-  it("persists interruption before flushing and removing socket or lock", async () => {
+  it("fsyncs a durable interruption marker before flushing and removing socket or lock", async () => {
     const events: string[] = [];
-    const running = runSupervisor(shutdownOptions(events));
+    const markerPath = path.join(fixture.root, "interruption.marker");
+    const running = runSupervisor({
+      ...shutdownOptions(events),
+      interruptionRecorder: {
+        async interruptActive() {
+          const marker = await open(markerPath, "wx", 0o600);
+          try {
+            await marker.writeFile("INTERRUPTED\n", "utf8");
+            await marker.sync();
+          } finally {
+            await marker.close();
+          }
+          const parent = await open(path.dirname(markerPath), "r");
+          try {
+            await parent.sync();
+          } finally {
+            await parent.close();
+          }
+          events.push("interrupt-fsynced");
+        },
+      },
+    });
     await readyObserved;
 
     signals.emit("SIGTERM");
     await running;
 
+    expect(await readFile(markerPath, "utf8")).toBe("INTERRUPTED\n");
     expect(events).toEqual([
       "stop-accepting",
       "stop-watchers",
-      "interrupt-active",
+      "interrupt-fsynced",
       "drain-control",
       "flush",
       "close-socket",
@@ -535,6 +557,14 @@ describe("runtime service supervisor", () => {
               finishClose = resolve;
             }),
         }),
+      umask: {
+        set(mask) {
+          if (mask === 0o022) events.push("restore-umask");
+          const previous = activeMask;
+          activeMask = mask;
+          return previous;
+        },
+      },
     });
     await readyObserved;
 
@@ -542,9 +572,174 @@ describe("runtime service supervisor", () => {
     await vi.advanceTimersByTimeAsync(25);
 
     expect(events).toEqual(["stop-accepting", "stop-watchers", "close-socket"]);
+    await expect(running).resolves.toMatchObject({ forced: true });
+    expect(events).toEqual(["stop-accepting", "stop-watchers", "close-socket"]);
     finishClose?.();
+    await vi.waitFor(() => {
+      expect(events).toEqual([
+        "stop-accepting",
+        "stop-watchers",
+        "close-socket",
+        "release-lock",
+        "restore-umask",
+      ]);
+    });
+    expect(activeMask).toBe(0o022);
+  });
+
+  it("returns at the deadline while socket close is permanently pending", async () => {
+    vi.useFakeTimers();
+    const events: string[] = [];
+    const running = runSupervisor({
+      ...shutdownOptions(events),
+      loaded: {
+        ...fixture.loaded,
+        config: { ...fixture.loaded.config, shutdown_timeout_ms: 25 },
+      },
+      interruptionRecorder: {
+        interruptActive: () => new Promise<void>(() => undefined),
+      },
+      createControlServer: () =>
+        fakeServer({
+          stopAccepting: () => events.push("stop-accepting"),
+          close: () => {
+            events.push("close-socket");
+            return new Promise<void>(() => undefined);
+          },
+        }),
+      umask: {
+        set(mask) {
+          if (mask === 0o022) events.push("restore-umask");
+          const previous = activeMask;
+          activeMask = mask;
+          return previous;
+        },
+      },
+    });
+    await readyObserved;
+
+    signals.emit("SIGTERM");
+    await vi.advanceTimersByTimeAsync(25);
+
+    await expect(running).resolves.toEqual({
+      reason: "SIGTERM",
+      forced: true,
+      serviceInstanceId,
+    });
+    expect(events).toEqual(["stop-accepting", "stop-watchers", "close-socket"]);
+    expect(activeMask).toBe(0o077);
+  });
+
+  it("returns at the deadline while lock release is permanently pending", async () => {
+    vi.useFakeTimers();
+    const events: string[] = [];
+    const running = runSupervisor({
+      ...shutdownOptions(events),
+      loaded: {
+        ...fixture.loaded,
+        config: { ...fixture.loaded.config, shutdown_timeout_ms: 25 },
+      },
+      interruptionRecorder: {
+        interruptActive: () => new Promise<void>(() => undefined),
+      },
+      acquireLock: () =>
+        Promise.resolve(
+          fakeLock(() => {
+            events.push("release-lock");
+            return new Promise<void>(() => undefined);
+          }),
+        ),
+      createControlServer: () =>
+        fakeServer({
+          stopAccepting: () => events.push("stop-accepting"),
+          close: () => {
+            events.push("close-socket");
+            return Promise.resolve();
+          },
+        }),
+      umask: {
+        set(mask) {
+          if (mask === 0o022) events.push("restore-umask");
+          const previous = activeMask;
+          activeMask = mask;
+          return previous;
+        },
+      },
+    });
+    await readyObserved;
+
+    signals.emit("SIGTERM");
+    await vi.advanceTimersByTimeAsync(25);
+
+    await expect(running).resolves.toEqual({
+      reason: "SIGTERM",
+      forced: true,
+      serviceInstanceId,
+    });
+    expect(events).toEqual(["stop-accepting", "stop-watchers", "close-socket", "release-lock"]);
+    expect(activeMask).toBe(0o077);
+  });
+
+  it("restores the umask only after a deferred lock release finishes", async () => {
+    vi.useFakeTimers();
+    const events: string[] = [];
+    let finishRelease: (() => void) | undefined;
+    const running = runSupervisor({
+      ...shutdownOptions(events),
+      loaded: {
+        ...fixture.loaded,
+        config: { ...fixture.loaded.config, shutdown_timeout_ms: 25 },
+      },
+      interruptionRecorder: {
+        interruptActive: () => new Promise<void>(() => undefined),
+      },
+      acquireLock: () =>
+        Promise.resolve(
+          fakeLock(
+            () =>
+              new Promise<void>((resolve) => {
+                events.push("release-lock");
+                finishRelease = resolve;
+              }),
+          ),
+        ),
+      createControlServer: () =>
+        fakeServer({
+          stopAccepting: () => events.push("stop-accepting"),
+          close: () => {
+            events.push("close-socket");
+            return Promise.resolve();
+          },
+        }),
+      umask: {
+        set(mask) {
+          if (mask === 0o022) events.push("restore-umask");
+          const previous = activeMask;
+          activeMask = mask;
+          return previous;
+        },
+      },
+    });
+    await readyObserved;
+
+    signals.emit("SIGTERM");
+    await vi.advanceTimersByTimeAsync(25);
+
     await expect(running).resolves.toMatchObject({ forced: true });
     expect(events).toEqual(["stop-accepting", "stop-watchers", "close-socket", "release-lock"]);
+    expect(activeMask).toBe(0o077);
+
+    finishRelease?.();
+    await vi.waitFor(() => {
+      expect(events).toEqual([
+        "stop-accepting",
+        "stop-watchers",
+        "close-socket",
+        "release-lock",
+        "restore-umask",
+      ]);
+    });
+    expect(activeMask).toBe(0o022);
   });
 
   it("continues ordered participant cleanup after interruption persistence fails", async () => {

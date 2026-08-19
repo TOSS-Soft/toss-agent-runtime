@@ -17,7 +17,6 @@ export function runService(options: {
   readonly stopAccepting: () => void;
   readonly drain: (signal: AbortSignal) => Promise<void>;
   readonly shutdownTimeoutMs: number;
-  readonly settleDrainAfterAbort?: boolean;
 }): Promise<ServiceOutcome> {
   return new Promise<ServiceOutcome>((resolve, reject) => {
     let stopPromise: Promise<ServiceOutcome> | undefined;
@@ -56,8 +55,7 @@ export function runService(options: {
           );
           const outcome = await Promise.race([drainOutcomePromise, timeoutPromise]);
           if (outcome === "forced") {
-            if (options.settleDrainAfterAbort === true) await drainOutcomePromise;
-            else void drainPromise.catch(() => undefined);
+            void drainPromise.catch(() => undefined);
           } else if (outcome.kind === "failed") {
             throw outcome.error;
           }
