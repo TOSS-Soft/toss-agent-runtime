@@ -31,6 +31,7 @@ export interface ServiceManager {
   restart(): Promise<ServiceManagerStatus>;
   status(): Promise<ServiceManagerStatus>;
   uninstall(): Promise<ServiceManagerStatus>;
+  installedConfigPath(): Promise<string | null>;
 }
 
 export interface CreateServiceManagerOptions {
@@ -58,6 +59,7 @@ const EMPTY_STATUS: ServiceManagerStatus = {
 const LINUX_EXECUTABLE = "/usr/bin/systemctl";
 const DARWIN_EXECUTABLE = "/bin/launchctl";
 const MAX_STATUS_OUTPUT_CHARS = 65_536;
+const CONFIG_PATH_PLACEHOLDER = "/__TOSS_RUNTIME_CONFIG_PATH_PLACEHOLDER__";
 
 function definitionUnsafe(): never {
   throw new RuntimeServiceError("RUNTIME_SERVICE_DEFINITION_UNSAFE");
@@ -85,6 +87,40 @@ function definitionEnvironment(
     if (value !== undefined) environment[key] = value;
   }
   return environment;
+}
+
+function decodeXmlText(value: string): string | undefined {
+  if (/&(?!amp;|lt;|gt;|quot;|apos;)/u.test(value)) return undefined;
+  return value.replace(/&(?:amp|lt|gt|quot|apos);/gu, (entity) => {
+    if (entity === "&amp;") return "&";
+    if (entity === "&lt;") return "<";
+    if (entity === "&gt;") return ">";
+    if (entity === "&quot;") return '"';
+    return "'";
+  });
+}
+
+function decodeSystemdArgument(value: string): string | undefined {
+  let decoded = "";
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index]!;
+    if (character === "\\") {
+      const escaped = value[index + 1];
+      if (escaped !== "\\" && escaped !== '"') return undefined;
+      decoded += escaped;
+      index += 1;
+      continue;
+    }
+    if (character === "$" || character === "%") {
+      if (value[index + 1] !== character) return undefined;
+      decoded += character;
+      index += 1;
+      continue;
+    }
+    if (character === '"') return undefined;
+    decoded += character;
+  }
+  return decoded;
 }
 
 function isUnavailable(error: unknown): boolean {
@@ -222,7 +258,38 @@ class NativeServiceManager implements ServiceManager {
     return this.options.runner ?? new ProcessCommandRunner();
   }
 
-  private async installedDefinition(): Promise<boolean> {
+  private renderDefinition(configPath: string): string {
+    return renderServiceDefinition({
+      platform: this.options.platform,
+      uid: this.options.uid,
+      nodePath: this.options.nodePath,
+      cliPath: this.options.cliPath,
+      configPath,
+      environment: definitionEnvironment(this.options.env),
+    });
+  }
+
+  private recoverConfigPath(existing: Uint8Array): string | undefined {
+    const template = this.renderDefinition(CONFIG_PATH_PLACEHOLDER);
+    const placeholderIndex = template.lastIndexOf(CONFIG_PATH_PLACEHOLDER);
+    if (placeholderIndex < 0) return undefined;
+    const prefix = template.slice(0, placeholderIndex);
+    const suffix = template.slice(placeholderIndex + CONFIG_PATH_PLACEHOLDER.length);
+    const text = Buffer.from(existing).toString("utf8");
+    if (!text.startsWith(prefix) || !text.endsWith(suffix)) return undefined;
+    const encoded = text.slice(prefix.length, text.length - suffix.length);
+    const configPath =
+      this.options.platform === "darwin" ? decodeXmlText(encoded) : decodeSystemdArgument(encoded);
+    if (configPath === undefined || !path.isAbsolute(configPath)) return undefined;
+    try {
+      const canonical = Buffer.from(this.renderDefinition(configPath), "utf8");
+      return canonical.equals(existing) ? configPath : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async installedDefinition(allowRecoveredConfig = false): Promise<boolean> {
     let existing: Uint8Array | undefined;
     try {
       existing = await readPrivateRegularFile(this.paths.definition);
@@ -232,7 +299,12 @@ class NativeServiceManager implements ServiceManager {
     if (existing === undefined) {
       return false;
     }
-    if (!Buffer.from(existing).equals(this.definition)) definitionUnsafe();
+    if (
+      !Buffer.from(existing).equals(this.definition) &&
+      (!allowRecoveredConfig || this.recoverConfigPath(existing) === undefined)
+    ) {
+      definitionUnsafe();
+    }
     return true;
   }
 
@@ -285,7 +357,7 @@ class NativeServiceManager implements ServiceManager {
   }
 
   async start(): Promise<ServiceManagerStatus> {
-    if (!(await this.installedDefinition())) return EMPTY_STATUS;
+    if (!(await this.installedDefinition(true))) return EMPTY_STATUS;
     if (this.options.platform === "linux") {
       await this.command(LINUX_EXECUTABLE, ["--user", "start", SYSTEMD_UNIT]);
     } else {
@@ -299,7 +371,7 @@ class NativeServiceManager implements ServiceManager {
   }
 
   async stop(): Promise<ServiceManagerStatus> {
-    if (!(await this.installedDefinition())) return EMPTY_STATUS;
+    if (!(await this.installedDefinition(true))) return EMPTY_STATUS;
     if (this.options.platform === "linux") {
       await this.command(LINUX_EXECUTABLE, ["--user", "stop", SYSTEMD_UNIT], "linux-stop");
     } else {
@@ -313,7 +385,7 @@ class NativeServiceManager implements ServiceManager {
   }
 
   async restart(): Promise<ServiceManagerStatus> {
-    if (!(await this.installedDefinition())) return EMPTY_STATUS;
+    if (!(await this.installedDefinition(true))) return EMPTY_STATUS;
     if (this.options.platform === "linux") {
       await this.command(LINUX_EXECUTABLE, ["--user", "restart", SYSTEMD_UNIT]);
     } else {
@@ -323,7 +395,7 @@ class NativeServiceManager implements ServiceManager {
   }
 
   async status(): Promise<ServiceManagerStatus> {
-    if (!(await this.installedDefinition())) return EMPTY_STATUS;
+    if (!(await this.installedDefinition(true))) return EMPTY_STATUS;
     if (this.options.platform === "linux") {
       const result = await this.command(
         LINUX_EXECUTABLE,
@@ -347,7 +419,7 @@ class NativeServiceManager implements ServiceManager {
   }
 
   async uninstall(): Promise<ServiceManagerStatus> {
-    if (!(await this.installedDefinition())) return EMPTY_STATUS;
+    if (!(await this.installedDefinition(true))) return EMPTY_STATUS;
     if (this.options.platform === "linux") {
       await this.command(LINUX_EXECUTABLE, ["--user", "stop", SYSTEMD_UNIT], "linux-stop");
       await this.command(LINUX_EXECUTABLE, ["--user", "disable", SYSTEMD_UNIT], "linux-disable");
@@ -367,6 +439,20 @@ class NativeServiceManager implements ServiceManager {
       await this.command(LINUX_EXECUTABLE, ["--user", "daemon-reload"]);
     }
     return EMPTY_STATUS;
+  }
+
+  async installedConfigPath(): Promise<string | null> {
+    let existing: Uint8Array | undefined;
+    try {
+      existing = await readPrivateRegularFile(this.paths.definition);
+    } catch (error) {
+      definitionError(error);
+    }
+    if (existing === undefined) return null;
+    if (Buffer.from(existing).equals(this.definition)) return this.options.configPath;
+    const recovered = this.recoverConfigPath(existing);
+    if (recovered === undefined) definitionUnsafe();
+    return recovered;
   }
 }
 

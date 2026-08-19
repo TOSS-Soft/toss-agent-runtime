@@ -1,7 +1,14 @@
+import { mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
 import { describe, expect, it } from "vitest";
 
-import { runCli } from "../src/cli/main.js";
+import { createMainServices, runCli, type CliServices } from "../src/cli/main.js";
 import { defaultConfig, RuntimeConfigError } from "../src/config/load.js";
+import type { ServiceStatusV1 } from "../src/service/contracts.js";
+import { RuntimeServiceError, type RuntimeServiceErrorCode } from "../src/service/errors.js";
+import type { ServiceManagerStatus } from "../src/service/manager.js";
 
 const platform = { os: "linux" as const, arch: "x64", node: "22.23.1" };
 
@@ -13,6 +20,88 @@ const services = {
       source: "defaults",
     }),
 };
+
+const absentManagerStatus: ServiceManagerStatus = {
+  installed: false,
+  enabled: false,
+  active: false,
+  backoff: false,
+  restartCount: 0,
+  lastExitCode: null,
+};
+
+const activeManagerStatus: ServiceManagerStatus = {
+  installed: true,
+  enabled: true,
+  active: true,
+  backoff: false,
+  restartCount: 0,
+  lastExitCode: 0,
+};
+
+const healthySocketStatus: ServiceStatusV1 = {
+  package_version: "0.0.0-development",
+  service_instance_id: "018f0f64-7b21-7d4f-8c3d-4a30413d5f42",
+  pid: 4217,
+  started_at: "2026-08-19T10:00:00.000Z",
+  health: "healthy",
+  accepting: true,
+};
+
+type ServiceAction = "install" | "start" | "stop" | "restart" | "status" | "uninstall";
+
+function serviceServices(
+  options: {
+    readonly manager?: ServiceManagerStatus;
+    readonly socket?: ServiceStatusV1 | Error;
+    readonly identity?: string | null;
+    readonly mode?: "development" | "production";
+    readonly managerError?: RuntimeServiceErrorCode | Error;
+    readonly calls?: { action: ServiceAction; configPath?: string }[];
+  } = {},
+): CliServices {
+  const manager = options.manager ?? activeManagerStatus;
+  const socket = options.socket ?? healthySocketStatus;
+  return {
+    ...services,
+    loadConfig: () =>
+      Promise.resolve({
+        config: { ...defaultConfig("linux", "/home/test"), mode: options.mode ?? "development" },
+        source: "defaults",
+      }),
+    manageService: (action, configPath) => {
+      options.calls?.push(configPath === undefined ? { action } : { action, configPath });
+      if (options.managerError instanceof Error) return Promise.reject(options.managerError);
+      if (options.managerError !== undefined) {
+        return Promise.reject(new RuntimeServiceError(options.managerError));
+      }
+      return Promise.resolve(manager);
+    },
+    requestServiceStatus: () =>
+      socket instanceof Error ? Promise.reject(socket) : Promise.resolve(socket),
+    probeServiceIdentity: () =>
+      Promise.resolve(
+        options.identity === undefined ? healthySocketStatus.service_instance_id : options.identity,
+      ),
+  };
+}
+
+function doctorChecks(output: { readonly stdout: string }): readonly {
+  readonly id: string;
+  readonly status: string;
+  readonly message: string;
+}[] {
+  const document = JSON.parse(output.stdout) as {
+    readonly data: {
+      readonly checks: readonly {
+        readonly id: string;
+        readonly status: string;
+        readonly message: string;
+      }[];
+    };
+  };
+  return document.data.checks;
+}
 
 describe("baseline CLI", () => {
   it("returns one versioned capabilities result in JSON mode", async () => {
@@ -63,6 +152,9 @@ describe("baseline CLI", () => {
     const version = await runCli(["--version"], services);
     expect(help).toMatchObject({ exitCode: 0, stderr: "" });
     expect(help.stdout).toContain("toss-runtime capabilities [--json]");
+    for (const action of ["install", "start", "stop", "restart", "status", "uninstall"]) {
+      expect(help.stdout).toContain(`toss-runtime service ${action}`);
+    }
     expect(version.stdout.trim()).toBe("0.0.0-development");
   });
 
@@ -140,6 +232,25 @@ describe("baseline CLI", () => {
   });
 
   it.each([
+    ["RUNTIME_SERVICE_ALREADY_RUNNING", 6],
+    ["RUNTIME_SERVICE_CONTROL_CONFLICT", 6],
+    ["RUNTIME_SERVICE_PATH_UNSAFE", 5],
+    ["RUNTIME_SERVICE_DEFINITION_UNSAFE", 5],
+  ] as const)("maps serve %s to stable exit %i", async (code, exitCode) => {
+    const output = await runCli(["serve", "--json"], {
+      ...services,
+      serve: () => Promise.reject(new RuntimeServiceError(code)),
+    });
+    expect(output).toMatchObject({ exitCode, stderr: "" });
+    expect(JSON.parse(output.stdout)).toMatchObject({
+      command: "serve",
+      ok: false,
+      exit_code: exitCode,
+      error: { code },
+    });
+  });
+
+  it.each([
     [["doctor", "--config"], "Missing value for --config"],
     [["capabilities", "--config", "/tmp/config"], "Unknown option for capabilities: --config"],
     [["doctor", "--unknown"], "Unknown option for doctor: --unknown"],
@@ -147,5 +258,320 @@ describe("baseline CLI", () => {
     const output = await runCli(argv, services);
     expect(output.exitCode).toBe(2);
     expect(output.stderr).toContain(message);
+  });
+
+  it.each(["install", "start", "stop", "restart", "status", "uninstall"] as const)(
+    "routes service %s with one canonical JSON result",
+    async (action) => {
+      const output = await runCli(["service", action, "--json"], serviceServices());
+      expect(output.stderr).toBe("");
+      expect(output.stdout.trim().split("\n")).toHaveLength(1);
+      expect(JSON.parse(output.stdout)).toMatchObject({
+        command: `service ${action}`,
+        ok: true,
+        exit_code: 0,
+      });
+    },
+  );
+
+  it("passes an explicit config only to service install", async () => {
+    const calls: { action: ServiceAction; configPath?: string }[] = [];
+    const cliServices = serviceServices({ calls });
+
+    await runCli(["service", "install", "--config", "/tmp/runtime.yaml", "--json"], cliServices);
+    await runCli(["service", "start", "--json"], cliServices);
+
+    expect(calls).toEqual([
+      { action: "install", configPath: "/tmp/runtime.yaml" },
+      { action: "start" },
+    ]);
+  });
+
+  it("builds installed definitions with the real CLI entry and absolute Node executable", async () => {
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-runtime-cli-service-")));
+    const cliTarget = path.join(root, "cli.js");
+    const cliLink = path.join(root, "toss-runtime");
+    const configPath = path.join(root, "config.yaml");
+    await writeFile(cliTarget, "", { mode: 0o600 });
+    await symlink(cliTarget, cliLink);
+    let managerOptions:
+      | { readonly nodePath: string; readonly cliPath: string; readonly configPath: string }
+      | undefined;
+    try {
+      const mainServices = createMainServices({
+        platform,
+        env: {},
+        home: root,
+        signals: { subscribe: () => () => undefined },
+        pid: 4217,
+        now: () => new Date("2026-08-19T10:00:00.000Z"),
+        createServiceInstanceId: () => healthySocketStatus.service_instance_id,
+        resolveExecutableHash: () => Promise.resolve("a".repeat(64)),
+        sendReady: () => undefined,
+        nodePath: process.execPath,
+        cliPath: cliLink,
+        uid: 501,
+        ensureServiceConfig: () => Promise.resolve(configPath),
+        createServiceManager: (options) => {
+          managerOptions = options;
+          return {
+            install: () => Promise.resolve(activeManagerStatus),
+            start: () => Promise.resolve(activeManagerStatus),
+            stop: () => Promise.resolve(activeManagerStatus),
+            restart: () => Promise.resolve(activeManagerStatus),
+            status: () => Promise.resolve(activeManagerStatus),
+            uninstall: () => Promise.resolve(absentManagerStatus),
+            installedConfigPath: () => Promise.resolve(configPath),
+          };
+        },
+      });
+
+      await mainServices.manageService?.("install", configPath);
+
+      expect(managerOptions).toMatchObject({
+        nodePath: process.execPath,
+        cliPath: cliTarget,
+        configPath,
+      });
+      expect(path.isAbsolute(managerOptions?.nodePath ?? "")).toBe(true);
+      expect(path.isAbsolute(managerOptions?.cliPath ?? "")).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    [["service", "--json"], "Missing service action"],
+    [["service", "launch", "--json"], "Unknown service action: launch"],
+    [["service", "start", "extra", "--json"], "Unknown option for service start: <argument>"],
+    [
+      ["service", "start", "--config", "/tmp/runtime.yaml", "--json"],
+      "Unknown option for service start: --config",
+    ],
+    [["service", "install", "--config", "--json"], "Missing value for --config"],
+    [["service", "install", "--json", "--json"], "Duplicate option: --json"],
+    [
+      ["service", "install", "--config", "/tmp/one", "--config", "/tmp/two", "--json"],
+      "Duplicate option: --config",
+    ],
+    [
+      ["service", "status", "--unknown=must-not-persist", "--json"],
+      "Unknown option for service status: --unknown",
+    ],
+    [
+      ["service", "status", "--api-token=must-not-persist", "--json"],
+      "Unknown option for service status: --api-token",
+    ],
+  ])("rejects malformed service grammar %# without reflecting values", async (argv, message) => {
+    const output = await runCli(argv, serviceServices());
+    expect(output).toMatchObject({ exitCode: 2, stderr: "" });
+    expect(output.stdout).toContain(message);
+    expect(output.stdout).not.toContain("must-not-persist");
+    expect(output.stdout).not.toContain("/tmp/one");
+    expect(output.stdout).not.toContain("/tmp/two");
+    expect(output.stdout.trim().split("\n")).toHaveLength(1);
+  });
+
+  it("rejects service management on an unsupported platform before calling the manager", async () => {
+    const calls: { action: ServiceAction; configPath?: string }[] = [];
+    const output = await runCli(["service", "status", "--json"], {
+      ...serviceServices({ calls }),
+      platform: { os: "win32", arch: "x64", node: "22.23.1" },
+    });
+
+    expect(calls).toEqual([]);
+    expect(output).toMatchObject({ exitCode: 5, stderr: "" });
+    expect(JSON.parse(output.stdout)).toMatchObject({
+      command: "service status",
+      ok: false,
+      error: { code: "RUNTIME_PLATFORM_UNSUPPORTED" },
+    });
+  });
+
+  it.each([
+    ["RUNTIME_SERVICE_ALREADY_RUNNING", 6],
+    ["RUNTIME_SERVICE_CONTROL_CONFLICT", 6],
+    ["RUNTIME_SERVICE_PATH_UNSAFE", 5],
+    ["RUNTIME_SERVICE_DEFINITION_UNSAFE", 5],
+    ["RUNTIME_SERVICE_MANAGER_UNAVAILABLE", 69],
+  ] as const)("maps %s to stable exit %i", async (code, exitCode) => {
+    const output = await runCli(
+      ["service", "start", "--json"],
+      serviceServices({ managerError: code }),
+    );
+    expect(output).toMatchObject({ exitCode, stderr: "" });
+    expect(output.stdout.trim().split("\n")).toHaveLength(1);
+    expect(JSON.parse(output.stdout)).toMatchObject({
+      command: "service start",
+      ok: false,
+      exit_code: exitCode,
+      error: { code },
+    });
+  });
+
+  it("maps unexpected service failures to one safe internal result", async () => {
+    const output = await runCli(
+      ["service", "restart", "--json"],
+      serviceServices({ managerError: new Error("private failure at /home/test") }),
+    );
+    expect(output).toMatchObject({ exitCode: 70, stderr: "" });
+    expect(output.stdout).not.toContain("/home/test");
+    expect(JSON.parse(output.stdout)).toMatchObject({
+      command: "service restart",
+      ok: false,
+      error: { code: "RUNTIME_SERVICE_FAILED" },
+    });
+  });
+
+  it("reports an absent service as successful status data", async () => {
+    const output = await runCli(
+      ["service", "status", "--json"],
+      serviceServices({
+        manager: absentManagerStatus,
+        socket: new RuntimeServiceError("RUNTIME_SERVICE_UNAVAILABLE"),
+        identity: null,
+      }),
+    );
+    expect(output.exitCode).toBe(0);
+    expect(JSON.parse(output.stdout)).toMatchObject({
+      ok: true,
+      data: { installed: false, socket: null, identity_matches: null },
+    });
+  });
+
+  it("reports installed-stopped and crash-backoff as status data, not command failures", async () => {
+    for (const manager of [
+      { ...activeManagerStatus, active: false },
+      { ...activeManagerStatus, active: false, backoff: true, restartCount: 5, lastExitCode: 70 },
+    ]) {
+      const output = await runCli(
+        ["service", "status", "--json"],
+        serviceServices({
+          manager,
+          socket: new RuntimeServiceError("RUNTIME_SERVICE_UNAVAILABLE"),
+          identity: null,
+        }),
+      );
+      expect(output.exitCode).toBe(0);
+      expect(JSON.parse(output.stdout)).toMatchObject({
+        ok: true,
+        data: { ...manager, socket: null },
+      });
+    }
+  });
+
+  it("renders service success and failure safely in human mode", async () => {
+    const success = await runCli(["service", "start"], serviceServices());
+    const failure = await runCli(
+      ["service", "start"],
+      serviceServices({
+        managerError: new RuntimeServiceError("RUNTIME_SERVICE_MANAGER_UNAVAILABLE"),
+      }),
+    );
+    expect(success).toMatchObject({ exitCode: 0, stderr: "" });
+    expect(success.stdout).toContain("Runtime service started");
+    expect(failure).toEqual({
+      exitCode: 69,
+      stdout: "",
+      stderr: "Runtime service manager is unavailable\n",
+    });
+  });
+
+  it("reports a healthy active matching manager and socket", async () => {
+    const output = await runCli(["doctor", "--json"], serviceServices());
+    expect(output.exitCode).toBe(0);
+    expect(doctorChecks(output)).toContainEqual({
+      id: "service",
+      status: "PASS",
+      message: "Runtime service is active and healthy",
+    });
+  });
+
+  it("warns for an absent or stopped service in development and fails in production", async () => {
+    for (const manager of [absentManagerStatus, { ...activeManagerStatus, active: false }]) {
+      const development = await runCli(
+        ["doctor", "--json"],
+        serviceServices({
+          manager,
+          socket: new RuntimeServiceError("RUNTIME_SERVICE_UNAVAILABLE"),
+          identity: null,
+        }),
+      );
+      const production = await runCli(
+        ["doctor", "--json"],
+        serviceServices({
+          manager,
+          socket: new RuntimeServiceError("RUNTIME_SERVICE_UNAVAILABLE"),
+          identity: null,
+          mode: "production",
+        }),
+      );
+      expect(development.exitCode).toBe(0);
+      expect(doctorChecks(development)).toContainEqual({
+        id: "service",
+        status: "WARN",
+        message: manager.installed
+          ? "Runtime service is installed but stopped"
+          : "Runtime service is not installed",
+      });
+      expect(production.exitCode).toBe(5);
+      expect(doctorChecks(production)).toContainEqual({
+        id: "service",
+        status: "FAIL",
+        message: manager.installed
+          ? "Runtime service is installed but stopped"
+          : "Runtime service is not installed",
+      });
+    }
+  });
+
+  it("reports crash backoff with safe remediation", async () => {
+    const output = await runCli(
+      ["doctor", "--json"],
+      serviceServices({
+        manager: {
+          ...activeManagerStatus,
+          active: false,
+          backoff: true,
+          restartCount: 5,
+          lastExitCode: 70,
+        },
+        socket: new RuntimeServiceError("RUNTIME_SERVICE_UNAVAILABLE"),
+        identity: null,
+      }),
+    );
+    expect(output.exitCode).toBe(5);
+    expect(doctorChecks(output)).toContainEqual({
+      id: "service",
+      status: "FAIL",
+      message: "Runtime service restart backoff is active; inspect service status",
+    });
+  });
+
+  it.each([
+    [
+      "unsafe definition",
+      serviceServices({ managerError: "RUNTIME_SERVICE_DEFINITION_UNSAFE" }),
+      "Runtime service definition is unsafe",
+    ],
+    [
+      "identity mismatch",
+      serviceServices({ identity: "018f0f64-7b21-7d4f-8c3d-4a30413d5f99" }),
+      "Runtime service socket identity does not match",
+    ],
+    [
+      "degraded socket",
+      serviceServices({ socket: { ...healthySocketStatus, health: "degraded" } }),
+      "Runtime service socket health is degraded",
+    ],
+  ])("fails doctor for %s", async (_name, cliServices, message) => {
+    const output = await runCli(["doctor", "--json"], cliServices);
+    expect(output.exitCode).toBe(5);
+    expect(output.stderr).toBe("");
+    expect(doctorChecks(output)).toContainEqual({
+      id: "service",
+      status: "FAIL",
+      message,
+    });
   });
 });

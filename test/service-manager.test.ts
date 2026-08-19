@@ -39,6 +39,8 @@ class RecordingRunner implements CommandRunner {
 
 interface ManagerFixture {
   readonly manager: ServiceManager;
+  readonly platform: "darwin" | "linux";
+  readonly home: string;
   readonly definition: string;
   readonly config: string;
   readonly canonicalRunArtifact: string;
@@ -112,6 +114,8 @@ async function fixture(
   });
   return {
     manager,
+    platform,
+    home,
     definition,
     config,
     canonicalRunArtifact,
@@ -120,6 +124,24 @@ async function fixture(
     pendingIntake,
     operationalLog,
   };
+}
+
+function managerFor(
+  fixture: ManagerFixture,
+  runner: CommandRunner,
+  configPath: string,
+): ServiceManager {
+  return createServiceManager({
+    platform: fixture.platform,
+    home: fixture.home,
+    env: {},
+    uid: 501,
+    nodePath: "/opt/toss/node/bin/node",
+    cliPath: "/opt/toss/bin/toss-runtime.js",
+    configPath,
+    randomSuffix: () => "alternate-definition",
+    runner,
+  });
 }
 
 function linuxFixture(runner: CommandRunner, options?: FixtureOptions): Promise<ManagerFixture> {
@@ -139,6 +161,75 @@ afterEach(async () => {
 });
 
 describe("native per-user service manager", () => {
+  it.each(["linux", "darwin"] as const)(
+    "recognizes a canonical %s definition installed with a custom config for every later action",
+    async (platform) => {
+      const runner = new RecordingRunner();
+      const artifacts = await fixture(platform, runner);
+      const customConfig = path.join(artifacts.home, 'custom % $ \\ " & < >.yaml');
+      await managerFor(artifacts, runner, customConfig).install();
+
+      await expect(artifacts.manager.installedConfigPath()).resolves.toBe(customConfig);
+      await expect(artifacts.manager.start()).resolves.toMatchObject({ installed: true });
+      await expect(artifacts.manager.stop()).resolves.toMatchObject({ installed: true });
+      await expect(artifacts.manager.restart()).resolves.toMatchObject({ installed: true });
+      await expect(artifacts.manager.status()).resolves.toMatchObject({ backoff: false });
+      await expect(artifacts.manager.uninstall()).resolves.toMatchObject({ installed: false });
+      await expect(lstat(artifacts.definition)).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
+
+  it.each(["linux", "darwin"] as const)(
+    "rejects a %s definition whose recovered config path is not absolute before native mutation",
+    async (platform) => {
+      const runner = new RecordingRunner();
+      const artifacts = await fixture(platform, runner);
+      const customConfig = path.join(artifacts.home, "custom-config.yaml");
+      const installer = managerFor(artifacts, runner, customConfig);
+      await installer.install();
+      runner.calls.splice(0);
+      const canonical = await readFile(artifacts.definition, "utf8");
+      await writeFile(artifacts.definition, canonical.replace(customConfig, "relative.yaml"), {
+        mode: 0o600,
+      });
+      await chmod(artifacts.definition, 0o600);
+
+      await expect(artifacts.manager.status()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      expect(runner.calls).toEqual([]);
+    },
+  );
+
+  it.each(["linux", "darwin"] as const)(
+    "rejects a canonical %s definition generated for another executable before native mutation",
+    async (platform) => {
+      const runner = new RecordingRunner();
+      const artifacts = await fixture(platform, runner);
+      const customConfig = path.join(artifacts.home, "custom-config.yaml");
+      await managerFor(artifacts, runner, customConfig).install();
+      runner.calls.splice(0);
+      await writeFile(
+        artifacts.definition,
+        renderServiceDefinition({
+          platform,
+          uid: 501,
+          nodePath: "/opt/untrusted/node",
+          cliPath: "/opt/toss/bin/toss-runtime.js",
+          configPath: customConfig,
+          environment: {},
+        }),
+        { mode: 0o600 },
+      );
+      await chmod(artifacts.definition, 0o600);
+
+      await expect(artifacts.manager.status()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      expect(runner.calls).toEqual([]);
+    },
+  );
+
   it("enables Linux login startup without starting during install", async () => {
     const runner = new RecordingRunner();
     const { manager } = await linuxFixture(runner);

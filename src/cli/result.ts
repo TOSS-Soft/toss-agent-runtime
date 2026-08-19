@@ -1,7 +1,26 @@
 import { canonicalJson, type JsonValue } from "../protocol/json.js";
 import type { RuntimeError } from "../protocol/types.js";
+import type { RuntimeServiceErrorCode } from "../service/errors.js";
 
 export type ExitCode = 0 | 2 | 3 | 4 | 5 | 6 | 69 | 70;
+
+export function serviceErrorExitCode(code: RuntimeServiceErrorCode): Exclude<ExitCode, 0> {
+  if (code === "RUNTIME_SERVICE_ALREADY_RUNNING" || code === "RUNTIME_SERVICE_CONTROL_CONFLICT") {
+    return 6;
+  }
+  if (
+    code === "RUNTIME_SERVICE_PATH_UNSAFE" ||
+    code === "RUNTIME_SERVICE_DEFINITION_UNSAFE" ||
+    code === "RUNTIME_SERVICE_LOCK_AMBIGUOUS" ||
+    code === "RUNTIME_SERVICE_CONTROL_INVALID"
+  ) {
+    return 5;
+  }
+  if (code === "RUNTIME_SERVICE_MANAGER_UNAVAILABLE" || code === "RUNTIME_SERVICE_UNAVAILABLE") {
+    return 69;
+  }
+  return 70;
+}
 
 export interface CommandResultV1 {
   readonly schema_version: "command-result.v1";
