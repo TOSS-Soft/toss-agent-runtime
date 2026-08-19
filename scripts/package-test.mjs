@@ -166,6 +166,7 @@ function assertPackageFiles(files) {
 
 const PROCESS_TIMEOUT_MS = 10_000;
 const CONTROL_TIMEOUT_MS = 5_000;
+const PUBLICATION_GUARD_PATTERN = /^\.c[0-9a-f]{64}$/u;
 const activeServes = new Set();
 
 function execInstalledLauncher(executable, args, options) {
@@ -381,7 +382,7 @@ async function assertPrivateRuntime(paths, run, canonicalJson) {
     }
   }
   const runtimeEntries = (await readdir(paths.runtime)).sort();
-  const stagingGuards = runtimeEntries.filter((entry) => /^\.c[0-9a-f]{8}$/u.test(entry));
+  const stagingGuards = runtimeEntries.filter((entry) => PUBLICATION_GUARD_PATTERN.test(entry));
   assert(
     runtimeEntries.includes("instance.lock") &&
       runtimeEntries.includes("runtime.sock") &&
@@ -406,7 +407,7 @@ async function assertPrivateRuntime(paths, run, canonicalJson) {
     typeof owner.service_instance_id === "string",
     "Installed serve lock owner lacked a service identity",
   );
-  return owner;
+  return { owner, publicationGuardName: stagingGuards[0] };
 }
 
 async function assertMissing(candidate, label) {
@@ -508,6 +509,68 @@ async function assertInstalledLauncherEnforcesExecuteMode(executable, cwd) {
   assert(failure?.code === "EACCES", "Installed launcher invocation bypassed its executable mode");
 }
 
+async function assertInstalledControl(paths, run, owner, api) {
+  const control = await requestInstalledStatus(paths.socket, api.canonicalJson);
+  const responseDocument = parseCanonicalDocument(
+    control.response,
+    api.canonicalJson,
+    "Installed control response",
+  );
+  const parsedResponse = api.parseServiceControlResponse(control.response);
+  assert(parsedResponse.ok, "Installed control response failed its packaged schema parser");
+  const response = parsedResponse.value;
+  assert(
+    response.request_id === control.requestId,
+    "Installed control response changed the request id",
+  );
+  assert(
+    response.ok === true && response.error === null,
+    "Installed control response was not successful",
+  );
+  assert(
+    response.status?.pid === run.child.pid,
+    "Installed control response returned the wrong pid",
+  );
+  assert(
+    response.status?.service_instance_id === owner.service_instance_id,
+    "Installed control and lock identities differed",
+  );
+  assert(
+    response.status?.package_version === "0.0.0-development",
+    "Installed control response returned the wrong package version",
+  );
+  assert(
+    response.status?.health === "healthy" && response.status.accepting === true,
+    "Installed control response was not healthy and accepting",
+  );
+  assert(
+    responseDocument.status?.service_instance_id === owner.service_instance_id,
+    "Installed control wire response returned the wrong identity",
+  );
+}
+
+async function stopInstalledServeGracefully(paths, run, signal, canonicalJson) {
+  assert(run.child.kill(signal), `${signal} could not be delivered to installed serve`);
+  const outcome = await waitForExit(run, `${signal} installed serve shutdown`);
+  assert(
+    outcome.code === 0 && outcome.signal === null,
+    `${signal} shutdown was not graceful: ${JSON.stringify(outcome)}; stderr=${JSON.stringify(run.stderr)}`,
+  );
+  assert(run.stderr === "", `${signal} shutdown wrote to stderr`);
+  const result = parseCanonicalDocument(run.stdout, canonicalJson, `${signal} serve result`);
+  assert(
+    result.command === "serve" && result.ok === true && result.exit_code === 0,
+    `${signal} result was not successful`,
+  );
+  await assertMissing(paths.socket, `${signal} socket`);
+  await assertMissing(paths.lock, `${signal} lock`);
+  assert(
+    (await readdir(paths.runtime)).length === 0,
+    `${signal} left unexpected runtime entries behind`,
+  );
+  assertReaped(run.child.pid, signal);
+}
+
 async function assertInstalledSupervisionCycle(options) {
   assertServiceSmokeAllowed("assertInstalledSupervisionCycle");
   const { executable, configPath, paths, signal, checkConflict, api } = options;
@@ -516,7 +579,7 @@ async function assertInstalledSupervisionCycle(options) {
     await waitForReadiness(run);
     assert(run.spawnError === undefined, "Installed serve emitted a spawn error");
     assert(run.child.pid !== undefined, "Installed serve did not expose a pid");
-    const owner = await assertPrivateRuntime(paths, run, api.canonicalJson);
+    const { owner } = await assertPrivateRuntime(paths, run, api.canonicalJson);
 
     if (checkConflict) {
       await assertDuplicateServeFails(executable, configPath, api.canonicalJson);
@@ -526,65 +589,57 @@ async function assertInstalledSupervisionCycle(options) {
       );
     }
 
-    const control = await requestInstalledStatus(paths.socket, api.canonicalJson);
-    const responseDocument = parseCanonicalDocument(
-      control.response,
-      api.canonicalJson,
-      "Installed control response",
-    );
-    const parsedResponse = api.parseServiceControlResponse(control.response);
-    assert(parsedResponse.ok, "Installed control response failed its packaged schema parser");
-    const response = parsedResponse.value;
-    assert(
-      response.request_id === control.requestId,
-      "Installed control response changed the request id",
-    );
-    assert(
-      response.ok === true && response.error === null,
-      "Installed control response was not successful",
-    );
-    assert(
-      response.status?.pid === run.child.pid,
-      "Installed control response returned the wrong pid",
-    );
-    assert(
-      response.status?.service_instance_id === owner.service_instance_id,
-      "Installed control and lock identities differed",
-    );
-    assert(
-      response.status?.package_version === "0.0.0-development",
-      "Installed control response returned the wrong package version",
-    );
-    assert(
-      response.status?.health === "healthy" && response.status.accepting === true,
-      "Installed control response was not healthy and accepting",
-    );
-    assert(
-      responseDocument.status?.service_instance_id === owner.service_instance_id,
-      "Installed control wire response returned the wrong identity",
-    );
-
-    assert(run.child.kill(signal), `${signal} could not be delivered to installed serve`);
-    const outcome = await waitForExit(run, `${signal} installed serve shutdown`);
-    assert(
-      outcome.code === 0 && outcome.signal === null,
-      `${signal} shutdown was not graceful: ${JSON.stringify(outcome)}; stderr=${JSON.stringify(run.stderr)}`,
-    );
-    assert(run.stderr === "", `${signal} shutdown wrote to stderr`);
-    const result = parseCanonicalDocument(run.stdout, api.canonicalJson, `${signal} serve result`);
-    assert(
-      result.command === "serve" && result.ok === true && result.exit_code === 0,
-      `${signal} result was not successful`,
-    );
-    await assertMissing(paths.socket, `${signal} socket`);
-    await assertMissing(paths.lock, `${signal} lock`);
-    assert(
-      (await readdir(paths.runtime)).length === 0,
-      `${signal} left unexpected runtime entries behind`,
-    );
-    assertReaped(run.child.pid, signal);
+    await assertInstalledControl(paths, run, owner, api);
+    await stopInstalledServeGracefully(paths, run, signal, api.canonicalJson);
   } finally {
     await forceReap(run);
+  }
+}
+
+async function assertInstalledCrashRestartCycle(options) {
+  assertServiceSmokeAllowed("assertInstalledCrashRestartCycle");
+  const { executable, configPath, paths, api } = options;
+  const crashed = startInstalledServe(executable, configPath);
+  let restarted;
+  try {
+    await waitForReadiness(crashed);
+    assert(crashed.spawnError === undefined, "Crash-cycle serve emitted a spawn error");
+    assert(crashed.child.pid !== undefined, "Crash-cycle serve did not expose a pid");
+    const first = await assertPrivateRuntime(paths, crashed, api.canonicalJson);
+
+    assert(crashed.child.kill("SIGKILL"), "SIGKILL could not be delivered to installed serve");
+    const crashOutcome = await waitForExit(crashed, "SIGKILL installed serve crash");
+    assert(
+      crashOutcome.code === null && crashOutcome.signal === "SIGKILL",
+      `SIGKILL did not terminate installed serve: ${JSON.stringify(crashOutcome)}`,
+    );
+    assertReaped(crashed.child.pid, "SIGKILL");
+    const crashedEntries = (await readdir(paths.runtime)).sort();
+    assert(
+      crashedEntries.includes(first.publicationGuardName) &&
+        crashedEntries.includes("instance.lock") &&
+        crashedEntries.includes("runtime.sock"),
+      `SIGKILL did not leave the expected recoverable runtime state: ${JSON.stringify(crashedEntries)}`,
+    );
+
+    restarted = startInstalledServe(executable, configPath);
+    await waitForReadiness(restarted);
+    assert(restarted.spawnError === undefined, "Restarted serve emitted a spawn error");
+    assert(restarted.child.pid !== undefined, "Restarted serve did not expose a pid");
+    const second = await assertPrivateRuntime(paths, restarted, api.canonicalJson);
+    assert(
+      second.publicationGuardName !== first.publicationGuardName,
+      "Restart reused the crashed service publication guard",
+    );
+    assert(
+      !(await readdir(paths.runtime)).includes(first.publicationGuardName),
+      "Restart left the crashed publication guard behind",
+    );
+    await assertInstalledControl(paths, restarted, second.owner, api);
+    await stopInstalledServeGracefully(paths, restarted, "SIGTERM", api.canonicalJson);
+  } finally {
+    if (restarted !== undefined) await forceReap(restarted);
+    await forceReap(crashed);
   }
 }
 
@@ -725,6 +780,12 @@ try {
       }),
       { mode: 0o600 },
     );
+    await assertInstalledCrashRestartCycle({
+      executable,
+      configPath: installedConfig,
+      paths: supervisionPaths,
+      api,
+    });
     await assertInstalledSupervisionCycle({
       executable,
       configPath: installedConfig,

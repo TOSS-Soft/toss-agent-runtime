@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, link, lstat, mkdir, rmdir, unlink } from "node:fs/promises";
+import { constants, lstatSync, unlinkSync, type Stats } from "node:fs";
+import { chmod, link, lstat, mkdir, open, readdir, rename, rmdir, unlink } from "node:fs/promises";
 import { createConnection, createServer, type Socket } from "node:net";
 import path from "node:path";
 
@@ -15,6 +16,9 @@ import { RuntimeServiceError, type RuntimeServiceErrorCode } from "./errors.js";
 
 const RESPONSE_FRAME_BYTES = MAX_CONTROL_MESSAGE_BYTES + 1;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+const LEGACY_PUBLICATION_GUARD_PATTERN = /^\.c[0-9a-f]{8}$/u;
+const PUBLICATION_GUARD_PATTERN = /^\.c[0-9a-f]{64}$/u;
+const PUBLICATION_CLAIM_PATTERN = /^\.r[0-9a-f]{64}$/u;
 const internalServiceErrors = new WeakSet<RuntimeServiceError>();
 
 interface FileIdentity {
@@ -52,6 +56,10 @@ export type PathOwnerClassifier = (userId: number, candidate: string) => PathOwn
 
 export interface ServiceControlOperationHooks {
   readonly beforePublish?: () => Promise<void>;
+  /** @internal Test seam for deterministic publication-guard races. */
+  readonly afterPublicationGuardClaim?: (candidatePath: string, claimPath: string) => Promise<void>;
+  /** @internal Test seam for deterministic native-close publication races. */
+  readonly beforePublicationGuardCloseClaim?: (candidatePath: string) => Promise<void>;
   readonly onConnectionCountChanged?: (count: number) => void;
   readonly onConnectionClosed?: () => void;
 }
@@ -196,6 +204,235 @@ async function assertPrivateRuntimeDirectory(
   }
   if (segments.length === 0 || runtimeIdentity === undefined) pathUnsafe();
   return runtimeIdentity;
+}
+
+function isPublicationArtifactName(candidate: string): boolean {
+  return (
+    LEGACY_PUBLICATION_GUARD_PATTERN.test(candidate) ||
+    PUBLICATION_GUARD_PATTERN.test(candidate) ||
+    PUBLICATION_CLAIM_PATTERN.test(candidate)
+  );
+}
+
+function publicationGuardName(serviceInstanceId: string): string {
+  return `.c${createHash("sha256").update(serviceInstanceId, "utf8").digest("hex")}`;
+}
+
+function publicationClaimName(serviceInstanceId: string, candidateName: string): string {
+  return `.r${createHash("sha256")
+    .update(serviceInstanceId, "utf8")
+    .update("\u0000", "utf8")
+    .update(candidateName, "utf8")
+    .digest("hex")}`;
+}
+
+async function requiredMetadata(candidate: string): Promise<Stats> {
+  try {
+    return await lstat(candidate);
+  } catch {
+    return pathUnsafe();
+  }
+}
+
+async function requiredEntries(candidate: string): Promise<readonly string[]> {
+  try {
+    return await readdir(candidate);
+  } catch {
+    return pathUnsafe();
+  }
+}
+
+function assertPrivatePublicationGuard(
+  metadata: Stats,
+  candidate: string,
+  classifier: PathOwnerClassifier | undefined,
+  currentUid: (() => number) | undefined,
+  expectedIdentity?: FileIdentity,
+): FileIdentity {
+  const identity = identityOf(metadata);
+  if (
+    metadata.isSymbolicLink() ||
+    !metadata.isDirectory() ||
+    classifyPathOwner(classifier, currentUid, metadata.uid, candidate) !== "current-user" ||
+    (metadata.mode & 0o777) !== 0o700 ||
+    (expectedIdentity !== undefined && !sameIdentity(identity, expectedIdentity))
+  ) {
+    pathUnsafe();
+  }
+  return identity;
+}
+
+async function inspectEmptyPublicationGuard(options: {
+  readonly candidate: string;
+  readonly classifier?: PathOwnerClassifier | undefined;
+  readonly currentUid?: (() => number) | undefined;
+}): Promise<FileIdentity> {
+  const { candidate, classifier, currentUid } = options;
+  const identity = assertPrivatePublicationGuard(
+    await requiredMetadata(candidate),
+    candidate,
+    classifier,
+    currentUid,
+  );
+  if ((await requiredEntries(candidate)).length !== 0) pathUnsafe();
+  assertPrivatePublicationGuard(
+    await requiredMetadata(candidate),
+    candidate,
+    classifier,
+    currentUid,
+    identity,
+  );
+  return identity;
+}
+
+async function assertUnchangedRuntimeDirectory(options: {
+  readonly socketPath: string;
+  readonly expected: FileIdentity;
+  readonly classifier?: PathOwnerClassifier | undefined;
+  readonly currentUid?: (() => number) | undefined;
+}): Promise<void> {
+  const current = await assertPrivateRuntimeDirectory(
+    options.socketPath,
+    options.classifier,
+    options.currentUid,
+  );
+  if (!sameIdentity(current, options.expected)) pathUnsafe();
+}
+
+async function removeClaimedPublicationGuard(options: {
+  readonly claimPath: string;
+  readonly expectedGuard: FileIdentity;
+  readonly socketPath: string;
+  readonly runtimeIdentity: FileIdentity;
+  readonly classifier?: PathOwnerClassifier | undefined;
+  readonly currentUid?: (() => number) | undefined;
+}): Promise<void> {
+  const { claimPath, classifier, currentUid, expectedGuard, runtimeIdentity, socketPath } = options;
+  let handle;
+  try {
+    handle = await open(
+      claimPath,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+  } catch {
+    pathUnsafe();
+  }
+  try {
+    assertPrivatePublicationGuard(
+      await handle.stat(),
+      claimPath,
+      classifier,
+      currentUid,
+      expectedGuard,
+    );
+    if ((await requiredEntries(claimPath)).length !== 0) pathUnsafe();
+    assertPrivatePublicationGuard(
+      await requiredMetadata(claimPath),
+      claimPath,
+      classifier,
+      currentUid,
+      expectedGuard,
+    );
+    await assertUnchangedRuntimeDirectory({
+      socketPath,
+      expected: runtimeIdentity,
+      classifier,
+      currentUid,
+    });
+    assertPrivatePublicationGuard(
+      await handle.stat(),
+      claimPath,
+      classifier,
+      currentUid,
+      expectedGuard,
+    );
+    assertPrivatePublicationGuard(
+      await requiredMetadata(claimPath),
+      claimPath,
+      classifier,
+      currentUid,
+      expectedGuard,
+    );
+    try {
+      await rmdir(claimPath);
+    } catch {
+      pathUnsafe();
+    }
+  } finally {
+    try {
+      await handle.close();
+    } catch {
+      // The directory operation is already complete or failed closed.
+    }
+  }
+}
+
+async function reclaimStalePublicationGuards(options: {
+  readonly socketPath: string;
+  readonly serviceInstanceId: string;
+  readonly runtimeIdentity: FileIdentity;
+  readonly classifier?: PathOwnerClassifier | undefined;
+  readonly currentUid?: (() => number) | undefined;
+  readonly hooks?: ServiceControlOperationHooks | undefined;
+}): Promise<void> {
+  const { classifier, currentUid, hooks, runtimeIdentity, serviceInstanceId, socketPath } = options;
+  const runtimePath = path.dirname(socketPath);
+  const candidates = (await requiredEntries(runtimePath)).filter(isPublicationArtifactName).sort();
+
+  for (const candidateName of candidates) {
+    const candidatePath = path.join(runtimePath, candidateName);
+    const expectedGuard = await inspectEmptyPublicationGuard({
+      candidate: candidatePath,
+      classifier,
+      currentUid,
+    });
+    await assertUnchangedRuntimeDirectory({
+      socketPath,
+      expected: runtimeIdentity,
+      classifier,
+      currentUid,
+    });
+
+    const claimPath = path.join(
+      runtimePath,
+      publicationClaimName(serviceInstanceId, candidateName),
+    );
+    try {
+      await lstat(claimPath);
+      pathUnsafe();
+    } catch (error) {
+      if (!isMissing(error)) {
+        if (error instanceof RuntimeServiceError && internalServiceErrors.has(error)) throw error;
+        pathUnsafe();
+      }
+    }
+    try {
+      await rename(candidatePath, claimPath);
+    } catch {
+      pathUnsafe();
+    }
+    try {
+      await hooks?.afterPublicationGuardClaim?.(candidatePath, claimPath);
+    } catch {
+      pathUnsafe();
+    }
+    await removeClaimedPublicationGuard({
+      claimPath,
+      expectedGuard,
+      socketPath,
+      runtimeIdentity,
+      classifier,
+      currentUid,
+    });
+  }
+
+  await assertUnchangedRuntimeDirectory({
+    socketPath,
+    expected: runtimeIdentity,
+    classifier,
+    currentUid,
+  });
+  if ((await requiredEntries(runtimePath)).some(isPublicationArtifactName)) pathUnsafe();
 }
 
 async function privateSocketIdentity(
@@ -349,14 +586,23 @@ export function createServiceControlServer(
   const connections = new Set<Socket>();
   const drainWaiters = new Set<() => void>();
   const cache = new Map<string, CacheEntry>();
+  const publicationGuardPath = path.join(
+    path.dirname(options.socketPath),
+    publicationGuardName(options.serviceInstanceId),
+  );
   const stagingSocketPath = path.join(
     path.dirname(options.socketPath),
     `.c${createHash("sha256").update(options.serviceInstanceId, "utf8").digest("hex").slice(0, 8)}`,
   );
   let ownedSocket: FileIdentity | undefined;
-  let stagingGuard: FileIdentity | undefined;
+  let publicationGuard: FileIdentity | undefined;
+  let ownedGuardPath = publicationGuardPath;
+  let ownedRuntime: FileIdentity | undefined;
   let listenPromise: Promise<void> | undefined;
   let acceptClosePromise: Promise<void> | undefined;
+  let resolveAcceptClose: (() => void) | undefined;
+  let closeAttemptRunning = false;
+  let publicSocketUnpublished = false;
   let closePromise: Promise<void> | undefined;
   let listening = false;
   let closing = false;
@@ -508,16 +754,19 @@ export function createServiceControlServer(
     // Listening failures are handled by listen(); later transport failures are contained.
   });
 
-  const stopAccepting = (): void => {
+  function stopAccepting(): void {
     stopRequested = true;
-    if (!listening || acceptClosePromise !== undefined) return;
-    acceptClosePromise = new Promise((resolve) => {
-      nativeServer.close(() => {
-        listening = false;
-        resolve();
-      });
+    if (!listening) return;
+    acceptClosePromise ??= new Promise((resolve) => {
+      resolveAcceptClose = resolve;
     });
-  };
+    try {
+      unpublishOwnedSocket();
+    } catch {
+      return;
+    }
+    void attemptNativeClose();
+  }
 
   const cleanupOwnedSocket = async (): Promise<void> => {
     if (ownedSocket === undefined) return;
@@ -546,11 +795,47 @@ export function createServiceControlServer(
     }
   };
 
-  const cleanupStagingGuard = async (): Promise<void> => {
-    if (stagingGuard === undefined) return;
+  function unpublishOwnedSocket(): void {
+    if (publicSocketUnpublished) return;
+    if (ownedSocket === undefined) pathUnsafe();
+    let metadata: Stats;
+    try {
+      metadata = lstatSync(options.socketPath);
+    } catch (error) {
+      if (isMissing(error)) {
+        publicSocketUnpublished = true;
+        return;
+      }
+      pathUnsafe();
+    }
+    const exactOwnedSocket =
+      !metadata.isSymbolicLink() &&
+      metadata.isSocket() &&
+      classifyPathOwner(
+        options.classifyPathOwner,
+        options.currentUid,
+        metadata.uid,
+        options.socketPath,
+      ) === "current-user" &&
+      (metadata.mode & 0o777) === 0o600 &&
+      sameIdentity(identityOf(metadata), ownedSocket);
+    if (!exactOwnedSocket) {
+      publicSocketUnpublished = true;
+      return;
+    }
+    try {
+      unlinkSync(options.socketPath);
+    } catch {
+      pathUnsafe();
+    }
+    publicSocketUnpublished = true;
+  }
+
+  const cleanupPublicationGuard = async (): Promise<void> => {
+    if (publicationGuard === undefined) return;
     let metadata;
     try {
-      metadata = await lstat(stagingSocketPath);
+      metadata = await lstat(ownedGuardPath);
     } catch {
       return;
     }
@@ -560,17 +845,102 @@ export function createServiceControlServer(
         options.classifyPathOwner,
         options.currentUid,
         metadata.uid,
-        stagingSocketPath,
+        ownedGuardPath,
       ) === "current-user" &&
-      sameIdentity(identityOf(metadata), stagingGuard)
+      (metadata.mode & 0o777) === 0o700 &&
+      sameIdentity(identityOf(metadata), publicationGuard)
     ) {
       try {
-        await rmdir(stagingSocketPath);
+        await rmdir(ownedGuardPath);
       } catch {
         // Cleanup is best effort and never recurses into a changed guard directory.
       }
     }
   };
+
+  async function armPublicationGuardForNativeClose(): Promise<void> {
+    if (publicationGuard === undefined || ownedRuntime === undefined) pathUnsafe();
+    if (ownedGuardPath === stagingSocketPath) {
+      const armed = await inspectEmptyPublicationGuard({
+        candidate: stagingSocketPath,
+        classifier: options.classifyPathOwner,
+        currentUid: options.currentUid,
+      });
+      if (!sameIdentity(armed, publicationGuard)) pathUnsafe();
+      await assertUnchangedRuntimeDirectory({
+        socketPath: options.socketPath,
+        expected: ownedRuntime,
+        classifier: options.classifyPathOwner,
+        currentUid: options.currentUid,
+      });
+      return;
+    }
+
+    const expected = await inspectEmptyPublicationGuard({
+      candidate: publicationGuardPath,
+      classifier: options.classifyPathOwner,
+      currentUid: options.currentUid,
+    });
+    if (!sameIdentity(expected, publicationGuard)) pathUnsafe();
+    await assertUnchangedRuntimeDirectory({
+      socketPath: options.socketPath,
+      expected: ownedRuntime,
+      classifier: options.classifyPathOwner,
+      currentUid: options.currentUid,
+    });
+    try {
+      await options.operationHooks?.beforePublicationGuardCloseClaim?.(stagingSocketPath);
+    } catch {
+      pathUnsafe();
+    }
+    try {
+      await lstat(stagingSocketPath);
+      pathUnsafe();
+    } catch (error) {
+      if (!isMissing(error)) {
+        if (error instanceof RuntimeServiceError && internalServiceErrors.has(error)) throw error;
+        pathUnsafe();
+      }
+    }
+    try {
+      await rename(publicationGuardPath, stagingSocketPath);
+    } catch {
+      pathUnsafe();
+    }
+    ownedGuardPath = stagingSocketPath;
+    const armed = await inspectEmptyPublicationGuard({
+      candidate: stagingSocketPath,
+      classifier: options.classifyPathOwner,
+      currentUid: options.currentUid,
+    });
+    if (!sameIdentity(armed, publicationGuard)) pathUnsafe();
+    await assertUnchangedRuntimeDirectory({
+      socketPath: options.socketPath,
+      expected: ownedRuntime,
+      classifier: options.classifyPathOwner,
+      currentUid: options.currentUid,
+    });
+  }
+
+  async function attemptNativeClose(): Promise<void> {
+    if (!listening || closeAttemptRunning) return;
+    closeAttemptRunning = true;
+    try {
+      await armPublicationGuardForNativeClose();
+    } catch {
+      closeAttemptRunning = false;
+      return;
+    }
+    try {
+      nativeServer.close(() => {
+        listening = false;
+        closeAttemptRunning = false;
+        resolveAcceptClose?.();
+      });
+    } catch {
+      closeAttemptRunning = false;
+    }
+  }
 
   const listen = (): Promise<void> => {
     if (listenPromise !== undefined) return listenPromise;
@@ -581,7 +951,16 @@ export function createServiceControlServer(
         options.classifyPathOwner,
         options.currentUid,
       );
+      ownedRuntime = runtimeIdentity;
       await removeStaleSocket(options.socketPath, options.classifyPathOwner, options.currentUid);
+      await reclaimStalePublicationGuards({
+        socketPath: options.socketPath,
+        serviceInstanceId: options.serviceInstanceId,
+        runtimeIdentity,
+        classifier: options.classifyPathOwner,
+        currentUid: options.currentUid,
+        hooks: options.operationHooks,
+      });
       try {
         await lstat(stagingSocketPath);
         pathUnsafe();
@@ -685,8 +1064,8 @@ export function createServiceControlServer(
           pathUnsafe();
         }
         await unlink(stagingSocketPath);
-        await mkdir(stagingSocketPath, { mode: 0o700 });
-        const createdGuard = await lstat(stagingSocketPath);
+        await mkdir(publicationGuardPath, { mode: 0o700 });
+        const createdGuard = await lstat(publicationGuardPath);
         if (
           createdGuard.isSymbolicLink() ||
           !createdGuard.isDirectory() ||
@@ -694,14 +1073,15 @@ export function createServiceControlServer(
             options.classifyPathOwner,
             options.currentUid,
             createdGuard.uid,
-            stagingSocketPath,
+            publicationGuardPath,
           ) !== "current-user"
         ) {
           pathUnsafe();
         }
-        stagingGuard = identityOf(createdGuard);
-        await chmod(stagingSocketPath, 0o700);
-        const guard = await lstat(stagingSocketPath);
+        publicationGuard = identityOf(createdGuard);
+        ownedGuardPath = publicationGuardPath;
+        await chmod(publicationGuardPath, 0o700);
+        const guard = await lstat(publicationGuardPath);
         if (
           guard.isSymbolicLink() ||
           !guard.isDirectory() ||
@@ -709,10 +1089,10 @@ export function createServiceControlServer(
             options.classifyPathOwner,
             options.currentUid,
             guard.uid,
-            stagingSocketPath,
+            publicationGuardPath,
           ) !== "current-user" ||
           (guard.mode & 0o777) !== 0o700 ||
-          !sameIdentity(identityOf(guard), stagingGuard)
+          !sameIdentity(identityOf(guard), publicationGuard)
         ) {
           pathUnsafe();
         }
@@ -727,7 +1107,7 @@ export function createServiceControlServer(
       } catch (error) {
         await new Promise<void>((resolve) => nativeServer.close(() => resolve()));
         await cleanupOwnedSocket();
-        await cleanupStagingGuard();
+        await cleanupPublicationGuard();
         if (error instanceof RuntimeServiceError && internalServiceErrors.has(error)) throw error;
         pathUnsafe();
       }
@@ -773,7 +1153,7 @@ export function createServiceControlServer(
       }
       await acceptClosePromise;
       await cleanupOwnedSocket();
-      await cleanupStagingGuard();
+      await cleanupPublicationGuard();
     })();
     return closePromise;
   };

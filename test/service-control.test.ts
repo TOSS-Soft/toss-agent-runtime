@@ -9,6 +9,7 @@ import {
   readdir,
   realpath,
   rename,
+  rmdir,
   rm,
   symlink,
   writeFile,
@@ -31,6 +32,8 @@ import {
 const serviceInstanceId = "018f0f64-7b21-7d4f-8c3d-4a30413d5f41";
 const fixedRequestId = "018f0f64-7b21-7d4f-8c3d-4a30413d5f42";
 const otherRequestId = "018f0f64-7b21-7d4f-8c3d-4a30413d5f43";
+const currentPublicationGuard =
+  ".c8fcfb3a77b48dbef2c3eab57379addc10c8368ab3418574a3d8dc1c68536feb9";
 const temporaryDirectories: string[] = [];
 const controlServers: ServiceControlServer[] = [];
 const nativeServers: Server[] = [];
@@ -124,19 +127,27 @@ interface PathSnapshot {
   readonly device: number;
   readonly inode: number;
   readonly mode: number;
-  readonly kind: "file" | "socket" | "symlink";
-  readonly content: string | null;
+  readonly kind: "directory" | "file" | "socket" | "symlink";
+  readonly content: readonly string[] | string | null;
 }
 
 async function snapshotPath(candidate: string): Promise<PathSnapshot> {
   const metadata = await lstat(candidate);
-  const kind = metadata.isFile() ? "file" : metadata.isSocket() ? "socket" : "symlink";
+  const kind = metadata.isDirectory()
+    ? "directory"
+    : metadata.isFile()
+      ? "file"
+      : metadata.isSocket()
+        ? "socket"
+        : "symlink";
   const content =
-    kind === "file"
-      ? await readFile(candidate, "utf8")
-      : kind === "symlink"
-        ? await readlink(candidate)
-        : null;
+    kind === "directory"
+      ? (await readdir(candidate)).sort()
+      : kind === "file"
+        ? await readFile(candidate, "utf8")
+        : kind === "symlink"
+          ? await readlink(candidate)
+          : null;
   return {
     device: metadata.dev,
     inode: metadata.ino,
@@ -321,6 +332,113 @@ describe("private service control socket", () => {
     await sticky.listen();
 
     expect((await lstat(socketPath)).isSocket()).toBe(true);
+  });
+
+  it("reclaims legacy, full-hash, and interrupted-claim guards before publishing one current guard", async () => {
+    const staleGuards = [`.c${"1".repeat(8)}`, `.c${"2".repeat(64)}`, `.r${"3".repeat(64)}`];
+    for (const name of staleGuards) {
+      const candidate = path.join(runtimePath, name);
+      await mkdir(candidate, { mode: 0o700 });
+      await chmod(candidate, 0o700);
+    }
+
+    const server = await listenControl();
+
+    expect((await readdir(runtimePath)).sort()).toEqual([currentPublicationGuard, "runtime.sock"]);
+    await server.close();
+    expect(await readdir(runtimePath)).toEqual([]);
+  });
+
+  it.each(["symlink", "regular file", "wrong mode", "nonempty directory"] as const)(
+    "fails closed without changing an unsafe stale publication guard: %s",
+    async (kind) => {
+      const candidate = path.join(runtimePath, `.c${"4".repeat(64)}`);
+      if (kind === "symlink") {
+        const target = path.join(runtimePath, "guard-target");
+        await writeFile(target, "preserve-target", { mode: 0o600 });
+        await symlink(target, candidate);
+      } else if (kind === "regular file") {
+        await writeFile(candidate, "preserve-file", { mode: 0o600 });
+      } else {
+        await mkdir(candidate, { mode: kind === "wrong mode" ? 0o755 : 0o700 });
+        await chmod(candidate, kind === "wrong mode" ? 0o755 : 0o700);
+        if (kind === "nonempty directory") {
+          await writeFile(path.join(candidate, "preserve-child"), "preserve-child", {
+            mode: 0o600,
+          });
+        }
+      }
+      const before = await snapshotPath(candidate);
+      const server = createServiceControlServer(options());
+      controlServers.push(server);
+
+      await expect(server.listen()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_PATH_UNSAFE",
+      });
+
+      expect(await snapshotPath(candidate)).toEqual(before);
+      expect(await pathIsMissing(socketPath)).toBe(true);
+    },
+  );
+
+  it("deletes only the exact guard inode atomically claimed for reclamation", async () => {
+    const staleGuard = path.join(runtimePath, `.c${"5".repeat(64)}`);
+    await mkdir(staleGuard, { mode: 0o700 });
+    await chmod(staleGuard, 0o700);
+    const original = await snapshotPath(staleGuard);
+    let claimedPath: string | undefined;
+    let replacement: PathSnapshot | undefined;
+    const server = createServiceControlServer(
+      options({
+        operationHooks: {
+          afterPublicationGuardClaim: async (_candidatePath: string, claimPath: string) => {
+            claimedPath = claimPath;
+            await rename(claimPath, staleGuard);
+            await mkdir(claimPath, { mode: 0o700 });
+            await chmod(claimPath, 0o700);
+            replacement = await snapshotPath(claimPath);
+          },
+        },
+      }),
+    );
+    controlServers.push(server);
+
+    await expect(server.listen()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_PATH_UNSAFE",
+    });
+
+    expect(claimedPath).toMatch(new RegExp(`^${runtimePath}/\\.r[0-9a-f]{64}$`, "u"));
+    expect(await snapshotPath(staleGuard)).toEqual(original);
+    expect(await snapshotPath(claimedPath!)).toEqual(replacement);
+    expect(await pathIsMissing(socketPath)).toBe(true);
+  });
+
+  it("reclaims an interrupted recognized guard claim on the next safe startup", async () => {
+    const staleGuard = path.join(runtimePath, `.c${"6".repeat(64)}`);
+    await mkdir(staleGuard, { mode: 0o700 });
+    await chmod(staleGuard, 0o700);
+    let interruptedClaim: string | undefined;
+    const interrupted = createServiceControlServer(
+      options({
+        operationHooks: {
+          afterPublicationGuardClaim: (_candidatePath: string, claimPath: string) => {
+            interruptedClaim = claimPath;
+            return Promise.reject(new Error("simulated reclamation interruption"));
+          },
+        },
+      }),
+    );
+    controlServers.push(interrupted);
+
+    await expect(interrupted.listen()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_PATH_UNSAFE",
+    });
+    expect(path.basename(interruptedClaim!)).toMatch(/^\.r[0-9a-f]{64}$/u);
+    expect((await lstat(interruptedClaim!)).isDirectory()).toBe(true);
+
+    await listenControl();
+
+    expect((await readdir(runtimePath)).sort()).toEqual([currentPublicationGuard, "runtime.sock"]);
   });
 
   it.each([
@@ -674,6 +792,46 @@ describe("private service control socket", () => {
     await closed;
 
     expect(await pathIsMissing(socketPath)).toBe(true);
+    expect(await readdir(runtimePath)).toEqual([]);
+  });
+
+  it("preserves a short bind-path replacement without falsely completing close", async () => {
+    const shortBindPath = path.join(runtimePath, ".c8fcfb3a7");
+    expect(await pathIsMissing(shortBindPath)).toBe(true);
+    let replacement: PathSnapshot | undefined;
+    let injected = false;
+    let signalReplacementReady: (() => void) | undefined;
+    const replacementReady = new Promise<void>((resolve) => {
+      signalReplacementReady = resolve;
+    });
+    const server = await listenControl({
+      operationHooks: {
+        beforePublicationGuardCloseClaim: async (candidatePath: string) => {
+          if (injected) return;
+          injected = true;
+          expect(candidatePath).toBe(shortBindPath);
+          await mkdir(candidatePath, { mode: 0o700 });
+          await chmod(candidatePath, 0o700);
+          replacement = await snapshotPath(candidatePath);
+          signalReplacementReady?.();
+        },
+      },
+    });
+    let closeSettled = false;
+    const closing = server.close().then(() => {
+      closeSettled = true;
+    });
+
+    await replacementReady;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(closeSettled).toBe(false);
+    expect(await snapshotPath(shortBindPath)).toEqual(replacement);
+    expect(await pathIsMissing(socketPath)).toBe(true);
+
+    await rmdir(shortBindPath);
+    server.stopAccepting();
+    await closing;
     expect(await readdir(runtimePath)).toEqual([]);
   });
 
