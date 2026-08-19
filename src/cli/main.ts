@@ -105,6 +105,7 @@ export interface CreateMainServicesOptions {
   readonly cliPath?: string;
   readonly uid?: number;
   readonly randomSuffix?: () => string;
+  readonly loadConfig?: NonNullable<CliServices["loadConfig"]>;
   readonly ensureServiceConfig?: typeof ensureServiceConfig;
   readonly createServiceManager?: (options: CreateServiceManagerOptions) => ServiceManager;
   readonly requestServiceStatus?: typeof requestRuntimeServiceStatus;
@@ -153,6 +154,18 @@ function processLiveness(pid: number): ProcessLiveness {
 }
 
 export function createMainServices(options: CreateMainServicesOptions): CliServices {
+  const loadConfigured = (configPath?: string): Promise<LoadedConfig> => {
+    if (!isSupportedPlatform(options.platform)) {
+      return Promise.reject(new RuntimeServiceError("RUNTIME_SERVICE_UNAVAILABLE"));
+    }
+    return (options.loadConfig ?? loadRuntimeConfig)({
+      ...(configPath === undefined ? {} : { explicitPath: configPath }),
+      env: options.env,
+      platform: options.platform.os,
+      home: options.home,
+    });
+  };
+
   const serviceManager = async (configPath: string): Promise<ServiceManager> => {
     if (!isSupportedPlatform(options.platform)) {
       throw new RuntimeServiceError("RUNTIME_SERVICE_UNAVAILABLE");
@@ -198,17 +211,13 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
       throw new RuntimeServiceError("RUNTIME_SERVICE_UNAVAILABLE");
     }
     const configPath = await installedServiceConfigPath();
-    const loaded = await loadRuntimeConfig({
-      explicitPath: configPath,
-      env: options.env,
-      platform: options.platform.os,
-      home: options.home,
-    });
+    const loaded = await loadConfigured(configPath);
     return loaded.config.paths.socket;
   };
 
   return {
     platform: options.platform,
+    loadConfig: ({ explicitPath }) => loadConfigured(explicitPath),
     manageService: async (action, configPath) => {
       if (!isSupportedPlatform(options.platform)) {
         throw new RuntimeServiceError("RUNTIME_SERVICE_UNAVAILABLE");
@@ -238,12 +247,7 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
       if (!isSupportedPlatform(options.platform)) {
         throw new RuntimeServiceError("RUNTIME_SERVICE_UNAVAILABLE");
       }
-      const loaded = await loadRuntimeConfig({
-        ...(configPath === undefined ? {} : { explicitPath: configPath }),
-        env: options.env,
-        platform: options.platform.os,
-        home: options.home,
-      });
+      const loaded = await loadConfigured(configPath);
       const executableHash = await options.resolveExecutableHash();
       return runSupervisor({
         loaded,
@@ -354,6 +358,13 @@ async function socketStatus(services: CliServices): Promise<SocketStatusSnapshot
   try {
     const socket = await services.requestServiceStatus();
     const identity = await services.probeServiceIdentity();
+    if (identity === null) {
+      return {
+        socket,
+        identityMatches: null,
+        errorCode: "RUNTIME_SERVICE_UNAVAILABLE",
+      };
+    }
     return {
       socket,
       identityMatches: identity === socket.service_instance_id,
@@ -452,6 +463,13 @@ async function service(
 
   try {
     const manager = await services.manageService(command.action, command.configPath);
+    if (!manager.installed && (command.action === "start" || command.action === "restart")) {
+      return serviceFailure(
+        commandName,
+        command.json,
+        new RuntimeServiceError("RUNTIME_SERVICE_UNAVAILABLE"),
+      );
+    }
     const snapshot =
       command.action === "status" && manager.active
         ? await socketStatus(services)
@@ -520,7 +538,7 @@ async function serviceDoctorCheck(
   }
 
   const snapshot = await socketStatus(services);
-  if (snapshot.socket === null) {
+  if (snapshot.errorCode !== null || snapshot.socket === null) {
     return {
       id: "service",
       status: "FAIL",

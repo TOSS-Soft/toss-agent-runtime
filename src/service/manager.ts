@@ -39,6 +39,7 @@ export interface CreateServiceManagerOptions {
   readonly home: string;
   readonly env: RuntimeEnvironment;
   readonly uid: number;
+  readonly currentUid?: () => number;
   readonly nodePath: string;
   readonly cliPath: string;
   readonly configPath: string;
@@ -228,9 +229,18 @@ class NativeServiceManager implements ServiceManager {
 
   constructor(private readonly options: CreateServiceManagerOptions) {
     try {
+      const currentUid =
+        options.currentUid === undefined
+          ? typeof process.getuid === "function"
+            ? process.getuid()
+            : Number.NaN
+          : options.currentUid();
       if (
         !Number.isSafeInteger(options.uid) ||
         options.uid < 0 ||
+        !Number.isSafeInteger(currentUid) ||
+        currentUid < 0 ||
+        options.uid !== currentUid ||
         !path.isAbsolute(options.home) ||
         !path.isAbsolute(options.nodePath) ||
         !path.isAbsolute(options.cliPath) ||

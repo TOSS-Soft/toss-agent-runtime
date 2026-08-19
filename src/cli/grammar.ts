@@ -68,8 +68,7 @@ const SERVICE_ACTIONS = new Set<ServiceAction>([
 
 function serviceAction(value: string): ServiceAction {
   if (SERVICE_ACTIONS.has(value as ServiceAction)) return value as ServiceAction;
-  const safeValue = value.startsWith("--") ? value.split("=", 1)[0]! : value;
-  throw new CliUsageError(`Unknown service action: ${safeValue}`);
+  throw new CliUsageError("Unknown service action");
 }
 
 export function parseCli(argv: readonly string[]): BaselineCommand {

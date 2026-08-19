@@ -103,6 +103,7 @@ async function fixture(
     home,
     env: {},
     uid: 501,
+    currentUid: () => 501,
     nodePath: "/opt/toss/node/bin/node",
     cliPath: "/opt/toss/bin/toss-runtime.js",
     configPath: config,
@@ -130,14 +131,21 @@ function managerFor(
   fixture: ManagerFixture,
   runner: CommandRunner,
   configPath: string,
+  overrides: Readonly<{
+    uid?: number;
+    currentUid?: () => number;
+    cliPath?: string;
+    env?: Readonly<Record<string, string | undefined>>;
+  }> = {},
 ): ServiceManager {
   return createServiceManager({
     platform: fixture.platform,
     home: fixture.home,
-    env: {},
-    uid: 501,
+    env: overrides.env ?? {},
+    uid: overrides.uid ?? 501,
+    currentUid: overrides.currentUid ?? (() => 501),
     nodePath: "/opt/toss/node/bin/node",
-    cliPath: "/opt/toss/bin/toss-runtime.js",
+    cliPath: overrides.cliPath ?? "/opt/toss/bin/toss-runtime.js",
     configPath,
     randomSuffix: () => "alternate-definition",
     runner,
@@ -161,6 +169,108 @@ afterEach(async () => {
 });
 
 describe("native per-user service manager", () => {
+  it.each([
+    ["linux", "different CLI entry", { cliPath: "/opt/other/toss-runtime.js" }],
+    ["darwin", "different CLI entry", { cliPath: "/opt/other/toss-runtime.js" }],
+    ["linux", "different allowlisted environment", { env: { LANG: "C" } }],
+    ["darwin", "different allowlisted environment", { env: { LANG: "C" } }],
+  ] as const)(
+    "rejects %s custom-config recovery with a %s before native mutation",
+    async (platform, _name, overrides) => {
+      const runner = new RecordingRunner();
+      const artifacts = await fixture(platform, runner);
+      const customConfig = path.join(artifacts.home, "custom-config.yaml");
+      await managerFor(artifacts, runner, customConfig).install();
+      const definitionBefore = await readFile(artifacts.definition);
+      runner.calls.splice(0);
+
+      const incompatible = managerFor(artifacts, runner, artifacts.config, overrides);
+      await expect(incompatible.status()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      expect(runner.calls).toEqual([]);
+      expect(await readFile(artifacts.definition)).toEqual(definitionBefore);
+    },
+  );
+
+  it.each([
+    ["mismatched", (): number => 502],
+    ["negative", (): number => -1],
+    [
+      "unavailable",
+      (): number => {
+        throw new Error("uid unavailable");
+      },
+    ],
+  ] as const)(
+    "rejects a %s current UID before definition or native mutation",
+    async (_name, currentUid) => {
+      const runner = new RecordingRunner();
+      const artifacts = await linuxFixture(runner);
+      const customConfig = path.join(artifacts.home, "custom-config.yaml");
+      await managerFor(artifacts, runner, customConfig).install();
+      const definitionBefore = await readFile(artifacts.definition);
+      runner.calls.splice(0);
+
+      expect(() => managerFor(artifacts, runner, artifacts.config, { currentUid })).toThrowError(
+        expect.objectContaining({ code: "RUNTIME_SERVICE_DEFINITION_UNSAFE" }),
+      );
+      expect(runner.calls).toEqual([]);
+      expect(await readFile(artifacts.definition)).toEqual(definitionBefore);
+    },
+  );
+
+  it.each(["linux", "darwin"] as const)(
+    "rejects malformed, control-bearing, and noncanonical %s definition bytes before native mutation",
+    async (platform) => {
+      const cases: Uint8Array[] = [];
+      const runner = new RecordingRunner();
+      const artifacts = await fixture(platform, runner);
+      const customConfig = path.join(
+        artifacts.home,
+        platform === "linux" ? "custom%config.yaml" : "custom&config.yaml",
+      );
+      await managerFor(artifacts, runner, customConfig).install();
+      runner.calls.splice(0);
+      const canonical = await readFile(artifacts.definition);
+      const encodedConfig =
+        platform === "linux"
+          ? customConfig.replaceAll("%", "%%")
+          : customConfig.replaceAll("&", "&amp;");
+      const configBytes = Buffer.from(encodedConfig, "utf8");
+      const configOffset = canonical.indexOf(configBytes);
+      expect(configOffset).toBeGreaterThanOrEqual(0);
+      cases.push(
+        Buffer.concat([
+          canonical.subarray(0, configOffset),
+          Buffer.from([0xff]),
+          canonical.subarray(configOffset + 1),
+        ]),
+      );
+      cases.push(
+        Buffer.from(canonical.toString("utf8").replace(encodedConfig, "/tmp/control\u0001.yaml")),
+      );
+      cases.push(
+        Buffer.from(
+          platform === "linux"
+            ? canonical.toString("utf8").replace("custom%%config.yaml", "custom%config.yaml")
+            : canonical
+                .toString("utf8")
+                .replace("custom&amp;config.yaml", "custom&#38;config.yaml"),
+        ),
+      );
+
+      for (const tampered of cases) {
+        await writeFile(artifacts.definition, tampered, { mode: 0o600 });
+        await chmod(artifacts.definition, 0o600);
+        await expect(artifacts.manager.status()).rejects.toMatchObject({
+          code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+        });
+        expect(runner.calls).toEqual([]);
+      }
+    },
+  );
+
   it.each(["linux", "darwin"] as const)(
     "recognizes a canonical %s definition installed with a custom config for every later action",
     async (platform) => {
