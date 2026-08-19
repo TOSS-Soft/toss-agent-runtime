@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toss.software/schemas/runtime/v1/runtime-config.v1.schema.json",
+  "title": "TOSS Runtime configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "document_type",
+    "mode",
+    "paths",
+    "shutdown_timeout_ms",
+    "logs",
+    "gateway_profile",
+    "provider_profiles",
+    "mcp_profiles",
+    "secret_references"
+  ],
+  "properties": {
+    "schema_version": { "const": "runtime-config.v1" },
+    "document_type": { "const": "runtime-config" },
+    "mode": { "type": "string", "enum": ["development", "production"] },
+    "paths": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "logs", "socket"],
+      "properties": {
+        "state": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "logs": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "socket": { "type": "string", "minLength": 1, "maxLength": 4096 }
+      }
+    },
+    "shutdown_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 300000 },
+    "logs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level", "retention_days", "max_bytes"],
+      "properties": {
+        "level": { "type": "string", "enum": ["debug", "info", "warn", "error"] },
+        "retention_days": { "const": 7 },
+        "max_bytes": { "const": 104857600 }
+      }
+    },
+    "gateway_profile": {
+      "type": ["string", "null"],
+      "pattern": "^[A-Za-z][A-Za-z0-9._:-]{0,127}$"
+    },
+    "provider_profiles": {
+      "type": "array",
+      "uniqueItems": true,
+      "maxItems": 64,
+      "items": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9._:-]{0,127}$" }
+    },
+    "mcp_profiles": {
+      "type": "array",
+      "uniqueItems": true,
+      "maxItems": 64,
+      "items": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9._:-]{0,127}$" }
+    },
+    "secret_references": {
+      "type": "object",
+      "maxProperties": 64,
+      "propertyNames": { "pattern": "^[A-Za-z][A-Za-z0-9._:-]{0,127}$" },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source", "key"],
+        "properties": {
+          "source": { "type": "string", "enum": ["env", "command"] },
+          "key": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,127}$" }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "mode": { "const": "production" } }, "required": ["mode"] },
+      "then": {
+        "properties": {
+          "gateway_profile": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+schema_version: runtime-config.v1
+document_type: runtime-config
+mode: development
+paths:
+  state: /var/tmp/toss-runtime/state
+  logs: /var/tmp/toss-runtime/logs
+  socket: /var/tmp/toss-runtime/runtime.sock
+shutdown_timeout_ms: 30000
+logs:
+  level: info
+  retention_days: 7
+  max_bytes: 104857600
+gateway_profile: null
+provider_profiles: []
+mcp_profiles: []
+secret_references: {}
