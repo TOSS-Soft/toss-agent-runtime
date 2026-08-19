@@ -1,5 +1,6 @@
 import { constants } from "node:fs";
 import {
+  link,
   lstat,
   mkdir,
   open,
@@ -34,7 +35,13 @@ export interface InstanceLockOperationHooks {
   readonly beforeOwnerClaimRename?: (operation: "reclaim" | "release") => Promise<void>;
   readonly afterOwnerClaimRename?: (operation: "reclaim" | "release") => Promise<void>;
   readonly afterOwnerlessSentinelCreate?: () => Promise<void>;
+  readonly afterDocumentStageOpen?: (kind: InstanceLockDocumentKind) => Promise<void>;
+  readonly afterDocumentStagePartialWrite?: (kind: InstanceLockDocumentKind) => Promise<void>;
+  readonly afterDocumentStageSync?: (kind: InstanceLockDocumentKind) => Promise<void>;
+  readonly afterDocumentPublishSync?: (kind: InstanceLockDocumentKind) => Promise<void>;
 }
+
+export type InstanceLockDocumentKind = "owner" | "owner-claim" | "ownerless-claim";
 
 type CurrentUserCheck = (userId: bigint, candidate?: string) => boolean;
 type RootUserCheck = (userId: bigint, candidate?: string) => boolean;
@@ -92,11 +99,26 @@ interface OpenedClaim {
   readonly identity: FileIdentity;
 }
 
+interface StageDescriptor {
+  readonly kind: InstanceLockDocumentKind;
+  readonly name: string;
+  readonly claimant: ServiceLockV1;
+  readonly ownerlessSinceNs?: bigint;
+}
+
+interface OpenedStage {
+  readonly bytes: Uint8Array;
+  readonly identity: FileIdentity;
+}
+
 const OWNER_FILE_NAME = "owner.json";
 const OWNERLESS_STALE_AFTER_NS = 30_000_000_000n;
 const UUID_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const OWNER_CLAIM_PATTERN = new RegExp(`^\\.owner-claim\\.(${UUID_PATTERN})\\.json$`);
 const OWNERLESS_CLAIM_PATTERN = new RegExp(`^\\.ownerless-reclaim\\.(${UUID_PATTERN})\\.json$`);
+const STAGE_PATTERN = new RegExp(
+  `^\\.(owner|owner-claim|ownerless-claim)-stage\\.(${UUID_PATTERN})\\.([1-9][0-9]*)\\.([0-9a-f]{64})\\.([0-9]+)(?:\\.([0-9]+))?\\.json$`,
+);
 const internalServiceErrors = new WeakSet<RuntimeServiceError>();
 
 function ownerClaimName(serviceInstanceId: string): string {
@@ -109,6 +131,26 @@ function displacedOwnerName(serviceInstanceId: string): string {
 
 function ownerlessSentinelName(serviceInstanceId: string): string {
   return `.ownerless-reclaim.${serviceInstanceId}.json`;
+}
+
+function stagePrefix(kind: InstanceLockDocumentKind): string {
+  return `.${kind}-stage.`;
+}
+
+function stageName(
+  kind: InstanceLockDocumentKind,
+  claimant: ServiceLockV1,
+  ownerlessSinceNs?: bigint,
+): string {
+  const createdAtNs = ownerTimestampNs(claimant);
+  if (createdAtNs % 1_000_000n !== 0n) lockAmbiguous();
+  const base = `${stagePrefix(kind)}${claimant.service_instance_id}.${claimant.pid}.${claimant.executable_hash}.${createdAtNs / 1_000_000n}`;
+  if (kind === "ownerless-claim") {
+    if (ownerlessSinceNs === undefined || ownerlessSinceNs < 0n) lockAmbiguous();
+    return `${base}.${ownerlessSinceNs}.json`;
+  }
+  if (ownerlessSinceNs !== undefined) lockAmbiguous();
+  return `${base}.json`;
 }
 
 function servicePathUnsafe(): never {
@@ -191,6 +233,76 @@ function createOwnerDocument(
   } catch {
     lockAmbiguous();
   }
+}
+
+function parseStageDescriptor(name: string): StageDescriptor | undefined {
+  const match = STAGE_PATTERN.exec(name);
+  if (match === null) return undefined;
+  const [, kindValue, serviceInstanceId, pidValue, executableHash, createdAtMsValue, sinceValue] =
+    match;
+  if (
+    (kindValue !== "owner" && kindValue !== "owner-claim" && kindValue !== "ownerless-claim") ||
+    serviceInstanceId === undefined ||
+    pidValue === undefined ||
+    executableHash === undefined ||
+    createdAtMsValue === undefined
+  ) {
+    lockAmbiguous();
+  }
+  let createdAtMs: bigint;
+  let pid: number;
+  try {
+    createdAtMs = BigInt(createdAtMsValue);
+    const numericPid = Number(pidValue);
+    const numericCreatedAt = Number(createdAtMs);
+    if (
+      !Number.isSafeInteger(numericPid) ||
+      String(numericPid) !== pidValue ||
+      !Number.isSafeInteger(numericCreatedAt) ||
+      String(numericCreatedAt) !== createdAtMsValue
+    ) {
+      lockAmbiguous();
+    }
+    pid = numericPid;
+  } catch {
+    lockAmbiguous();
+  }
+  let createdAt: string;
+  try {
+    createdAt = new Date(Number(createdAtMs)).toISOString();
+  } catch {
+    lockAmbiguous();
+  }
+  const candidate = {
+    schema_version: "service-lock.v1",
+    document_type: "service-lock",
+    service_instance_id: serviceInstanceId,
+    pid,
+    executable_hash: executableHash,
+    created_at: createdAt,
+  } as const;
+  const parsed = parseServiceLock(Buffer.from(canonicalJson(candidate), "utf8"));
+  if (!parsed.ok) lockAmbiguous();
+  let ownerlessSinceNs: bigint | undefined;
+  if (kindValue === "ownerless-claim") {
+    if (sinceValue === undefined) lockAmbiguous();
+    try {
+      ownerlessSinceNs = BigInt(sinceValue);
+    } catch {
+      lockAmbiguous();
+    }
+    if (ownerlessSinceNs < 0n || ownerlessSinceNs.toString() !== sinceValue) lockAmbiguous();
+  } else if (sinceValue !== undefined) {
+    lockAmbiguous();
+  }
+  const descriptor: StageDescriptor = {
+    kind: kindValue,
+    name,
+    claimant: parsed.value,
+    ...(ownerlessSinceNs === undefined ? {} : { ownerlessSinceNs }),
+  };
+  if (stageName(kindValue, parsed.value, ownerlessSinceNs) !== name) lockAmbiguous();
+  return descriptor;
 }
 
 function assertAbsolutePath(candidate: string): void {
@@ -553,42 +665,144 @@ function sameClaim(actual: OpenedClaim, expected: OpenedClaim): boolean {
   );
 }
 
-async function writePrivateClaim(
-  claimPath: string,
-  claim: LockClaimV1,
-  isCurrentUser: CurrentUserCheck,
-): Promise<OpenedClaim> {
-  const bytes = Buffer.from(canonicalJson(claim), "utf8");
-  const validated = parseCanonicalClaim(bytes);
-  if (bytes.byteLength > MAX_CONTROL_MESSAGE_BYTES) lockAmbiguous();
+async function writeAll(
+  handle: FileHandle,
+  bytes: Uint8Array,
+  offset: number,
+  length: number,
+): Promise<void> {
+  let written = 0;
+  while (written < length) {
+    const result = await handle.write(bytes, offset + written, length - written, offset + written);
+    if (result.bytesWritten <= 0) lockAmbiguous();
+    written += result.bytesWritten;
+  }
+}
+
+function sameStage(actual: OpenedStage, expected: OpenedStage): boolean {
+  return (
+    fileIdentityMatches(actual.identity, expected.identity) &&
+    Buffer.from(actual.bytes).equals(Buffer.from(expected.bytes))
+  );
+}
+
+async function publishCanonicalDocument(options: {
+  readonly kind: InstanceLockDocumentKind;
+  readonly finalPath: string;
+  readonly bytes: Uint8Array;
+  readonly claimant: ServiceLockV1;
+  readonly ownerlessSinceNs?: bigint;
+  readonly lockPath: string;
+  readonly directory: OpenedDirectory;
+  readonly expectedEntries: readonly string[];
+  readonly isCurrentUser: CurrentUserCheck;
+  readonly runtimeIdentity: FileIdentity;
+  readonly hooks?: InstanceLockOperationHooks;
+}): Promise<FileIdentity> {
+  const {
+    bytes,
+    claimant,
+    directory,
+    expectedEntries,
+    finalPath,
+    hooks,
+    isCurrentUser,
+    kind,
+    lockPath,
+    ownerlessSinceNs,
+    runtimeIdentity,
+  } = options;
+  if (bytes.byteLength === 0 || bytes.byteLength > MAX_CONTROL_MESSAGE_BYTES) lockAmbiguous();
+  const stageFileName = stageName(kind, claimant, ownerlessSinceNs);
+  const stagePath = path.join(lockPath, stageFileName);
+  let afterStageOpen: ((kind: InstanceLockDocumentKind) => Promise<void>) | undefined;
+  let afterStagePartialWrite: ((kind: InstanceLockDocumentKind) => Promise<void>) | undefined;
+  let afterStageSync: ((kind: InstanceLockDocumentKind) => Promise<void>) | undefined;
+  let afterPublishSync: ((kind: InstanceLockDocumentKind) => Promise<void>) | undefined;
+  try {
+    afterStageOpen = hooks?.afterDocumentStageOpen;
+    afterStagePartialWrite = hooks?.afterDocumentStagePartialWrite;
+    afterStageSync = hooks?.afterDocumentStageSync;
+    afterPublishSync = hooks?.afterDocumentPublishSync;
+  } catch {
+    lockAmbiguous();
+  }
+  await exactEntries(lockPath, expectedEntries);
+  await assertRemovalContext({ lockPath, directory, isCurrentUser, runtimeIdentity });
+
   let handle: FileHandle;
   try {
     handle = await open(
-      claimPath,
+      stagePath,
       constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
       0o600,
     );
   } catch {
     lockAmbiguous();
   }
-  let identity: FileIdentity;
+  let staged: OpenedStage;
   try {
     const metadata = await handle.stat({ bigint: true });
-    identity = identityOf(metadata);
+    const identity = identityOf(metadata);
     if (
       !metadata.isFile() ||
-      !ownershipCheck(isCurrentUser, metadata.uid, claimPath) ||
+      !ownershipCheck(isCurrentUser, metadata.uid, stagePath) ||
       (metadata.mode & 0o777n) !== 0o600n
     ) {
       servicePathUnsafe();
     }
-    await handle.writeFile(bytes);
+    await runOperationHook(afterStageOpen === undefined ? undefined : () => afterStageOpen(kind));
+    const partialLength = Math.max(1, Math.floor(bytes.byteLength / 2));
+    await writeAll(handle, bytes, 0, partialLength);
     await handle.sync();
+    await runOperationHook(
+      afterStagePartialWrite === undefined ? undefined : () => afterStagePartialWrite(kind),
+    );
+    await writeAll(handle, bytes, partialLength, bytes.byteLength - partialLength);
+    await handle.sync();
+    staged = { bytes, identity };
+    await runOperationHook(afterStageSync === undefined ? undefined : () => afterStageSync(kind));
   } finally {
     await handle.close();
   }
-  await assertCurrentIdentity(claimPath, identity, "file", 0o600, isCurrentUser, true);
-  return { claim: validated, identity };
+
+  const currentStage = await readPrivateBytes(stagePath, isCurrentUser);
+  if (currentStage === undefined || !sameStage(currentStage, staged)) lockAmbiguous();
+  await assertRemovalContext({ lockPath, directory, isCurrentUser, runtimeIdentity });
+  await exactEntries(lockPath, [...expectedEntries, stageFileName]);
+  try {
+    await link(stagePath, finalPath);
+    await directory.handle.sync();
+  } catch {
+    lockAmbiguous();
+  }
+  await runOperationHook(afterPublishSync === undefined ? undefined : () => afterPublishSync(kind));
+
+  const [publishedStage, publishedFinal] = await Promise.all([
+    readPrivateBytes(stagePath, isCurrentUser),
+    readPrivateBytes(finalPath, isCurrentUser),
+  ]);
+  if (
+    publishedStage === undefined ||
+    publishedFinal === undefined ||
+    !sameStage(publishedStage, staged) ||
+    !sameStage(publishedFinal, staged)
+  ) {
+    lockAmbiguous();
+  }
+  await assertRemovalContext({ lockPath, directory, isCurrentUser, runtimeIdentity });
+  await exactEntries(lockPath, [...expectedEntries, stageFileName, path.basename(finalPath)]);
+  try {
+    await unlink(stagePath);
+    await directory.handle.sync();
+  } catch {
+    lockAmbiguous();
+  }
+  const final = await readPrivateBytes(finalPath, isCurrentUser);
+  if (final === undefined || !sameStage(final, staged)) lockAmbiguous();
+  await assertRemovalContext({ lockPath, directory, isCurrentUser, runtimeIdentity });
+  await exactEntries(lockPath, [...expectedEntries, path.basename(finalPath)]);
+  return staged.identity;
 }
 
 function ownerClaimDocument(claimant: ServiceLockV1, originalOwner: ServiceLockV1): LockClaimV1 {
@@ -644,19 +858,27 @@ async function claimOwnerForRemoval(options: {
   const displacedName = displacedOwnerName(claimant.service_instance_id);
   const claimPath = path.join(lockPath, claimName);
   const displacedPath = path.join(lockPath, displacedName);
+  const claimantCreatedAt = ownerTimestampNs(claimant);
+  if (ownerTimestampNs(owner.owner) > claimantCreatedAt) lockAmbiguous();
+  const claimDocument = ownerClaimDocument(claimant, owner.owner);
+  const claimBytes = Buffer.from(canonicalJson(claimDocument), "utf8");
+  const validatedClaim = parseCanonicalClaim(claimBytes);
 
   await exactEntries(lockPath, [OWNER_FILE_NAME]);
   await assertRemovalContext({ lockPath, directory, isCurrentUser, runtimeIdentity });
-  const claim = await writePrivateClaim(
-    claimPath,
-    ownerClaimDocument(claimant, owner.owner),
+  const claimIdentity = await publishCanonicalDocument({
+    kind: "owner-claim",
+    finalPath: claimPath,
+    bytes: claimBytes,
+    claimant,
+    lockPath,
+    directory,
+    expectedEntries: [OWNER_FILE_NAME],
     isCurrentUser,
-  );
-  try {
-    await directory.handle.sync();
-  } catch {
-    lockAmbiguous();
-  }
+    runtimeIdentity,
+    ...(hooks === undefined ? {} : { hooks }),
+  });
+  const claim: OpenedClaim = { claim: validatedClaim, identity: claimIdentity };
   await exactEntries(lockPath, [OWNER_FILE_NAME, claimName]);
   const currentOwner = await readPrivateOwner(ownerPath, isCurrentUser);
   if (currentOwner === undefined) lockAmbiguous();
@@ -786,6 +1008,8 @@ async function reclaimOwnerlessLock(options: {
   const { acquire, claimant, directory, hooks, isCurrentUser, nowNs, runtimeIdentity } = options;
   await exactEntries(acquire.lockPath, []);
   assertOwnerlessStale(directory.modifiedAtNs, nowNs);
+  const claimantCreatedAt = ownerTimestampNs(claimant);
+  if (directory.modifiedAtNs > claimantCreatedAt) lockAmbiguous();
   await assertRemovalContext({
     lockPath: acquire.lockPath,
     directory,
@@ -797,16 +1021,23 @@ async function reclaimOwnerlessLock(options: {
     acquire.lockPath,
     ownerlessSentinelName(claimant.service_instance_id),
   );
-  const sentinel = await writePrivateClaim(
-    sentinelPath,
-    ownerlessClaimDocument(claimant, directory.modifiedAtNs),
+  const sentinelDocument = ownerlessClaimDocument(claimant, directory.modifiedAtNs);
+  const sentinelBytes = Buffer.from(canonicalJson(sentinelDocument), "utf8");
+  const validatedSentinel = parseCanonicalClaim(sentinelBytes);
+  const sentinelIdentity = await publishCanonicalDocument({
+    kind: "ownerless-claim",
+    finalPath: sentinelPath,
+    bytes: sentinelBytes,
+    claimant,
+    ownerlessSinceNs: directory.modifiedAtNs,
+    lockPath: acquire.lockPath,
+    directory,
+    expectedEntries: [],
     isCurrentUser,
-  );
-  try {
-    await directory.handle.sync();
-  } catch {
-    lockAmbiguous();
-  }
+    runtimeIdentity,
+    ...(hooks === undefined ? {} : { hooks }),
+  });
+  const sentinel: OpenedClaim = { claim: validatedSentinel, identity: sentinelIdentity };
   await runOperationHook(hooks?.afterOwnerlessSentinelCreate);
   assertOwnerlessStale(directory.modifiedAtNs, nowNs);
   await assertRemovalContext({
@@ -864,6 +1095,156 @@ type ClaimState =
       readonly ownerPresent: boolean;
     }
   | { readonly kind: "ownerless"; readonly claimName: string };
+
+interface StageState {
+  readonly descriptor: StageDescriptor;
+  readonly finalName?: string;
+}
+
+function looksLikeStage(name: string): boolean {
+  return (
+    name.startsWith(stagePrefix("owner")) ||
+    name.startsWith(stagePrefix("owner-claim")) ||
+    name.startsWith(stagePrefix("ownerless-claim"))
+  );
+}
+
+function classifyStageState(entries: readonly string[]): StageState | undefined {
+  const stageEntries = entries.filter(looksLikeStage);
+  if (stageEntries.length === 0) return undefined;
+  if (stageEntries.length !== 1) lockAmbiguous();
+  const descriptor = parseStageDescriptor(stageEntries[0]!);
+  if (descriptor === undefined) lockAmbiguous();
+  let expected: string[];
+  let finalName: string | undefined;
+  if (descriptor.kind === "owner") {
+    finalName = entries.includes(OWNER_FILE_NAME) ? OWNER_FILE_NAME : undefined;
+    expected = [descriptor.name, ...(finalName === undefined ? [] : [finalName])];
+  } else if (descriptor.kind === "owner-claim") {
+    const claimName = ownerClaimName(descriptor.claimant.service_instance_id);
+    finalName = entries.includes(claimName) ? claimName : undefined;
+    expected = [OWNER_FILE_NAME, descriptor.name, ...(finalName === undefined ? [] : [finalName])];
+  } else {
+    const claimName = ownerlessSentinelName(descriptor.claimant.service_instance_id);
+    finalName = entries.includes(claimName) ? claimName : undefined;
+    expected = [descriptor.name, ...(finalName === undefined ? [] : [finalName])];
+  }
+  const sortedExpected = expected.sort();
+  if (
+    entries.length !== sortedExpected.length ||
+    entries.some((entry, index) => entry !== sortedExpected[index])
+  ) {
+    lockAmbiguous();
+  }
+  return { descriptor, ...(finalName === undefined ? {} : { finalName }) };
+}
+
+function isExactPrefix(actual: Uint8Array, expected: Uint8Array): boolean {
+  return (
+    actual.byteLength <= expected.byteLength &&
+    Buffer.from(actual).equals(Buffer.from(expected).subarray(0, actual.byteLength))
+  );
+}
+
+async function recoverDocumentStage(options: {
+  readonly acquire: AcquireInstanceLockOptions;
+  readonly directory: OpenedDirectory;
+  readonly state: StageState;
+  readonly nowNs: bigint;
+  readonly isCurrentUser: CurrentUserCheck;
+  readonly runtimeIdentity: FileIdentity;
+}): Promise<"retry" | "reclaimed"> {
+  const { acquire, directory, isCurrentUser, nowNs, runtimeIdentity, state } = options;
+  const { descriptor, finalName } = state;
+  const stagePath = path.join(acquire.lockPath, descriptor.name);
+  const stage = await readPrivateBytes(stagePath, isCurrentUser);
+  if (stage === undefined) lockAmbiguous();
+  const claimantCreatedAt = ownerTimestampNs(descriptor.claimant);
+  if (claimantCreatedAt > nowNs) lockAmbiguous();
+
+  let expectedBytes: Uint8Array;
+  let original: OpenedOwner | undefined;
+  if (descriptor.kind === "owner") {
+    expectedBytes = Buffer.from(canonicalJson(descriptor.claimant), "utf8");
+  } else if (descriptor.kind === "owner-claim") {
+    original = await readPrivateOwner(path.join(acquire.lockPath, OWNER_FILE_NAME), isCurrentUser);
+    if (original === undefined || ownerTimestampNs(original.owner) > claimantCreatedAt) {
+      lockAmbiguous();
+    }
+    expectedBytes = Buffer.from(
+      canonicalJson(ownerClaimDocument(descriptor.claimant, original.owner)),
+      "utf8",
+    );
+    parseCanonicalClaim(expectedBytes);
+  } else {
+    if (descriptor.ownerlessSinceNs === undefined) lockAmbiguous();
+    assertOwnerlessStale(descriptor.ownerlessSinceNs, nowNs);
+    if (descriptor.ownerlessSinceNs > claimantCreatedAt) lockAmbiguous();
+    expectedBytes = Buffer.from(
+      canonicalJson(ownerlessClaimDocument(descriptor.claimant, descriptor.ownerlessSinceNs)),
+      "utf8",
+    );
+    parseCanonicalClaim(expectedBytes);
+  }
+  if (!isExactPrefix(stage.bytes, expectedBytes)) lockAmbiguous();
+
+  let published: OpenedStage | undefined;
+  if (finalName !== undefined) {
+    published = await readPrivateBytes(path.join(acquire.lockPath, finalName), isCurrentUser);
+    if (
+      published === undefined ||
+      !fileIdentityMatches(published.identity, stage.identity) ||
+      !Buffer.from(published.bytes).equals(Buffer.from(expectedBytes))
+    ) {
+      lockAmbiguous();
+    }
+  }
+  assertDeadClaimProcess(acquire, descriptor.claimant);
+  if ((await identifySocket(() => acquire.socketProbe, acquire.socketPath)) !== null) {
+    lockAmbiguous();
+  }
+
+  const currentStage = await readPrivateBytes(stagePath, isCurrentUser);
+  if (currentStage === undefined || !sameStage(currentStage, stage)) lockAmbiguous();
+  if (original !== undefined) {
+    const currentOriginal = await readPrivateOwner(
+      path.join(acquire.lockPath, OWNER_FILE_NAME),
+      isCurrentUser,
+    );
+    if (currentOriginal === undefined || !sameOwner(currentOriginal, original)) lockAmbiguous();
+  }
+  if (finalName !== undefined && published !== undefined) {
+    const currentPublished = await readPrivateBytes(
+      path.join(acquire.lockPath, finalName),
+      isCurrentUser,
+    );
+    if (currentPublished === undefined || !sameStage(currentPublished, published)) lockAmbiguous();
+  }
+  await assertRemovalContext({
+    lockPath: acquire.lockPath,
+    directory,
+    isCurrentUser,
+    runtimeIdentity,
+  });
+  const expectedEntries = [descriptor.name];
+  if (descriptor.kind === "owner-claim") expectedEntries.push(OWNER_FILE_NAME);
+  if (finalName !== undefined) expectedEntries.push(finalName);
+  await exactEntries(acquire.lockPath, expectedEntries);
+  try {
+    await unlink(stagePath);
+    await directory.handle.sync();
+  } catch {
+    lockAmbiguous();
+  }
+
+  if (finalName !== undefined || descriptor.kind === "owner-claim") return "retry";
+  try {
+    await rmdir(acquire.lockPath);
+  } catch {
+    lockAmbiguous();
+  }
+  return "reclaimed";
+}
 
 function classifyClaimState(entries: readonly string[]): ClaimState | "owner" | "ownerless" {
   if (entries.length === 0) return "ownerless";
@@ -1045,12 +1426,25 @@ async function inspectAndReclaim(options: {
   const directory = await openPrivateDirectory(acquire.lockPath, isCurrentUser);
   if (directory === undefined) lockAmbiguous();
   try {
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
       let entries: string[];
       try {
         entries = (await readdir(acquire.lockPath)).sort();
       } catch {
         lockAmbiguous();
+      }
+      const stageState = classifyStageState(entries);
+      if (stageState !== undefined) {
+        const recovery = await recoverDocumentStage({
+          acquire,
+          directory,
+          state: stageState,
+          nowNs,
+          isCurrentUser,
+          runtimeIdentity,
+        });
+        if (recovery === "reclaimed") return;
+        continue;
       }
       const state = classifyClaimState(entries);
       if (state === "ownerless") {
@@ -1130,8 +1524,9 @@ async function createClaim(options: {
   readonly ownerPath: string;
   readonly isCurrentUser: CurrentUserCheck;
   readonly runtimeIdentity: FileIdentity;
+  readonly hooks?: InstanceLockOperationHooks;
 }): Promise<AcquiredIdentity | "existing"> {
-  const { acquire, isCurrentUser, ownerBytes, ownerPath, runtimeIdentity } = options;
+  const { acquire, hooks, isCurrentUser, ownerBytes, ownerPath, runtimeIdentity } = options;
   try {
     await mkdir(acquire.lockPath, { mode: 0o700 });
   } catch (error) {
@@ -1140,7 +1535,6 @@ async function createClaim(options: {
   }
 
   let directory: OpenedDirectory | undefined;
-  let ownerIdentity: FileIdentity | undefined;
   try {
     await assertCurrentIdentity(
       path.dirname(acquire.lockPath),
@@ -1151,30 +1545,19 @@ async function createClaim(options: {
     );
     directory = await openPrivateDirectory(acquire.lockPath, isCurrentUser);
     if (directory === undefined) servicePathUnsafe();
-    const ownerHandle = await open(
-      ownerPath,
-      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
-      0o600,
-    );
-    try {
-      const metadata = await ownerHandle.stat({ bigint: true });
-      ownerIdentity = identityOf(metadata);
-      if (
-        !metadata.isFile() ||
-        !ownershipCheck(isCurrentUser, metadata.uid, ownerPath) ||
-        (metadata.mode & 0o777n) !== 0o600n
-      ) {
-        servicePathUnsafe();
-      }
-      await ownerHandle.writeFile(ownerBytes);
-      await ownerHandle.sync();
-    } finally {
-      await ownerHandle.close();
-    }
-    if (ownerIdentity === undefined) servicePathUnsafe();
-    await assertCurrentIdentity(ownerPath, ownerIdentity, "file", 0o600, isCurrentUser);
-    await exactEntries(acquire.lockPath, [OWNER_FILE_NAME]);
-    await directory.handle.sync();
+    const owner = parseCanonicalOwner(ownerBytes);
+    const ownerIdentity = await publishCanonicalDocument({
+      kind: "owner",
+      finalPath: ownerPath,
+      bytes: ownerBytes,
+      claimant: owner,
+      lockPath: acquire.lockPath,
+      directory,
+      expectedEntries: [],
+      isCurrentUser,
+      runtimeIdentity,
+      ...(hooks === undefined ? {} : { hooks }),
+    });
     const runtimeHandle = await open(
       path.dirname(acquire.lockPath),
       constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
@@ -1275,6 +1658,7 @@ async function acquireInstanceLockInternal(
     ownerPath,
     isCurrentUser,
     runtimeIdentity,
+    ...(operationHooks === undefined ? {} : { hooks: operationHooks }),
   });
   if (acquiredIdentity === "existing") {
     await inspectAndReclaim({
@@ -1292,6 +1676,7 @@ async function acquireInstanceLockInternal(
       ownerPath,
       isCurrentUser,
       runtimeIdentity,
+      ...(operationHooks === undefined ? {} : { hooks: operationHooks }),
     });
     if (acquiredIdentity === "existing") lockAmbiguous();
   }

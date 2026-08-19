@@ -60,12 +60,20 @@ interface TestOperationHooks {
   readonly beforeOwnerClaimRename?: (operation: "reclaim" | "release") => Promise<void>;
   readonly afterOwnerClaimRename?: (operation: "reclaim" | "release") => Promise<void>;
   readonly afterOwnerlessSentinelCreate?: () => Promise<void>;
+  readonly afterDocumentStageOpen?: (kind: TestDocumentKind) => Promise<void>;
+  readonly afterDocumentStagePartialWrite?: (kind: TestDocumentKind) => Promise<void>;
+  readonly afterDocumentStageSync?: (kind: TestDocumentKind) => Promise<void>;
+  readonly afterDocumentPublishSync?: (kind: TestDocumentKind) => Promise<void>;
 }
+
+type TestDocumentKind = "owner" | "owner-claim" | "ownerless-claim";
 
 let fixture: Fixture;
 
 function serviceOwner(
-  overrides: Partial<Pick<ServiceLockV1, "pid" | "service_instance_id" | "executable_hash">> = {},
+  overrides: Partial<
+    Pick<ServiceLockV1, "pid" | "service_instance_id" | "executable_hash" | "created_at">
+  > = {},
 ): ServiceLockV1 {
   return {
     schema_version: "service-lock.v1",
@@ -73,7 +81,7 @@ function serviceOwner(
     service_instance_id: overrides.service_instance_id ?? oldId,
     pid: overrides.pid ?? 4100,
     executable_hash: overrides.executable_hash ?? executableHash,
-    created_at: "2026-08-19T11:00:00.000Z",
+    created_at: overrides.created_at ?? "2026-08-19T11:00:00.000Z",
   };
 }
 
@@ -124,6 +132,32 @@ async function writePrivate(candidate: string, bytes: string): Promise<void> {
 async function reacquireAfterMovingCurrentLock(instanceId: string): Promise<void> {
   await rename(fixture.lockPath, `${fixture.lockPath}.displaced`);
   await acquireInstanceLock(options({ instanceId }));
+}
+
+function stagePrefix(kind: TestDocumentKind): string {
+  if (kind === "owner") return ".owner-stage.";
+  if (kind === "owner-claim") return ".owner-claim-stage.";
+  return ".ownerless-claim-stage.";
+}
+
+async function preparePublication(kind: TestDocumentKind): Promise<void> {
+  if (kind === "owner-claim") {
+    await writeOwner();
+    return;
+  }
+  if (kind === "ownerless-claim") {
+    await mkdir(fixture.lockPath, { mode: 0o700 });
+    await chmod(fixture.lockPath, 0o700);
+    const stale = new Date(now.getTime() - 30_001);
+    await utimes(fixture.lockPath, stale, stale);
+  }
+}
+
+async function findStage(kind: TestDocumentKind): Promise<string> {
+  const entries = await readdir(fixture.lockPath);
+  const stages = entries.filter((entry) => entry.startsWith(stagePrefix(kind)));
+  expect(stages).toHaveLength(1);
+  return stages[0]!;
 }
 
 async function missing(candidate: string): Promise<boolean> {
@@ -214,6 +248,238 @@ describe("runtime supervisor instance lock", () => {
 
     await lock.release();
     expect(await missing(fixture.lockPath)).toBe(true);
+  });
+
+  it.each([
+    ["owner", "open"],
+    ["owner", "partial"],
+    ["owner-claim", "open"],
+    ["owner-claim", "partial"],
+    ["ownerless-claim", "open"],
+    ["ownerless-claim", "partial"],
+  ] as const)(
+    "recovers a dead interrupted %s document after its stage %s boundary",
+    async (kind, boundary) => {
+      await preparePublication(kind);
+      const crash = (actual: TestDocumentKind): Promise<void> =>
+        actual === kind
+          ? Promise.reject(new Error(`simulated-${kind}-${boundary}-crash`))
+          : Promise.resolve();
+
+      await expect(
+        acquireInstanceLock(
+          options({
+            operationHooks:
+              boundary === "open"
+                ? { afterDocumentStageOpen: crash }
+                : { afterDocumentStagePartialWrite: crash },
+          }),
+        ),
+      ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+
+      const stage = await findStage(kind);
+      const stageBytes = await readFile(path.join(fixture.lockPath, stage));
+      if (boundary === "open") expect(stageBytes.byteLength).toBe(0);
+      else expect(stageBytes.byteLength).toBeGreaterThan(0);
+
+      const recovered = await acquireInstanceLock(
+        options({ instanceId: otherId, livenessForPid: () => "dead" }),
+      );
+      expect(recovered.owner.service_instance_id).toBe(otherId);
+      expect(await readFile(fixture.ownerPath, "utf8")).toBe(canonicalJson(recovered.owner));
+      await recovered.release();
+    },
+  );
+
+  it.each(["alive", "unknown"] as const)(
+    "preserves an interrupted initial-owner stage whose claimant is %s",
+    async (liveness) => {
+      await expect(
+        acquireInstanceLock(
+          options({
+            operationHooks: {
+              afterDocumentStageOpen: () => Promise.reject(new Error("simulated-owner-crash")),
+            },
+          }),
+        ),
+      ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+      const stage = await findStage("owner");
+
+      await expect(
+        acquireInstanceLock(options({ instanceId: otherId, livenessForPid: () => liveness })),
+      ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+      expect(await readdir(fixture.lockPath)).toEqual([stage]);
+    },
+  );
+
+  it("preserves an interrupted stage when a listener identity conflicts", async () => {
+    await expect(
+      acquireInstanceLock(
+        options({
+          operationHooks: {
+            afterDocumentStageOpen: () => Promise.reject(new Error("simulated-owner-crash")),
+          },
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+    const stage = await findStage("owner");
+
+    await expect(
+      acquireInstanceLock(
+        options({
+          instanceId: otherId,
+          livenessForPid: () => "dead",
+          identifySocket: () => Promise.resolve(oldId),
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+    expect(await readdir(fixture.lockPath)).toEqual([stage]);
+  });
+
+  it("fails closed for malformed interrupted stage bytes", async () => {
+    await expect(
+      acquireInstanceLock(
+        options({
+          operationHooks: {
+            afterDocumentStagePartialWrite: () =>
+              Promise.reject(new Error("simulated-owner-partial-crash")),
+          },
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+    const stage = await findStage("owner");
+    const stagePath = path.join(fixture.lockPath, stage);
+    await writeFile(stagePath, "not-a-canonical-prefix", { mode: 0o600 });
+    await chmod(stagePath, 0o600);
+
+    await expect(
+      acquireInstanceLock(options({ instanceId: otherId, livenessForPid: () => "dead" })),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+    expect(await readFile(stagePath, "utf8")).toBe("not-a-canonical-prefix");
+  });
+
+  it("detects replacement of a stage inode during publication", async () => {
+    await expect(
+      acquireInstanceLock(
+        options({
+          operationHooks: {
+            afterDocumentStagePartialWrite: async () => {
+              const stage = await findStage("owner");
+              const stagePath = path.join(fixture.lockPath, stage);
+              const replacement = path.join(fixture.lockPath, ".replacement-stage");
+              await writePrivate(replacement, await readFile(stagePath, "utf8"));
+              await rename(replacement, stagePath);
+            },
+          },
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+    expect(await findStage("owner")).toContain(newId);
+  });
+
+  it("fails closed when multiple strict stage artifacts exist", async () => {
+    await expect(
+      acquireInstanceLock(
+        options({
+          operationHooks: {
+            afterDocumentStageOpen: () => Promise.reject(new Error("simulated-owner-crash")),
+          },
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+    const stage = await findStage("owner");
+    const competingStage = stage.replace(newId, otherId);
+    await writePrivate(path.join(fixture.lockPath, competingStage), "");
+
+    await expect(
+      acquireInstanceLock(options({ instanceId: oldId, livenessForPid: () => "dead" })),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+    expect((await readdir(fixture.lockPath)).sort()).toEqual([competingStage, stage].sort());
+  });
+
+  it("does not overwrite an owner published while its stage is being synced", async () => {
+    const replacementOwner = serviceOwner({ service_instance_id: otherId, pid: 4300 });
+
+    await expect(
+      acquireInstanceLock(
+        options({
+          operationHooks: {
+            afterDocumentStageSync: async (kind) => {
+              if (kind === "owner")
+                await writePrivate(fixture.ownerPath, canonicalJson(replacementOwner));
+            },
+          },
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+    expect(JSON.parse(await readFile(fixture.ownerPath, "utf8"))).toEqual(replacementOwner);
+    expect(await findStage("owner")).toContain(newId);
+  });
+
+  it.each(["owner", "owner-claim", "ownerless-claim"] as const)(
+    "publishes exact canonical %s bytes before the post-directory-sync boundary",
+    async (expectedKind) => {
+      await preparePublication(expectedKind);
+      const events: string[] = [];
+      let stagedBytes: string | undefined;
+      const finalPath =
+        expectedKind === "owner"
+          ? fixture.ownerPath
+          : path.join(
+              fixture.lockPath,
+              expectedKind === "owner-claim"
+                ? `.owner-claim.${newId}.json`
+                : `.ownerless-reclaim.${newId}.json`,
+            );
+
+      await expect(
+        acquireInstanceLock(
+          options({
+            operationHooks: {
+              afterDocumentStageSync: async (kind) => {
+                if (kind !== expectedKind) return;
+                events.push("stage-synced");
+                const stage = await findStage(expectedKind);
+                stagedBytes = await readFile(path.join(fixture.lockPath, stage), "utf8");
+                expect(stagedBytes).toBe(canonicalJson(JSON.parse(stagedBytes)));
+                expect(await missing(finalPath)).toBe(true);
+              },
+              afterDocumentPublishSync: async (kind) => {
+                if (kind !== expectedKind) return;
+                events.push("directory-synced");
+                const stage = await findStage(expectedKind);
+                const stagePath = path.join(fixture.lockPath, stage);
+                expect(await readFile(finalPath, "utf8")).toBe(stagedBytes);
+                const [stageIdentity, finalIdentity] = await Promise.all([
+                  lstat(stagePath, { bigint: true }),
+                  lstat(finalPath, { bigint: true }),
+                ]);
+                expect(stageIdentity.ino).toBe(finalIdentity.ino);
+                throw new Error("simulated-post-publish-crash");
+              },
+            },
+          }),
+        ),
+      ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+      expect(events).toEqual(["stage-synced", "directory-synced"]);
+
+      const recovered = await acquireInstanceLock(
+        options({ instanceId: otherId, livenessForPid: () => "dead" }),
+      );
+      expect(recovered.owner.service_instance_id).toBe(otherId);
+      await recovered.release();
+    },
+  );
+
+  it("rejects claim publication on clock rollback before creating a stage", async () => {
+    const futureOwner = serviceOwner({ created_at: "2026-08-19T13:00:00.000Z" });
+    await writeOwner(futureOwner);
+
+    await expect(acquireInstanceLock(options())).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS",
+    });
+    expect(await readdir(fixture.lockPath)).toEqual(["owner.json"]);
+    expect(JSON.parse(await readFile(fixture.ownerPath, "utf8"))).toEqual(futureOwner);
   });
 
   it("rejects a lock target outside the fixed instance.lock deletion scope", async () => {
