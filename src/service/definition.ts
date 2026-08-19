@@ -7,7 +7,7 @@ type ServiceEnvironmentKey = "LANG" | "LC_ALL" | "TZ";
 const ENVIRONMENT_KEYS: readonly ServiceEnvironmentKey[] = ["LANG", "LC_ALL", "TZ"];
 const LOCALE_PATTERN =
   /^(?:C|POSIX|[A-Za-z0-9-]+(?:_[A-Za-z0-9-]+)?(?:\.[A-Za-z0-9_-]+)?(?:@[A-Za-z0-9_-]+)?)$/;
-const TIMEZONE_PATTERN = /^(?:UTC|GMT|[A-Za-z0-9._+-]+(?:\/[A-Za-z0-9._+-]+)+)$/;
+const TIMEZONE_PATTERN = /^(?:UTC|GMT|[A-Za-z][A-Za-z0-9_+-]*(?:\/[A-Za-z][A-Za-z0-9_+-]*)+)$/;
 const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/;
 
 export interface ServiceDefinitionInput {
@@ -79,7 +79,11 @@ function escapeXmlText(value: string): string {
 }
 
 function escapeSystemdArgument(value: string): string {
-  return value.replaceAll("%", "%%").replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+  return value
+    .replaceAll("$", () => "$$")
+    .replaceAll("%", "%%")
+    .replaceAll("\\", "\\\\")
+    .replaceAll('"', '\\"');
 }
 
 function systemdArgument(value: string): string {

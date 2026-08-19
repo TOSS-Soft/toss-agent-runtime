@@ -63,6 +63,15 @@ WantedBy=default.target
     expect(definition).toContain(
       "<string>/Users/Test User/Library/Application Support/TOSS/runtime/config&amp;prod.yaml</string>",
     );
+    expect(definition).toContain(
+      "<key>Label</key>\n\t<string>software.toss.agent-runtime</string>",
+    );
+    expect(definition).toContain("<key>RunAtLoad</key>\n\t<true/>");
+    expect(definition).toContain(
+      "<key>KeepAlive</key>\n\t<dict>\n\t\t<key>SuccessfulExit</key>\n\t\t<false/>",
+    );
+    expect(definition).toContain("<key>ThrottleInterval</key>\n\t<integer>5</integer>");
+    expect(definition).toContain("<key>ProcessType</key>\n\t<string>Background</string>");
     expect(definition).toContain("<key>LANG</key>\n\t\t<string>C</string>");
   });
 
@@ -72,12 +81,12 @@ WantedBy=default.target
       uid: 501,
       nodePath: "/opt/Node Tools/bin/node",
       cliPath: '/opt/toss/bin/runtime "stable"\\release.js',
-      configPath: "/home/test/configs/100% ready.yaml",
+      configPath: "/home/$USER/configs/100% ready.yaml",
       environment: {},
     });
 
     expect(definition).toContain(
-      'ExecStart="/opt/Node Tools/bin/node" "/opt/toss/bin/runtime \\"stable\\"\\\\release.js" "serve" "--config" "/home/test/configs/100%% ready.yaml"',
+      'ExecStart="/opt/Node Tools/bin/node" "/opt/toss/bin/runtime \\"stable\\"\\\\release.js" "serve" "--config" "/home/$$USER/configs/100%% ready.yaml"',
     );
   });
 
@@ -115,6 +124,9 @@ WantedBy=default.target
     ["credential-looking key", { ...common, environment: { credential: "must-not-persist" } }],
     ["locale with a slash", { ...common, environment: { LANG: "en_US/UTF-8" } }],
     ["timezone without an IANA area", { ...common, environment: { TZ: "Europe" } }],
+    ["timezone traversal prefix", { ...common, environment: { TZ: "../etc/passwd" } }],
+    ["timezone traversal segment", { ...common, environment: { TZ: "Area/.." } }],
+    ["timezone numeric path", { ...common, environment: { TZ: "1/2" } }],
     ["environment NUL", { ...common, environment: { LANG: "C\u0000" } }],
     ["environment newline", { ...common, environment: { TZ: "UTC\n" } }],
   ])("rejects %s without emitting its value", (_name, input) => {
@@ -128,6 +140,32 @@ WantedBy=default.target
     expect(error).toBeInstanceOf(Error);
     expect(String(error)).not.toContain(rejectedValue);
   });
+
+  it.each([
+    ["LANG", "a".repeat(128), "a".repeat(129)],
+    ["TZ", `A/${"b".repeat(126)}`, `A/${"b".repeat(127)}`],
+  ] as const)(
+    "accepts an exact 128-byte %s value and rejects a longer one",
+    (key, valid, invalid) => {
+      const validInput = {
+        ...common,
+        platform: "linux" as const,
+        uid: 501,
+        environment: { [key]: valid },
+      };
+      const invalidInput = {
+        ...common,
+        platform: "linux" as const,
+        uid: 501,
+        environment: { [key]: invalid },
+      };
+
+      expect(renderServiceDefinition(validInput)).toContain(`Environment="${key}=${valid}"`);
+      expect(() => renderServiceDefinition(invalidInput)).toThrow(
+        "Invalid service definition input",
+      );
+    },
+  );
 
   it("rejects relative homes and unsupported platforms while resolving manager paths", () => {
     expect(() => resolveServicePaths({ platform: "linux", home: "home/test", env: {} })).toThrow();
