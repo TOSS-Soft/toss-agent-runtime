@@ -260,6 +260,27 @@ describe("private service control socket", () => {
     expect(await pathIsMissing(path.join(actualRuntime, "runtime.sock"))).toBe(true);
   });
 
+  it("treats modeled uid 0 private paths as current-user-owned for a root process", async () => {
+    const server = createServiceControlServer(
+      options({
+        classifyPathOwner: (_userId: number, candidate: string) =>
+          candidate === temporaryRoot ||
+          candidate === runtimePath ||
+          path.dirname(candidate) === runtimePath
+            ? 0
+            : "root",
+        currentUid: () => 0,
+      }),
+    );
+    controlServers.push(server);
+
+    await server.listen();
+
+    const metadata = await lstat(socketPath);
+    expect(metadata.isSocket()).toBe(true);
+    expect(metadata.mode & 0o777).toBe(0o600);
+  });
+
   it("rejects an injected non-root, non-current owner in the runtime ancestry", async () => {
     const filesystemRoot = path.parse(runtimePath).root;
     const server = createServiceControlServer(

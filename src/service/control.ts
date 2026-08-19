@@ -42,11 +42,13 @@ export interface CreateServiceControlServerOptions {
   readonly maxConnections: 32;
   readonly cacheSize: 256;
   readonly classifyPathOwner?: PathOwnerClassifier;
+  /** @internal Test seam for modeling the current process UID. */
+  readonly currentUid?: () => number;
   readonly operationHooks?: ServiceControlOperationHooks;
 }
 
 export type PathOwner = "root" | "current-user" | "other";
-export type PathOwnerClassifier = (userId: number, candidate: string) => PathOwner;
+export type PathOwnerClassifier = (userId: number, candidate: string) => PathOwner | number;
 
 export interface ServiceControlOperationHooks {
   readonly beforePublish?: () => Promise<void>;
@@ -95,20 +97,29 @@ function errorCode(error: unknown): string | undefined {
     : undefined;
 }
 
-function defaultPathOwner(userId: number): PathOwner {
+function processCurrentUid(): number {
+  if (typeof process.getuid !== "function") pathUnsafe();
+  return process.getuid();
+}
+
+function defaultPathOwner(userId: number, currentUid: number): PathOwner {
+  if (userId === currentUid) return "current-user";
   if (userId === 0) return "root";
-  return typeof process.getuid === "function" && process.getuid() === userId
-    ? "current-user"
-    : "other";
+  return "other";
 }
 
 function classifyPathOwner(
   classifier: PathOwnerClassifier | undefined,
+  currentUid: (() => number) | undefined,
   userId: number,
   candidate: string,
 ): PathOwner {
   try {
-    const owner = classifier?.(userId, candidate) ?? defaultPathOwner(userId);
+    const classified = classifier?.(userId, candidate) ?? userId;
+    const owner =
+      typeof classified === "number"
+        ? defaultPathOwner(classified, (currentUid ?? processCurrentUid)())
+        : classified;
     if (owner !== "root" && owner !== "current-user" && owner !== "other") pathUnsafe();
     return owner;
   } catch (error) {
@@ -139,6 +150,7 @@ function assertSocketPath(candidate: string): void {
 async function assertPrivateRuntimeDirectory(
   socketPath: string,
   classifier?: PathOwnerClassifier,
+  currentUid?: () => number,
 ): Promise<FileIdentity> {
   assertSocketPath(socketPath);
   const runtimePath = path.dirname(socketPath);
@@ -165,7 +177,7 @@ async function assertPrivateRuntimeDirectory(
     }
     if (metadata.isSymbolicLink() || !metadata.isDirectory()) pathUnsafe();
 
-    const owner = classifyPathOwner(classifier, metadata.uid, candidate);
+    const owner = classifyPathOwner(classifier, currentUid, metadata.uid, candidate);
     if (owner === "root" && !reachedCurrentUserDirectory) {
       if ((metadata.mode & 0o022) !== 0 && (metadata.mode & 0o1000) === 0) pathUnsafe();
     } else if (owner === "current-user") {
@@ -189,6 +201,7 @@ async function assertPrivateRuntimeDirectory(
 async function privateSocketIdentity(
   socketPath: string,
   classifier?: PathOwnerClassifier,
+  currentUid?: () => number,
 ): Promise<FileIdentity | undefined> {
   let metadata;
   try {
@@ -200,7 +213,7 @@ async function privateSocketIdentity(
   if (
     metadata.isSymbolicLink() ||
     !metadata.isSocket() ||
-    classifyPathOwner(classifier, metadata.uid, socketPath) !== "current-user" ||
+    classifyPathOwner(classifier, currentUid, metadata.uid, socketPath) !== "current-user" ||
     (metadata.mode & 0o777) !== 0o600
   ) {
     pathUnsafe();
@@ -232,13 +245,14 @@ async function socketHasListener(socketPath: string): Promise<boolean> {
 async function removeStaleSocket(
   socketPath: string,
   classifier?: PathOwnerClassifier,
+  currentUid?: () => number,
 ): Promise<void> {
-  const expected = await privateSocketIdentity(socketPath, classifier);
+  const expected = await privateSocketIdentity(socketPath, classifier, currentUid);
   if (expected === undefined) return;
   if (await socketHasListener(socketPath)) {
     throw serviceError("RUNTIME_SERVICE_ALREADY_RUNNING");
   }
-  const current = await privateSocketIdentity(socketPath, classifier);
+  const current = await privateSocketIdentity(socketPath, classifier, currentUid);
   if (current === undefined || !sameIdentity(current, expected)) pathUnsafe();
   try {
     await unlink(socketPath);
@@ -516,8 +530,12 @@ export function createServiceControlServer(
     }
     if (
       metadata.isSocket() &&
-      classifyPathOwner(options.classifyPathOwner, metadata.uid, options.socketPath) ===
-        "current-user" &&
+      classifyPathOwner(
+        options.classifyPathOwner,
+        options.currentUid,
+        metadata.uid,
+        options.socketPath,
+      ) === "current-user" &&
       sameIdentity(identityOf(metadata), ownedSocket)
     ) {
       try {
@@ -538,8 +556,12 @@ export function createServiceControlServer(
     }
     if (
       metadata.isDirectory() &&
-      classifyPathOwner(options.classifyPathOwner, metadata.uid, stagingSocketPath) ===
-        "current-user" &&
+      classifyPathOwner(
+        options.classifyPathOwner,
+        options.currentUid,
+        metadata.uid,
+        stagingSocketPath,
+      ) === "current-user" &&
       sameIdentity(identityOf(metadata), stagingGuard)
     ) {
       try {
@@ -557,8 +579,9 @@ export function createServiceControlServer(
       const runtimeIdentity = await assertPrivateRuntimeDirectory(
         options.socketPath,
         options.classifyPathOwner,
+        options.currentUid,
       );
-      await removeStaleSocket(options.socketPath, options.classifyPathOwner);
+      await removeStaleSocket(options.socketPath, options.classifyPathOwner, options.currentUid);
       try {
         await lstat(stagingSocketPath);
         pathUnsafe();
@@ -589,8 +612,12 @@ export function createServiceControlServer(
         if (
           created.isSymbolicLink() ||
           !created.isSocket() ||
-          classifyPathOwner(options.classifyPathOwner, created.uid, stagingSocketPath) !==
-            "current-user"
+          classifyPathOwner(
+            options.classifyPathOwner,
+            options.currentUid,
+            created.uid,
+            stagingSocketPath,
+          ) !== "current-user"
         ) {
           pathUnsafe();
         }
@@ -600,8 +627,12 @@ export function createServiceControlServer(
         if (
           stagedSocket.isSymbolicLink() ||
           !stagedSocket.isSocket() ||
-          classifyPathOwner(options.classifyPathOwner, stagedSocket.uid, stagingSocketPath) !==
-            "current-user" ||
+          classifyPathOwner(
+            options.classifyPathOwner,
+            options.currentUid,
+            stagedSocket.uid,
+            stagingSocketPath,
+          ) !== "current-user" ||
           (stagedSocket.mode & 0o777) !== 0o600 ||
           !sameIdentity(identityOf(stagedSocket), createdIdentity)
         ) {
@@ -616,6 +647,7 @@ export function createServiceControlServer(
         const beforePublishRuntime = await assertPrivateRuntimeDirectory(
           options.socketPath,
           options.classifyPathOwner,
+          options.currentUid,
         );
         if (!sameIdentity(beforePublishRuntime, runtimeIdentity)) pathUnsafe();
 
@@ -625,8 +657,12 @@ export function createServiceControlServer(
         if (
           privateSocket.isSymbolicLink() ||
           !privateSocket.isSocket() ||
-          classifyPathOwner(options.classifyPathOwner, privateSocket.uid, options.socketPath) !==
-            "current-user" ||
+          classifyPathOwner(
+            options.classifyPathOwner,
+            options.currentUid,
+            privateSocket.uid,
+            options.socketPath,
+          ) !== "current-user" ||
           (privateSocket.mode & 0o777) !== 0o600 ||
           !sameIdentity(identityOf(privateSocket), createdIdentity)
         ) {
@@ -637,8 +673,12 @@ export function createServiceControlServer(
         if (
           linkedStage.isSymbolicLink() ||
           !linkedStage.isSocket() ||
-          classifyPathOwner(options.classifyPathOwner, linkedStage.uid, stagingSocketPath) !==
-            "current-user" ||
+          classifyPathOwner(
+            options.classifyPathOwner,
+            options.currentUid,
+            linkedStage.uid,
+            stagingSocketPath,
+          ) !== "current-user" ||
           (linkedStage.mode & 0o777) !== 0o600 ||
           !sameIdentity(identityOf(linkedStage), createdIdentity)
         ) {
@@ -650,8 +690,12 @@ export function createServiceControlServer(
         if (
           createdGuard.isSymbolicLink() ||
           !createdGuard.isDirectory() ||
-          classifyPathOwner(options.classifyPathOwner, createdGuard.uid, stagingSocketPath) !==
-            "current-user"
+          classifyPathOwner(
+            options.classifyPathOwner,
+            options.currentUid,
+            createdGuard.uid,
+            stagingSocketPath,
+          ) !== "current-user"
         ) {
           pathUnsafe();
         }
@@ -661,8 +705,12 @@ export function createServiceControlServer(
         if (
           guard.isSymbolicLink() ||
           !guard.isDirectory() ||
-          classifyPathOwner(options.classifyPathOwner, guard.uid, stagingSocketPath) !==
-            "current-user" ||
+          classifyPathOwner(
+            options.classifyPathOwner,
+            options.currentUid,
+            guard.uid,
+            stagingSocketPath,
+          ) !== "current-user" ||
           (guard.mode & 0o777) !== 0o700 ||
           !sameIdentity(identityOf(guard), stagingGuard)
         ) {
@@ -671,6 +719,7 @@ export function createServiceControlServer(
         const readyRuntime = await assertPrivateRuntimeDirectory(
           options.socketPath,
           options.classifyPathOwner,
+          options.currentUid,
         );
         if (!sameIdentity(readyRuntime, runtimeIdentity)) pathUnsafe();
         listening = true;
