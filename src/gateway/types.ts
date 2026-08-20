@@ -65,6 +65,26 @@ export interface GatewayCredentialCoordinator {
   clear(): void;
 }
 
+export interface AgentgatewayFetchOptions {
+  readonly method: "GET" | "POST";
+  readonly headers: Headers;
+  readonly redirect: "error";
+  readonly signal: AbortSignal;
+  readonly body?: string;
+}
+
+export type AgentgatewayFetch = (
+  input: string,
+  options: AgentgatewayFetchOptions,
+) => Promise<Response>;
+
+export type AgentgatewayClientHealth = AgentgatewayHealth | Readonly<{ status: "unavailable" }>;
+
+export interface AgentgatewayClient {
+  discover(signal: AbortSignal): Promise<AgentgatewayCapabilitiesV1>;
+  health(): Promise<AgentgatewayClientHealth>;
+}
+
 export interface ParseAgentgatewayCapabilitiesOptions {
   readonly now: () => Date;
 }

@@ -11,6 +11,11 @@ const PROVIDER_ERROR_DETAILS = {
     retryable: false,
     safe_message: "Provider capability is unsupported",
   },
+  RUNTIME_PROVIDER_ROUTE_NOT_FOUND: {
+    category: "unsupported-capability",
+    retryable: false,
+    safe_message: "Gateway route was not found",
+  },
   RUNTIME_PROVIDER_AUTHENTICATION: {
     category: "authentication",
     retryable: false,
@@ -40,6 +45,21 @@ const PROVIDER_ERROR_DETAILS = {
     category: "unavailable",
     retryable: true,
     safe_message: "Provider is temporarily unavailable",
+  },
+  RUNTIME_PROVIDER_GATEWAY_UNAVAILABLE: {
+    category: "unavailable",
+    retryable: true,
+    safe_message: "Agentgateway is unavailable",
+  },
+  RUNTIME_PROVIDER_CAPABILITY_DOWNGRADE: {
+    category: "integrity",
+    retryable: false,
+    safe_message: "Gateway route capability was downgraded",
+  },
+  RUNTIME_PROVIDER_GATEWAY_INVALID: {
+    category: "integrity",
+    retryable: false,
+    safe_message: "Agentgateway response is invalid",
   },
   RUNTIME_PROVIDER_UNAVAILABLE: {
     category: "unavailable",
