@@ -9,6 +9,41 @@
     "schema_version": { "const": "service-control-request.v1" },
     "document_type": { "const": "service-control-request" },
     "request_id": { "type": "string", "format": "uuid" },
-    "command": { "const": "status" }
-  }
+    "command": {
+      "type": "string",
+      "enum": ["status", "project-register", "project-unregister", "project-list"]
+    },
+    "root": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "project_id": { "type": "string", "format": "uuid" }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "command": { "const": "status" },
+        "root": false,
+        "project_id": false
+      }
+    },
+    {
+      "required": ["root"],
+      "properties": {
+        "command": { "const": "project-register" },
+        "project_id": false
+      }
+    },
+    {
+      "required": ["project_id"],
+      "properties": {
+        "command": { "const": "project-unregister" },
+        "root": false
+      }
+    },
+    {
+      "properties": {
+        "command": { "const": "project-list" },
+        "root": false,
+        "project_id": false
+      }
+    }
+  ]
 }

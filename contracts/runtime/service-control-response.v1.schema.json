@@ -4,7 +4,7 @@
   "title": "TOSS local runtime service control response v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "document_type", "request_id", "ok", "status", "error"],
+  "required": ["schema_version", "document_type", "request_id", "ok", "status", "data", "error"],
   "properties": {
     "schema_version": { "const": "service-control-response.v1" },
     "document_type": { "const": "service-control-response" },
@@ -30,11 +30,60 @@
         "accepting": { "type": "boolean" }
       }
     },
+    "data": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/project_registration_data" },
+        { "$ref": "#/$defs/project_list_data" }
+      ]
+    },
     "error": {
       "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/service_error" }]
     }
   },
   "$defs": {
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "project_registration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project_id", "registry_revision", "canonical_root", "manifest_hash", "state"],
+      "properties": {
+        "project_id": { "type": "string", "format": "uuid" },
+        "registry_revision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "canonical_root": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "manifest_hash": { "$ref": "#/$defs/sha256" },
+        "state": {
+          "type": "string",
+          "enum": ["ACTIVE", "UNREGISTERED", "BLOCKED_PROJECT_UNAVAILABLE"]
+        }
+      }
+    },
+    "project_registration_data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "registration"],
+      "properties": {
+        "kind": { "const": "project-registration" },
+        "registration": { "$ref": "#/$defs/project_registration" }
+      }
+    },
+    "project_list_data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "registrations"],
+      "properties": {
+        "kind": { "const": "project-list" },
+        "registrations": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": { "$ref": "#/$defs/project_registration" }
+        }
+      }
+    },
     "service_error": {
       "type": "object",
       "additionalProperties": false,
@@ -119,6 +168,54 @@
             "retryable": { "const": true },
             "safe_message": { "const": "Runtime service is unavailable" }
           }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_PROJECT_INVALID" },
+            "category": { "const": "invalid-input" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Project input is invalid" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_PROJECT_PATH_UNSAFE" },
+            "category": { "const": "integrity" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Project path is unsafe" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_PROJECT_NOT_FOUND" },
+            "category": { "const": "invalid-input" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Project registration was not found" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_PROJECT_UNAVAILABLE" },
+            "category": { "const": "unavailable" },
+            "retryable": { "const": true },
+            "safe_message": { "const": "Project is unavailable" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_PROJECT_REGISTRY_CORRUPT" },
+            "category": { "const": "integrity" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Project registry is corrupt" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_PROJECT_INTAKE_CORRUPT" },
+            "category": { "const": "integrity" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Project intake state is corrupt" }
+          }
         }
       ]
     }
@@ -129,6 +226,21 @@
         "request_id": { "type": "string", "format": "uuid" },
         "ok": { "const": true },
         "status": { "type": "object" },
+        "data": { "type": "null" },
+        "error": { "type": "null" }
+      }
+    },
+    {
+      "properties": {
+        "request_id": { "type": "string", "format": "uuid" },
+        "ok": { "const": true },
+        "status": { "type": "null" },
+        "data": {
+          "oneOf": [
+            { "$ref": "#/$defs/project_registration_data" },
+            { "$ref": "#/$defs/project_list_data" }
+          ]
+        },
         "error": { "type": "null" }
       }
     },
@@ -136,6 +248,7 @@
       "properties": {
         "ok": { "const": false },
         "status": { "type": "null" },
+        "data": { "type": "null" },
         "error": { "type": "object" }
       }
     }

@@ -26,9 +26,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { canonicalJson } from "../src/protocol/json.js";
 import type { ServiceStatusV1 } from "../src/service/contracts.js";
+import { RuntimeProjectError } from "../src/service/project/errors.js";
 import {
   createServiceControlServer,
   probeServiceIdentity,
+  requestProjectOperation,
   requestServiceStatus,
   type ServiceControlOperationHooks,
   type ServiceControlServer,
@@ -120,6 +122,28 @@ function statusRequest(requestId: string): string {
     command: "status",
   })}\n`;
 }
+
+function projectRequest(
+  command: "project-register" | "project-unregister" | "project-list",
+  requestId = fixedRequestId,
+  argument: Readonly<{ root?: string; project_id?: string }> = {},
+): string {
+  return `${canonicalJson({
+    schema_version: "service-control-request.v1",
+    document_type: "service-control-request",
+    request_id: requestId,
+    command,
+    ...argument,
+  })}\n`;
+}
+
+const projectRegistration = {
+  project_id: "00000000-0000-4000-8000-000000000001",
+  registry_revision: 1,
+  canonical_root: "/private/tmp/project",
+  manifest_hash: `sha256:${"a".repeat(64)}` as const,
+  state: "ACTIVE",
+} as const;
 
 function numberedRequestId(index: number): string {
   return `018f0f64-7b21-7d4f-8c3d-${index.toString(16).padStart(12, "0")}`;
@@ -1334,6 +1358,122 @@ describe("private service control socket", () => {
     expect(statusCalls).toBe(1);
   });
 
+  it("dispatches and byte-replays one completed async project operation", async () => {
+    let handlerCalls = 0;
+    await listenControl({
+      handleProjectRequest: (request) => {
+        handlerCalls += 1;
+        expect(request).toMatchObject({
+          command: "project-register",
+          root: "/private/tmp/project",
+        });
+        return Promise.resolve({
+          kind: "project-registration",
+          registration: projectRegistration,
+        });
+      },
+    });
+    const request = projectRequest("project-register", fixedRequestId, {
+      root: "/private/tmp/project",
+    });
+
+    const first = await sendRaw(request);
+    const second = await sendRaw(request);
+
+    expect(second).toBe(first);
+    expect(JSON.parse(first)).toMatchObject({
+      request_id: fixedRequestId,
+      ok: true,
+      status: null,
+      data: { kind: "project-registration", registration: projectRegistration },
+      error: null,
+    });
+    expect(handlerCalls).toBe(1);
+  });
+
+  it("returns a fixed project error and never reflects handler details", async () => {
+    const secret = "private-project-handler-stack";
+    await listenControl({
+      handleProjectRequest: () => {
+        const error = new RuntimeProjectError("RUNTIME_PROJECT_NOT_FOUND");
+        Object.assign(error, { stack: secret });
+        return Promise.reject(error);
+      },
+    });
+
+    const response = await sendRaw(
+      projectRequest("project-unregister", fixedRequestId, {
+        project_id: projectRegistration.project_id,
+      }),
+    );
+
+    expect(response).not.toContain(secret);
+    expect(JSON.parse(response)).toMatchObject({
+      request_id: fixedRequestId,
+      ok: false,
+      status: null,
+      data: null,
+      error: { code: "RUNTIME_PROJECT_NOT_FOUND" },
+    });
+  });
+
+  it("conflicts a changed project input while the original request is in flight", async () => {
+    let resolveHandler: (() => void) | undefined;
+    let handlerCalls = 0;
+    await listenControl({
+      handleProjectRequest: async () => {
+        handlerCalls += 1;
+        await new Promise<void>((resolve) => {
+          resolveHandler = resolve;
+        });
+        return { kind: "project-registration", registration: projectRegistration };
+      },
+    });
+    const original = sendRaw(
+      projectRequest("project-register", fixedRequestId, { root: "/private/tmp/project" }),
+    );
+    await vi.waitFor(() => expect(resolveHandler).toBeTypeOf("function"));
+
+    const conflict = await sendRaw(
+      projectRequest("project-register", fixedRequestId, { root: "/private/tmp/other" }),
+    );
+    resolveHandler?.();
+    await original;
+
+    expect(JSON.parse(conflict)).toMatchObject({
+      request_id: fixedRequestId,
+      ok: false,
+      error: { code: "RUNTIME_SERVICE_CONTROL_CONFLICT" },
+    });
+    expect(handlerCalls).toBe(1);
+  });
+
+  it("drains an in-flight project handler before shutdown completes", async () => {
+    let resolveHandler: (() => void) | undefined;
+    const server = await listenControl({
+      handleProjectRequest: async () => {
+        await new Promise<void>((resolve) => {
+          resolveHandler = resolve;
+        });
+        return { kind: "project-list", registrations: [projectRegistration] };
+      },
+    });
+    const response = sendRaw(projectRequest("project-list"));
+    await vi.waitFor(() => expect(resolveHandler).toBeTypeOf("function"));
+    server.stopAccepting();
+    let drained = false;
+    const draining = server.drain(new AbortController().signal).then(() => {
+      drained = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(drained).toBe(false);
+
+    resolveHandler?.();
+    await response;
+    await draining;
+    expect(drained).toBe(true);
+  });
+
   it("returns a fixed conflict when an existing request id has different canonical bytes", async () => {
     await listenControl();
     await sendRaw(statusRequest(fixedRequestId));
@@ -1680,6 +1820,46 @@ describe("private service control socket", () => {
     expect(statusCalls).toBe(1);
   });
 
+  it("requests one validated project operation over the private socket", async () => {
+    await listenControl({
+      handleProjectRequest: (request) => {
+        expect(request).toMatchObject({ command: "project-list" });
+        return Promise.resolve({ kind: "project-list", registrations: [projectRegistration] });
+      },
+    });
+
+    await expect(
+      requestProjectOperation({
+        socketPath,
+        requestId: fixedRequestId,
+        idleTimeoutMs: 5_000,
+        operation: { command: "project-list" },
+      }),
+    ).resolves.toEqual({ kind: "project-list", registrations: [projectRegistration] });
+  });
+
+  it("returns one normalized project failure through the control client", async () => {
+    await listenControl({
+      handleProjectRequest: () =>
+        Promise.reject(new RuntimeProjectError("RUNTIME_PROJECT_NOT_FOUND")),
+    });
+
+    await expect(
+      requestProjectOperation({
+        socketPath,
+        requestId: fixedRequestId,
+        idleTimeoutMs: 5_000,
+        operation: {
+          command: "project-unregister",
+          project_id: projectRegistration.project_id,
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "RUNTIME_PROJECT_NOT_FOUND",
+      safe_message: "Project registration was not found",
+    });
+  });
+
   it("fails closed when the socket path changes while a status response is in flight", async () => {
     const nativeServer = await listenNative(socketPath, true);
     await chmod(socketPath, 0o600);
@@ -1704,6 +1884,7 @@ describe("private service control socket", () => {
                 health: "healthy",
                 accepting: true,
               },
+              data: null,
               error: null,
             })}\n`,
           );
