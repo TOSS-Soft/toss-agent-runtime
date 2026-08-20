@@ -173,6 +173,7 @@ export function collectProviderEvents(events: readonly ProviderEventV1[]): Provi
     usage,
     finish_reason: terminal,
     structured_output: structuredOutput,
+    route_identity: first.data.route_identity ?? null,
   } satisfies ProviderCompletion;
   return deepFreezeJson(completion as unknown as JsonValue) as unknown as ProviderCompletion;
 }

@@ -16,6 +16,10 @@ import {
   parseProjectWatchManifest,
   type ProjectIntake,
   type ProjectRegistry,
+  type ProviderCompletion,
+  type ProviderRouteIdentity,
+  type ProviderWireResponse,
+  type ProviderWireStream,
 } from "../src/index.js";
 
 describe("package metadata", () => {
@@ -47,6 +51,15 @@ describe("package metadata", () => {
       category: "rate-limit",
       retryable: true,
     });
+    expectTypeOf<
+      ProviderWireResponse["route_identity"]
+    >().toEqualTypeOf<ProviderRouteIdentity | null>();
+    expectTypeOf<
+      ProviderWireStream["route_identity"]
+    >().toEqualTypeOf<ProviderRouteIdentity | null>();
+    expectTypeOf<
+      ProviderCompletion["route_identity"]
+    >().toEqualTypeOf<ProviderRouteIdentity | null>();
     expect(packageApi).not.toHaveProperty("openai");
     expect(packageApi).not.toHaveProperty("anthropic");
     expect(packageApi).not.toHaveProperty("gemini");

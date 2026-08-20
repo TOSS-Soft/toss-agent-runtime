@@ -96,7 +96,58 @@
     "start": {
       "type": "object",
       "additionalProperties": false,
-      "properties": { "response_id": { "$ref": "#/$defs/safe_id" } }
+      "properties": {
+        "response_id": { "$ref": "#/$defs/safe_id" },
+        "route_identity": { "$ref": "#/$defs/route_identity" }
+      }
+    },
+    "route_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "transport",
+        "gateway_profile",
+        "gateway_revision",
+        "route_id",
+        "requested_model",
+        "resolved_provider",
+        "resolved_model",
+        "capability_document_hash",
+        "requirement_hash",
+        "gateway_request_id"
+      ],
+      "properties": {
+        "transport": { "const": "agentgateway" },
+        "gateway_profile": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9._:-]{0,127}$"
+        },
+        "gateway_revision": { "$ref": "#/$defs/nonnegative" },
+        "route_id": { "$ref": "#/$defs/safe_id" },
+        "requested_model": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$"
+        },
+        "resolved_provider": {
+          "type": "string",
+          "enum": ["openai", "anthropic", "gemini"]
+        },
+        "resolved_model": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$"
+        },
+        "capability_document_hash": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "requirement_hash": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "gateway_request_id": {
+          "anyOf": [{ "$ref": "#/$defs/safe_id" }, { "type": "null" }]
+        }
+      }
     },
     "content_delta": {
       "type": "object",

@@ -5,6 +5,7 @@ import {
   parseProviderEvent,
   RuntimeProviderError,
   type ProviderEventV1,
+  type ProviderRouteIdentity,
 } from "../src/providers/index.js";
 import { canonicalJson } from "../src/protocol/json.js";
 
@@ -29,6 +30,19 @@ function event(
   } as ProviderEventV1;
 }
 
+const routeIdentity: ProviderRouteIdentity = {
+  transport: "agentgateway",
+  gateway_profile: "gateway-production",
+  gateway_revision: 7,
+  route_id: "balanced-openai-primary",
+  requested_model: "balanced-code",
+  resolved_provider: "openai",
+  resolved_model: "gpt-5",
+  capability_document_hash: `sha256:${"a".repeat(64)}`,
+  requirement_hash: `sha256:${"b".repeat(64)}`,
+  gateway_request_id: "gw_req_1",
+};
+
 describe("provider event contract", () => {
   it("parses and freezes one closed provider event", () => {
     const candidate = event(0, "response-start", { response_id: "resp_123" });
@@ -41,6 +55,26 @@ describe("provider event contract", () => {
       expect(Object.isFrozen(result.value.data)).toBe(true);
     }
   });
+
+  it("collects one closed agentgateway route identity", () => {
+    const completion = collectProviderEvents([
+      event(0, "response-start", { response_id: "resp_1", route_identity: routeIdentity }),
+      event(1, "response-completed", { finish_reason: "stop" }),
+    ]);
+
+    expect(completion.route_identity).toEqual(routeIdentity);
+    expect(Object.isFrozen(completion.route_identity)).toBe(true);
+  });
+
+  it.each(["authorization", "endpoint", "headers", "token"])(
+    "rejects route identity native field %s",
+    (field) => {
+      const candidate = event(0, "response-start", {
+        route_identity: { ...routeIdentity, [field]: "must-not-leak" },
+      });
+      expect(parseProviderEvent(canonicalJson(candidate)).ok).toBe(false);
+    },
+  );
 
   it.each([
     ["native payload", { ...event(0, "response-start", {}), native_response: { secret: "x" } }],
@@ -96,6 +130,7 @@ describe("provider event contract", () => {
       },
       finish_reason: "tool-calls",
       structured_output: null,
+      route_identity: null,
     });
   });
 

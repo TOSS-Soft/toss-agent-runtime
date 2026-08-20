@@ -166,9 +166,13 @@ export type {
   ProviderReasoningEffort,
   ProviderRequest,
   ProviderResponseFormat,
+  ProviderRouteIdentity,
+  ProviderRouteRequirement,
   ProviderToolCall,
   ProviderToolDefinition,
   ProviderUsage,
   ProviderWireContext,
+  ProviderWireResponse,
+  ProviderWireStream,
   ProviderWireTransport,
 } from "./providers/index.js";
