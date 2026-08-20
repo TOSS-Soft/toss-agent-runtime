@@ -60,6 +60,11 @@ interface FixtureOptions {
   readonly isDefinitionCurrentUser?: (userId: number, candidate?: string) => boolean;
   readonly definitionRemovalHooks?: {
     readonly beforeClaim?: () => Promise<void>;
+    readonly afterStateStageWrite?: () => Promise<void>;
+    readonly afterStateLink?: () => Promise<void>;
+    readonly afterStateSync?: () => Promise<void>;
+    readonly beforeStateStageUnlink?: () => Promise<void>;
+    readonly afterStateStageUnlink?: () => Promise<void>;
     readonly beforeRename?: () => Promise<void>;
     readonly afterRename?: () => Promise<void>;
     readonly afterSync?: () => Promise<void>;
@@ -119,7 +124,7 @@ async function fixture(
     nodePath: "/opt/toss/node/bin/node",
     cliPath: "/opt/toss/bin/toss-runtime.js",
     configPath: config,
-    randomSuffix: () => "definition",
+    randomSuffix: () => "00000000-0000-4000-8000-000000000001",
     runner,
     ...(beforeDefinitionPublish === undefined
       ? {}
@@ -214,6 +219,90 @@ describe("native per-user service manager", () => {
     },
   );
 
+  it.each([
+    ["linux", "directory"],
+    ["linux", "symlink"],
+    ["linux", "cross-owner"],
+    ["darwin", "directory"],
+    ["darwin", "symlink"],
+    ["darwin", "cross-owner"],
+  ] as const)(
+    "cleans only its prepared %s claim when a %s replaces the definition before linking",
+    async (platform, kind) => {
+      let definition = "";
+      let crossOwner = false;
+      let identity: { readonly dev: bigint; readonly ino: bigint } | undefined;
+      const replace = async (): Promise<void> => {
+        if (kind === "directory") {
+          await rm(definition);
+          await mkdir(definition, { mode: 0o700 });
+          await chmod(definition, 0o700);
+        } else if (kind === "symlink") {
+          const target = path.join(path.dirname(path.dirname(definition)), "prepared-target");
+          await writeFile(target, "preserve", { mode: 0o600 });
+          await chmod(target, 0o600);
+          await rm(definition);
+          await symlink(target, definition);
+        } else {
+          await rm(definition);
+          await writeFile(definition, "cross-owner", { mode: 0o600 });
+          await chmod(definition, 0o600);
+          crossOwner = true;
+        }
+        const metadata = await lstat(definition, { bigint: true });
+        identity = { dev: metadata.dev, ino: metadata.ino };
+      };
+      const runner = new RecordingRunner();
+      const artifacts = await (platform === "linux" ? linuxFixture : darwinFixture)(runner, {
+        isDefinitionCurrentUser: (_uid, candidate) => !crossOwner || candidate !== definition,
+        definitionRemovalHooks: { afterStateStageUnlink: replace },
+      });
+      definition = artifacts.definition;
+      await artifacts.manager.install();
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      const after = await lstat(definition, { bigint: true });
+      expect(after.dev).toBe(identity?.dev);
+      expect(after.ino).toBe(identity?.ino);
+      expect(after.isDirectory()).toBe(kind === "directory");
+      expect(after.isSymbolicLink()).toBe(kind === "symlink");
+      expect(after.isFile()).toBe(kind === "cross-owner");
+      expect(
+        (await readdir(path.dirname(definition))).filter((entry) => entry.includes("delete-claim")),
+      ).toEqual([]);
+    },
+  );
+
+  it("repairs a restrictive umask to a private claim directory before publishing state", async () => {
+    const runner = new RecordingRunner();
+    const artifacts = await linuxFixture(runner, {
+      deleteClaimOwnerState: () => "dead",
+      definitionRemovalHooks: {
+        afterStateStageUnlink: () => Promise.reject(new Error("inspect claim mode")),
+      },
+    });
+    await artifacts.manager.install();
+    const previousUmask = process.umask(0o777);
+    try {
+      await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+    } finally {
+      process.umask(previousUmask);
+    }
+    const claimName = (await readdir(path.dirname(artifacts.definition))).find((entry) =>
+      entry.includes("delete-claim"),
+    );
+    expect(claimName).toBeDefined();
+    const metadata = await lstat(path.join(path.dirname(artifacts.definition), claimName!), {
+      bigint: true,
+    });
+    expect(Number(metadata.mode & 0o777n)).toBe(0o700);
+  });
+
   it.each(["linux", "darwin"] as const)(
     "preserves a byte-identical %s definition replacement with a different inode",
     async (platform) => {
@@ -253,6 +342,169 @@ describe("native per-user service manager", () => {
     },
   );
 
+  it.each(["dead", "live", "unknown"] as const)(
+    "recovers a %s claimant's partial initial state stage only when the claimant is dead",
+    async (ownerState) => {
+      const runner = new RecordingRunner();
+      const artifacts = await linuxFixture(runner, {
+        deleteClaimOwnerState: () => ownerState,
+      });
+      await artifacts.manager.install();
+      runner.calls.splice(0);
+
+      const claimName = `.${path.basename(artifacts.definition)}.${process.pid}.00000000-0000-4000-8000-000000000001.delete-claim`;
+      const claim = path.join(path.dirname(artifacts.definition), claimName);
+      await mkdir(claim, { mode: 0o700 });
+      await chmod(claim, 0o700);
+      await writeFile(path.join(claim, "state.stage"), "{", { mode: 0o600 });
+      await chmod(path.join(claim, "state.stage"), 0o600);
+      runner.calls.splice(0);
+
+      if (ownerState === "dead") {
+        await expect(artifacts.manager.status()).resolves.toBeDefined();
+        expect(
+          (await readdir(path.dirname(artifacts.definition))).filter((entry) =>
+            entry.includes("delete-claim"),
+          ),
+        ).toEqual([]);
+      } else {
+        await expect(artifacts.manager.status()).rejects.toMatchObject({
+          code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+        });
+        expect(
+          (await readdir(path.dirname(artifacts.definition))).filter((entry) =>
+            entry.includes("delete-claim"),
+          ),
+        ).toEqual([claimName]);
+        expect(runner.calls).toEqual([]);
+      }
+    },
+  );
+
+  it("recovers a dead claimant's empty attributed claim without reading the canonical definition", async () => {
+    const runner = new RecordingRunner();
+    const artifacts = await linuxFixture(runner, { deleteClaimOwnerState: () => "dead" });
+    await artifacts.manager.install();
+    runner.calls.splice(0);
+    const claimName = `.${path.basename(artifacts.definition)}.${process.pid}.00000000-0000-4000-8000-000000000001.delete-claim`;
+    await mkdir(path.join(path.dirname(artifacts.definition), claimName), { mode: 0o700 });
+    await chmod(path.join(path.dirname(artifacts.definition), claimName), 0o700);
+    await rm(artifacts.definition);
+    await mkdir(artifacts.definition, { mode: 0o700 });
+    await chmod(artifacts.definition, 0o700);
+
+    await expect(artifacts.manager.status()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+    });
+    expect(
+      (await readdir(path.dirname(artifacts.definition))).filter((entry) =>
+        entry.includes("delete-claim"),
+      ),
+    ).toEqual([]);
+    expect(runner.calls).toEqual([]);
+  });
+
+  it.each([
+    "afterStateStageWrite",
+    "afterStateLink",
+    "afterStateSync",
+    "beforeStateStageUnlink",
+    "afterStateStageUnlink",
+  ] as const)(
+    "recovers a dead claimant interrupted at the %s state-persistence boundary",
+    async (boundary) => {
+      const runner = new RecordingRunner();
+      const artifacts = await linuxFixture(runner, {
+        deleteClaimOwnerState: () => "dead",
+        definitionRemovalHooks: {
+          [boundary]: () => Promise.reject(new Error(`interrupt-${boundary}`)),
+        },
+      });
+      await artifacts.manager.install();
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      expect(
+        (await readdir(path.dirname(artifacts.definition))).filter((entry) =>
+          entry.includes("delete-claim"),
+        ),
+      ).toHaveLength(1);
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.install()).resolves.toMatchObject({ installed: true });
+      expect(
+        (await readdir(path.dirname(artifacts.definition))).filter((entry) =>
+          entry.includes("delete-claim"),
+        ),
+      ).toEqual([]);
+    },
+  );
+
+  it.each([
+    ["linux", "beforeUnlink", "directory"],
+    ["linux", "afterUnlink", "directory"],
+    ["linux", "beforeUnlink", "symlink"],
+    ["linux", "afterUnlink", "symlink"],
+    ["linux", "beforeUnlink", "cross-owner"],
+    ["linux", "afterUnlink", "cross-owner"],
+    ["darwin", "beforeUnlink", "directory"],
+    ["darwin", "afterUnlink", "directory"],
+    ["darwin", "beforeUnlink", "symlink"],
+    ["darwin", "afterUnlink", "symlink"],
+    ["darwin", "beforeUnlink", "cross-owner"],
+    ["darwin", "afterUnlink", "cross-owner"],
+  ] as const)(
+    "preserves a %s %s replacement at the internal %s boundary without a claim leak",
+    async (platform, boundary, kind) => {
+      let definition = "";
+      let crossOwner = false;
+      let identity: { readonly dev: bigint; readonly ino: bigint } | undefined;
+      const createReplacement = async (): Promise<void> => {
+        if (kind === "directory") {
+          await rm(definition, { force: true });
+          await mkdir(definition, { mode: 0o700 });
+          await chmod(definition, 0o700);
+        } else if (kind === "symlink") {
+          const target = path.join(path.dirname(path.dirname(definition)), "replacement-target");
+          await writeFile(target, "preserve", { mode: 0o600 });
+          await chmod(target, 0o600);
+          await rm(definition, { force: true });
+          await symlink(target, definition);
+        } else {
+          await rm(definition, { force: true });
+          await writeFile(definition, "cross-owner", { mode: 0o600 });
+          await chmod(definition, 0o600);
+          crossOwner = true;
+        }
+        const after = await lstat(definition, { bigint: true });
+        identity = { dev: after.dev, ino: after.ino };
+      };
+      const runner = new RecordingRunner();
+      const artifacts = await (platform === "linux" ? linuxFixture : darwinFixture)(runner, {
+        isDefinitionCurrentUser: (_uid, candidate) => !crossOwner || candidate !== definition,
+        definitionRemovalHooks: { [boundary]: createReplacement },
+      });
+      definition = artifacts.definition;
+      await artifacts.manager.install();
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      const after = await lstat(definition, { bigint: true });
+      expect(after.dev).toBe(identity?.dev);
+      expect(after.ino).toBe(identity?.ino);
+      expect(after.isDirectory()).toBe(kind === "directory");
+      expect(after.isSymbolicLink()).toBe(kind === "symlink");
+      expect(after.isFile()).toBe(kind === "cross-owner");
+      expect(
+        (await readdir(path.dirname(definition))).filter((entry) => entry.includes("delete-claim")),
+      ).toEqual([]);
+    },
+  );
+
   it.each(["linux", "darwin"] as const)(
     "restores a %s directory replacement that races the final preclaim validation",
     async (platform) => {
@@ -279,6 +531,42 @@ describe("native per-user service manager", () => {
       });
       const after = await lstat(definition, { bigint: true });
       expect(after.isDirectory()).toBe(true);
+      expect(after.dev).toBe(replacementIdentity?.dev);
+      expect(after.ino).toBe(replacementIdentity?.ino);
+      expect(
+        (await readdir(path.dirname(definition))).filter((entry) => entry.includes("delete-claim")),
+      ).toEqual([]);
+    },
+  );
+
+  it.each(["linux", "darwin"] as const)(
+    "preserves a %s symlink replacement before the claim link without a claim leak",
+    async (platform) => {
+      let definition = "";
+      let replacementIdentity: { readonly dev: bigint; readonly ino: bigint } | undefined;
+      const runner = new RecordingRunner();
+      const artifacts = await (platform === "linux" ? linuxFixture : darwinFixture)(runner, {
+        definitionRemovalHooks: {
+          beforeRename: async () => {
+            const target = path.join(path.dirname(path.dirname(definition)), "preclaim-target");
+            await writeFile(target, "preserve", { mode: 0o600 });
+            await chmod(target, 0o600);
+            await rm(definition);
+            await symlink(target, definition);
+            const metadata = await lstat(definition, { bigint: true });
+            replacementIdentity = { dev: metadata.dev, ino: metadata.ino };
+          },
+        },
+      });
+      definition = artifacts.definition;
+      await artifacts.manager.install();
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      const after = await lstat(definition, { bigint: true });
+      expect(after.isSymbolicLink()).toBe(true);
       expect(after.dev).toBe(replacementIdentity?.dev);
       expect(after.ino).toBe(replacementIdentity?.ino);
       expect(
@@ -363,6 +651,7 @@ describe("native per-user service manager", () => {
     await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
       code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
     });
+    await rm(artifacts.definition);
     await writeFile(artifacts.definition, accepted, { mode: 0o600 });
     await chmod(artifacts.definition, 0o600);
     runner.calls.splice(0);
@@ -375,7 +664,7 @@ describe("native per-user service manager", () => {
       (await readdir(path.dirname(artifacts.definition))).filter((entry) =>
         entry.includes("delete-claim"),
       ),
-    ).toHaveLength(1);
+    ).toEqual([]);
     expect(runner.calls).toEqual([]);
   });
 

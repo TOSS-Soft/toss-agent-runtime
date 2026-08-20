@@ -52,6 +52,11 @@ export interface CreateServiceManagerOptions {
   readonly isDefinitionCurrentUser?: (userId: number, candidate?: string) => boolean;
   readonly definitionRemovalHooks?: {
     readonly beforeClaim?: () => Promise<void>;
+    readonly afterStateStageWrite?: () => Promise<void>;
+    readonly afterStateLink?: () => Promise<void>;
+    readonly afterStateSync?: () => Promise<void>;
+    readonly beforeStateStageUnlink?: () => Promise<void>;
+    readonly afterStateStageUnlink?: () => Promise<void>;
     readonly beforeRename?: () => Promise<void>;
     readonly afterRename?: () => Promise<void>;
     readonly afterSync?: () => Promise<void>;
