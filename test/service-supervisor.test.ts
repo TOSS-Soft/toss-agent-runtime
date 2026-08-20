@@ -330,7 +330,7 @@ describe("runtime service supervisor", () => {
     await running;
   });
 
-  it("fsyncs a durable interruption marker before flushing and removing socket or lock", async () => {
+  it("flushes project intake and drains control before persisting interruption", async () => {
     const events: string[] = [];
     const markerPath = path.join(fixture.root, "interruption.marker");
     const running = runSupervisor({
@@ -363,9 +363,9 @@ describe("runtime service supervisor", () => {
     expect(events).toEqual([
       "stop-accepting",
       "stop-watchers",
-      "interrupt-fsynced",
-      "drain-control",
       "flush",
+      "drain-control",
+      "interrupt-fsynced",
       "close-socket",
       "release-lock",
     ]);
@@ -391,9 +391,9 @@ describe("runtime service supervisor", () => {
     expect(events).toEqual([
       "stop-accepting",
       "stop-watchers",
-      "interrupt-active",
-      "drain-control",
       "flush",
+      "drain-control",
+      "interrupt-active",
       "close-socket",
       "release-lock",
     ]);
@@ -456,6 +456,8 @@ describe("runtime service supervisor", () => {
     expect(events).toEqual([
       "stop-accepting",
       "stop-watchers",
+      "flush",
+      "drain-control",
       "abort",
       "close-socket",
       "release-lock",
@@ -571,14 +573,15 @@ describe("runtime service supervisor", () => {
     signals.emit("SIGTERM");
     await vi.advanceTimersByTimeAsync(25);
 
-    expect(events).toEqual(["stop-accepting", "stop-watchers", "close-socket"]);
+    expect(events).toEqual(["stop-accepting", "stop-watchers", "flush", "close-socket"]);
     await expect(running).resolves.toMatchObject({ forced: true });
-    expect(events).toEqual(["stop-accepting", "stop-watchers", "close-socket"]);
+    expect(events).toEqual(["stop-accepting", "stop-watchers", "flush", "close-socket"]);
     finishClose?.();
     await vi.waitFor(() => {
       expect(events).toEqual([
         "stop-accepting",
         "stop-watchers",
+        "flush",
         "close-socket",
         "release-lock",
         "restore-umask",
@@ -626,7 +629,7 @@ describe("runtime service supervisor", () => {
       forced: true,
       serviceInstanceId,
     });
-    expect(events).toEqual(["stop-accepting", "stop-watchers", "close-socket"]);
+    expect(events).toEqual(["stop-accepting", "stop-watchers", "flush", "close-socket"]);
     expect(activeMask).toBe(0o077);
   });
 
@@ -676,7 +679,13 @@ describe("runtime service supervisor", () => {
       forced: true,
       serviceInstanceId,
     });
-    expect(events).toEqual(["stop-accepting", "stop-watchers", "close-socket", "release-lock"]);
+    expect(events).toEqual([
+      "stop-accepting",
+      "stop-watchers",
+      "flush",
+      "close-socket",
+      "release-lock",
+    ]);
     expect(activeMask).toBe(0o077);
   });
 
@@ -726,7 +735,13 @@ describe("runtime service supervisor", () => {
     await vi.advanceTimersByTimeAsync(25);
 
     await expect(running).resolves.toMatchObject({ forced: true });
-    expect(events).toEqual(["stop-accepting", "stop-watchers", "close-socket", "release-lock"]);
+    expect(events).toEqual([
+      "stop-accepting",
+      "stop-watchers",
+      "flush",
+      "close-socket",
+      "release-lock",
+    ]);
     expect(activeMask).toBe(0o077);
 
     finishRelease?.();
@@ -734,6 +749,7 @@ describe("runtime service supervisor", () => {
       expect(events).toEqual([
         "stop-accepting",
         "stop-watchers",
+        "flush",
         "close-socket",
         "release-lock",
         "restore-umask",
@@ -762,9 +778,9 @@ describe("runtime service supervisor", () => {
     expect(events).toEqual([
       "stop-accepting",
       "stop-watchers",
-      "interrupt-active",
-      "drain-control",
       "flush",
+      "drain-control",
+      "interrupt-active",
       "close-socket",
       "release-lock",
     ]);

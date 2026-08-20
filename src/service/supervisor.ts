@@ -349,20 +349,22 @@ export async function runSupervisor(options: RunSupervisorOptions): Promise<Supe
                 }
               }
 
-              const interruption = await runParticipantStage(signal, () =>
-                options.interruptionRecorder.interruptActive(signal),
-              );
-              if (interruption.error !== undefined) capture(interruption.error);
+              for (const participant of options.recoveryParticipants) {
+                if (signal.aborted) break;
+                const flushed = await runParticipantStage(signal, () => participant.flush(signal));
+                if (flushed.error !== undefined) capture(flushed.error);
+              }
 
               if (!signal.aborted) {
                 const controlDrain = await runParticipantStage(signal, () => server!.drain(signal));
                 if (controlDrain.error !== undefined) capture(controlDrain.error);
               }
 
-              for (const participant of options.recoveryParticipants) {
-                if (signal.aborted) break;
-                const flushed = await runParticipantStage(signal, () => participant.flush(signal));
-                if (flushed.error !== undefined) capture(flushed.error);
+              if (!signal.aborted) {
+                const interruption = await runParticipantStage(signal, () =>
+                  options.interruptionRecorder.interruptActive(signal),
+                );
+                if (interruption.error !== undefined) capture(interruption.error);
               }
             } finally {
               await finalizeOwnedResources();

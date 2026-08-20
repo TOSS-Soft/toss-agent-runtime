@@ -59,9 +59,12 @@ export function createBaselineCapabilities(platform: {
     platform: Object.freeze({ ...platform }),
     supported_protocols: Object.freeze([PROTOCOL_VERSION]),
     supported_schemas: Object.freeze([
+      "candidate-job-intent.v1",
       "execution-request.v1",
       "execution-event.v1",
       "execution-result.v1",
+      "project-registry-entry.v1",
+      "project-watch-manifest.v1",
       "runtime-capabilities.v1",
       "run-journal-entry.v1",
       "service-lock.v1",

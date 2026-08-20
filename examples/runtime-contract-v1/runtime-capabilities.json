@@ -18,9 +18,12 @@
   },
   "supported_protocols": ["runtime-contract.v1"],
   "supported_schemas": [
+    "candidate-job-intent.v1",
     "execution-request.v1",
     "execution-event.v1",
     "execution-result.v1",
+    "project-registry-entry.v1",
+    "project-watch-manifest.v1",
     "runtime-capabilities.v1",
     "run-journal-entry.v1",
     "service-lock.v1",

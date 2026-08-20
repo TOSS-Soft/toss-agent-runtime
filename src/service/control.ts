@@ -20,7 +20,10 @@ import {
   MAX_CONTROL_MESSAGE_BYTES,
   parseServiceControlRequest,
   parseServiceControlResponse,
+  type ServiceControlRequestV1,
   type ServiceControlResponseV1,
+  type ServiceProjectDataV1,
+  type ServiceProjectRequestV1,
   type ServiceStatusV1,
 } from "./contracts.js";
 import { RuntimeServiceError, type RuntimeServiceErrorCode } from "./errors.js";
@@ -31,6 +34,7 @@ import {
   isServiceSocketPlatform,
   serviceSocketLayoutFits,
 } from "./paths.js";
+import { RuntimeProjectError, type RuntimeProjectErrorCode } from "./project/errors.js";
 
 const RESPONSE_FRAME_BYTES = MAX_CONTROL_MESSAGE_BYTES + 1;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
@@ -48,6 +52,11 @@ interface CacheEntry {
   readonly response: string;
 }
 
+interface PendingCacheEntry {
+  readonly requestHash: string;
+  readonly response: Promise<string>;
+}
+
 export interface ServiceControlServer {
   listen(): Promise<void>;
   stopAccepting(): void;
@@ -62,6 +71,9 @@ export interface CreateServiceControlServerOptions {
   readonly idleTimeoutMs: 5_000;
   readonly maxConnections: 32;
   readonly cacheSize: 256;
+  readonly handleProjectRequest?: (
+    request: ServiceProjectRequestV1,
+  ) => Promise<ServiceProjectDataV1>;
   /** @internal Deterministic current-platform seam for portable path-budget tests. */
   readonly socketPathPlatform?: "darwin" | "linux";
   /** @internal Deterministic Unix-socket ABI-budget seam for portable tests. */
@@ -104,6 +116,21 @@ export interface RequestServiceStatusOptions {
   readonly socketPath: string;
   readonly requestId?: string;
   readonly createRequestId?: () => string;
+  readonly idleTimeoutMs?: 5_000;
+}
+
+export type ProjectControlOperation =
+  | { readonly command: "project-register"; readonly root: string }
+  | { readonly command: "project-unregister"; readonly project_id: string }
+  | { readonly command: "project-list" };
+
+export interface RequestProjectOperationOptions {
+  readonly socketPath: string;
+  readonly operation: ProjectControlOperation;
+  readonly requestId?: string;
+  readonly createRequestId?: () => string;
+  readonly operationId?: string;
+  readonly createOperationId?: () => string;
   readonly idleTimeoutMs?: 5_000;
 }
 
@@ -1008,13 +1035,18 @@ async function reclaimStaleStagedSockets(options: {
   }
 }
 
-function plainError(code: RuntimeServiceErrorCode): Readonly<{
-  code: RuntimeServiceErrorCode;
+type ControlErrorCode = RuntimeServiceErrorCode | RuntimeProjectErrorCode;
+
+function plainError(code: ControlErrorCode): Readonly<{
+  code: ControlErrorCode;
   category: RuntimeServiceError["category"];
   retryable: boolean;
   safe_message: string;
 }> {
-  const error = new RuntimeServiceError(code);
+  const error =
+    code.startsWith("RUNTIME_PROJECT_") || code === "RUNTIME_OPERATION_CONFLICT"
+      ? new RuntimeProjectError(code as RuntimeProjectErrorCode)
+      : new RuntimeServiceError(code as RuntimeServiceErrorCode);
   return {
     code: error.code,
     category: error.category,
@@ -1025,7 +1057,7 @@ function plainError(code: RuntimeServiceErrorCode): Readonly<{
 
 function failureResponse(
   requestId: string | null,
-  code: RuntimeServiceErrorCode,
+  code: ControlErrorCode,
 ): ServiceControlResponseV1 {
   return {
     schema_version: "service-control-response.v1",
@@ -1033,12 +1065,15 @@ function failureResponse(
     request_id: requestId,
     ok: false,
     status: null,
+    data: null,
     error: plainError(code),
   };
 }
 
 function framedResponse(response: ServiceControlResponseV1): string {
-  return `${canonicalJson(response)}\n`;
+  const framed = `${canonicalJson(response)}\n`;
+  if (Buffer.byteLength(framed, "utf8") <= RESPONSE_FRAME_BYTES) return framed;
+  return `${canonicalJson(failureResponse(response.request_id, "RUNTIME_SERVICE_UNAVAILABLE"))}\n`;
 }
 
 const INVALID_RESPONSE = framedResponse(failureResponse(null, "RUNTIME_SERVICE_CONTROL_INVALID"));
@@ -1070,6 +1105,7 @@ function validatedSuccessResponse(
       request_id: requestId,
       ok: true,
       status,
+      data: null,
       error: null,
     };
     const parsed = parseServiceControlResponse(canonicalJson(response));
@@ -1079,12 +1115,73 @@ function validatedSuccessResponse(
   }
 }
 
+function validatedProjectResponse(
+  request: ServiceProjectRequestV1,
+  data: ServiceProjectDataV1,
+): ServiceControlResponseV1 | undefined {
+  try {
+    if (
+      (request.command === "project-list" && data.kind !== "project-list") ||
+      (request.command !== "project-list" && data.kind !== "project-registration") ||
+      (request.command === "project-register" &&
+        data.kind === "project-registration" &&
+        (data.registration.state !== "ACTIVE" ||
+          data.registration.canonical_root !== request.root)) ||
+      (request.command === "project-unregister" &&
+        data.kind === "project-registration" &&
+        (data.registration.state !== "UNREGISTERED" ||
+          data.registration.project_id !== request.project_id.toLowerCase()))
+    ) {
+      return undefined;
+    }
+    const response: ServiceControlResponseV1 = {
+      schema_version: "service-control-response.v1",
+      document_type: "service-control-response",
+      request_id: request.request_id,
+      ok: true,
+      status: null,
+      data,
+      error: null,
+    };
+    const parsed = parseServiceControlResponse(canonicalJson(response));
+    return parsed.ok ? parsed.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function canonicalProjectRequest(request: ServiceProjectRequestV1): ServiceProjectRequestV1 {
+  if (request.command === "project-list") return request;
+  if (request.command === "project-register") {
+    return { ...request, operation_id: request.operation_id.toLowerCase() };
+  }
+  return {
+    ...request,
+    operation_id: request.operation_id.toLowerCase(),
+    project_id: request.project_id.toLowerCase(),
+  };
+}
+
+function safeOperationFailure(error: unknown): ControlErrorCode {
+  if (error instanceof RuntimeProjectError) {
+    try {
+      return new RuntimeProjectError(error.code).code;
+    } catch {
+      return "RUNTIME_SERVICE_UNAVAILABLE";
+    }
+  }
+  if (error instanceof RuntimeServiceError && internalServiceErrors.has(error)) return error.code;
+  return "RUNTIME_SERVICE_UNAVAILABLE";
+}
+
 function validatedConfiguration(options: CreateServiceControlServerOptions): boolean {
   return (
     options.idleTimeoutMs === 5_000 &&
     options.maxConnections === 32 &&
     options.cacheSize === 256 &&
     typeof options.status === "function" &&
+    (options.handleProjectRequest === undefined ||
+      typeof options.handleProjectRequest === "function") &&
     typeof options.serviceInstanceId === "string" &&
     UUID_PATTERN.test(options.serviceInstanceId)
   );
@@ -1094,8 +1191,10 @@ export function createServiceControlServer(
   options: CreateServiceControlServerOptions,
 ): ServiceControlServer {
   const connections = new Set<Socket>();
+  const activeOperations = new Set<Promise<void>>();
   const drainWaiters = new Set<() => void>();
   const cache = new Map<string, CacheEntry>();
+  const pendingCache = new Map<string, PendingCacheEntry>();
   const publicationGuardPath = path.join(
     path.dirname(options.socketPath),
     publicationGuardName(options.serviceInstanceId),
@@ -1135,7 +1234,7 @@ export function createServiceControlServer(
   };
 
   const resolveDrains = (): void => {
-    if (connections.size !== 0) return;
+    if (connections.size !== 0 || activeOperations.size !== 0) return;
     for (const resolve of drainWaiters) resolve();
     drainWaiters.clear();
   };
@@ -1157,7 +1256,29 @@ export function createServiceControlServer(
     }
   };
 
-  const responseForFrame = (frame: Buffer): string => {
+  const dispatch = async (request: ServiceControlRequestV1): Promise<string> => {
+    if (request.command === "status") {
+      const success = validatedSuccessResponse(options, request.request_id);
+      return framedResponse(
+        success ?? failureResponse(request.request_id, "RUNTIME_SERVICE_UNAVAILABLE"),
+      );
+    }
+    if (options.handleProjectRequest === undefined) {
+      return framedResponse(failureResponse(request.request_id, "RUNTIME_SERVICE_UNAVAILABLE"));
+    }
+    try {
+      const canonicalRequest = canonicalProjectRequest(request);
+      const data = await options.handleProjectRequest(canonicalRequest);
+      const success = validatedProjectResponse(canonicalRequest, data);
+      return framedResponse(
+        success ?? failureResponse(request.request_id, "RUNTIME_SERVICE_UNAVAILABLE"),
+      );
+    } catch (error) {
+      return framedResponse(failureResponse(request.request_id, safeOperationFailure(error)));
+    }
+  };
+
+  const responseForFrame = async (frame: Buffer, allowDispatch = true): Promise<string> => {
     if (
       frame.byteLength < 2 ||
       frame.byteLength > RESPONSE_FRAME_BYTES ||
@@ -1191,17 +1312,32 @@ export function createServiceControlServer(
       cache.set(requestId, existing);
       return existing.response;
     }
+    const pending = pendingCache.get(requestId);
+    if (pending !== undefined) {
+      return pending.requestHash === requestHash
+        ? pending.response
+        : framedResponse(failureResponse(requestId, "RUNTIME_SERVICE_CONTROL_CONFLICT"));
+    }
 
     const parsed = parseServiceControlRequest(body);
-    let response: string;
+    let responsePromise: Promise<string>;
     if (!parsed.ok) {
-      response = framedResponse(failureResponse(requestId, "RUNTIME_SERVICE_CONTROL_INVALID"));
+      responsePromise = Promise.resolve(
+        framedResponse(failureResponse(requestId, "RUNTIME_SERVICE_CONTROL_INVALID")),
+      );
+    } else if (!allowDispatch) {
+      responsePromise = Promise.resolve(
+        framedResponse(failureResponse(requestId, "RUNTIME_SERVICE_UNAVAILABLE")),
+      );
     } else {
-      const success = validatedSuccessResponse(options, requestId);
-      response =
-        success === undefined
-          ? framedResponse(failureResponse(requestId, "RUNTIME_SERVICE_UNAVAILABLE"))
-          : framedResponse(success);
+      responsePromise = dispatch(parsed.value);
+    }
+    pendingCache.set(requestId, { requestHash, response: responsePromise });
+    let response: string;
+    try {
+      response = await responsePromise;
+    } finally {
+      if (pendingCache.get(requestId)?.response === responsePromise) pendingCache.delete(requestId);
     }
     storeResponse(requestId, requestHash, response);
     return response;
@@ -1244,7 +1380,18 @@ export function createServiceControlServer(
       chunks.push(chunk);
     });
     socket.once("end", () => {
-      finish(oversized ? INVALID_RESPONSE : responseForFrame(Buffer.concat(chunks, totalBytes)));
+      const operation = (
+        oversized
+          ? Promise.resolve(INVALID_RESPONSE)
+          : responseForFrame(Buffer.concat(chunks, totalBytes), !stopRequested && !closing)
+      )
+        .then(finish)
+        .catch(() => finish(framedResponse(failureResponse(null, "RUNTIME_SERVICE_UNAVAILABLE"))))
+        .finally(() => {
+          activeOperations.delete(operation);
+          resolveDrains();
+        });
+      activeOperations.add(operation);
     });
     socket.once("error", () => {
       socket.destroy();
@@ -1653,7 +1800,7 @@ export function createServiceControlServer(
   };
 
   const drain = async (signal: AbortSignal): Promise<void> => {
-    if (connections.size === 0) return;
+    if (connections.size === 0 && activeOperations.size === 0) return;
     await new Promise<void>((resolve) => {
       const finish = (): void => {
         signal.removeEventListener("abort", abort);
@@ -1667,7 +1814,7 @@ export function createServiceControlServer(
       drainWaiters.add(finish);
       signal.addEventListener("abort", abort, { once: true });
       if (signal.aborted) abort();
-      if (connections.size === 0) finish();
+      if (connections.size === 0 && activeOperations.size === 0) finish();
     });
   };
 
@@ -1685,7 +1832,7 @@ export function createServiceControlServer(
       }
       stopAccepting();
       for (const socket of connections) socket.destroy();
-      if (connections.size !== 0) {
+      if (connections.size !== 0 || activeOperations.size !== 0) {
         await new Promise<void>((resolve) => drainWaiters.add(resolve));
       }
       await acceptClosePromise;
@@ -1698,7 +1845,9 @@ export function createServiceControlServer(
   return Object.freeze({ listen, stopAccepting, drain, close });
 }
 
-function requestIdFor(options: RequestServiceStatusOptions): string {
+function requestIdFor(
+  options: Pick<RequestServiceStatusOptions, "requestId" | "createRequestId">,
+): string {
   try {
     const requestId = options.requestId ?? options.createRequestId?.() ?? randomUUID();
     if (!UUID_PATTERN.test(requestId)) controlInvalid();
@@ -1709,21 +1858,16 @@ function requestIdFor(options: RequestServiceStatusOptions): string {
   }
 }
 
-async function readStatusResponse(
-  options: RequestServiceStatusOptions,
-  requestId: string,
-): Promise<ServiceStatusV1> {
+async function readControlResponse(
+  options: Pick<RequestServiceStatusOptions, "socketPath" | "idleTimeoutMs">,
+  request: ServiceControlRequestV1,
+): Promise<ServiceControlResponseV1> {
   await assertPrivateRuntimeDirectory(options.socketPath);
   const expectedSocket = await privateSocketIdentity(options.socketPath);
   if (expectedSocket === undefined) unavailable();
   const timeout = options.idleTimeoutMs ?? 5_000;
   if (timeout !== 5_000) controlInvalid();
-  const request = `${canonicalJson({
-    schema_version: "service-control-request.v1",
-    document_type: "service-control-request",
-    request_id: requestId,
-    command: "status",
-  })}\n`;
+  const requestFrame = `${canonicalJson(request)}\n`;
 
   const frame = await new Promise<Buffer>((resolve, reject) => {
     const socket = createConnection({ path: options.socketPath });
@@ -1738,7 +1882,7 @@ async function readStatusResponse(
       else reject(error);
     };
     socket.setTimeout(timeout, () => finish(serviceError("RUNTIME_SERVICE_UNAVAILABLE")));
-    socket.once("connect", () => socket.end(request));
+    socket.once("connect", () => socket.end(requestFrame));
     socket.on("data", (chunk: Buffer) => {
       totalBytes += chunk.byteLength;
       if (totalBytes > RESPONSE_FRAME_BYTES) {
@@ -1766,13 +1910,22 @@ async function readStatusResponse(
   const body = frame.subarray(0, frame.byteLength - 1);
   const parsed = parseServiceControlResponse(body);
   if (!parsed.ok || !Buffer.from(canonicalJson(parsed.value), "utf8").equals(body)) unavailable();
-  if (parsed.value.request_id !== requestId) unavailable();
-  if (!parsed.value.ok || parsed.value.status === null) {
-    const code = parsed.value.error?.code as RuntimeServiceErrorCode | undefined;
-    if (code === undefined) unavailable();
-    throw serviceError(code);
+  if (parsed.value.request_id !== request.request_id) unavailable();
+  return parsed.value;
+}
+
+function throwControlFailure(response: ServiceControlResponseV1): never {
+  const code = response.error?.code;
+  if (typeof code !== "string") unavailable();
+  if (code.startsWith("RUNTIME_PROJECT_") || code === "RUNTIME_OPERATION_CONFLICT") {
+    try {
+      throw new RuntimeProjectError(code as RuntimeProjectErrorCode);
+    } catch (error) {
+      if (error instanceof RuntimeProjectError) throw error;
+      unavailable();
+    }
   }
-  return parsed.value.status;
+  throw serviceError(code as RuntimeServiceErrorCode);
 }
 
 export async function requestServiceStatus(
@@ -1780,8 +1933,58 @@ export async function requestServiceStatus(
 ): Promise<ServiceStatusV1> {
   try {
     const requestId = requestIdFor(options);
-    return await readStatusResponse(options, requestId);
+    const response = await readControlResponse(options, {
+      schema_version: "service-control-request.v1",
+      document_type: "service-control-request",
+      request_id: requestId,
+      command: "status",
+    });
+    if (!response.ok) throwControlFailure(response);
+    if (response.status === null || response.data !== null) unavailable();
+    return response.status;
   } catch (error) {
+    if (error instanceof RuntimeServiceError && internalServiceErrors.has(error)) throw error;
+    unavailable();
+  }
+}
+
+export async function requestProjectOperation(
+  options: RequestProjectOperationOptions,
+): Promise<ServiceProjectDataV1> {
+  try {
+    const requestId = requestIdFor(options);
+    const request = {
+      schema_version: "service-control-request.v1",
+      document_type: "service-control-request",
+      request_id: requestId,
+      ...(options.operation.command === "project-list"
+        ? {}
+        : { operation_id: options.operationId ?? options.createOperationId?.() ?? randomUUID() }),
+      ...options.operation,
+    } as const;
+    const validated = parseServiceControlRequest(canonicalJson(request));
+    if (!validated.ok || validated.value.command === "status") controlInvalid();
+    const response = await readControlResponse(options, validated.value);
+    if (!response.ok) throwControlFailure(response);
+    if (response.status !== null || response.data === null) unavailable();
+    if (
+      (options.operation.command === "project-list" && response.data.kind !== "project-list") ||
+      (options.operation.command !== "project-list" &&
+        response.data.kind !== "project-registration")
+    ) {
+      unavailable();
+    }
+    return response.data;
+  } catch (error) {
+    if (error instanceof RuntimeProjectError) {
+      let normalized: RuntimeProjectError;
+      try {
+        normalized = new RuntimeProjectError(error.code);
+      } catch {
+        unavailable();
+      }
+      throw normalized;
+    }
     if (error instanceof RuntimeServiceError && internalServiceErrors.has(error)) throw error;
     unavailable();
   }

@@ -19,9 +19,11 @@ import { createProcessSignalSource } from "../platform/signals.js";
 import {
   createServiceControlServer,
   probeServiceIdentity as probeRuntimeServiceIdentity,
+  requestProjectOperation as requestRuntimeProjectOperation,
   requestServiceStatus as requestRuntimeServiceStatus,
+  type ProjectControlOperation,
 } from "../service/control.js";
-import type { ServiceStatusV1 } from "../service/contracts.js";
+import type { ServiceProjectDataV1, ServiceStatusV1 } from "../service/contracts.js";
 import { ensureServiceConfig } from "../service/definition-store.js";
 import { RuntimeServiceError } from "../service/errors.js";
 import { acquireInstanceLock, type ProcessLiveness } from "../service/instance-lock.js";
@@ -33,6 +35,10 @@ import {
   type ServiceManagerStatus,
 } from "../service/manager.js";
 import { runSupervisor } from "../service/supervisor.js";
+import { createProjectIntake } from "../service/project/intake.js";
+import { RuntimeProjectError, type RuntimeProjectErrorCode } from "../service/project/errors.js";
+import { createProjectRegistry } from "../service/project/registry.js";
+import { createProjectWatcher } from "../service/project/watcher.js";
 import { PACKAGE_VERSION } from "../version.js";
 import { CliUsageError, parseCli, type BaselineCommand, type ServiceAction } from "./grammar.js";
 import {
@@ -55,6 +61,9 @@ Commands:
   toss-runtime service restart [--json]
   toss-runtime service status [--json]
   toss-runtime service uninstall [--json]
+  toss-runtime project register <absolute-root> [--json]
+  toss-runtime project unregister <project-id> [--json]
+  toss-runtime project list [--json]
   toss-runtime --version
 `;
 
@@ -79,6 +88,9 @@ export interface CliServices {
   ) => Promise<ServiceManagerStatus>;
   readonly requestServiceStatus?: () => Promise<ServiceStatusV1>;
   readonly probeServiceIdentity?: () => Promise<string | null>;
+  readonly requestProjectOperation?: (
+    operation: ProjectControlOperation,
+  ) => Promise<ServiceProjectDataV1>;
 }
 
 export interface CliOutput {
@@ -111,6 +123,7 @@ export interface CreateMainServicesOptions {
   readonly createServiceManager?: (options: CreateServiceManagerOptions) => ServiceManager;
   readonly requestServiceStatus?: typeof requestRuntimeServiceStatus;
   readonly probeServiceIdentity?: typeof probeRuntimeServiceIdentity;
+  readonly requestProjectOperation?: typeof requestRuntimeProjectOperation;
 }
 
 async function hashFile(filePath: string): Promise<string> {
@@ -244,6 +257,11 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
       (options.probeServiceIdentity ?? probeRuntimeServiceIdentity)({
         socketPath: await serviceSocketPath(),
       }),
+    requestProjectOperation: async (operation) =>
+      (options.requestProjectOperation ?? requestRuntimeProjectOperation)({
+        socketPath: await serviceSocketPath(),
+        operation,
+      }),
     serve: async ({ configPath }) => {
       if (!isSupportedPlatform(options.platform)) {
         throw new RuntimeServiceError("RUNTIME_SERVICE_UNAVAILABLE");
@@ -254,6 +272,21 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
         statePath: loaded.config.paths.state,
         now: options.now,
         randomId: options.createServiceInstanceId,
+      });
+      const registry = createProjectRegistry({
+        statePath: loaded.config.paths.state,
+        now: options.now,
+        randomId: randomUUID,
+      });
+      const intake = createProjectIntake({
+        statePath: loaded.config.paths.state,
+        now: options.now,
+        randomId: randomUUID,
+      });
+      const projects = createProjectWatcher({
+        registry,
+        intake,
+        runtimeStatePath: loaded.config.paths.state,
       });
       return runSupervisor({
         loaded,
@@ -266,10 +299,28 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
         socketProbe: {
           identify: (socketPath) => probeRuntimeServiceIdentity({ socketPath }),
         },
-        recoveryParticipants: [journal],
+        recoveryParticipants: [journal, projects],
         interruptionRecorder: journal,
         acquireLock: acquireInstanceLock,
-        createControlServer: createServiceControlServer,
+        createControlServer: (serverOptions) =>
+          createServiceControlServer({
+            ...serverOptions,
+            handleProjectRequest: async (request) => {
+              if (request.command === "project-register") {
+                return {
+                  kind: "project-registration",
+                  registration: await projects.register(request.root, request.operation_id),
+                };
+              }
+              if (request.command === "project-unregister") {
+                return {
+                  kind: "project-registration",
+                  registration: await projects.unregister(request.project_id, request.operation_id),
+                };
+              }
+              return { kind: "project-list", registrations: await projects.list() };
+            },
+          }),
         onReady: () => {
           try {
             options.sendReady();
@@ -430,6 +481,90 @@ function serviceFailure(commandName: string, json: boolean, error: unknown): Cli
     json,
     "",
   );
+}
+
+function projectErrorExitCode(code: RuntimeProjectErrorCode): Exclude<ExitCode, 0> {
+  if (code === "RUNTIME_OPERATION_CONFLICT") return 6;
+  if (code === "RUNTIME_PROJECT_INVALID" || code === "RUNTIME_PROJECT_NOT_FOUND") return 3;
+  if (code === "RUNTIME_PROJECT_UNAVAILABLE") return 69;
+  return 5;
+}
+
+function projectFailure(commandName: string, json: boolean, error: unknown): CliOutput {
+  if (error instanceof RuntimeProjectError) {
+    return outputForResult(
+      commandResult({
+        command: commandName,
+        exitCode: projectErrorExitCode(error.code),
+        error: {
+          code: error.code,
+          category: error.category,
+          retryable: error.retryable,
+          safe_message: error.safe_message,
+        },
+      }),
+      json,
+      "",
+    );
+  }
+  if (error instanceof RuntimeServiceError) return serviceFailure(commandName, json, error);
+  return outputForResult(
+    commandResult({
+      command: commandName,
+      exitCode: 70,
+      error: runtimeError("RUNTIME_PROJECT_FAILED", "internal", "Project command failed"),
+    }),
+    json,
+    "",
+  );
+}
+
+async function project(
+  command: Extract<BaselineCommand, { name: "project" }>,
+  services: CliServices,
+): Promise<CliOutput> {
+  const commandName = `project ${command.action}`;
+  if (!isSupportedPlatform(services.platform)) {
+    return outputForResult(
+      commandResult({
+        command: commandName,
+        exitCode: 5,
+        error: runtimeError(
+          "RUNTIME_PLATFORM_UNSUPPORTED",
+          "unsupported-capability",
+          "Platform is unsupported",
+        ),
+      }),
+      command.json,
+      "",
+    );
+  }
+  if (services.requestProjectOperation === undefined) {
+    return projectFailure(
+      commandName,
+      command.json,
+      new RuntimeProjectError("RUNTIME_PROJECT_UNAVAILABLE"),
+    );
+  }
+  const operation: ProjectControlOperation =
+    command.action === "register"
+      ? { command: "project-register", root: command.root }
+      : command.action === "unregister"
+        ? { command: "project-unregister", project_id: command.projectId }
+        : { command: "project-list" };
+  try {
+    const data = await services.requestProjectOperation(operation);
+    const result = commandResult({ command: commandName, exitCode: 0, data: jsonValue(data) });
+    const human =
+      command.action === "register"
+        ? "Project registered"
+        : command.action === "unregister"
+          ? "Project unregistered"
+          : `${data.kind === "project-list" ? data.registrations.length : 0} registered projects`;
+    return outputForResult(result, command.json, human);
+  } catch (error) {
+    return projectFailure(commandName, command.json, error);
+  }
 }
 
 async function service(
@@ -745,6 +880,7 @@ export async function runCli(argv: readonly string[], services: CliServices): Pr
   if (command.name === "capabilities") return capabilities(command, services);
   if (command.name === "doctor") return doctor(command, services);
   if (command.name === "service") return service(command, services);
+  if (command.name === "project") return project(command, services);
   return serve(command, services);
 }
 

@@ -42,18 +42,38 @@ const REQUIRED_FILES = Object.freeze([
   "README.md",
   "bin/toss-runtime.js",
   "contracts/runtime/command-result.v1.schema.json",
+  "contracts/runtime/candidate-job-intent.v1.schema.json",
   "contracts/runtime/execution-event.v1.schema.json",
   "contracts/runtime/execution-request.v1.schema.json",
   "contracts/runtime/execution-result.v1.schema.json",
+  "contracts/runtime/project-registry-entry.v1.schema.json",
+  "contracts/runtime/project-watch-manifest.v1.schema.json",
   "contracts/runtime/runtime-capabilities.v1.schema.json",
   "contracts/runtime/runtime-common.v1.schema.json",
   "contracts/runtime/runtime-config.v1.schema.json",
   "contracts/runtime/service-control-request.v1.schema.json",
   "contracts/runtime/service-control-response.v1.schema.json",
   "contracts/runtime/service-lock.v1.schema.json",
+  "dist/contracts/runtime/candidate-job-intent.v1.schema.json",
+  "dist/contracts/runtime/project-registry-entry.v1.schema.json",
+  "dist/contracts/runtime/project-watch-manifest.v1.schema.json",
   "dist/contracts/runtime/service-control-request.v1.schema.json",
   "dist/contracts/runtime/service-control-response.v1.schema.json",
   "dist/contracts/runtime/service-lock.v1.schema.json",
+  "dist/src/service/project/contracts.d.ts",
+  "dist/src/service/project/contracts.js",
+  "dist/src/service/project/errors.d.ts",
+  "dist/src/service/project/errors.js",
+  "dist/src/service/project/index.js",
+  "dist/src/service/project/intake.js",
+  "dist/src/service/project/interfaces.d.ts",
+  "dist/src/service/project/interfaces.js",
+  "dist/src/service/project/paths.js",
+  "dist/src/service/project/private-files.js",
+  "dist/src/service/project/registry.js",
+  "dist/src/service/project/types.d.ts",
+  "dist/src/service/project/types.js",
+  "dist/src/service/project/watcher.js",
   "dist/src/index.d.ts",
   "dist/src/index.js",
   "dist/src/platform/commands.d.ts",
@@ -187,6 +207,16 @@ function assertPackageFiles(files) {
         publishedPath,
       ),
       `Secret-shaped file name leaked: ${publishedPath}`,
+    );
+    assert(
+      !/^dist\/src\/service\/project\/.*\.(?:js|d\.ts)\.map$/u.test(publishedPath),
+      `Project source map leaked: ${publishedPath}`,
+    );
+    assert(
+      !/^dist\/src\/service\/project\/(?:index|intake|paths|private-files|registry|watcher)\.d\.ts$/u.test(
+        publishedPath,
+      ),
+      `Private project declaration leaked: ${publishedPath}`,
     );
   }
 }
@@ -740,7 +770,7 @@ try {
     [
       "--input-type=module",
       "--eval",
-      'import { parseExecutionRequest, validateExecutionChain } from "@toss-software/agent-runtime"; if (typeof parseExecutionRequest !== "function" || typeof validateExecutionChain !== "function") process.exit(1);',
+      'import * as api from "@toss-software/agent-runtime"; const required = ["parseExecutionRequest", "validateExecutionChain", "parseCandidateJobIntent", "parseProjectRegistryEntry", "parseProjectWatchManifest", "RuntimeProjectError"]; const forbidden = ["createProjectRegistry", "createProjectIntake", "createProjectWatcher"]; if (required.some((name) => typeof api[name] !== "function") || forbidden.some((name) => name in api)) process.exit(1);',
     ],
     { cwd: temporaryDirectory, encoding: "utf8" },
   );
@@ -758,6 +788,22 @@ try {
     "agent-runtime",
   );
   const api = await import(pathToFileURL(path.join(installedRoot, "dist", "src", "index.js")).href);
+  const projectInterfaces = await readFile(
+    path.join(installedRoot, "dist", "src", "service", "project", "interfaces.d.ts"),
+    "utf8",
+  );
+  assert(
+    projectInterfaces.includes("interface ProjectRegistry"),
+    "ProjectRegistry declaration missing",
+  );
+  assert(
+    projectInterfaces.includes("interface ProjectIntake"),
+    "ProjectIntake declaration missing",
+  );
+  assert(
+    !/operationHooks|statePath|CreateProject/u.test(projectInterfaces),
+    "Public project declarations exposed filesystem construction hooks",
+  );
   await assertInstalledLauncherEnforcesExecuteMode(executable, temporaryDirectory);
   const help = await execInstalledLauncher(executable, ["--help"], {
     cwd: temporaryDirectory,

@@ -8,6 +8,7 @@ import { createMainServices, runCli, type CliServices } from "../src/cli/main.js
 import { defaultConfig, RuntimeConfigError } from "../src/config/load.js";
 import type { ServiceStatusV1 } from "../src/service/contracts.js";
 import { RuntimeServiceError, type RuntimeServiceErrorCode } from "../src/service/errors.js";
+import { RuntimeProjectError } from "../src/service/project/errors.js";
 import { createServiceManager, type ServiceManagerStatus } from "../src/service/manager.js";
 
 const platform = { os: "linux" as const, arch: "x64", node: "22.23.1" };
@@ -267,6 +268,112 @@ describe("baseline CLI", () => {
     const output = await runCli(argv, services);
     expect(output.exitCode).toBe(2);
     expect(output.stderr).toContain(message);
+  });
+
+  it("routes closed project register, list, and unregister commands", async () => {
+    const calls: unknown[] = [];
+    const registration = {
+      project_id: "00000000-0000-4000-8000-000000000001",
+      registry_revision: 1,
+      canonical_root: "/private/tmp/project",
+      manifest_hash: `sha256:${"a".repeat(64)}` as const,
+      state: "ACTIVE" as const,
+    };
+    const projectServices = {
+      ...services,
+      requestProjectOperation: (operation: unknown) => {
+        calls.push(operation);
+        return Promise.resolve(
+          (operation as { readonly command: string }).command === "project-list"
+            ? { kind: "project-list" as const, registrations: [registration] }
+            : { kind: "project-registration" as const, registration },
+        );
+      },
+    };
+
+    const registered = await runCli(
+      ["project", "register", "/private/tmp/project", "--json"],
+      projectServices,
+    );
+    const listed = await runCli(["project", "list", "--json"], projectServices);
+    const unregistered = await runCli(
+      ["project", "unregister", registration.project_id],
+      projectServices,
+    );
+
+    expect(calls).toEqual([
+      { command: "project-register", root: "/private/tmp/project" },
+      { command: "project-list" },
+      { command: "project-unregister", project_id: registration.project_id },
+    ]);
+    expect(JSON.parse(registered.stdout)).toMatchObject({
+      command: "project register",
+      ok: true,
+      data: { kind: "project-registration", registration },
+    });
+    expect(JSON.parse(listed.stdout)).toMatchObject({
+      command: "project list",
+      ok: true,
+      data: { kind: "project-list", registrations: [registration] },
+    });
+    expect(unregistered).toEqual({
+      exitCode: 0,
+      stdout: "Project unregistered\n",
+      stderr: "",
+    });
+  });
+
+  it.each([
+    [["project"], "Missing project action"],
+    [["project", "scan"], "Unknown project action"],
+    [["project", "register", "relative/project"], "Project root must be absolute"],
+    [["project", "register", "/tmp/project", "extra"], "Unknown option"],
+    [["project", "unregister", "not-a-uuid"], "Project ID must be a UUID"],
+    [["project", "list", "extra"], "Unknown option"],
+    [["project", "list", "--json", "--json"], "Duplicate option: --json"],
+  ])("rejects malformed project grammar %# safely", async (argv, message) => {
+    const output = await runCli(argv, services);
+    expect(output.exitCode).toBe(2);
+    expect(`${output.stdout}${output.stderr}`).toContain(message);
+  });
+
+  it("maps project failures to fixed safe command results", async () => {
+    const output = await runCli(["project", "list", "--json"], {
+      ...services,
+      requestProjectOperation: () =>
+        Promise.reject(new RuntimeProjectError("RUNTIME_PROJECT_REGISTRY_CORRUPT")),
+    });
+
+    expect(output).toMatchObject({ exitCode: 5, stderr: "" });
+    expect(JSON.parse(output.stdout)).toMatchObject({
+      command: "project list",
+      ok: false,
+      error: {
+        code: "RUNTIME_PROJECT_REGISTRY_CORRUPT",
+        safe_message: "Project registry is corrupt",
+      },
+    });
+
+    const conflict = await runCli(["project", "list", "--json"], {
+      ...services,
+      requestProjectOperation: () =>
+        Promise.reject(new RuntimeProjectError("RUNTIME_OPERATION_CONFLICT")),
+    });
+    expect(conflict.exitCode).toBe(6);
+    expect(JSON.parse(conflict.stdout)).toMatchObject({
+      error: { code: "RUNTIME_OPERATION_CONFLICT", category: "stale-revision" },
+    });
+
+    for (const code of ["RUNTIME_PROJECT_INVALID", "RUNTIME_PROJECT_NOT_FOUND"] as const) {
+      const invalidInput = await runCli(["project", "list", "--json"], {
+        ...services,
+        requestProjectOperation: () => Promise.reject(new RuntimeProjectError(code)),
+      });
+      expect(invalidInput.exitCode).toBe(3);
+      expect(JSON.parse(invalidInput.stdout)).toMatchObject({
+        error: { code, category: "invalid-input" },
+      });
+    }
   });
 
   it.each(["install", "start", "stop", "restart", "status", "uninstall"] as const)(

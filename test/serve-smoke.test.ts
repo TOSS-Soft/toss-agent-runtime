@@ -1,11 +1,12 @@
-import { chmod, lstat, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { computeExecutableHash, createMainServices, runCli } from "../src/cli/main.js";
 import { defaultConfig } from "../src/config/load.js";
+import { requestProjectOperation } from "../src/service/control.js";
 import type { InstanceLock } from "../src/service/instance-lock.js";
 import { runSupervisor } from "../src/service/supervisor.js";
 import { FakeSignals } from "./support/fake-signals.js";
@@ -58,7 +59,7 @@ describe("serve command lifecycle integration", () => {
       resolveReady = resolve;
     });
     const services = createMainServices({
-      platform: { os: "linux", arch: "x64", node: "22.23.1" },
+      platform: { os: "darwin", arch: "arm64", node: "22.23.1" },
       env: {},
       home: root,
       signals,
@@ -71,7 +72,7 @@ describe("serve command lifecycle integration", () => {
 
     const running = services.serve?.({});
     await ready;
-    const config = defaultConfig("linux", root);
+    const config = defaultConfig("darwin", root);
     const socket = await lstat(config.paths.socket);
     const ownerPath = path.join(path.dirname(config.paths.socket), "instance.lock", "owner.json");
     const lockOwner: unknown = JSON.parse(await readFile(ownerPath, "utf8"));
@@ -80,6 +81,49 @@ describe("serve command lifecycle integration", () => {
     expect(socket.mode & 0o777).toBe(0o600);
     expect(lockOwner).toMatchObject({ executable_hash: "a".repeat(64) });
     expect(JSON.stringify(lockOwner)).not.toContain(process.execPath);
+
+    const projectRoot = path.join(root, "project");
+    await mkdir(path.join(projectRoot, ".toss"), { recursive: true, mode: 0o700 });
+    await mkdir(path.join(projectRoot, "src"), { mode: 0o700 });
+    await writeFile(
+      path.join(projectRoot, ".toss", "project.yaml"),
+      "schema_version: project-watch-manifest.v1\nwatch_paths:\n  - src\n",
+      { mode: 0o600 },
+    );
+    const sourcePath = path.join(projectRoot, "src", "main.ts");
+    await writeFile(sourcePath, "first", { mode: 0o600 });
+    const registered = await requestProjectOperation({
+      socketPath: config.paths.socket,
+      operation: { command: "project-register", root: projectRoot },
+    });
+    expect(registered).toMatchObject({
+      kind: "project-registration",
+      registration: { canonical_root: projectRoot, state: "ACTIVE" },
+    });
+    await writeFile(sourcePath, "second", { mode: 0o600 });
+    const candidatesPath = path.join(config.paths.state, "projects", "intake", "candidates.jsonl");
+    await vi.waitFor(
+      async () => {
+        const candidate = JSON.parse((await readFile(candidatesPath, "utf8")).trim()) as {
+          readonly changes: readonly { readonly path: string }[];
+        };
+        expect(candidate.changes.map((change) => change.path)).toContain("src/main.ts");
+      },
+      { timeout: 2_000 },
+    );
+    if (registered.kind !== "project-registration") throw new Error("registration expected");
+    await expect(
+      requestProjectOperation({
+        socketPath: config.paths.socket,
+        operation: {
+          command: "project-unregister",
+          project_id: registered.registration.project_id,
+        },
+      }),
+    ).resolves.toMatchObject({
+      kind: "project-registration",
+      registration: { state: "UNREGISTERED" },
+    });
     signals.emit("SIGTERM");
     await expect(running).resolves.toMatchObject({ reason: "SIGTERM", forced: false });
     await expect(lstat(ownerPath)).rejects.toMatchObject({ code: "ENOENT" });

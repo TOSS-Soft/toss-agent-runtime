@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toss.software/schemas/runtime/v1/project-watch-manifest.v1.schema.json",
+  "title": "TOSS project watch manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "watch_paths"],
+  "properties": {
+    "schema_version": { "const": "project-watch-manifest.v1" },
+    "watch_paths": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 256,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/relative_path" }
+    },
+    "ignore_paths": {
+      "type": "array",
+      "maxItems": 256,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/relative_path" }
+    }
+  },
+  "$defs": {
+    "relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+    }
+  }
+}

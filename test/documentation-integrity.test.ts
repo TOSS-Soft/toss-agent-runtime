@@ -26,6 +26,18 @@ async function readExample(name: string): Promise<Uint8Array> {
 }
 
 describe("published protocol artifacts", () => {
+  it("keeps the lockfile root platform metadata aligned with the macOS-only package", async () => {
+    const packageManifest = JSON.parse(await readFile("package.json", "utf8")) as {
+      readonly os: readonly string[];
+    };
+    const lockfile = JSON.parse(await readFile("package-lock.json", "utf8")) as {
+      readonly packages: Readonly<Record<string, { readonly os?: readonly string[] }>>;
+    };
+
+    expect(packageManifest.os).toEqual(["darwin"]);
+    expect(lockfile.packages[""]?.os).toEqual(packageManifest.os);
+  });
+
   it("keeps the packaged capability example aligned with baseline schemas", async () => {
     const result = parseRuntimeCapabilities(await readExample("runtime-capabilities"));
     const baseline = createBaselineCapabilities({ os: "linux", arch: "x64", node: "22.23.1" });
@@ -60,10 +72,13 @@ describe("published protocol artifacts", () => {
     ) as ContractManifest;
     expect(manifest.schema_version).toBe("runtime-contract-manifest.v1");
     expect(manifest.schemas.map((entry) => entry.schema_version)).toEqual([
+      "candidate-job-intent.v1",
       "command-result.v1",
       "execution-event.v1",
       "execution-request.v1",
       "execution-result.v1",
+      "project-registry-entry.v1",
+      "project-watch-manifest.v1",
       "run-journal-entry.v1",
       "runtime-capabilities.v1",
       "runtime-common.v1",
@@ -155,5 +170,31 @@ toss-runtime service uninstall [--json]`;
     expect(changelog).not.toContain(
       "Production-durable `INTERRUPTED` journal persistence remains pending issue #1",
     );
+  });
+
+  it("documents the explicit project intake and candidate-only governance boundary", async () => {
+    const readme = await readFile("README.md", "utf8");
+    const serviceContract = await readFile("docs/contracts/local-service-control-v1.md", "utf8");
+    const protocolContract = await readFile(
+      "docs/contracts/runtime-contract-protocol-v1.md",
+      "utf8",
+    );
+    const changelog = await readFile("CHANGELOG.md", "utf8");
+    const packageManifest = JSON.parse(await readFile("package.json", "utf8")) as {
+      readonly os: readonly string[];
+    };
+
+    expect(packageManifest.os).toEqual(["darwin"]);
+    expect(readme).toContain("toss-runtime project register <absolute-root> [--json]");
+    expect(readme).toContain("schema_version: project-watch-manifest.v1");
+    expect(readme).toContain("200 ms");
+    expect(readme).toContain("2 second");
+    expect(readme).toMatch(/never scans an unregistered project/u);
+    expect(readme).toMatch(/candidate job intent/u);
+    expect(serviceContract).toContain('`command: "project-register"`');
+    expect(serviceContract).toContain("RUNTIME_PROJECT_INTAKE_CORRUPT");
+    expect(protocolContract).toContain("`candidate-job-intent.v1`");
+    expect(protocolContract).toMatch(/does not authorize\s+execution/u);
+    expect(changelog).toContain("Explicit project registry");
   });
 });
