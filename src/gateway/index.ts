@@ -4,6 +4,7 @@ export {
   parseAgentgatewayHealth,
   selectedAgentgatewayProfile,
 } from "./contracts.js";
+export { createGatewayCredentialCoordinator } from "./credentials.js";
 export type {
   AgentgatewayBodyObservability,
   AgentgatewayCapabilitiesV1,
@@ -12,6 +13,9 @@ export type {
   AgentgatewayHealthValidationResult,
   AgentgatewayProfileV1,
   AgentgatewayRouteV1,
+  GatewayCredentialCoordinator,
+  GatewayCredentialLease,
+  GatewayCredentialProvider,
   ParseAgentgatewayCapabilitiesOptions,
   SelectedAgentgatewayProfile,
 } from "./types.js";

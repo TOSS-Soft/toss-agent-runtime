@@ -1,4 +1,5 @@
 import type { RuntimeDocument, ValidationResult } from "../protocol/types.js";
+import type { SecretReference } from "../config/types.js";
 import type { ProviderAdapterCapabilities, ProviderKind } from "../providers/types.js";
 
 export type AgentgatewayBodyObservability = "off" | "redacted-metadata";
@@ -41,6 +42,27 @@ export interface AgentgatewayHealth {
 export interface SelectedAgentgatewayProfile {
   readonly name: string;
   readonly profile: AgentgatewayProfileV1;
+}
+
+export interface GatewayCredentialLease {
+  readonly scheme: "Bearer";
+  readonly token: string;
+  readonly expires_at: string;
+}
+
+export interface GatewayCredentialProvider {
+  resolve(
+    reference: SecretReference,
+    options: {
+      readonly signal: AbortSignal;
+      readonly minimum_validity_ms: 30_000;
+    },
+  ): Promise<unknown>;
+}
+
+export interface GatewayCredentialCoordinator {
+  resolve(reference: SecretReference, signal: AbortSignal): Promise<GatewayCredentialLease>;
+  clear(): void;
 }
 
 export interface ParseAgentgatewayCapabilitiesOptions {
