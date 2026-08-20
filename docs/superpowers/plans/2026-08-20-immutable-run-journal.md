@@ -474,7 +474,7 @@ export interface RunJournalStore {
 }
 ```
 
-`transition` rejects new caller intake after `stopIntake`; the internal shutdown path remains allowed to append interruption records. `flush` waits for already queued work unless aborted; `list` sorts run IDs by UTF-8 byte order and verifies every returned history. `interruptActive` lists verified journals, skips terminal `COMPLETED|CANCELLED|INTERRUPTED`, and appends an `INTERRUPTED` command with deterministic `command_id = shutdown:<journal_revision>:<entry_hash-without-prefix>` using the snapshot's exact head. Stale races reload once and skip only if the new state is terminal; no unresolved side effect is retried.
+`transition` rejects new caller intake after `stopIntake`; the internal shutdown path remains allowed to append interruption records. `flush` waits for already queued work unless aborted; `list` sorts run IDs by UTF-8 byte order and verifies every returned history. `interruptActive` lists verified journals, skips inactive/terminal `FAILED|BLOCKED|COMPLETED|CANCELLED|INTERRUPTED`, and appends an `INTERRUPTED` command with deterministic `command_id = shutdown:<journal_revision>:<entry_hash-without-prefix>` using the snapshot's exact head. Stale races reload once and skip only if the new state is no longer active; no unresolved side effect is retried.
 
 - [ ] **Step 7: Run focused store gates and commit**
 
