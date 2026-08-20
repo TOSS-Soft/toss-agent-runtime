@@ -1,0 +1,19 @@
+{
+  "protocol_version": "runtime-contract.v1",
+  "schema_version": "provider-event.v1",
+  "document_type": "provider-event",
+  "event_id": "018f6c52-8c49-7b2a-9d35-9a38b04fd6e1",
+  "request_id": "018f6c52-8c49-7b2a-9d35-9a38b04fd6e0",
+  "sequence": 0,
+  "occurred_at": "2026-08-20T00:00:00.000Z",
+  "provider": "openai",
+  "model": "gpt-5.2",
+  "event_type": "response-start",
+  "provenance": {
+    "native_event": "response.created",
+    "lossy_fields": ["service_tier"]
+  },
+  "data": {
+    "response_id": "resp_1"
+  }
+}

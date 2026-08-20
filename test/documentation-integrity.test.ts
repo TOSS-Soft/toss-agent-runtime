@@ -8,6 +8,7 @@ import {
   parseExecutionEvent,
   parseExecutionRequest,
   parseExecutionResult,
+  parseProviderEvent,
   parseRuntimeCapabilities,
   validateExecutionChain,
 } from "../src/index.js";
@@ -51,10 +52,11 @@ describe("published protocol artifacts", () => {
   it("loads the complete example chain through the public package API", async () => {
     const request = parseExecutionRequest(await readExample("execution-request"));
     const event = parseExecutionEvent(await readExample("execution-event"));
+    const providerEvent = parseProviderEvent(await readExample("provider-event"));
     const result = parseExecutionResult(await readExample("execution-result"));
     const capabilities = parseRuntimeCapabilities(await readExample("runtime-capabilities"));
 
-    expect(request.ok && event.ok && result.ok && capabilities.ok).toBe(true);
+    expect(request.ok && event.ok && providerEvent.ok && result.ok && capabilities.ok).toBe(true);
     if (request.ok && event.ok && result.ok) {
       expect(
         validateExecutionChain({
@@ -78,6 +80,7 @@ describe("published protocol artifacts", () => {
       "execution-request.v1",
       "execution-result.v1",
       "operational-event.v1",
+      "provider-event.v1",
       "project-registry-entry.v1",
       "project-watch-manifest.v1",
       "run-journal-entry.v1",

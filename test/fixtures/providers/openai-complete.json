@@ -1,0 +1,24 @@
+{
+  "id": "resp_1",
+  "model": "gpt-5",
+  "status": "completed",
+  "service_tier": "default",
+  "output": [
+    {
+      "type": "message",
+      "content": [{ "type": "output_text", "text": "Hello" }]
+    },
+    {
+      "type": "function_call",
+      "call_id": "call_1",
+      "name": "lookup",
+      "arguments": "{\"q\":\"docs\"}"
+    }
+  ],
+  "usage": {
+    "input_tokens": 10,
+    "output_tokens": 5,
+    "input_tokens_details": { "cached_tokens": 2 },
+    "output_tokens_details": { "reasoning_tokens": 1 }
+  }
+}

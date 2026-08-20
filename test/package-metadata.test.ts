@@ -6,6 +6,11 @@ import {
   PACKAGE_VERSION,
   PROTOCOL_VERSION,
   RuntimeProjectError,
+  RuntimeProviderError,
+  createAnthropicAdapter,
+  createGeminiAdapter,
+  createOpenAIAdapter,
+  parseProviderEvent,
   parseCandidateJobIntent,
   parseProjectRegistryEntry,
   parseProjectWatchManifest,
@@ -31,5 +36,19 @@ describe("package metadata", () => {
     expect(packageApi).not.toHaveProperty("createProjectRegistry");
     expect(packageApi).not.toHaveProperty("createProjectIntake");
     expect(packageApi).not.toHaveProperty("createProjectWatcher");
+  });
+
+  it("exports the normalized provider contract without a native SDK surface", () => {
+    expect(parseProviderEvent).toBeTypeOf("function");
+    expect(createOpenAIAdapter).toBeTypeOf("function");
+    expect(createAnthropicAdapter).toBeTypeOf("function");
+    expect(createGeminiAdapter).toBeTypeOf("function");
+    expect(new RuntimeProviderError("RUNTIME_PROVIDER_RATE_LIMIT")).toMatchObject({
+      category: "rate-limit",
+      retryable: true,
+    });
+    expect(packageApi).not.toHaveProperty("openai");
+    expect(packageApi).not.toHaveProperty("anthropic");
+    expect(packageApi).not.toHaveProperty("gemini");
   });
 });

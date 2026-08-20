@@ -1,0 +1,29 @@
+[
+  { "type": "response.created", "response": { "id": "resp_1" } },
+  { "type": "response.output_text.delta", "delta": "Hello", "output_index": 0 },
+  {
+    "type": "response.output_item.added",
+    "output_index": 1,
+    "item": { "type": "function_call", "call_id": "call_1", "name": "lookup" }
+  },
+  {
+    "type": "response.function_call_arguments.delta",
+    "output_index": 1,
+    "item_id": "call_1",
+    "delta": "{\"q\":\"docs\"}"
+  },
+  {
+    "type": "response.completed",
+    "response": {
+      "status": "completed",
+      "service_tier": "default",
+      "output": [{ "type": "function_call" }],
+      "usage": {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "input_tokens_details": { "cached_tokens": 2 },
+        "output_tokens_details": { "reasoning_tokens": 1 }
+      }
+    }
+  }
+]

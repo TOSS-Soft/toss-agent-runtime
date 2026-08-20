@@ -923,7 +923,7 @@ async function doctor(
     id: "execution-capabilities",
     status: production ? "FAIL" : "WARN",
     message:
-      "Execution providers, skills, MCP, and orchestration are not installed in the baseline wave",
+      "Execution routing, skills, MCP, and orchestration are not installed in the baseline wave",
   });
   const healthy = checks.every((check) => check.status !== "FAIL");
   const data = jsonValue({ healthy, checks });

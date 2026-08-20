@@ -213,6 +213,14 @@ Operational events use the closed `operational-event.v1` envelope with a canonic
 
 `toss-runtime logs` reads the same event identities in deterministic human or JSON form. Level is a minimum severity; project and run filters are exact. Follow mode is human-only and deduplicates an inode across active-file rotation. A partial final active line is ignored and reported until recovery; an invalid interior line is corrupt. Storage, synchronization, rotation, or retention failure enters sticky `RUNTIME_LOGGING_DEGRADED` state until an explicit successful recovery. Required state-changing operations MUST NOT acknowledge success when their required log event is not durable.
 
+### Normalized provider boundary
+
+`provider-event.v1` is the only public provider event envelope. It binds a canonical event/request identity, provider, selected model, contiguous sequence, UTC time, closed event type, normalized data, and safe provenance. Event variants are response start, content delta, tool-call delta, usage, completion, and normalized error. Provenance records only the native event type and sorted safe names of provider-specific fields that were deliberately dropped; raw native values are forbidden.
+
+OpenAI, Anthropic, and Gemini adapters accept the same bounded provider-neutral request and expose the same event stream and canonical completion. Capability preflight occurs before the injected wire transport and covers tools, JSON schema, vision, reasoning, streaming, and output limits. The completion collector rejects identity/sequence changes, missing or duplicate terminals, post-terminal events, malformed tool arguments, and inconsistent stable errors. Streaming and non-streaming paths MUST close to the same completion semantics.
+
+The adapter boundary performs no automatic retry and owns no credential lookup. Authentication, rate limit, timeout, cancellation, refusal, transient unavailability, invalid input, and internal failure are distinct stable codes with fixed retryability. Native SDK objects, headers, endpoints, error messages, credentials, stacks, and unrestricted response objects MUST NOT enter provider events, journals, results, operational logs, or evidence. Authenticated agentgateway transport/tracing and routing/fallback remain separate governed layers.
+
 ## 11. Stable failures
 
 Library validation returns `RUNTIME_DOCUMENT_INVALID` for malformed content and `RUNTIME_DOCUMENT_UNSUPPORTED` for a recognized envelope requiring an unimplemented version or capability. Issues contain a JSON Pointer-like path, stable keyword, and safe message in deterministic order.

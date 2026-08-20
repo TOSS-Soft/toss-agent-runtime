@@ -33,6 +33,11 @@
       "id": "https://toss.software/schemas/runtime/v1/operational-event.v1.schema.json"
     },
     {
+      "schema_version": "provider-event.v1",
+      "path": "contracts/runtime/provider-event.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/provider-event.v1.schema.json"
+    },
+    {
       "schema_version": "project-registry-entry.v1",
       "path": "contracts/runtime/project-registry-entry.v1.schema.json",
       "id": "https://toss.software/schemas/runtime/v1/project-registry-entry.v1.schema.json"

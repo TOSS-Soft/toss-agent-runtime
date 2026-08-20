@@ -38,13 +38,14 @@ describe("Runtime Contract Protocol v1 chain", () => {
     ).toEqual({ ok: true, value: true });
   });
 
-  it("reports every future subsystem as unavailable in the baseline", () => {
+  it("reports only the delivered provider subsystem as available in the baseline", () => {
     const document = createBaselineCapabilities({ os: "linux", arch: "x64", node: "22.23.1" });
     expect(document.execution_topologies).toEqual([]);
     expect(document.model_classes).toEqual([]);
     expect(document.mcp_profiles).toEqual([]);
+    expect(document.provider_transports).toEqual(["openai", "anthropic", "gemini"]);
     expect(document.features).toEqual({
-      providers: "unavailable",
+      providers: "available",
       routing: "unavailable",
       skills: "unavailable",
       mcp: "unavailable",
@@ -74,7 +75,7 @@ describe("Runtime Contract Protocol v1 chain", () => {
     const baseline = createBaselineCapabilities({ os: "linux", arch: "x64", node: "22.23.1" });
     const contradictory = {
       ...baseline,
-      provider_transports: ["openai"],
+      features: { ...baseline.features, providers: "unavailable" },
       model_classes: [{ logical_class: "balanced-code", capabilities: ["tools"] }],
     };
     expect(parseRuntimeCapabilities(canonicalJson(contradictory))).toMatchObject({
