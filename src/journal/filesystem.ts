@@ -1,15 +1,16 @@
-import { constants, type BigIntStats } from "node:fs";
-import { createHash } from "node:crypto";
 import {
-  link,
-  lstat,
-  mkdir,
-  open,
-  readdir,
-  rename,
-  unlink,
-  type FileHandle,
-} from "node:fs/promises";
+  constants,
+  fstatSync,
+  linkSync,
+  lstatSync,
+  readSync,
+  renameSync,
+  unlinkSync,
+  writeSync,
+  type BigIntStats,
+} from "node:fs";
+import { createHash } from "node:crypto";
+import { lstat, mkdir, open, readdir, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 
 import { RuntimeJournalError } from "./errors.js";
@@ -26,6 +27,13 @@ type CurrentUserCheck = (userId: bigint, candidate: string) => boolean;
 
 export interface JournalOperationHooks {
   readonly beforeJournalSync?: () => Promise<void>;
+  readonly beforeDirectorySync?: (directoryPath: string) => Promise<void>;
+  readonly beforeDirectoryCreationSync?: (
+    directoryPath: string,
+    parentPath: string,
+  ) => Promise<void>;
+  readonly beforeAppendWrite?: () => Promise<void>;
+  readonly beforeStageCleanup?: (stagePath: string) => Promise<void>;
   readonly beforeRecoveryRename?: () => Promise<void>;
 }
 
@@ -42,6 +50,13 @@ interface FileIdentity {
   readonly inode: bigint;
 }
 
+interface OpenedDirectory {
+  readonly candidate: string;
+  readonly exactPrivate: boolean;
+  readonly handle: FileHandle;
+  readonly identity: FileIdentity;
+}
+
 export interface JournalFileSnapshot {
   readonly bytes: Uint8Array;
   readonly identity: FileIdentity;
@@ -55,7 +70,7 @@ export interface JournalFilesystem {
   listRunIds(): Promise<readonly string[]>;
   read(runId: string): Promise<JournalFileSnapshot | null>;
   create(runId: string, bytes: Uint8Array): Promise<"created" | "existing">;
-  append(runId: string, expected: FileIdentity, bytes: Uint8Array): Promise<void>;
+  append(runId: string, expected: JournalFileSnapshot, bytes: Uint8Array): Promise<void>;
   recoverPartial(
     runId: string,
     expected: FileIdentity,
@@ -139,6 +154,8 @@ function assertPrivateDirectory(
 async function ensurePrivateDirectory(
   candidate: string,
   isCurrentUser: CurrentUserCheck,
+  exactPrivateRoot: string,
+  beforeParentSync?: (directoryPath: string, parentPath: string) => Promise<void>,
 ): Promise<void> {
   if (
     !path.isAbsolute(candidate) ||
@@ -167,6 +184,10 @@ async function ensurePrivateDirectory(
       if (!isMissing(error)) pathUnsafe();
       try {
         await mkdir(current, { mode: 0o700 });
+      } catch (mkdirError) {
+        if (!isExisting(mkdirError)) pathUnsafe();
+      }
+      try {
         metadata = await lstat(current, { bigint: true });
       } catch {
         pathUnsafe();
@@ -176,6 +197,7 @@ async function ensurePrivateDirectory(
       assertPrivateDirectory(metadata, current, isCurrentUser, final, reachedCurrentUser) ||
       reachedCurrentUser;
   }
+  await syncPrivateDirectoryEntry(candidate, isCurrentUser, exactPrivateRoot, beforeParentSync);
 }
 
 function assertPrivateFile(
@@ -193,54 +215,249 @@ function assertPrivateFile(
   }
 }
 
-async function openDirectory(candidate: string): Promise<{
-  readonly handle: FileHandle;
-  readonly identity: FileIdentity;
-}> {
+function directoryChainPaths(candidate: string): readonly string[] {
+  const parsed = path.parse(candidate);
+  const segments = candidate.slice(parsed.root.length).split(path.sep);
+  let current = parsed.root;
+  return segments.map((segment) => {
+    current = path.join(current, segment);
+    return current;
+  });
+}
+
+function isAtOrBelow(candidate: string, root: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== "..");
+}
+
+async function openDirectoryChain(
+  candidate: string,
+  isCurrentUser: CurrentUserCheck,
+  exactPrivateRoot: string,
+): Promise<readonly OpenedDirectory[]> {
+  const result: OpenedDirectory[] = [];
+  let reachedCurrentUser = false;
   try {
-    const handle = await open(
-      candidate,
-      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    const candidates = directoryChainPaths(candidate);
+    for (const current of candidates) {
+      const exactPrivate = isAtOrBelow(current, exactPrivateRoot);
+      const before = await lstat(current, { bigint: true });
+      const nextReached = assertPrivateDirectory(
+        before,
+        current,
+        isCurrentUser,
+        exactPrivate,
+        reachedCurrentUser,
+      );
+      const handle = await open(
+        current,
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+      );
+      result.push({ candidate: current, exactPrivate, handle, identity: identity(before) });
+      const held = await handle.stat({ bigint: true });
+      assertPrivateDirectory(held, current, isCurrentUser, exactPrivate, reachedCurrentUser);
+      if (!identitiesMatch(identity(before), identity(held))) pathUnsafe();
+      reachedCurrentUser = nextReached || reachedCurrentUser;
+    }
+    return result;
+  } catch (error) {
+    for (const opened of result.reverse()) {
+      await opened.handle.close().catch(() => undefined);
+    }
+    if (error instanceof RuntimeJournalError) throw error;
+    pathUnsafe();
+  }
+}
+
+async function closeDirectoryChain(opened: readonly OpenedDirectory[]): Promise<void> {
+  for (const directory of [...opened].reverse()) {
+    await directory.handle.close();
+  }
+}
+
+function readExactSync(fileDescriptor: number, expectedBytes: Uint8Array): void {
+  const actual = Buffer.allocUnsafe(expectedBytes.byteLength);
+  let offset = 0;
+  while (offset < actual.byteLength) {
+    const bytesRead = readSync(fileDescriptor, actual, offset, actual.byteLength - offset, offset);
+    if (bytesRead === 0) pathUnsafe();
+    offset += bytesRead;
+  }
+  if (!actual.equals(Buffer.from(expectedBytes))) pathUnsafe();
+}
+
+function writeAllSync(fileDescriptor: number, bytes: Uint8Array): void {
+  const buffer = Buffer.from(bytes);
+  let offset = 0;
+  while (offset < buffer.byteLength) {
+    const bytesWritten = writeSync(
+      fileDescriptor,
+      buffer,
+      offset,
+      buffer.byteLength - offset,
+      null,
     );
-    const metadata = await handle.stat({ bigint: true });
-    return { handle, identity: identity(metadata) };
+    if (bytesWritten === 0) unavailable();
+    offset += bytesWritten;
+  }
+}
+
+function assertExactPrivateFileSync(
+  candidate: string,
+  fileDescriptor: number,
+  expectedIdentity: FileIdentity,
+  expectedBytes: Uint8Array,
+  isCurrentUser: CurrentUserCheck,
+): void {
+  try {
+    const before = lstatSync(candidate, { bigint: true });
+    const heldBefore = fstatSync(fileDescriptor, { bigint: true });
+    assertPrivateFile(before, candidate, isCurrentUser);
+    assertPrivateFile(heldBefore, candidate, isCurrentUser);
+    if (
+      !identitiesMatch(expectedIdentity, identity(before)) ||
+      !identitiesMatch(expectedIdentity, identity(heldBefore)) ||
+      before.size !== BigInt(expectedBytes.byteLength) ||
+      heldBefore.size !== BigInt(expectedBytes.byteLength)
+    ) {
+      pathUnsafe();
+    }
+    readExactSync(fileDescriptor, expectedBytes);
+    const after = lstatSync(candidate, { bigint: true });
+    const heldAfter = fstatSync(fileDescriptor, { bigint: true });
+    assertPrivateFile(after, candidate, isCurrentUser);
+    assertPrivateFile(heldAfter, candidate, isCurrentUser);
+    if (
+      !identitiesMatch(expectedIdentity, identity(after)) ||
+      !identitiesMatch(expectedIdentity, identity(heldAfter)) ||
+      after.size !== BigInt(expectedBytes.byteLength) ||
+      heldAfter.size !== BigInt(expectedBytes.byteLength)
+    ) {
+      pathUnsafe();
+    }
   } catch (error) {
     if (error instanceof RuntimeJournalError) throw error;
     pathUnsafe();
   }
 }
 
-async function syncAndRevalidateDirectory(
+function assertLinkedPrivateFileSync(
   candidate: string,
-  opened: { readonly handle: FileHandle; readonly identity: FileIdentity },
-): Promise<void> {
-  await opened.handle.sync();
-  const current = await lstat(candidate, { bigint: true });
-  const held = await opened.handle.stat({ bigint: true });
-  if (
-    !current.isDirectory() ||
-    !identitiesMatch(opened.identity, identity(current)) ||
-    !identitiesMatch(opened.identity, identity(held))
-  ) {
+  expectedIdentity: FileIdentity,
+  isCurrentUser: CurrentUserCheck,
+): void {
+  try {
+    const metadata = lstatSync(candidate, { bigint: true });
+    assertPrivateFile(metadata, candidate, isCurrentUser);
+    if (!identitiesMatch(expectedIdentity, identity(metadata))) pathUnsafe();
+  } catch (error) {
+    if (error instanceof RuntimeJournalError) throw error;
     pathUnsafe();
   }
 }
 
-async function unlinkExactPrivateFile(
+function revalidateDirectoryChainSync(
+  opened: readonly OpenedDirectory[],
+  isCurrentUser: CurrentUserCheck,
+): void {
+  try {
+    let reachedCurrentUser = false;
+    for (const directory of opened) {
+      const current = lstatSync(directory.candidate, { bigint: true });
+      const held = fstatSync(directory.handle.fd, { bigint: true });
+      const nextReached = assertPrivateDirectory(
+        current,
+        directory.candidate,
+        isCurrentUser,
+        directory.exactPrivate,
+        reachedCurrentUser,
+      );
+      assertPrivateDirectory(
+        held,
+        directory.candidate,
+        isCurrentUser,
+        directory.exactPrivate,
+        reachedCurrentUser,
+      );
+      if (
+        !identitiesMatch(directory.identity, identity(current)) ||
+        !identitiesMatch(directory.identity, identity(held))
+      ) {
+        pathUnsafe();
+      }
+      reachedCurrentUser = nextReached || reachedCurrentUser;
+    }
+  } catch (error) {
+    if (error instanceof RuntimeJournalError) throw error;
+    pathUnsafe();
+  }
+}
+
+async function syncAndRevalidateDirectoryChain(
+  opened: readonly OpenedDirectory[],
+  isCurrentUser: CurrentUserCheck,
+  beforeSync?: (directoryPath: string) => Promise<void>,
+): Promise<void> {
+  const final = opened.at(-1);
+  if (final === undefined) pathUnsafe();
+  revalidateDirectoryChainSync(opened, isCurrentUser);
+  await beforeSync?.(final.candidate);
+  await final.handle.sync();
+  revalidateDirectoryChainSync(opened, isCurrentUser);
+}
+
+async function syncPrivateDirectoryEntry(
+  candidate: string,
+  isCurrentUser: CurrentUserCheck,
+  exactPrivateRoot: string,
+  beforeParentSync?: (directoryPath: string, parentPath: string) => Promise<void>,
+): Promise<void> {
+  const opened = await openDirectoryChain(candidate, isCurrentUser, exactPrivateRoot);
+  try {
+    const parentDirectories = opened.slice(0, -1);
+    const parent = parentDirectories.at(-1);
+    if (parent === undefined) pathUnsafe();
+    await syncAndRevalidateDirectoryChain(opened, isCurrentUser);
+    await syncAndRevalidateDirectoryChain(
+      parentDirectories,
+      isCurrentUser,
+      beforeParentSync === undefined
+        ? undefined
+        : (parentPath) => beforeParentSync(candidate, parentPath),
+    );
+    revalidateDirectoryChainSync(opened, isCurrentUser);
+  } catch (error) {
+    if (error instanceof RuntimeJournalError) throw error;
+    unavailable();
+  } finally {
+    await closeDirectoryChain(opened);
+  }
+}
+
+function unlinkExactPrivateFileSync(
   candidate: string,
   expected: FileIdentity,
   isCurrentUser: CurrentUserCheck,
-): Promise<void> {
+): void {
   try {
-    const metadata = await lstat(candidate, { bigint: true });
-    assertPrivateFile(metadata, candidate, isCurrentUser);
-    if (!identitiesMatch(expected, identity(metadata))) pathUnsafe();
-    await unlink(candidate);
+    assertLinkedPrivateFileSync(candidate, expected, isCurrentUser);
+    assertLinkedPrivateFileSync(candidate, expected, isCurrentUser);
+    unlinkSync(candidate);
   } catch (error) {
     if (isMissing(error)) return;
     if (error instanceof RuntimeJournalError) throw error;
     unavailable();
   }
+}
+
+function requireMissingSync(candidate: string): void {
+  try {
+    lstatSync(candidate, { bigint: true });
+  } catch (error) {
+    if (isMissing(error)) return;
+    pathUnsafe();
+  }
+  pathUnsafe();
 }
 
 async function readBounded(handle: FileHandle): Promise<Uint8Array> {
@@ -266,9 +483,24 @@ export function createJournalFilesystem(
   const quarantinePath = path.join(options.statePath, "quarantine");
 
   const ensureRoots = async (): Promise<void> => {
-    await ensurePrivateDirectory(options.statePath, isCurrentUser);
-    await ensurePrivateDirectory(journalsPath, isCurrentUser);
-    await ensurePrivateDirectory(quarantinePath, isCurrentUser);
+    await ensurePrivateDirectory(
+      options.statePath,
+      isCurrentUser,
+      options.statePath,
+      options.operationHooks?.beforeDirectoryCreationSync,
+    );
+    await ensurePrivateDirectory(
+      journalsPath,
+      isCurrentUser,
+      options.statePath,
+      options.operationHooks?.beforeDirectoryCreationSync,
+    );
+    await ensurePrivateDirectory(
+      quarantinePath,
+      isCurrentUser,
+      options.statePath,
+      options.operationHooks?.beforeDirectoryCreationSync,
+    );
   };
 
   const runPath = (runId: string): string => {
@@ -279,26 +511,52 @@ export function createJournalFilesystem(
   const ensureRun = async (runId: string): Promise<string> => {
     await ensureRoots();
     const candidate = runPath(runId);
-    await ensurePrivateDirectory(candidate, isCurrentUser);
+    await ensurePrivateDirectory(
+      candidate,
+      isCurrentUser,
+      options.statePath,
+      options.operationHooks?.beforeDirectoryCreationSync,
+    );
     return candidate;
+  };
+
+  const existingRun = async (runId: string): Promise<string | null> => {
+    await ensureRoots();
+    const candidate = runPath(runId);
+    try {
+      const metadata = await lstat(candidate, { bigint: true });
+      assertPrivateDirectory(metadata, candidate, isCurrentUser, true, true);
+      return candidate;
+    } catch (error) {
+      if (isMissing(error)) return null;
+      if (error instanceof RuntimeJournalError) throw error;
+      pathUnsafe();
+    }
   };
 
   const removeStages = async (directory: string, entries: readonly string[]): Promise<void> => {
     const stages = entries.filter(
       (entry) => CREATE_STAGE_PATTERN.test(entry) || RECOVERY_STAGE_PATTERN.test(entry),
     );
-    for (const name of stages) {
-      const candidate = path.join(directory, name);
-      const metadata = await lstat(candidate, { bigint: true });
-      assertPrivateFile(metadata, candidate, isCurrentUser);
-      await unlinkExactPrivateFile(candidate, identity(metadata), isCurrentUser);
-    }
     if (stages.length > 0) {
-      const opened = await openDirectory(directory);
+      const opened = await openDirectoryChain(directory, isCurrentUser, options.statePath);
       try {
-        await syncAndRevalidateDirectory(directory, opened);
+        for (const name of stages) {
+          const candidate = path.join(directory, name);
+          const metadata = await lstat(candidate, { bigint: true });
+          assertPrivateFile(metadata, candidate, isCurrentUser);
+          await options.operationHooks?.beforeStageCleanup?.(candidate);
+          revalidateDirectoryChainSync(opened, isCurrentUser);
+          unlinkExactPrivateFileSync(candidate, identity(metadata), isCurrentUser);
+          revalidateDirectoryChainSync(opened, isCurrentUser);
+        }
+        await syncAndRevalidateDirectoryChain(
+          opened,
+          isCurrentUser,
+          options.operationHooks?.beforeDirectorySync,
+        );
       } finally {
-        await opened.handle.close();
+        await closeDirectoryChain(opened);
       }
     }
   };
@@ -321,29 +579,37 @@ export function createJournalFilesystem(
 
   const read = async (runId: string): Promise<JournalFileSnapshot | null> => {
     try {
-      const directory = await ensureRun(runId);
+      const directory = await existingRun(runId);
+      if (directory === null) return null;
       const entries = await inspectRunEntries(directory);
       if (entries.length === 0) return null;
       const candidate = path.join(directory, EVENTS_NAME);
-      const before = await lstat(candidate, { bigint: true });
-      assertPrivateFile(before, candidate, isCurrentUser);
-      const handle = await open(candidate, constants.O_RDONLY | constants.O_NOFOLLOW);
+      const runDirectories = await openDirectoryChain(directory, isCurrentUser, options.statePath);
       try {
-        const opened = await handle.stat({ bigint: true });
-        assertPrivateFile(opened, candidate, isCurrentUser);
-        if (!identitiesMatch(identity(before), identity(opened))) pathUnsafe();
-        const bytes = await readBounded(handle);
-        const after = await lstat(candidate, { bigint: true });
-        const held = await handle.stat({ bigint: true });
-        if (
-          !identitiesMatch(identity(opened), identity(after)) ||
-          !identitiesMatch(identity(opened), identity(held))
-        ) {
-          pathUnsafe();
+        const before = await lstat(candidate, { bigint: true });
+        assertPrivateFile(before, candidate, isCurrentUser);
+        const handle = await open(candidate, constants.O_RDONLY | constants.O_NOFOLLOW);
+        try {
+          const opened = await handle.stat({ bigint: true });
+          assertPrivateFile(opened, candidate, isCurrentUser);
+          if (!identitiesMatch(identity(before), identity(opened))) pathUnsafe();
+          const bytes = await readBounded(handle);
+          await options.operationHooks?.beforeJournalSync?.();
+          await handle.sync();
+          assertExactPrivateFileSync(candidate, handle.fd, identity(opened), bytes, isCurrentUser);
+          await syncAndRevalidateDirectoryChain(
+            runDirectories,
+            isCurrentUser,
+            options.operationHooks?.beforeDirectorySync,
+          );
+          assertExactPrivateFileSync(candidate, handle.fd, identity(opened), bytes, isCurrentUser);
+          revalidateDirectoryChainSync(runDirectories, isCurrentUser);
+          return { bytes, identity: identity(opened) };
+        } finally {
+          await handle.close();
         }
-        return { bytes, identity: identity(opened) };
       } finally {
-        await handle.close();
+        await closeDirectoryChain(runDirectories);
       }
     } catch (error) {
       if (error instanceof RuntimeJournalError) throw error;
@@ -353,17 +619,19 @@ export function createJournalFilesystem(
   };
 
   const create = async (runId: string, bytes: Uint8Array): Promise<"created" | "existing"> => {
+    if (bytes.byteLength > MAX_RUN_JOURNAL_BYTES) unavailable();
     const directory = await ensureRun(runId);
     await inspectRunEntries(directory);
     const randomId = options.randomId();
     assertRandomId(randomId);
     const stagePath = path.join(directory, `.events-create.${randomId}.stage`);
     const eventsPath = path.join(directory, EVENTS_NAME);
+    const runDirectories = await openDirectoryChain(directory, isCurrentUser, options.statePath);
     let stageIdentity: FileIdentity | undefined;
     try {
       const stage = await open(
         stagePath,
-        constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
+        constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW,
         0o600,
       );
       try {
@@ -373,76 +641,110 @@ export function createJournalFilesystem(
         await stage.writeFile(bytes);
         await options.operationHooks?.beforeJournalSync?.();
         await stage.sync();
+        revalidateDirectoryChainSync(runDirectories, isCurrentUser);
+        assertExactPrivateFileSync(stagePath, stage.fd, stageIdentity, bytes, isCurrentUser);
+        try {
+          linkSync(stagePath, eventsPath);
+        } catch (error) {
+          if (!isExisting(error)) throw error;
+          revalidateDirectoryChainSync(runDirectories, isCurrentUser);
+          unlinkExactPrivateFileSync(stagePath, stageIdentity, isCurrentUser);
+          stageIdentity = undefined;
+          await syncAndRevalidateDirectoryChain(
+            runDirectories,
+            isCurrentUser,
+            options.operationHooks?.beforeDirectorySync,
+          );
+          return "existing";
+        }
+        const publishedIdentity = stageIdentity;
+        assertExactPrivateFileSync(stagePath, stage.fd, stageIdentity, bytes, isCurrentUser);
+        assertLinkedPrivateFileSync(eventsPath, stageIdentity, isCurrentUser);
+        revalidateDirectoryChainSync(runDirectories, isCurrentUser);
+        unlinkExactPrivateFileSync(stagePath, stageIdentity, isCurrentUser);
+        stageIdentity = undefined;
+        await syncAndRevalidateDirectoryChain(
+          runDirectories,
+          isCurrentUser,
+          options.operationHooks?.beforeDirectorySync,
+        );
+        assertExactPrivateFileSync(eventsPath, stage.fd, publishedIdentity, bytes, isCurrentUser);
+        revalidateDirectoryChainSync(runDirectories, isCurrentUser);
+        return "created";
       } finally {
         await stage.close();
       }
-      try {
-        await link(stagePath, eventsPath);
-      } catch (error) {
-        if (!isExisting(error)) throw error;
-        await unlinkExactPrivateFile(stagePath, stageIdentity, isCurrentUser);
-        stageIdentity = undefined;
-        return "existing";
-      }
-      await unlinkExactPrivateFile(stagePath, stageIdentity, isCurrentUser);
-      stageIdentity = undefined;
-      const opened = await openDirectory(directory);
-      try {
-        await syncAndRevalidateDirectory(directory, opened);
-      } finally {
-        await opened.handle.close();
-      }
-      return "created";
     } catch (error) {
       if (stageIdentity !== undefined) {
         try {
-          await unlinkExactPrivateFile(stagePath, stageIdentity, isCurrentUser);
+          revalidateDirectoryChainSync(runDirectories, isCurrentUser);
+          unlinkExactPrivateFileSync(stagePath, stageIdentity, isCurrentUser);
         } catch {
           // Preserve the primary safe failure; later recovery validates the stage.
         }
       }
       if (error instanceof RuntimeJournalError) throw error;
       unavailable();
+    } finally {
+      await closeDirectoryChain(runDirectories);
     }
   };
 
   const append = async (
     runId: string,
-    expected: FileIdentity,
+    expected: JournalFileSnapshot,
     bytes: Uint8Array,
   ): Promise<void> => {
     const directory = await ensureRun(runId);
     await inspectRunEntries(directory);
     const candidate = path.join(directory, EVENTS_NAME);
+    const runDirectories = await openDirectoryChain(directory, isCurrentUser, options.statePath);
     try {
       const before = await lstat(candidate, { bigint: true });
       assertPrivateFile(before, candidate, isCurrentUser);
-      if (!identitiesMatch(expected, identity(before))) pathUnsafe();
+      if (!identitiesMatch(expected.identity, identity(before))) pathUnsafe();
       const handle = await open(
         candidate,
-        constants.O_APPEND | constants.O_WRONLY | constants.O_NOFOLLOW,
+        constants.O_APPEND | constants.O_RDWR | constants.O_NOFOLLOW,
       );
       try {
         const opened = await handle.stat({ bigint: true });
         assertPrivateFile(opened, candidate, isCurrentUser);
-        if (!identitiesMatch(expected, identity(opened))) pathUnsafe();
-        await handle.writeFile(bytes);
+        if (!identitiesMatch(expected.identity, identity(opened))) pathUnsafe();
+        if (
+          expected.bytes.byteLength + bytes.byteLength > MAX_RUN_JOURNAL_BYTES ||
+          opened.size !== BigInt(expected.bytes.byteLength)
+        ) {
+          unavailable();
+        }
+        await options.operationHooks?.beforeAppendWrite?.();
+        revalidateDirectoryChainSync(runDirectories, isCurrentUser);
+        assertExactPrivateFileSync(
+          candidate,
+          handle.fd,
+          expected.identity,
+          expected.bytes,
+          isCurrentUser,
+        );
+        writeAllSync(handle.fd, bytes);
         await options.operationHooks?.beforeJournalSync?.();
         await handle.sync();
-        const after = await lstat(candidate, { bigint: true });
-        const held = await handle.stat({ bigint: true });
-        if (
-          !identitiesMatch(expected, identity(after)) ||
-          !identitiesMatch(expected, identity(held))
-        ) {
-          pathUnsafe();
-        }
+        assertExactPrivateFileSync(
+          candidate,
+          handle.fd,
+          expected.identity,
+          Buffer.concat([Buffer.from(expected.bytes), Buffer.from(bytes)]),
+          isCurrentUser,
+        );
+        revalidateDirectoryChainSync(runDirectories, isCurrentUser);
       } finally {
         await handle.close();
       }
     } catch (error) {
       if (error instanceof RuntimeJournalError) throw error;
       unavailable();
+    } finally {
+      await closeDirectoryChain(runDirectories);
     }
   };
 
@@ -463,66 +765,131 @@ export function createJournalFilesystem(
     );
     const stagePath = path.join(directory, `.events-recovery.${randomId}.stage`);
     const eventsPath = path.join(directory, EVENTS_NAME);
+    const runDirectories = await openDirectoryChain(directory, isCurrentUser, options.statePath);
     let stageIdentity: FileIdentity | undefined;
     try {
-      const quarantine = await open(
-        quarantineFile,
-        constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
-        0o600,
+      const quarantineDirectories = await openDirectoryChain(
+        quarantinePath,
+        isCurrentUser,
+        options.statePath,
       );
       try {
-        const metadata = await quarantine.stat({ bigint: true });
-        assertPrivateFile(metadata, quarantineFile, isCurrentUser);
-        await quarantine.writeFile(fragment);
-        await quarantine.sync();
+        const quarantine = await open(
+          quarantineFile,
+          constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW,
+          0o600,
+        );
+        try {
+          const metadata = await quarantine.stat({ bigint: true });
+          assertPrivateFile(metadata, quarantineFile, isCurrentUser);
+          const quarantineIdentity = identity(metadata);
+          await quarantine.writeFile(fragment);
+          await quarantine.sync();
+          assertExactPrivateFileSync(
+            quarantineFile,
+            quarantine.fd,
+            quarantineIdentity,
+            fragment,
+            isCurrentUser,
+          );
+          await syncAndRevalidateDirectoryChain(
+            quarantineDirectories,
+            isCurrentUser,
+            options.operationHooks?.beforeDirectorySync,
+          );
+          assertExactPrivateFileSync(
+            quarantineFile,
+            quarantine.fd,
+            quarantineIdentity,
+            fragment,
+            isCurrentUser,
+          );
+          revalidateDirectoryChainSync(quarantineDirectories, isCurrentUser);
+        } finally {
+          await quarantine.close();
+        }
       } finally {
-        await quarantine.close();
-      }
-      const quarantineDirectory = await openDirectory(quarantinePath);
-      try {
-        await syncAndRevalidateDirectory(quarantinePath, quarantineDirectory);
-      } finally {
-        await quarantineDirectory.handle.close();
+        await closeDirectoryChain(quarantineDirectories);
       }
 
       const stage = await open(
         stagePath,
-        constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
+        constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW,
         0o600,
       );
       try {
         const metadata = await stage.stat({ bigint: true });
         assertPrivateFile(metadata, stagePath, isCurrentUser);
         stageIdentity = identity(metadata);
+        let publishedIdentity: FileIdentity | undefined;
         await stage.writeFile(validPrefix);
         await stage.sync();
+        await options.operationHooks?.beforeRecoveryRename?.();
+        const expectedCurrentBytes = Buffer.concat([validPrefix, fragment]);
+        const currentHandle = await open(eventsPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+        try {
+          assertExactPrivateFileSync(
+            eventsPath,
+            currentHandle.fd,
+            expected,
+            expectedCurrentBytes,
+            isCurrentUser,
+          );
+          assertExactPrivateFileSync(
+            stagePath,
+            stage.fd,
+            stageIdentity,
+            validPrefix,
+            isCurrentUser,
+          );
+          revalidateDirectoryChainSync(runDirectories, isCurrentUser);
+          publishedIdentity = stageIdentity;
+          renameSync(stagePath, eventsPath);
+          stageIdentity = undefined;
+          requireMissingSync(stagePath);
+          assertExactPrivateFileSync(
+            eventsPath,
+            stage.fd,
+            publishedIdentity,
+            validPrefix,
+            isCurrentUser,
+          );
+          revalidateDirectoryChainSync(runDirectories, isCurrentUser);
+        } finally {
+          await currentHandle.close();
+        }
+        await syncAndRevalidateDirectoryChain(
+          runDirectories,
+          isCurrentUser,
+          options.operationHooks?.beforeDirectorySync,
+        );
+        if (publishedIdentity === undefined) pathUnsafe();
+        assertExactPrivateFileSync(
+          eventsPath,
+          stage.fd,
+          publishedIdentity,
+          validPrefix,
+          isCurrentUser,
+        );
+        revalidateDirectoryChainSync(runDirectories, isCurrentUser);
       } finally {
         await stage.close();
-      }
-      await options.operationHooks?.beforeRecoveryRename?.();
-      const current = await lstat(eventsPath, { bigint: true });
-      assertPrivateFile(current, eventsPath, isCurrentUser);
-      if (!identitiesMatch(expected, identity(current))) pathUnsafe();
-      await rename(stagePath, eventsPath);
-      stageIdentity = undefined;
-      const runDirectory = await openDirectory(directory);
-      try {
-        await syncAndRevalidateDirectory(directory, runDirectory);
-      } finally {
-        await runDirectory.handle.close();
       }
       const restored = await read(runId);
       if (restored === null || !Buffer.from(restored.bytes).equals(validPrefix)) unavailable();
     } catch (error) {
       if (stageIdentity !== undefined) {
         try {
-          await unlinkExactPrivateFile(stagePath, stageIdentity, isCurrentUser);
+          revalidateDirectoryChainSync(runDirectories, isCurrentUser);
+          unlinkExactPrivateFileSync(stagePath, stageIdentity, isCurrentUser);
         } catch {
           // Preserve the primary safe failure; later recovery validates the stage.
         }
       }
       if (error instanceof RuntimeJournalError) throw error;
       unavailable();
+    } finally {
+      await closeDirectoryChain(runDirectories);
     }
   };
 

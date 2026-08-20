@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdtemp, readFile, realpath, rm, symlink } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readFile, readdir, realpath, rm, symlink } from "node:fs/promises";
 import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -116,6 +116,23 @@ describe("private append-only run journal store", () => {
     expect((await lstat(eventsPath)).size).toBe(size);
   });
 
+  it("does not create run directories while reading missing or stale runs", async () => {
+    const { statePath } = await fixture();
+    const store = createStore(statePath);
+
+    expect(await store.load("run-missing")).toBeNull();
+    await expect(
+      store.transition(
+        command("run-stale", "CREATED", {
+          journal_revision: 1,
+          sequence: 1,
+          entry_hash: `sha256:${"a".repeat(64)}`,
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "RUNTIME_STATE_STALE" });
+    expect(await readdir(path.join(statePath, "journals"))).toEqual([]);
+  });
+
   it("serializes competing commands so only one exact head can append", async () => {
     const { statePath } = await fixture();
     const store = createStore(statePath);
@@ -135,6 +152,28 @@ describe("private append-only run journal store", () => {
       expect(rejection.reason.code).toBe("RUNTIME_STATE_STALE");
     }
     expect((await store.load("run-1"))?.entries).toHaveLength(2);
+  });
+
+  it("serializes exact-head transitions across public store instances", async () => {
+    const { statePath } = await fixture();
+    const firstStore = createStore(statePath);
+    const secondStore = createStore(statePath);
+    const created = await firstStore.transition(command("run-shared", "CREATED", null));
+
+    const results = await Promise.allSettled([
+      firstStore.transition(
+        command("run-shared", "ROUTED", created.head, { command_id: "shared-route" }),
+      ),
+      secondStore.transition(
+        command("run-shared", "BLOCKED", created.head, { command_id: "shared-block" }),
+      ),
+    ]);
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect(await createStore(statePath).load("run-shared")).toMatchObject({
+      head: { journal_revision: 2, sequence: 2 },
+    });
   });
 
   it("persists approval waiting across store instances and resumes idempotently", async () => {
@@ -221,5 +260,22 @@ describe("private append-only run journal store", () => {
     await expect(createStore(statePath).load("run-1")).rejects.toMatchObject({
       code: "RUNTIME_JOURNAL_PATH_UNSAFE",
     });
+  });
+
+  it("does not quarantine or rewrite a journal containing only a partial entry", async () => {
+    const { statePath } = await fixture();
+    const journal = createStore(statePath);
+    await journal.transition(command("run-partial-only", "CREATED", null));
+    const eventsPath = path.join(statePath, "journals", "run-partial-only", "events.jsonl");
+    const partial = Buffer.from('{"partial":', "utf8");
+    await import("node:fs/promises").then(({ writeFile }) =>
+      writeFile(eventsPath, partial, { mode: 0o600 }),
+    );
+
+    await expect(createStore(statePath).load("run-partial-only")).rejects.toMatchObject({
+      code: "RUNTIME_JOURNAL_CORRUPT",
+    });
+    expect(await readFile(eventsPath)).toEqual(partial);
+    expect(await readdir(path.join(statePath, "quarantine"))).toEqual([]);
   });
 });

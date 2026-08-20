@@ -1,3 +1,6 @@
+import { realpath } from "node:fs/promises";
+import path from "node:path";
+
 import { canonicalJson } from "../protocol/json.js";
 import { parseRunJournalEntry, ZERO_JOURNAL_HASH } from "./entry.js";
 import { RuntimeJournalError } from "./errors.js";
@@ -45,6 +48,45 @@ interface ParsedJournal {
   readonly entries: readonly RunJournalEntryV1[];
   readonly validPrefixLength: number;
   readonly fragment: Uint8Array;
+}
+
+interface JournalCoordinator {
+  readonly queues: Map<string, Promise<unknown>>;
+}
+
+const coordinatorInitializers = new Map<string, Promise<JournalCoordinator>>();
+const coordinators = new Map<string, WeakRef<JournalCoordinator>>();
+const coordinatorFinalizer = new FinalizationRegistry<string>((canonicalRoot) => {
+  if (coordinators.get(canonicalRoot)?.deref() === undefined) {
+    coordinators.delete(canonicalRoot);
+  }
+});
+
+function coordinatorFor(filesystem: ReturnType<typeof createJournalFilesystem>) {
+  const requestedRoot = path.resolve(filesystem.statePath);
+  const existing = coordinatorInitializers.get(requestedRoot);
+  if (existing !== undefined) return existing;
+
+  const initialized = (async () => {
+    await filesystem.ensureRoots();
+    const canonicalRoot = await realpath(filesystem.statePath);
+    let coordinator = coordinators.get(canonicalRoot)?.deref();
+    if (coordinator === undefined) {
+      coordinator = { queues: new Map() };
+      coordinators.set(canonicalRoot, new WeakRef(coordinator));
+      coordinatorFinalizer.register(coordinator, canonicalRoot);
+    }
+    return coordinator;
+  })();
+  coordinatorInitializers.set(requestedRoot, initialized);
+  void initialized
+    .finally(() => {
+      if (coordinatorInitializers.get(requestedRoot) === initialized) {
+        coordinatorInitializers.delete(requestedRoot);
+      }
+    })
+    .catch(() => undefined);
+  return initialized;
 }
 
 function corrupt(): never {
@@ -117,17 +159,24 @@ function validateHistory(runId: string, entries: readonly RunJournalEntryV1[]): 
 
 function parseJournal(runId: string, bytes: Uint8Array): ParsedJournal {
   const buffer = Buffer.from(bytes);
+  if (buffer.length === 0) corrupt();
   const finalNewline = buffer.lastIndexOf(0x0a);
   const validPrefixLength = finalNewline < 0 ? 0 : finalNewline + 1;
   const complete = buffer.subarray(0, validPrefixLength);
   const fragment = buffer.subarray(validPrefixLength);
   const entries: RunJournalEntryV1[] = [];
   if (complete.length > 0) {
-    const lines = complete.toString("utf8").slice(0, -1).split("\n");
-    for (const line of lines) {
+    let start = 0;
+    for (let end = 0; end < complete.length; end += 1) {
+      if (complete[end] !== 0x0a) continue;
+      const line = complete.subarray(start, end);
       const parsed = parseRunJournalEntry(line);
       if (!parsed.ok) corrupt();
+      if (!Buffer.from(canonicalJson(parsed.value), "utf8").equals(line)) {
+        corrupt();
+      }
       entries.push(parsed.value);
+      start = end + 1;
     }
   }
   validateHistory(runId, entries);
@@ -174,23 +223,29 @@ export function createRunJournalStore(options: CreateRunJournalStoreOptions): Ru
     now: options.now,
     randomId: options.randomId,
   });
-  const queues = new Map<string, Promise<unknown>>();
+  const coordinator = coordinatorFor(filesystem);
   const pending = new Set<Promise<unknown>>();
   const corruptRuns = new Set<string>();
   let intakeStopped = false;
 
   const enqueue = <T>(runId: string, operation: () => Promise<T>): Promise<T> => {
-    const previous = queues.get(runId) ?? Promise.resolve();
-    const current = previous.catch(() => undefined).then(operation);
-    queues.set(runId, current);
-    pending.add(current);
-    void current
+    const scheduled = coordinator.then(async (shared) => {
+      const previous = shared.queues.get(runId) ?? Promise.resolve();
+      const current = previous.catch(() => undefined).then(operation);
+      shared.queues.set(runId, current);
+      try {
+        return await current;
+      } finally {
+        if (shared.queues.get(runId) === current) shared.queues.delete(runId);
+      }
+    });
+    pending.add(scheduled);
+    void scheduled
       .finally(() => {
-        pending.delete(current);
-        if (queues.get(runId) === current) queues.delete(runId);
+        pending.delete(scheduled);
       })
       .catch(() => undefined);
-    return current;
+    return scheduled;
   };
 
   const loadInternal = async (runId: string): Promise<RunJournalSnapshot | null> => {
@@ -201,6 +256,7 @@ export function createRunJournalStore(options: CreateRunJournalStoreOptions): Ru
       if (file === null) return null;
       let parsed = parseJournal(runId, file.bytes);
       if (parsed.fragment.length > 0) {
+        if (parsed.entries.length === 0) corrupt();
         await filesystem.recoverPartial(
           runId,
           file.identity,
@@ -239,7 +295,17 @@ export function createRunJournalStore(options: CreateRunJournalStoreOptions): Ru
     } else {
       const file = await filesystem.read(command.run_id);
       if (file === null) throw new RuntimeJournalError("RUNTIME_STATE_STALE");
-      await filesystem.append(command.run_id, file.identity, bytes);
+      const observed = parseJournal(command.run_id, file.bytes);
+      const observedSnapshot = snapshotOf(command.run_id, observed.entries);
+      if (
+        observed.fragment.length > 0 ||
+        observedSnapshot === null ||
+        observedSnapshot.head.journal_revision !== current.head.journal_revision ||
+        observedSnapshot.head.entry_hash !== current.head.entry_hash
+      ) {
+        throw new RuntimeJournalError("RUNTIME_STATE_STALE");
+      }
+      await filesystem.append(command.run_id, file, bytes);
     }
     return { entry: decision.entry, head: head(decision.entry), replayed: false };
   };
@@ -259,7 +325,7 @@ export function createRunJournalStore(options: CreateRunJournalStoreOptions): Ru
 
   return {
     async recover() {
-      await filesystem.ensureRoots();
+      await coordinator;
       await listInternal();
     },
     stopIntake() {

@@ -61,12 +61,19 @@ unresolved intent is returned for reconciliation rather than automatically
 repeated.
 
 Private journals are current-user `0600` JSONL beneath current-user `0700`
-state directories. Startup validates every complete line and the full chain. A
-nonempty unterminated tail is unpublished: it is copied byte-for-byte to a
-private synchronized quarantine artifact before the exact valid prefix is
-restored. Invalid complete content or an interior chain break blocks that run
-without being skipped or truncated and does not invalidate unrelated verified
-runs.
+state directories. Public store instances that resolve to the same canonical
+state root share one process-wide per-run writer queue; cross-process journal
+writers remain unsupported and the supervised runtime's instance lock excludes
+them. Initial publication, append, recovery, and replay require exact private
+file and directory-ancestry identities plus successful file and run-directory
+durability barriers. Each journal is bounded at 64 MiB; an initial publication
+or append that would exceed the bound fails before journal growth. Startup
+validates every complete line and the full chain. A nonempty unterminated tail
+after at least one complete entry is unpublished: it is copied byte-for-byte
+to a private synchronized quarantine artifact before the exact valid prefix is
+restored. An unterminated first entry, invalid complete content, or an interior
+chain break blocks that run without being skipped or truncated and does not
+invalidate unrelated verified runs.
 
 ## 5. Capability handshake and compatibility
 
