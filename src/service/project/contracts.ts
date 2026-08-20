@@ -93,7 +93,7 @@ function parseJsonContract<T>(
   return { ok: true, value: candidate as unknown as T };
 }
 
-function safeRelativePath(candidate: string): boolean {
+export function isSafeProjectRelativePath(candidate: string): boolean {
   if (
     candidate.length === 0 ||
     path.posix.isAbsolute(candidate) ||
@@ -157,8 +157,8 @@ export function parseProjectWatchManifest(
   if (
     !unique(raw.watch_paths) ||
     !unique(ignorePaths) ||
-    raw.watch_paths.some((candidate) => !safeRelativePath(candidate)) ||
-    ignorePaths.some((candidate) => !safeRelativePath(candidate))
+    raw.watch_paths.some((candidate) => !isSafeProjectRelativePath(candidate)) ||
+    ignorePaths.some((candidate) => !isSafeProjectRelativePath(candidate))
   ) {
     return invalid("", "relativePath", "manifest paths must be safe and unique");
   }
@@ -218,7 +218,7 @@ export function parseCandidateJobIntent(
 ): ValidationResult<CandidateJobIntentV1> {
   const parsed = parseJsonContract<CandidateJobIntentV1>(input, validateCandidate);
   if (!parsed.ok) return parsed;
-  if (parsed.value.changes.some((change) => !safeRelativePath(change.path))) {
+  if (parsed.value.changes.some((change) => !isSafeProjectRelativePath(change.path))) {
     return invalid("/changes", "relativePath", "candidate paths must be safe and relative");
   }
   const order = parsed.value.changes.map(changeOrder);
