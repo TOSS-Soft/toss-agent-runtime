@@ -3,16 +3,17 @@
 ## Status and scope
 
 This document is the normative operator and trust-boundary contract for the
-implemented issue #28 per-user service foundation. It covers macOS launchd and
-Linux `systemd --user`, explicit service lifecycle commands, the single-instance
-lock, the private local status socket, readiness, and bounded shutdown. Windows,
-remote control, provider/tool execution, project watching, and operational log
-management are outside this contract.
+implemented per-user service foundation and issue #29 project-control extension.
+It covers macOS launchd, the retained Linux `systemd --user` definition contract,
+explicit service lifecycle commands, the single-instance lock, private local
+control, project registration/intake, readiness, and bounded shutdown. The
+v1.0.0 package supports macOS only. Windows, remote control, provider/tool
+execution, and operational log management are outside this contract.
 
 This foundation does not complete Wave 2. Production-durable `INTERRUPTED`
 journal persistence is implemented through the private run-journal store.
 Issue #28 remains open for its separate real macOS login/native crash-loop
-acceptance. Issues #29 and #30 and npm `1.0.0` remain incomplete.
+acceptance. Issue #30 and npm `1.0.0` remain incomplete.
 
 ## Operator grammar and activation boundary
 
@@ -139,11 +140,12 @@ no listener accepts it, and its filesystem identity is unchanged at removal.
 Symlinks, non-sockets, wrong ownership/mode, active listeners, or replacements
 are preserved and fail closed.
 
-## Closed local status protocol
+## Closed local control protocol
 
 The control surface is a Unix domain socket only; there is no TCP or remote
 fallback. Its private `0700` runtime directory and `0600` socket are the local
-same-user access boundary. The v1 request grammar exposes only `status`.
+same-user access boundary. The v1 request grammar exposes `status` plus explicit
+project register, unregister, and list operations.
 
 Each connection carries exactly one newline-delimited canonical JSON request
 and one canonical JSON response, then closes. The JSON body is limited to
@@ -154,18 +156,23 @@ before dispatch and are never echoed. Connections idle for five seconds are
 closed. At most 32 connections are tracked; overflow connections are destroyed
 immediately without a structured-response guarantee.
 
-`service-control-request.v1` is a closed object containing only:
+`service-control-request.v1` is a closed object containing:
 
 - `schema_version: "service-control-request.v1"`;
 - `document_type: "service-control-request"`;
-- a UUID `request_id`; and
-- `command: "status"`.
+- a UUID `request_id`;
+- `command: "status"`, `command: "project-register"`,
+  `command: "project-unregister"`, or `command: "project-list"`;
+- an absolute `root` only for register; or
+- a UUID `project_id` only for unregister.
 
 `service-control-response.v1` is a closed object containing schema/document
-identity, the validated request ID or `null`, `ok`, and exactly one of a status
-or fixed service error. Status contains package version, service instance UUID,
-PID, UTC start time, `healthy|degraded|stopping`, and whether the server is
-accepting. A rejection before request-ID validation uses `request_id: null`.
+identity, the validated request ID or `null`, `ok`, and exactly one of status,
+project data, or a fixed service/project error. Status contains package version,
+service instance UUID, PID, UTC start time, `healthy|degraded|stopping`, and
+whether the server is accepting. Project data is either one validated
+registration or a bytewise project-ID-sorted registration list. A rejection
+before request-ID validation uses `request_id: null`.
 
 The live service keeps a 256-entry LRU cache of request ID, request hash, and
 exact response. Repeating an ID with the same canonical request bytes returns
@@ -173,6 +180,16 @@ the byte-identical cached response without dispatching status again. Reusing
 the ID with different canonical bytes returns
 `RUNTIME_SERVICE_CONTROL_CONFLICT` and does not replace the original cache
 entry. The cache is in-memory and scoped to one service instance.
+
+Project mutations are dispatched only after a validated local request reaches
+the supervised daemon; the CLI never writes registry or intake files directly.
+The daemon binds a canonical root and closed `.toss/project.yaml`, arms only
+declared watch scopes, coalesces changes at 200 ms with a hard 2 second maximum,
+and durably publishes deduplicated candidate intents. Built-in ignores include
+`.git`, `.toss/runtime`, and runtime-owned state. Recovery restores valid
+registry/pending state before readiness. A missing or replaced root is blocked
+without automatic relocation. Project watchers can propose candidates only and
+cannot bypass governance, execution, provider, tool, or acceptance gates.
 
 ## Status, doctor, and stable failures
 
@@ -191,6 +208,17 @@ document content, environment values, socket detail, or stacks.
 | `RUNTIME_SERVICE_MANAGER_UNAVAILABLE` |   69 | Required native manager executable is absent   |
 | `RUNTIME_SERVICE_UNAVAILABLE`         |   69 | Installed/local service is unavailable         |
 | `RUNTIME_SERVICE_MANAGER_FAILED`      |   70 | Native manager operation failed safely         |
+
+Project operations additionally use these fixed failures:
+
+| Project error                      | Exit | Meaning                                       |
+| ---------------------------------- | ---: | --------------------------------------------- |
+| `RUNTIME_PROJECT_INVALID`          |    3 | Project input or manifest is invalid          |
+| `RUNTIME_PROJECT_NOT_FOUND`        |    3 | Project registration does not exist           |
+| `RUNTIME_PROJECT_PATH_UNSAFE`      |    5 | Root, manifest, or filesystem state is unsafe |
+| `RUNTIME_PROJECT_REGISTRY_CORRUPT` |    5 | Registry history cannot be trusted            |
+| `RUNTIME_PROJECT_INTAKE_CORRUPT`   |    5 | Pending/candidate intake cannot be trusted    |
+| `RUNTIME_PROJECT_UNAVAILABLE`      |   69 | Registered project is unavailable             |
 
 Usage failures use exit `2`; successful actions use `0`. Unexpected internal
 service failures use `70`. Configuration selection/validation failures and an

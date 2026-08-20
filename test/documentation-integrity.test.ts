@@ -159,4 +159,30 @@ toss-runtime service uninstall [--json]`;
       "Production-durable `INTERRUPTED` journal persistence remains pending issue #1",
     );
   });
+
+  it("documents the explicit project intake and candidate-only governance boundary", async () => {
+    const readme = await readFile("README.md", "utf8");
+    const serviceContract = await readFile("docs/contracts/local-service-control-v1.md", "utf8");
+    const protocolContract = await readFile(
+      "docs/contracts/runtime-contract-protocol-v1.md",
+      "utf8",
+    );
+    const changelog = await readFile("CHANGELOG.md", "utf8");
+    const packageManifest = JSON.parse(await readFile("package.json", "utf8")) as {
+      readonly os: readonly string[];
+    };
+
+    expect(packageManifest.os).toEqual(["darwin"]);
+    expect(readme).toContain("toss-runtime project register <absolute-root> [--json]");
+    expect(readme).toContain("schema_version: project-watch-manifest.v1");
+    expect(readme).toContain("200 ms");
+    expect(readme).toContain("2 second");
+    expect(readme).toMatch(/never scans an unregistered project/u);
+    expect(readme).toMatch(/candidate job intent/u);
+    expect(serviceContract).toContain('`command: "project-register"`');
+    expect(serviceContract).toContain("RUNTIME_PROJECT_INTAKE_CORRUPT");
+    expect(protocolContract).toContain("`candidate-job-intent.v1`");
+    expect(protocolContract).toMatch(/does not authorize\s+execution/u);
+    expect(changelog).toContain("Explicit project registry");
+  });
 });

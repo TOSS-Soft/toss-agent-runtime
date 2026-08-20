@@ -2,12 +2,12 @@
 
 `@toss-software/agent-runtime` is the governed, provider-neutral execution runtime for TOSS. This development baseline publishes Runtime Contract Protocol v1, strict configuration loading, a truthful capability handshake, immutable append-only run journals, and the explicit per-user `toss-runtime` service-supervision foundation.
 
-> Status: the package remains `0.0.0-development` until all v1 release waves and protected live-provider gates pass. Immutable run-journal persistence is implemented; issue #28 still requires its separate real macOS login/native crash-loop acceptance. Issues #29 and #30 and npm `1.0.0` remain incomplete. This baseline does not execute agents, call providers, run tools, or expose remote control.
+> Status: the package remains `0.0.0-development` until all v1 release waves and protected live-provider gates pass. Immutable run-journal persistence and explicit project intake are implemented; issue #28 still requires its separate real macOS login/native crash-loop acceptance. Issue #30 and npm `1.0.0` remain incomplete. This baseline does not execute agents, call providers, run tools, or expose remote control.
 
 ## Requirements
 
 - Node.js 22.23.0 or newer in the Node 22 line, or Node.js 24
-- macOS or Linux
+- macOS
 - npm
 
 ## Install
@@ -41,11 +41,34 @@ toss-runtime service stop [--json]
 toss-runtime service restart [--json]
 toss-runtime service status [--json]
 toss-runtime service uninstall [--json]
+toss-runtime project register <absolute-root> [--json]
+toss-runtime project unregister <project-id> [--json]
+toss-runtime project list [--json]
 ```
 
 Only `service install` accepts `--config`. It validates or materializes a private configuration, writes the current user's native service definition, and enables automatic startup at login. It does not start the service in the current session; run `toss-runtime service start` for that explicit activation. `service status` is read-only and returns success with `installed: false` when no compatible definition exists. `service stop` and `service uninstall` are idempotent when absent, while absent `start` or `restart` returns unavailable.
 
 Repository acceptance verifies deterministic launchd/systemd definitions, native syntax lint on the host platform, exact enable/start command arrays, status/backoff parsing, doctor remediation, and a directly started installed-supervisor smoke. It deliberately does not mutate a real user's service manager. Automatic login-session activation and native crash-loop observation remain platform-integration pending; ordinary `npm run verify` jobs do not close those gates.
+
+## Project registration and intake
+
+The service never scans an unregistered project, a home directory, or neighboring workspace roots. Registration is explicit and requires a closed manifest at `<absolute-root>/.toss/project.yaml`:
+
+```yaml
+schema_version: project-watch-manifest.v1
+watch_paths:
+  - src
+  - package.json
+ignore_paths:
+  - dist
+  - tmp
+```
+
+`watch_paths` and `ignore_paths` are project-relative literal paths. Absolute paths, traversal, backslashes, symlinks, root escapes, `.git`, `.toss/runtime`, and runtime-owned state are rejected or always ignored. Registration binds the canonical project root and manifest hash to a stable project ID. `project unregister` stops that watch without deleting project files, registry history, candidates, journals, or logs.
+
+Native changes are normalized and coalesced after 200 ms, with a hard 2 second maximum for a continuous burst. The pending window is synchronized before its timer is armed; after restart it is either completed exactly once or rejected safely. Duplicate normalized change sets append no second record. A missing, moved, or replaced root becomes `BLOCKED_PROJECT_UNAVAILABLE`; the runtime never guesses a replacement root.
+
+The watcher emits only a durable `candidate-job-intent.v1` candidate job intent. A candidate does not authorize execution, approve policy, select a provider, invoke a tool, mutate authoritative project artifacts, or satisfy acceptance. Those governance gates remain owned by the TOSS control plane.
 
 `doctor` checks package, platform, Node, configuration, native manager state, restart backoff, and private socket health. A healthy active service with a matching socket identity passes the service check. Missing or stopped service state warns in development and fails in production; backoff, unsafe state, unavailable/degraded control, or identity mismatch fails. See the [Local Service Control v1 contract](docs/contracts/local-service-control-v1.md) for exact native commands, permissions, protocol bounds, stable failures, and shutdown ordering.
 
@@ -77,6 +100,8 @@ const journal = createRunJournalStore({
 ```
 
 The public parser returns either a validated, deeply frozen domain value or a normalized failure. Input is bounded JSON; duplicate keys, unknown properties, unsupported schema versions, and unsafe JavaScript values are rejected.
+
+The same top-level API exports the closed project manifest, registry-entry, and candidate-intent parsers plus safe registry/intake interface types. Filesystem constructors and operation hooks remain internal to the supervised process.
 
 ## Contracts and examples
 

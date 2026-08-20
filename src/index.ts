@@ -91,3 +91,25 @@ export {
   type TransitionDecision,
   type TransitionResult,
 } from "./journal/index.js";
+export {
+  candidateJobKey,
+  hashProjectRegistryEntry,
+  hashProjectWatchManifest,
+  parseCandidateJobIntent,
+  parseProjectRegistryEntry,
+  parseProjectWatchManifest,
+} from "./service/project/contracts.js";
+export { RuntimeProjectError, type RuntimeProjectErrorCode } from "./service/project/errors.js";
+export type { ProjectIntake } from "./service/project/intake.js";
+export type { ProjectRegistry } from "./service/project/registry.js";
+export type {
+  CandidateJobIntentV1,
+  HashableProjectRegistryEntryV1,
+  ProjectChange,
+  ProjectChangeKind,
+  ProjectFileIdentity,
+  ProjectRegistration,
+  ProjectRegistryEntryV1,
+  ProjectRegistryState,
+  ProjectWatchManifestV1,
+} from "./service/project/types.js";

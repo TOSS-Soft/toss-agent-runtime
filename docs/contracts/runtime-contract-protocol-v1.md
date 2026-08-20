@@ -75,6 +75,27 @@ restored. An unterminated first entry, invalid complete content, or an interior
 chain break blocks that run without being skipped or truncated and does not
 invalidate unrelated verified runs.
 
+### Project registry and candidate intents
+
+`project-watch-manifest.v1` is the closed, explicit input that selects one or
+more project-relative watch paths and optional ignore paths. Registration binds
+that manifest hash to a stable project UUID, canonical root, and append-only
+`project-registry-entry.v1` revision chain. The runtime MUST NOT discover or
+scan unregistered projects. Watch and ignore paths MUST NOT be absolute, escape
+the registered root, traverse symlinks, include `.git` or `.toss/runtime`, or
+reach runtime-owned state.
+
+Normalized file changes are bytewise sorted and recorded in
+`candidate-job-intent.v1`. Its `candidate_key` hashes the exact project ID,
+registry revision, manifest hash, and normalized changes. Repeating the same
+key appends no second candidate. A missing, moved, or identity-replaced root is
+recorded as `BLOCKED_PROJECT_UNAVAILABLE`; the runtime MUST NOT relocate it.
+
+A candidate job intent is intake evidence only. It does not authorize
+execution, satisfy approval, choose routing or providers, invoke tools, mutate
+authoritative project artifacts, or constitute acceptance. Every governance
+decision remains with the control plane.
+
 ## 5. Capability handshake and compatibility
 
 Before execution, the consumer obtains `runtime-capabilities.v1` and negotiates the request. It MUST confirm the protocol, request schema, logical model class, every required model capability, every required Superpowers capability, an MCP transport, the exact MCP profile identity, and the required execution topology. Every execution-critical feature state MUST be `available`; `blocked` and `unavailable` fail negotiation.
