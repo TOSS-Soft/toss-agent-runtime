@@ -34,10 +34,7 @@ export function parseRunJournalEntry(
   }
 
   const sideEffect = result.value.side_effect;
-  if (
-    (sideEffect === null && result.value.operation_id !== null) ||
-    (sideEffect !== null && result.value.operation_id !== sideEffect.identity)
-  ) {
+  if (sideEffect !== null && result.value.operation_id !== sideEffect.identity) {
     return invalidIssue("/side_effect/identity", "operationIdentity", "must equal operation_id");
   }
 

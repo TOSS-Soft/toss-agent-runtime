@@ -135,6 +135,12 @@ describe("run journal entry contract", () => {
     expect(parseRunJournalEntry(canonicalJson(completed))).toMatchObject({ ok: true });
   });
 
+  it("accepts an operation id without a provider or tool side effect", () => {
+    expect(
+      parseRunJournalEntry(canonicalJson(entry({ operation_id: "approval-1" }))),
+    ).toMatchObject({ ok: true });
+  });
+
   it.each([
     {
       name: "intent output",
