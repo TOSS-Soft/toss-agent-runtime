@@ -8,6 +8,7 @@ import {
 } from "../protocol/json.js";
 import { RuntimeProviderError } from "../providers/errors.js";
 import type {
+  ProviderRouteIdentity,
   ProviderRouteRequirement,
   ProviderWireContext,
   ProviderWireResponse,
@@ -23,7 +24,9 @@ import {
 import { createAgentgatewayClient, readBoundedAgentgatewayResponse } from "./client.js";
 import { createGatewayCredentialCoordinator } from "./credentials.js";
 import { agentgatewayError, classifyAgentgatewayHttpStatus } from "./errors.js";
+import { parseBoundedSse } from "./sse.js";
 import type {
+  AgentgatewayCapabilitiesV1,
   AgentgatewayFetch,
   AgentgatewayFetchOptions,
   GatewayCredentialProvider,
@@ -243,9 +246,10 @@ function fixedResponseHeaders(options: {
   readonly capabilityRevision: number;
   readonly capabilityHash: `sha256:${string}`;
   readonly requirementHash: `sha256:${string}`;
+  readonly accept: "application/json" | "text/event-stream";
 }): Headers {
   const headers = new Headers();
-  headers.set("accept", "application/json");
+  headers.set("accept", options.accept);
   headers.set("authorization", `Bearer ${options.token}`);
   headers.set("content-type", "application/json");
   headers.set(
@@ -298,6 +302,67 @@ function rejectRedirectedResponse(response: Response, expectedUrl: string): void
   }
 }
 
+async function cancelResponseBody(response: Response | undefined): Promise<void> {
+  if (response?.body === null || response?.body === undefined) return;
+  try {
+    await response.body.cancel();
+  } catch {
+    // The stable request outcome owns failure precedence.
+  }
+}
+
+function responseContentType(response: Response): string | null {
+  let value: unknown;
+  try {
+    value = response.headers.get("content-type");
+  } catch {
+    throw agentgatewayError("RUNTIME_PROVIDER_GATEWAY_INVALID");
+  }
+  return typeof value === "string" ? value : null;
+}
+
+const STREAM_EVENT_TYPES = new Set([
+  "error",
+  "response.completed",
+  "response.created",
+  "response.function_call_arguments.delta",
+  "response.output_item.added",
+  "response.output_text.delta",
+  "response.refusal.delta",
+]);
+
+function streamEventType(value: JsonValue): string {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw agentgatewayError("RUNTIME_PROVIDER_GATEWAY_INVALID");
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const descriptor = descriptors.type;
+  if (
+    descriptor === undefined ||
+    descriptor.get !== undefined ||
+    descriptor.set !== undefined ||
+    typeof descriptor.value !== "string" ||
+    !STREAM_EVENT_TYPES.has(descriptor.value)
+  ) {
+    throw agentgatewayError("RUNTIME_PROVIDER_GATEWAY_INVALID");
+  }
+  return descriptor.value;
+}
+
+async function* validatedStreamEvents(
+  body: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
+): AsyncIterable<JsonValue> {
+  let terminal = false;
+  for await (const event of parseBoundedSse(body, signal)) {
+    if (terminal) throw agentgatewayError("RUNTIME_PROVIDER_GATEWAY_INVALID");
+    const type = streamEventType(event);
+    if (type === "response.completed" || type === "error") terminal = true;
+    yield event;
+  }
+  if (!terminal) throw agentgatewayError("RUNTIME_PROVIDER_GATEWAY_INVALID");
+}
+
 export function createAgentgatewayTransport(options: {
   readonly selectedProfile: SelectedAgentgatewayProfile;
   readonly credentialReference: SecretReference;
@@ -322,59 +387,80 @@ export function createAgentgatewayTransport(options: {
     now: options.now,
   });
 
+  async function performRequest(
+    input: JsonValue,
+    wireContext: ProviderWireContext,
+    streaming: boolean,
+  ): Promise<{
+    readonly response: Response;
+    readonly context: ReturnType<typeof normalizedContext>;
+    readonly capability: AgentgatewayCapabilitiesV1;
+    readonly routeIdentity: ProviderRouteIdentity;
+  }> {
+    let context: ReturnType<typeof normalizedContext>;
+    let body: string;
+    try {
+      context = normalizedContext(wireContext);
+      if (context.requirement.streaming !== streaming || !isDeepFrozenPlainJson(input)) {
+        throw agentgatewayError("RUNTIME_PROVIDER_GATEWAY_INVALID");
+      }
+      body = canonicalJson(input, RESPONSE_LIMITS);
+    } catch (error) {
+      if (error instanceof RuntimeProviderError) throw error;
+      throw agentgatewayError("RUNTIME_PROVIDER_GATEWAY_INVALID");
+    }
+
+    let response: Response | undefined;
+    try {
+      const capability = await client.discover(context.signal);
+      requireExecutableRoute(capability, context.requirement);
+      const requirementHash = hashProviderRouteRequirement(context.requirement);
+      const lease = await credentials.resolve(options.credentialReference, context.signal);
+      const request: AgentgatewayFetchOptions = {
+        method: "POST",
+        headers: fixedResponseHeaders({
+          token: lease.token,
+          context,
+          capabilityRevision: capability.gateway.revision,
+          capabilityHash: capability.document_hash,
+          requirementHash,
+          accept: streaming ? "text/event-stream" : "application/json",
+        }),
+        redirect: "error",
+        signal: context.signal,
+        body,
+      };
+      response = await options.fetch(responseUrl, request);
+      rejectRedirectedResponse(response, responseUrl);
+      if (response.status < 200 || response.status >= 300) {
+        throw classifyResponseFailure(response);
+      }
+      const routeIdentity = parseAgentgatewayAttestation({
+        headers: response.headers,
+        capability,
+        requirement: context.requirement,
+        requirementHash,
+        gatewayProfile: options.selectedProfile.name,
+      });
+      return { response, context, capability, routeIdentity };
+    } catch (error) {
+      await cancelResponseBody(response);
+      throw normalizeFailure(error, context.signal);
+    }
+  }
+
   return Object.freeze({
     async complete(
       input: JsonValue,
       wireContext: ProviderWireContext,
     ): Promise<ProviderWireResponse> {
-      let context: ReturnType<typeof normalizedContext>;
-      let body: string;
+      const prepared = await performRequest(input, wireContext, false);
       try {
-        context = normalizedContext(wireContext);
-        if (!isDeepFrozenPlainJson(input)) {
-          throw agentgatewayError("RUNTIME_PROVIDER_GATEWAY_INVALID");
-        }
-        body = canonicalJson(input, RESPONSE_LIMITS);
-      } catch (error) {
-        if (error instanceof RuntimeProviderError) throw error;
-        throw agentgatewayError("RUNTIME_PROVIDER_GATEWAY_INVALID");
-      }
-
-      try {
-        const capability = await client.discover(context.signal);
-        requireExecutableRoute(capability, context.requirement);
-        const requirementHash = hashProviderRouteRequirement(context.requirement);
-        const lease = await credentials.resolve(options.credentialReference, context.signal);
-        const request: AgentgatewayFetchOptions = {
-          method: "POST",
-          headers: fixedResponseHeaders({
-            token: lease.token,
-            context,
-            capabilityRevision: capability.gateway.revision,
-            capabilityHash: capability.document_hash,
-            requirementHash,
-          }),
-          redirect: "error",
-          signal: context.signal,
-          body,
-        };
-        const response = await options.fetch(responseUrl, request);
-        rejectRedirectedResponse(response, responseUrl);
-        if (response.status < 200 || response.status >= 300) {
-          throw classifyResponseFailure(response);
-        }
-        const routeIdentity = parseAgentgatewayAttestation({
-          headers: response.headers,
-          capability,
-          requirement: context.requirement,
-          requirementHash,
-          gatewayProfile: options.selectedProfile.name,
-        });
         let payload: JsonValue;
         try {
           payload = deepFreezeJson(
             parseJsonBytes(
-              await readBoundedAgentgatewayResponse(response, RESPONSE_BYTES),
+              await readBoundedAgentgatewayResponse(prepared.response, RESPONSE_BYTES),
               RESPONSE_LIMITS,
             ),
             RESPONSE_LIMITS,
@@ -383,15 +469,25 @@ export function createAgentgatewayTransport(options: {
           if (error instanceof RuntimeProviderError) throw error;
           throw agentgatewayError("RUNTIME_PROVIDER_GATEWAY_INVALID");
         }
-        return Object.freeze({ payload, route_identity: routeIdentity });
+        return Object.freeze({ payload, route_identity: prepared.routeIdentity });
       } catch (error) {
-        throw normalizeFailure(error, context.signal);
+        throw normalizeFailure(error, prepared.context.signal);
       }
     },
-    stream(input: JsonValue, context: ProviderWireContext): Promise<ProviderWireStream> {
-      void input;
-      void context;
-      return Promise.reject(agentgatewayError("RUNTIME_PROVIDER_UNSUPPORTED"));
+    async stream(input: JsonValue, context: ProviderWireContext): Promise<ProviderWireStream> {
+      const prepared = await performRequest(input, context, true);
+      const contentType = responseContentType(prepared.response);
+      if (!/^text\/event-stream(?:;[ \t]*charset=utf-8)?$/iu.test(contentType ?? "")) {
+        await cancelResponseBody(prepared.response);
+        throw agentgatewayError("RUNTIME_PROVIDER_GATEWAY_INVALID");
+      }
+      if (prepared.response.body === null) {
+        throw agentgatewayError("RUNTIME_PROVIDER_GATEWAY_INVALID");
+      }
+      return Object.freeze({
+        route_identity: prepared.routeIdentity,
+        events: validatedStreamEvents(prepared.response.body, prepared.context.signal),
+      });
     },
     health() {
       return client.health();

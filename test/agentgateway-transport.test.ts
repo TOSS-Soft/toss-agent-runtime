@@ -12,14 +12,18 @@ import {
 } from "../src/gateway/index.js";
 import { canonicalJson, deepFreezeJson, type JsonValue } from "../src/protocol/json.js";
 import {
+  collectProviderEvents,
   createOpenAIAdapter,
   RuntimeProviderError,
+  type ProviderAdapter,
   type ProviderAdapterCapabilities,
   type ProviderExecutionOptions,
+  type ProviderEventV1,
   type ProviderRequest,
   type ProviderRouteRequirement,
   type ProviderWireContext,
 } from "../src/providers/index.js";
+import { parseBoundedSse } from "../src/gateway/sse.js";
 import { startFakeAgentgateway, type FakeAgentgateway } from "./helpers/fake-agentgateway.js";
 
 const now = () => new Date("2026-08-20T10:00:00.000Z");
@@ -570,6 +574,233 @@ describe("agentgateway non-streaming transport", () => {
   });
 });
 
+describe("agentgateway bounded streaming transport", () => {
+  it("normalizes CRLF and split UTF-8 SSE to the same canonical completion", async () => {
+    const fake = await gateway();
+    const capability = capabilityDocument();
+    fake.setResponse("/runtime/v1/toss/capabilities", {
+      status: 200,
+      body: canonicalJson(capability),
+    });
+    fake.setResponse("/runtime/v1/responses", {
+      status: 200,
+      headers: attestationHeaders({ capability }),
+      body: canonicalJson(nativeCompletion()),
+    });
+    const complete = await adapter(fake.endpoint).complete(request, execution);
+    const streamingRequirement = streamRequirement();
+    const sseBytes = Buffer.from(
+      [
+        ": split fox 🦊",
+        "event: response.created",
+        `data: ${canonicalJson({ type: "response.created", response: { id: "resp_1" } })}`,
+        "",
+        "id: event-2",
+        "retry: 1000",
+        `data: ${canonicalJson({ type: "response.output_text.delta", output_index: 0, delta: "gateway " })}`,
+        "",
+        `data: ${canonicalJson({ type: "response.output_text.delta", output_index: 0, delta: "answer" })}`,
+        "",
+        `data: ${canonicalJson({ type: "response.completed", response: { status: "completed", usage: { input_tokens: 3, output_tokens: 2 } } })}`,
+        "",
+        "data: [DONE]",
+        "",
+        "",
+      ].join("\r\n"),
+      "utf8",
+    );
+    const fox = sseBytes.indexOf(Buffer.from("🦊"));
+    fake.setResponse("/runtime/v1/responses", {
+      status: 200,
+      headers: {
+        ...attestationHeaders({ capability, requirement: streamingRequirement }),
+        "content-type": "text/event-stream; charset=utf-8",
+      },
+      body: [
+        new Uint8Array(sseBytes.subarray(0, fox + 1)),
+        new Uint8Array(sseBytes.subarray(fox + 1, fox + 3)),
+        new Uint8Array(sseBytes.subarray(fox + 3)),
+      ],
+    });
+    const events: ProviderEventV1[] = [];
+
+    for await (const event of adapter(fake.endpoint).stream(request, execution)) events.push(event);
+    const streamed = collectProviderEvents(events);
+
+    expect(streamed).toEqual({
+      ...complete,
+      route_identity: {
+        ...complete.route_identity,
+        requirement_hash: hashProviderRouteRequirement(streamingRequirement),
+      },
+    });
+    expect(streamed.route_identity).toMatchObject({
+      route_id: complete.route_identity?.route_id,
+      resolved_provider: complete.route_identity?.resolved_provider,
+      resolved_model: complete.route_identity?.resolved_model,
+      requirement_hash: hashProviderRouteRequirement(streamingRequirement),
+    });
+    expect(fake.requests[3]).toMatchObject({
+      method: "POST",
+      path: "/runtime/v1/responses",
+      headers: {
+        accept: "text/event-stream",
+        authorization: `Bearer ${virtualToken}`,
+        "x-toss-requirement-sha256": hashProviderRouteRequirement(streamingRequirement),
+      },
+    });
+  });
+
+  it.each([
+    ["total bytes", new Uint8Array(8 * 1024 * 1024 + 1)],
+    ["event bytes", Buffer.from(`data: ${"x".repeat(1024 * 1024 + 1)}\n\n`)],
+    ["invalid UTF-8", new Uint8Array([0xff, 0xfe])],
+    ["invalid JSON", Buffer.from("data: {not-json}\n\n")],
+    ["truncated event", Buffer.from("data: {}\n")],
+    ["data after done", Buffer.from("data: [DONE]\n\ndata: {}\n\n")],
+  ] as const)("rejects bounded SSE %s without reflecting bytes", async (_name, bytes) => {
+    const body = streamBody(bytes, _name === "truncated event");
+    let error: unknown;
+    try {
+      for await (const event of parseBoundedSse(body.stream, new AbortController().signal)) {
+        void event;
+      }
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toEqual(new RuntimeProviderError("RUNTIME_PROVIDER_GATEWAY_INVALID"));
+    expect(String(error)).not.toContain("not-json");
+  });
+
+  it("rejects event 10,001 and cancels the body exactly once", async () => {
+    const event = `data: ${canonicalJson({ type: "response.created", response: { id: "resp_1" } })}\n\n`;
+    const body = streamBody(Buffer.from(event.repeat(10_001)), false);
+
+    await expect(collectSse(body.stream)).rejects.toEqual(
+      new RuntimeProviderError("RUNTIME_PROVIDER_GATEWAY_INVALID"),
+    );
+    expect(body.cancelled()).toBe(1);
+  });
+
+  it("rejects DONE without a normalized terminal event", async () => {
+    const capability = capabilityDocument();
+    const fetch = streamingFetch(
+      capability,
+      streamBody(
+        Buffer.from(
+          `data: ${canonicalJson({ type: "response.created", response: { id: "resp_1" } })}\n\ndata: [DONE]\n\n`,
+        ),
+        true,
+      ).stream,
+    );
+    const instance = createOpenAIAdapter({
+      transport: transport({ endpoint: "https://gateway.example.test/runtime", fetch }),
+      capabilities: adapterCapabilities,
+      now,
+      createEventId: () => "018f0f64-7b21-7d4f-8c3d-4a30413d5f41",
+    });
+
+    await expect(collectAdapterStream(instance, request, execution)).rejects.toEqual(
+      new RuntimeProviderError("RUNTIME_PROVIDER_GATEWAY_INVALID"),
+    );
+  });
+
+  it("cancels a blocked body exactly once on external abort", async () => {
+    const capability = capabilityDocument();
+    const body = blockedBody();
+    const fetch = streamingFetch(capability, body.stream);
+    const instance = createOpenAIAdapter({
+      transport: transport({ endpoint: "https://gateway.example.test/runtime", fetch }),
+      capabilities: adapterCapabilities,
+      now,
+      createEventId: () => "018f0f64-7b21-7d4f-8c3d-4a30413d5f41",
+    });
+    const controller = new AbortController();
+    const operation = collectAdapterStream(instance, request, {
+      ...execution,
+      signal: controller.signal,
+    });
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+
+    controller.abort();
+
+    await expect(operation).rejects.toEqual(new RuntimeProviderError("RUNTIME_PROVIDER_CANCELLED"));
+    expect(body.cancelled()).toBe(1);
+  });
+
+  it("preserves adapter timeout and cancels a blocked body exactly once", async () => {
+    vi.useFakeTimers();
+    try {
+      const capability = capabilityDocument();
+      const body = blockedBody();
+      const fetch = streamingFetch(capability, body.stream);
+      const instance = createOpenAIAdapter({
+        transport: transport({ endpoint: "https://gateway.example.test/runtime", fetch }),
+        capabilities: adapterCapabilities,
+        now,
+        createEventId: () => "018f0f64-7b21-7d4f-8c3d-4a30413d5f41",
+      });
+      const operation = collectAdapterStream(instance, { ...request, timeout_ms: 10 }, execution);
+      const expectation = expect(operation).rejects.toEqual(
+        new RuntimeProviderError("RUNTIME_PROVIDER_TIMEOUT"),
+      );
+      await vi.advanceTimersByTimeAsync(10);
+
+      await expectation;
+      expect(body.cancelled()).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels the body exactly once when the consumer stops after response-start", async () => {
+    const capability = capabilityDocument();
+    const body = streamBody(
+      Buffer.from(
+        `data: ${canonicalJson({ type: "response.created", response: { id: "resp_1" } })}\n\n`,
+      ),
+      false,
+    );
+    const fetch = streamingFetch(capability, body.stream);
+    const instance = createOpenAIAdapter({
+      transport: transport({ endpoint: "https://gateway.example.test/runtime", fetch }),
+      capabilities: adapterCapabilities,
+      now,
+      createEventId: () => "018f0f64-7b21-7d4f-8c3d-4a30413d5f41",
+    });
+
+    for await (const event of instance.stream(request, execution)) {
+      expect(event.event_type).toBe("response-start");
+      break;
+    }
+
+    expect(body.cancelled()).toBe(1);
+  });
+
+  it("cancels the body exactly once on parser failure", async () => {
+    const capability = capabilityDocument();
+    const body = streamBody(Buffer.from("data: {must-not-leak}\n\n"), false);
+    const fetch = streamingFetch(capability, body.stream);
+    const instance = createOpenAIAdapter({
+      transport: transport({ endpoint: "https://gateway.example.test/runtime", fetch }),
+      capabilities: adapterCapabilities,
+      now,
+      createEventId: () => "018f0f64-7b21-7d4f-8c3d-4a30413d5f41",
+    });
+
+    let error: unknown;
+    try {
+      await collectAdapterStream(instance, request, execution);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toEqual(new RuntimeProviderError("RUNTIME_PROVIDER_GATEWAY_INVALID"));
+    expect(String(error)).not.toContain("must-not-leak");
+    expect(body.cancelled()).toBe(1);
+  });
+});
+
 function context(): ProviderWireContext {
   return {
     request_id: request.request_id,
@@ -588,6 +819,92 @@ function context(): ProviderWireContext {
     signal: new AbortController().signal,
     timeout_ms: request.timeout_ms,
   };
+}
+
+function streamRequirement(): ProviderRouteRequirement {
+  return {
+    schema_version: "gateway-route-requirement.v1",
+    alias: "balanced-code",
+    tools: false,
+    json_schema: false,
+    vision: false,
+    reasoning: false,
+    streaming: true,
+    max_output_tokens: 128,
+  };
+}
+
+function streamBody(
+  bytes: Uint8Array,
+  close: boolean,
+): {
+  readonly stream: ReadableStream<Uint8Array>;
+  readonly cancelled: () => number;
+} {
+  let cancellations = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(bytes);
+      if (close) controller.close();
+    },
+    cancel() {
+      cancellations += 1;
+    },
+  });
+  return { stream, cancelled: () => cancellations };
+}
+
+function blockedBody(): {
+  readonly stream: ReadableStream<Uint8Array>;
+  readonly cancelled: () => number;
+} {
+  let cancellations = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    cancel() {
+      cancellations += 1;
+    },
+  });
+  return { stream, cancelled: () => cancellations };
+}
+
+async function collectSse(stream: ReadableStream<Uint8Array>): Promise<readonly JsonValue[]> {
+  const events: JsonValue[] = [];
+  for await (const event of parseBoundedSse(stream, new AbortController().signal)) {
+    events.push(event);
+  }
+  return events;
+}
+
+async function collectAdapterStream(
+  instance: ProviderAdapter,
+  candidate: ProviderRequest,
+  candidateExecution: ProviderExecutionOptions,
+): Promise<readonly ProviderEventV1[]> {
+  const events: ProviderEventV1[] = [];
+  for await (const event of instance.stream(candidate, candidateExecution)) events.push(event);
+  return events;
+}
+
+function streamingFetch(
+  capability: AgentgatewayCapabilitiesV1,
+  body: ReadableStream<Uint8Array>,
+): ReturnType<typeof vi.fn<AgentgatewayFetch>> {
+  let call = 0;
+  return vi.fn<AgentgatewayFetch>(() => {
+    call += 1;
+    if (call === 1) {
+      return Promise.resolve(new Response(canonicalJson(capability), { status: 200 }));
+    }
+    return Promise.resolve(
+      new Response(body, {
+        status: 200,
+        headers: {
+          ...attestationHeaders({ capability, requirement: streamRequirement() }),
+          "content-type": "text/event-stream",
+        },
+      }),
+    );
+  });
 }
 
 function scriptedFetch(options: {
