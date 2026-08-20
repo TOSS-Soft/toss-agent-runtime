@@ -1,11 +1,16 @@
 import { describe, expect, it } from "vitest";
 
+import { sha256 } from "../src/protocol/json.js";
 import {
+  hashModelSelectionPlan,
   hashModelCatalog,
+  hashRoutingState,
   hashRoutingPolicy,
+  parseModelSelectionPlan,
   parseGovernedRoutingOverride,
   parseModelCatalog,
   parseRoutingPolicy,
+  parseRoutingState,
 } from "../src/routing/contracts.js";
 import { routingRuntimeError } from "../src/routing/errors.js";
 import {
@@ -14,9 +19,18 @@ import {
   overrideValueHash,
   policyBytes,
   policyDocumentHash,
+  routingStateBytes,
+  routingStateDocumentHash,
+  selectionDecisionHash,
+  selectionPlanBytes,
+  selectionPlanDocumentHash,
   validCatalog,
+  validBlockedSelectionPlan,
+  validPlannedSelectionPlan,
   validRoutingOverride,
   validRoutingPolicy,
+  validRoutingReservation,
+  validRoutingState,
 } from "./helpers/routing-fixtures.js";
 
 function parsedCatalog(value: Record<string, unknown>) {
@@ -451,6 +465,339 @@ describe("routing override contract", () => {
     ],
   ])("rejects %s", (_name, input) => {
     expect(parseGovernedRoutingOverride(input())).toMatchObject({
+      ok: false,
+      code: "RUNTIME_DOCUMENT_INVALID",
+    });
+  });
+});
+
+function parsedState(value: Record<string, unknown>) {
+  return parseRoutingState(routingStateBytes(value));
+}
+
+describe("routing state contract", () => {
+  it("accepts an empty state, every circuit variant, and a combined reservation", () => {
+    const empty = validRoutingState();
+    const parsedEmpty = parsedState(empty);
+    expect(parsedEmpty).toMatchObject({
+      ok: true,
+      value: { document_hash: routingStateDocumentHash(empty) },
+    });
+
+    const state = validRoutingState();
+    state.revision = 2;
+    state.previous_state_hash = `sha256:${"9".repeat(64)}`;
+    state.reservations = [validRoutingReservation()];
+    state.circuits = [
+      {
+        entry_id: "balanced-primary",
+        status: "closed",
+        consecutive_failures: 0,
+        retry_at: null,
+        probe_decision_id: null,
+      },
+      {
+        entry_id: "deep-primary",
+        status: "open",
+        consecutive_failures: 3,
+        retry_at: "2026-08-21T12:01:00.000Z",
+        probe_decision_id: null,
+      },
+      {
+        entry_id: "review-primary",
+        status: "probe-reserved",
+        consecutive_failures: 3,
+        retry_at: "2026-08-21T12:01:00.000Z",
+        probe_decision_id: "decision-1",
+      },
+    ];
+
+    const parsed = parsedState(state);
+    expect(parsed).toMatchObject({ ok: true });
+    if (!parsed.ok) return;
+    expect(Object.isFrozen(parsed.value)).toBe(true);
+    expect(Object.isFrozen(parsed.value.reservations[0]?.allocations)).toBe(true);
+    expect(hashRoutingState(parsed.value)).toBe(routingStateDocumentHash(state));
+  });
+
+  it("rejects a mismatched document hash and incoherent prior state identity", () => {
+    const state = validRoutingState();
+    expect(
+      parseRoutingState(JSON.stringify({ ...state, document_hash: `sha256:${"f".repeat(64)}` })),
+    ).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
+
+    state.revision = 2;
+    expect(parsedState(state)).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
+  });
+
+  it.each([
+    [
+      "duplicate reservations",
+      (state: Record<string, unknown>) => {
+        const reservation = validRoutingReservation();
+        state.reservations = [reservation, reservation];
+      },
+    ],
+    [
+      "duplicate allocation attempt IDs",
+      (state: Record<string, unknown>) => {
+        const reservation = validRoutingReservation();
+        const allocation = (reservation.allocations as unknown[])[0];
+        reservation.allocations = [allocation, allocation];
+        state.reservations = [reservation];
+      },
+    ],
+    [
+      "duplicate circuit entry IDs",
+      (state: Record<string, unknown>) => {
+        const circuit = {
+          entry_id: "balanced-primary",
+          status: "closed",
+          consecutive_failures: 0,
+          retry_at: null,
+          probe_decision_id: null,
+        };
+        state.circuits = [circuit, circuit];
+      },
+    ],
+    [
+      "unsorted reservations",
+      (state: Record<string, unknown>) => {
+        state.reservations = [
+          { ...validRoutingReservation(), decision_id: "decision-z" },
+          { ...validRoutingReservation(), decision_id: "decision-a" },
+        ];
+      },
+    ],
+    [
+      "an invalid closed circuit",
+      (state: Record<string, unknown>) => {
+        state.circuits = [
+          {
+            entry_id: "balanced-primary",
+            status: "closed",
+            consecutive_failures: 0,
+            retry_at: "2026-08-21T12:01:00.000Z",
+            probe_decision_id: null,
+          },
+        ];
+      },
+    ],
+    [
+      "an invalid open circuit",
+      (state: Record<string, unknown>) => {
+        state.circuits = [
+          {
+            entry_id: "balanced-primary",
+            status: "open",
+            consecutive_failures: 2,
+            retry_at: null,
+            probe_decision_id: null,
+          },
+        ];
+      },
+    ],
+    [
+      "an invalid probe reservation",
+      (state: Record<string, unknown>) => {
+        state.circuits = [
+          {
+            entry_id: "balanced-primary",
+            status: "probe-reserved",
+            consecutive_failures: 2,
+            retry_at: "2026-08-21T12:01:00.000Z",
+            probe_decision_id: null,
+          },
+        ];
+      },
+    ],
+    [
+      "unknown cost with active reservations",
+      (state: Record<string, unknown>) => {
+        state.budget_status = "unknown";
+        state.settled = { ...(state.settled as object), cost_microusd: null };
+        state.reservations = [validRoutingReservation()];
+      },
+    ],
+  ])("rejects %s", (_name, mutate) => {
+    const state = validRoutingState();
+    mutate(state);
+    expect(parsedState(state)).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
+  });
+
+  it("rejects input over two MiB", () => {
+    expect(parseRoutingState(" ".repeat(2 * 1024 * 1024 + 1))).toMatchObject({
+      ok: false,
+      code: "RUNTIME_DOCUMENT_INVALID",
+    });
+  });
+});
+
+function parsedPlan(value: Record<string, unknown>) {
+  return parseModelSelectionPlan(selectionPlanBytes(value));
+}
+
+describe("selection plan contract", () => {
+  it("accepts planned and blocked variants, freezes them, and binds exact hashes", () => {
+    const planned = validPlannedSelectionPlan();
+    const parsedPlanned = parsedPlan(planned);
+    expect(parsedPlanned).toMatchObject({
+      ok: true,
+      value: { document_hash: selectionPlanDocumentHash(planned) },
+    });
+    if (parsedPlanned.ok) {
+      expect(Object.isFrozen(parsedPlanned.value)).toBe(true);
+      expect(Object.isFrozen(parsedPlanned.value.eliminations)).toBe(true);
+      expect(hashModelSelectionPlan(parsedPlanned.value)).toBe(selectionPlanDocumentHash(planned));
+    }
+
+    expect(parsedPlan(validBlockedSelectionPlan())).toMatchObject({ ok: true });
+  });
+
+  it("binds complete decision semantics without a state/plan hash cycle", () => {
+    const plan = validPlannedSelectionPlan();
+    const originalDecisionHash = selectionDecisionHash(plan);
+    const changedNextState = { ...plan, next_state_hash: `sha256:${"a".repeat(64)}` };
+    expect(selectionDecisionHash(changedNextState)).toBe(originalDecisionHash);
+    expect(selectionPlanDocumentHash(changedNextState)).not.toBe(selectionPlanDocumentHash(plan));
+
+    const semanticSubstitutions = [
+      (candidate: Record<string, unknown>) => {
+        const attempt = (candidate.worker_attempts as Record<string, unknown>[])[0] as Record<
+          string,
+          unknown
+        >;
+        candidate.worker_attempts = [{ ...attempt, latency_class: "extended" }];
+      },
+      (candidate: Record<string, unknown>) => {
+        const attempt = (candidate.worker_attempts as Record<string, unknown>[])[0] as Record<
+          string,
+          unknown
+        >;
+        const routes = attempt.accepted_routes as Record<string, unknown>[];
+        const route = routes[0] as Record<string, unknown>;
+        candidate.worker_attempts = [
+          {
+            ...attempt,
+            accepted_routes: [
+              {
+                ...route,
+                pricing: {
+                  ...(route.pricing as object),
+                  input_microusd_per_million: 3_000_001,
+                },
+              },
+              routes[1],
+            ],
+          },
+        ];
+      },
+      (candidate: Record<string, unknown>) => {
+        const attempt = (candidate.worker_attempts as Record<string, unknown>[])[0] as Record<
+          string,
+          unknown
+        >;
+        const requirement = { ...(attempt.requirement as object), tools: false };
+        candidate.worker_attempts = [
+          { ...attempt, requirement, requirement_hash: sha256(requirement) },
+        ];
+      },
+      (candidate: Record<string, unknown>) => {
+        candidate.eliminations = [{ entry_id: "economy-secondary", reason: "capability" }];
+      },
+    ];
+
+    for (const mutate of semanticSubstitutions) {
+      const substituted = validPlannedSelectionPlan();
+      mutate(substituted);
+      const result = parsedPlan(substituted);
+      expect(result).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
+      if (result.ok) continue;
+      expect(
+        result.issues.some(
+          (issue) =>
+            issue.path === "/reservation/decision_hash" && issue.keyword === "decisionBinding",
+        ),
+      ).toBe(true);
+    }
+  });
+
+  it("rejects a mismatched final document hash", () => {
+    const plan = validPlannedSelectionPlan();
+    expect(
+      parseModelSelectionPlan(
+        JSON.stringify({ ...plan, document_hash: `sha256:${"f".repeat(64)}` }),
+      ),
+    ).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
+  });
+
+  it.each([
+    [
+      "duplicate plan attempt IDs",
+      (plan: Record<string, unknown>) => {
+        const attempt = (plan.worker_attempts as unknown[])[0];
+        plan.worker_attempts = [attempt, { ...(attempt as object), fallback_index: 1 }];
+      },
+    ],
+    [
+      "out-of-order worker attempts",
+      (plan: Record<string, unknown>) => {
+        const attempt = (plan.worker_attempts as Record<string, unknown>[])[0];
+        plan.worker_attempts = [
+          { ...attempt, attempt_id: "attempt-worker-1", fallback_index: 1 },
+          attempt,
+        ];
+      },
+    ],
+    [
+      "duplicate accepted route IDs",
+      (plan: Record<string, unknown>) => {
+        const attempt = (plan.worker_attempts as Record<string, unknown>[])[0] as Record<
+          string,
+          unknown
+        >;
+        const route = (attempt.accepted_routes as unknown[])[0];
+        plan.worker_attempts = [{ ...attempt, accepted_routes: [route, route] }];
+      },
+    ],
+    [
+      "duplicate elimination entry IDs",
+      (plan: Record<string, unknown>) => {
+        const elimination = (plan.eliminations as unknown[])[0];
+        plan.eliminations = [elimination, elimination];
+      },
+    ],
+  ])("rejects %s", (_name, mutate) => {
+    const plan = validPlannedSelectionPlan();
+    mutate(plan);
+    expect(parsedPlan(plan)).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
+  });
+
+  it("rejects blocked plans carrying attempts and planned plans lacking next state", () => {
+    const blocked = validBlockedSelectionPlan();
+    blocked.worker_attempts = [];
+    expect(parsedPlan(blocked)).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
+
+    const planned = validPlannedSelectionPlan();
+    delete planned.next_state_hash;
+    expect(parsedPlan(planned)).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
+  });
+
+  it("rejects unsafe elimination text or metadata", () => {
+    const plan = validBlockedSelectionPlan();
+    plan.eliminations = [
+      {
+        entry_id: "economy-secondary",
+        reason: "latency",
+        message: "provider token leaked",
+        metadata: { endpoint: "https://provider.invalid" },
+      },
+    ];
+    expect(parsedPlan(plan)).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
+  });
+
+  it("rejects input over two MiB", () => {
+    expect(parseModelSelectionPlan(" ".repeat(2 * 1024 * 1024 + 1))).toMatchObject({
       ok: false,
       code: "RUNTIME_DOCUMENT_INVALID",
     });
