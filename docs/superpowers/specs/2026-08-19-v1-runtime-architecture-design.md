@@ -13,9 +13,10 @@ governance state, assignment, human authority, and evidence acceptance. The
 runtime may execute an exact request and emit evidence, but it cannot approve
 its own work, mutate governance state, or widen its authority.
 
-The package supports Node.js 22 and 24 LTS on macOS and Linux. Node.js 20 is
-not supported because it is end-of-life at the time of this design. The source
-is TypeScript ESM, built and published with npm.
+The package supports Node.js 22 and 24 LTS on macOS. Linux, Windows, and other
+operating systems are outside the v1.0.0 release contract. Node.js 20 is not
+supported because it is end-of-life at the time of this design. The source is
+TypeScript ESM, built and published with npm.
 
 ## Delivery model
 
@@ -221,9 +222,9 @@ gateway, MCP servers, filesystems where necessary, and fault injection.
 
 Security, state transition, interruption, partial-write, idempotency,
 injection, symlink escape, SSRF, redaction, reviewer independence, and
-capability downgrade regressions are release blockers. macOS and Linux service
-smoke jobs validate installation, single-instance behavior, socket permissions,
-restart, drain, and uninstall preservation.
+capability downgrade regressions are release blockers. macOS service smoke jobs
+validate installation, single-instance behavior, socket permissions, restart,
+drain, and uninstall preservation.
 
 Normal CI is credential-free and hermetic. A protected release environment
 must additionally pass live smoke tests against OpenAI, Anthropic, Gemini, and
