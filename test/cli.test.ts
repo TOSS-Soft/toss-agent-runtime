@@ -1062,6 +1062,79 @@ describe("baseline CLI", () => {
     }
   });
 
+  it("reports a native installed but unloaded LaunchAgent as stopped in doctor", async () => {
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-runtime-cli-launchd-")));
+    const cliPath = path.join(root, "cli.js");
+    const configPath = path.join(
+      root,
+      "Library",
+      "Application Support",
+      "TOSS",
+      "runtime",
+      "config.yaml",
+    );
+    await writeFile(cliPath, "", { mode: 0o600 });
+    const nativeOutput =
+      'Bad request.\nCould not find service "software.toss.agent-runtime" in domain for user gui: 501\n';
+    const runner = {
+      calls: [] as { file: string; args: readonly string[] }[],
+      run(file: string, args: readonly string[]) {
+        this.calls.push({ file, args: [...args] });
+        return Promise.resolve({ exitCode: 113, stdout: "", stderr: nativeOutput });
+      },
+    };
+    try {
+      const installer = createServiceManager({
+        platform: "darwin",
+        home: root,
+        env: {},
+        uid: 501,
+        currentUid: () => 501,
+        nodePath: process.execPath,
+        cliPath,
+        configPath,
+        randomSuffix: () => "definition",
+        runner,
+      });
+      await installer.install();
+      runner.calls.splice(0);
+      const mainServices = createMainServices({
+        platform: { os: "darwin", arch: "arm64", node: "22.23.1" },
+        env: {},
+        home: root,
+        signals: { subscribe: () => () => undefined },
+        pid: 4217,
+        now: () => new Date("2026-08-20T10:00:00.000Z"),
+        createServiceInstanceId: () => healthySocketStatus.service_instance_id,
+        resolveExecutableHash: () => Promise.resolve("a".repeat(64)),
+        sendReady: () => undefined,
+        nodePath: process.execPath,
+        cliPath,
+        uid: 501,
+        loadConfig: () =>
+          Promise.resolve({ config: defaultConfig("darwin", root), source: "launchd-format-test" }),
+        createServiceManager: (options) =>
+          createServiceManager({ ...options, currentUid: () => 501, runner }),
+      });
+
+      const output = await runCli(["doctor", "--json"], mainServices);
+
+      expect(output.exitCode).toBe(0);
+      expect(doctorChecks(output)).toContainEqual({
+        id: "service",
+        status: "WARN",
+        message: "Runtime service is installed but stopped",
+      });
+      expect(output.stdout).not.toContain("Could not find service");
+      expect(output.stdout).not.toContain("Bad request");
+      expect(runner.calls).toEqual([
+        { file: "/bin/launchctl", args: ["print", "gui/501/software.toss.agent-runtime"] },
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("renders oversized native status integers as safe JSON fallback values", async () => {
     const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-runtime-cli-status-")));
     const cliPath = path.join(root, "cli.js");

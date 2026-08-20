@@ -16,9 +16,8 @@ keeping unrelated or ambiguous native failures fail-closed.
 
 ## Implementation
 
-1. Add RED manager tests for the observed exit-113 output:
-   `Could not find service "software.toss.agent-runtime" in domain for user
-   gui: <uid>`.
+1. Add RED manager tests for the observed exit-113 native unloaded-service
+   output.
 2. Assert a verified installed definition returns
    `installed=true`, `enabled=true`, `active=false`, rather than an absent or
    failed status.
