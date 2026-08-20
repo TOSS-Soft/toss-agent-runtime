@@ -78,6 +78,7 @@ export interface CreateProjectIntakeOptions {
 export interface ProjectIntake {
   record(registration: ProjectRegistration, change: ProjectChange): Promise<void>;
   recover(registrations: readonly ProjectRegistration[]): Promise<void>;
+  discard(projectId: string): Promise<void>;
   stopIntake(): void;
   flush(signal: AbortSignal): Promise<void>;
   listCandidates(): Promise<readonly CandidateJobIntentV1[]>;
@@ -812,6 +813,16 @@ export function createProjectIntake(options: CreateProjectIntakeOptions): Projec
     },
     recover(registrations) {
       return enqueue(() => recoverFiles(registrations));
+    },
+    discard(projectId) {
+      return enqueue(() => {
+        if (!UUID_PATTERN.test(projectId)) projectError("RUNTIME_PROJECT_INVALID");
+        const state = windows.get(projectId);
+        if (state === undefined) return;
+        if (state.timer !== undefined) clearTimeout(state.timer);
+        removeExactPending(state);
+        windows.delete(projectId);
+      });
     },
     stopIntake() {
       stopped = true;

@@ -112,6 +112,30 @@ afterEach(async () => {
 });
 
 describe("registered project watcher coordinator", () => {
+  it("arms explicit runtime registrations and stops them on unregister", async () => {
+    const { statePath, projectRoot } = await fixture();
+    const { registry, intake } = services(statePath);
+    const adapter = new FakeWatchAdapter();
+    const watcher = createProjectWatcher({
+      registry,
+      intake,
+      runtimeStatePath: statePath,
+      adapter,
+    });
+    await watcher.recover();
+
+    const registered = await watcher.register(projectRoot);
+    await writeFile(path.join(projectRoot, "src", "old.ts"), "changed");
+    adapter.emit({ kind: "change", absolutePath: path.join(projectRoot, "src", "old.ts") });
+    await watcher.flush(signal());
+    expect(await intake.listCandidates()).toHaveLength(1);
+
+    const unregistered = await watcher.unregister(registered.project_id);
+    expect(unregistered.state).toBe("UNREGISTERED");
+    expect(adapter.listeners.size).toBe(0);
+    expect(await watcher.list()).toEqual([]);
+  });
+
   it("ignores unregistered, ignored, and runtime-owned changes", async () => {
     const { statePath, projectRoot, outsideRoot } = await fixture();
     const { registry, intake } = services(statePath);

@@ -39,6 +39,9 @@ export interface CreateProjectWatcherOptions {
 
 export interface ProjectWatcher {
   recover(): Promise<void>;
+  register(root: string): Promise<ProjectRegistration>;
+  unregister(projectId: string): Promise<ProjectRegistration>;
+  list(): Promise<readonly ProjectRegistration[]>;
   stopIntake(): void;
   flush(signal: AbortSignal): Promise<void>;
 }
@@ -261,6 +264,49 @@ export function createProjectWatcher(options: CreateProjectWatcherOptions): Proj
           await options.registry.blockUnavailable(registration.project_id);
         }
       }
+    },
+    async register(root) {
+      if (stopped) projectError("RUNTIME_PROJECT_UNAVAILABLE");
+      await awaitEvents(new AbortController().signal);
+      const registration = await options.registry.register(root);
+      const existing = active.get(registration.project_id);
+      if (existing?.registration.registry_revision === registration.registry_revision) {
+        return registration;
+      }
+      if (existing !== undefined) {
+        active.delete(registration.project_id);
+        closeProject(existing);
+        await options.intake.discard(registration.project_id);
+      }
+      try {
+        arm(registration);
+      } catch (error) {
+        await options.registry.blockUnavailable(registration.project_id);
+        if (error instanceof RuntimeProjectError) throw error;
+        projectError("RUNTIME_PROJECT_UNAVAILABLE");
+      }
+      return registration;
+    },
+    async unregister(projectId) {
+      if (stopped) projectError("RUNTIME_PROJECT_UNAVAILABLE");
+      const existing = active.get(projectId);
+      if (existing !== undefined) {
+        active.delete(projectId);
+        closeProject(existing);
+      }
+      await awaitEvents(new AbortController().signal);
+      await options.intake.discard(projectId);
+      try {
+        return await options.registry.unregister(projectId);
+      } catch (error) {
+        if (existing !== undefined) arm(existing.registration);
+        throw error;
+      }
+    },
+    async list() {
+      if (stopped) projectError("RUNTIME_PROJECT_UNAVAILABLE");
+      await awaitEvents(new AbortController().signal);
+      return options.registry.list();
     },
     stopIntake() {
       if (stopped) return;

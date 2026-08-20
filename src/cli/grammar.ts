@@ -1,4 +1,7 @@
+import path from "node:path";
+
 export type ServiceAction = "install" | "start" | "stop" | "restart" | "status" | "uninstall";
+export type ProjectAction = "register" | "unregister" | "list";
 
 export type BaselineCommand =
   | Readonly<{ name: "help" }>
@@ -11,6 +14,23 @@ export type BaselineCommand =
       action: ServiceAction;
       json: boolean;
       configPath?: string;
+    }>
+  | Readonly<{
+      name: "project";
+      action: "register";
+      root: string;
+      json: boolean;
+    }>
+  | Readonly<{
+      name: "project";
+      action: "unregister";
+      projectId: string;
+      json: boolean;
+    }>
+  | Readonly<{
+      name: "project";
+      action: "list";
+      json: boolean;
     }>;
 
 export class CliUsageError extends Error {
@@ -71,6 +91,41 @@ function serviceAction(value: string): ServiceAction {
   throw new CliUsageError("Unknown service action");
 }
 
+function projectAction(value: string): ProjectAction {
+  if (value === "register" || value === "unregister" || value === "list") return value;
+  throw new CliUsageError("Unknown project action");
+}
+
+function projectCommand(args: readonly string[]): Extract<BaselineCommand, { name: "project" }> {
+  const [rawAction, ...projectArgs] = args;
+  if (rawAction === undefined || rawAction.startsWith("--")) {
+    throw new CliUsageError("Missing project action");
+  }
+  const action = projectAction(rawAction);
+  if (action === "list") {
+    return { name: "project", action, ...parseOptions("project list", projectArgs, false) };
+  }
+  const [argument, ...optionArgs] = projectArgs;
+  if (argument === undefined || argument.startsWith("--")) {
+    throw new CliUsageError(action === "register" ? "Missing project root" : "Missing project ID");
+  }
+  const parsed = parseOptions(`project ${action}`, optionArgs, false);
+  if (action === "register") {
+    if (
+      !path.isAbsolute(argument) ||
+      path.normalize(argument) !== argument ||
+      /[\u0000-\u001f\u007f]/u.test(argument)
+    ) {
+      throw new CliUsageError("Project root must be absolute");
+    }
+    return { name: "project", action, root: argument, ...parsed };
+  }
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(argument)) {
+    throw new CliUsageError("Project ID must be a UUID");
+  }
+  return { name: "project", action, projectId: argument.toLowerCase(), ...parsed };
+}
+
 export function parseCli(argv: readonly string[]): BaselineCommand {
   if (argv.length === 0 || (argv.length === 1 && ["--help", "-h", "help"].includes(argv[0]!))) {
     return { name: "help" };
@@ -95,5 +150,6 @@ export function parseCli(argv: readonly string[]): BaselineCommand {
       ...parseOptions(`service ${action}`, serviceArgs, action === "install"),
     };
   }
+  if (name === "project") return projectCommand(args);
   throw new CliUsageError("Unknown command");
 }
