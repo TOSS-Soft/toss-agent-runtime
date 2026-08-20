@@ -1792,6 +1792,48 @@ describe("native per-user service manager", () => {
     await expect(readFile(artifacts.operationalLog, "utf8")).resolves.toBe("preserve");
   });
 
+  it("uninstalls after stop when native bootout reports no such process", async () => {
+    const runner = new RecordingRunner([
+      { exitCode: 0, stdout: "", stderr: "" },
+      { exitCode: 3, stdout: "", stderr: "Boot-out failed: 3: No such process\n" },
+    ]);
+    const artifacts = await darwinFixture(runner);
+    await artifacts.manager.install();
+
+    await expect(artifacts.manager.stop()).resolves.toMatchObject({
+      installed: true,
+      active: false,
+    });
+    await expect(artifacts.manager.uninstall()).resolves.toMatchObject({
+      installed: false,
+      active: false,
+    });
+
+    await expect(lstat(artifacts.definition)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(runner.calls).toEqual([
+      { file: "/bin/launchctl", args: ["bootout", "gui/501/software.toss.agent-runtime"] },
+      { file: "/bin/launchctl", args: ["bootout", "gui/501/software.toss.agent-runtime"] },
+    ]);
+  });
+
+  it.each([
+    ["wrong exit code", "stop", 1, "Boot-out failed: 3: No such process\n"],
+    ["altered native code", "stop", 3, "Boot-out failed: 2: No such process\n"],
+    ["additional output", "stop", 3, "Boot-out failed: 3: No such process\nuntrusted"],
+    ["status operation", "status", 3, "Boot-out failed: 3: No such process\n"],
+  ] as const)(
+    "rejects the native Darwin no-process result for %s",
+    async (_name, action, exitCode, stderr) => {
+      const runner = new RecordingRunner([{ exitCode, stdout: "", stderr }]);
+      const { manager } = await darwinFixture(runner);
+      await manager.install();
+
+      await expect(manager[action]()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_MANAGER_FAILED",
+      });
+    },
+  );
+
   it("keeps repeated Darwin stop and uninstall operations idempotent", async () => {
     const runner = new RecordingRunner([
       { exitCode: 0, stdout: "", stderr: "" },
