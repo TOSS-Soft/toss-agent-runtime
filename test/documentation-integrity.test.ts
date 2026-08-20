@@ -60,10 +60,13 @@ describe("published protocol artifacts", () => {
     ) as ContractManifest;
     expect(manifest.schema_version).toBe("runtime-contract-manifest.v1");
     expect(manifest.schemas.map((entry) => entry.schema_version)).toEqual([
+      "candidate-job-intent.v1",
       "command-result.v1",
       "execution-event.v1",
       "execution-request.v1",
       "execution-result.v1",
+      "project-registry-entry.v1",
+      "project-watch-manifest.v1",
       "run-journal-entry.v1",
       "runtime-capabilities.v1",
       "runtime-common.v1",

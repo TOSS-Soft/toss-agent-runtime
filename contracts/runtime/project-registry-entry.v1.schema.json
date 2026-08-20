@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toss.software/schemas/runtime/v1/project-registry-entry.v1.schema.json",
+  "title": "TOSS project registry entry v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "schema_version",
+    "document_type",
+    "registry_revision",
+    "previous_entry_hash",
+    "entry_hash",
+    "project_id",
+    "canonical_root",
+    "manifest_hash",
+    "state",
+    "reason_code",
+    "timestamp"
+  ],
+  "properties": {
+    "protocol_version": { "const": "runtime-contract.v1" },
+    "schema_version": { "const": "project-registry-entry.v1" },
+    "document_type": { "const": "project-registry-entry" },
+    "registry_revision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "previous_entry_hash": { "$ref": "#/$defs/sha256" },
+    "entry_hash": { "$ref": "#/$defs/sha256" },
+    "project_id": { "type": "string", "format": "uuid" },
+    "canonical_root": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "manifest_hash": { "$ref": "#/$defs/sha256" },
+    "state": {
+      "type": "string",
+      "enum": ["ACTIVE", "UNREGISTERED", "BLOCKED_PROJECT_UNAVAILABLE"]
+    },
+    "reason_code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{2,127}$" },
+    "timestamp": { "type": "string", "format": "date-time", "pattern": "Z$" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "state": { "const": "ACTIVE" },
+        "reason_code": { "enum": ["PROJECT_REGISTERED", "PROJECT_MANIFEST_UPDATED"] }
+      }
+    },
+    {
+      "properties": {
+        "state": { "const": "UNREGISTERED" },
+        "reason_code": { "const": "PROJECT_UNREGISTERED" }
+      }
+    },
+    {
+      "properties": {
+        "state": { "const": "BLOCKED_PROJECT_UNAVAILABLE" },
+        "reason_code": { "const": "PROJECT_ROOT_UNAVAILABLE" }
+      }
+    }
+  ]
+}
