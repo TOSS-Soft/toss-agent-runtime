@@ -246,13 +246,20 @@ function darwinStatus(result: CommandResult): ServiceManagerStatus {
   const state = /^\s*state\s*=\s*(.+)$/im.exec(output)?.[1]?.trim();
   const runs = /^\s*runs\s*=\s*([0-9]+)\s*$/im.exec(output)?.[1];
   const exit = /^\s*last exit code\s*=\s*(-?[0-9]+)\s*$/im.exec(output)?.[1];
+  const restartCount = parseNonnegativeInteger(runs);
+  const lastExitCode = parseExitCode(exit);
   return {
     installed: true,
     enabled: true,
     active: state === "running",
-    backoff: state === "waiting" && /throttl/i.test(output),
-    restartCount: parseNonnegativeInteger(runs),
-    lastExitCode: parseExitCode(exit),
+    backoff:
+      (state === "waiting" && /throttl/i.test(output)) ||
+      (state === "spawn scheduled" &&
+        restartCount > 1 &&
+        lastExitCode !== null &&
+        lastExitCode > 0),
+    restartCount,
+    lastExitCode,
   };
 }
 
