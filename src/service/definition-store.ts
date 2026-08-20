@@ -418,6 +418,11 @@ export interface RemoveOwnedDefinitionOptions {
     readonly afterSync?: () => Promise<void>;
     readonly beforeUnlink?: () => Promise<void>;
     readonly afterUnlink?: () => Promise<void>;
+    readonly afterFinalValidationBeforeMove?: () => Promise<void>;
+    readonly afterMove?: () => Promise<void>;
+    readonly afterMoveSync?: () => Promise<void>;
+    readonly afterMovedUnlink?: () => Promise<void>;
+    readonly afterCanonicalReappearance?: () => Promise<void>;
   };
   readonly claimOwnerState?: (pid: number) => "dead" | "live" | "unknown";
 }
@@ -425,6 +430,7 @@ export interface RemoveOwnedDefinitionOptions {
 const DELETE_CLAIM_STAGE_FILE = "state.stage";
 const DELETE_CLAIM_STATE_FILE = "state";
 const DELETE_CLAIM_DEFINITION_FILE = "definition";
+const DELETE_CLAIM_MOVED_FILE = "moved";
 const MAX_DELETE_CLAIMS = 8;
 const MAX_DELETE_CLAIM_BYTES = 1024;
 const CLAIM_PID_MAX = 2_147_483_647;
@@ -669,7 +675,8 @@ async function claimEntries(
       (entry) =>
         entry !== DELETE_CLAIM_STAGE_FILE &&
         entry !== DELETE_CLAIM_STATE_FILE &&
-        entry !== DELETE_CLAIM_DEFINITION_FILE,
+        entry !== DELETE_CLAIM_DEFINITION_FILE &&
+        entry !== DELETE_CLAIM_MOVED_FILE,
     )
   ) {
     servicePathUnsafe();
@@ -724,6 +731,7 @@ async function unlinkExactClaimEntry(
   await verifyClaimDirectory(claim, isCurrentUser);
   await syncDirectory(claim.path, DEFAULT_OPERATIONS);
   await verifyClaimDirectory(claim, isCurrentUser);
+  await claimEntries(claim, isCurrentUser);
 }
 
 async function unlinkExactClaimFile(
@@ -746,6 +754,7 @@ async function unlinkExactClaimFile(
   await verifyClaimDirectory(claim, isCurrentUser);
   await syncDirectory(claim.path, DEFAULT_OPERATIONS);
   await verifyClaimDirectory(claim, isCurrentUser);
+  await claimEntries(claim, isCurrentUser);
 }
 
 async function removeClaimDirectory(
@@ -806,6 +815,17 @@ async function cleanAcceptedClaim(
     undefined,
     isCurrentUser,
   );
+}
+
+async function cleanExpectedMovedClaim(
+  claim: ClaimRecord,
+  state: PrivateRegularFileSnapshot,
+  definition: PrivateRegularFileSnapshot,
+  moved: PrivateRegularFileSnapshot,
+  isCurrentUser: CurrentUserCheck,
+): Promise<void> {
+  await unlinkExactClaimFile(claim, DELETE_CLAIM_MOVED_FILE, moved, isCurrentUser);
+  await cleanAcceptedClaim(claim, state, definition, isCurrentUser);
 }
 
 async function cleanExactUnlinkedClaim(
@@ -989,9 +1009,10 @@ async function recoverDeleteClaim(
   const definition = entries.includes(DELETE_CLAIM_DEFINITION_FILE)
     ? await readClaimFile(claim, DELETE_CLAIM_DEFINITION_FILE, isCurrentUser)
     : undefined;
+  const hasMoved = entries.includes(DELETE_CLAIM_MOVED_FILE);
 
   if (state === undefined) {
-    if (definition !== undefined) servicePathUnsafe();
+    if (definition !== undefined || hasMoved) servicePathUnsafe();
     await cleanClaim(claim, entries, undefined, undefined, stage, isCurrentUser);
     return;
   }
@@ -1002,10 +1023,32 @@ async function recoverDeleteClaim(
     await unlinkExactClaimFile(claim, DELETE_CLAIM_STAGE_FILE, stage, isCurrentUser);
   }
   if (definition === undefined) {
+    if (hasMoved) servicePathUnsafe();
     await cleanClaim(claim, [DELETE_CLAIM_STATE_FILE], state, undefined, undefined, isCurrentUser);
     return;
   }
   if (!snapshotMatches(definition, descriptor)) servicePathUnsafe();
+  if (hasMoved) {
+    if ((await claimEntries(claim, isCurrentUser)).join(",") !== "definition,moved,state") {
+      servicePathUnsafe();
+    }
+    let moved: PrivateRegularFileSnapshot | undefined;
+    try {
+      moved = await readClaimFile(claim, DELETE_CLAIM_MOVED_FILE, isCurrentUser);
+    } catch {
+      servicePathUnsafe();
+    }
+    if (moved === undefined || !snapshotMatches(moved, descriptor)) servicePathUnsafe();
+    let canonicalReappeared = false;
+    try {
+      canonicalReappeared = await pathExists(filePath);
+    } catch {
+      canonicalReappeared = true;
+    }
+    await cleanExpectedMovedClaim(claim, state, definition, moved, isCurrentUser);
+    if (canonicalReappeared || (await pathExists(filePath))) servicePathUnsafe();
+    return;
+  }
   let canonical: PrivateRegularFileSnapshot | undefined;
   let canonicalSafe = true;
   try {
@@ -1234,20 +1277,50 @@ export async function removeOwnedDefinition(
       claim = undefined;
       servicePathUnsafe();
     }
-    await unlink(filePath);
-    const immediateReappearance = await pathExists(filePath);
-    const immediateClaim = await readClaimFile(claim, DELETE_CLAIM_DEFINITION_FILE, isCurrentUser);
-    if (
-      immediateReappearance ||
-      !sameIdentity(immediateClaim, snapshot) ||
-      !expectedSnapshotMatches(immediateClaim, options)
-    ) {
-      await cleanAcceptedClaim(claim, state, snapshot, isCurrentUser);
-      claim = undefined;
+    if (options.hooks?.afterFinalValidationBeforeMove !== undefined) {
+      await options.hooks.afterFinalValidationBeforeMove();
+    }
+    if ((await claimEntries(claim, isCurrentUser)).join(",") !== "definition,state") {
       servicePathUnsafe();
     }
+    const movedPath = path.join(claim.path, DELETE_CLAIM_MOVED_FILE);
+    await verifyClaimDirectory(claim, isCurrentUser);
+    await rename(filePath, movedPath);
+    await syncDirectory(claim.path, DEFAULT_OPERATIONS);
+    await verifyClaimDirectory(claim, isCurrentUser);
+    if ((await claimEntries(claim, isCurrentUser)).join(",") !== "definition,moved,state") {
+      servicePathUnsafe();
+    }
+    if (options.hooks?.afterMove !== undefined) await options.hooks.afterMove();
+    await syncDirectory(claim.path, DEFAULT_OPERATIONS);
+    await verifyClaimDirectory(claim, isCurrentUser);
+    if ((await claimEntries(claim, isCurrentUser)).join(",") !== "definition,moved,state") {
+      servicePathUnsafe();
+    }
+    if (options.hooks?.afterMoveSync !== undefined) await options.hooks.afterMoveSync();
+    let moved: PrivateRegularFileSnapshot;
+    try {
+      moved = await readClaimFile(claim, DELETE_CLAIM_MOVED_FILE, isCurrentUser);
+    } catch {
+      servicePathUnsafe();
+    }
+    if (
+      !sameIdentity(moved, snapshot) ||
+      !expectedSnapshotMatches(moved, options) ||
+      !sameIdentity(moved, finalClaim)
+    ) {
+      servicePathUnsafe();
+    }
+    await unlinkExactClaimFile(claim, DELETE_CLAIM_MOVED_FILE, moved, isCurrentUser);
+    if ((await claimEntries(claim, isCurrentUser)).join(",") !== "definition,state") {
+      servicePathUnsafe();
+    }
+    if (options.hooks?.afterMovedUnlink !== undefined) await options.hooks.afterMovedUnlink();
     if (options.hooks?.afterUnlink !== undefined) await options.hooks.afterUnlink();
     const reappeared = await pathExists(filePath);
+    if (reappeared && options.hooks?.afterCanonicalReappearance !== undefined) {
+      await options.hooks.afterCanonicalReappearance();
+    }
     const remainingClaim = await readClaimFile(claim, DELETE_CLAIM_DEFINITION_FILE, isCurrentUser);
     if (
       !sameIdentity(remainingClaim, snapshot) ||
@@ -1257,7 +1330,7 @@ export async function removeOwnedDefinition(
     }
     await cleanAcceptedClaim(claim, state, snapshot, isCurrentUser);
     claim = undefined;
-    if (reappeared) servicePathUnsafe();
+    if (reappeared || (await pathExists(filePath))) servicePathUnsafe();
   } catch (error) {
     if (!linked && !retainUnlinkedClaim && claim !== undefined) {
       try {

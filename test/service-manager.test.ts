@@ -70,6 +70,11 @@ interface FixtureOptions {
     readonly afterSync?: () => Promise<void>;
     readonly beforeUnlink?: () => Promise<void>;
     readonly afterUnlink?: () => Promise<void>;
+    readonly afterFinalValidationBeforeMove?: () => Promise<void>;
+    readonly afterMove?: () => Promise<void>;
+    readonly afterMoveSync?: () => Promise<void>;
+    readonly afterMovedUnlink?: () => Promise<void>;
+    readonly afterCanonicalReappearance?: () => Promise<void>;
   };
   readonly deleteClaimOwnerState?: () => "dead" | "live" | "unknown";
 }
@@ -195,6 +200,80 @@ afterEach(async () => {
 });
 
 describe("native per-user service manager", () => {
+  it.each([
+    ["linux", "regular"],
+    ["linux", "directory"],
+    ["linux", "symlink"],
+    ["linux", "cross-owner"],
+    ["darwin", "regular"],
+    ["darwin", "directory"],
+    ["darwin", "symlink"],
+    ["darwin", "cross-owner"],
+  ] as const)(
+    "preserves an unexpected %s %s moved after final validation and fails later operations closed",
+    async (platform, kind) => {
+      let definition = "";
+      let crossOwner = false;
+      let replacementIdentity: { readonly dev: bigint; readonly ino: bigint } | undefined;
+      const runner = new RecordingRunner();
+      const artifacts = await (platform === "linux" ? linuxFixture : darwinFixture)(runner, {
+        isDefinitionCurrentUser: (_uid, candidate) => !crossOwner || candidate !== definition,
+        deleteClaimOwnerState: () => "dead",
+        definitionRemovalHooks: {
+          afterFinalValidationBeforeMove: async () => {
+            if (kind === "directory") {
+              await rm(definition);
+              await mkdir(definition, { mode: 0o700 });
+              await chmod(definition, 0o700);
+            } else if (kind === "symlink") {
+              const target = path.join(path.dirname(path.dirname(definition)), "moved-target");
+              await writeFile(target, "preserve", { mode: 0o600 });
+              await chmod(target, 0o600);
+              await rm(definition);
+              await symlink(target, definition);
+            } else {
+              await rm(definition);
+              await writeFile(definition, kind === "regular" ? "replacement" : "cross-owner", {
+                mode: 0o600,
+              });
+              await chmod(definition, 0o600);
+              crossOwner = kind === "cross-owner";
+            }
+            const metadata = await lstat(definition, { bigint: true });
+            replacementIdentity = { dev: metadata.dev, ino: metadata.ino };
+          },
+        },
+      });
+      definition = artifacts.definition;
+      await artifacts.manager.install();
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      const claimName = (await readdir(path.dirname(definition))).find((name) =>
+        name.includes("delete-claim"),
+      );
+      expect(claimName).toBeDefined();
+      const moved = path.join(path.dirname(definition), claimName!, "moved");
+      const after = await lstat(moved, { bigint: true });
+      expect(after.dev).toBe(replacementIdentity?.dev);
+      expect(after.ino).toBe(replacementIdentity?.ino);
+      expect(after.isDirectory()).toBe(kind === "directory");
+      expect(after.isSymbolicLink()).toBe(kind === "symlink");
+      expect(after.isFile()).toBe(kind === "regular" || kind === "cross-owner");
+      await expect(lstat(definition, { bigint: true })).rejects.toMatchObject({ code: "ENOENT" });
+      runner.calls.splice(0);
+      await expect(artifacts.manager.status()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      const retained = await lstat(moved, { bigint: true });
+      expect(retained.dev).toBe(replacementIdentity?.dev);
+      expect(retained.ino).toBe(replacementIdentity?.ino);
+      expect(runner.calls).toEqual([]);
+    },
+  );
+
   it.each([
     ["linux", "different CLI entry", { cliPath: "/opt/other/toss-runtime.js" }],
     ["darwin", "different CLI entry", { cliPath: "/opt/other/toss-runtime.js" }],
@@ -674,7 +753,16 @@ describe("native per-user service manager", () => {
     },
   );
 
-  it.each(["beforeClaim", "afterRename", "afterSync", "beforeUnlink", "afterUnlink"] as const)(
+  it.each([
+    "beforeClaim",
+    "afterRename",
+    "afterSync",
+    "beforeUnlink",
+    "afterUnlink",
+    "afterMove",
+    "afterMoveSync",
+    "afterMovedUnlink",
+  ] as const)(
     "recovers an interrupted delete claim at the %s boundary before a later manager install",
     async (boundary) => {
       const interruption = new Error(`interrupt-${boundary}`);
@@ -709,6 +797,43 @@ describe("native per-user service manager", () => {
       ]);
     },
   );
+
+  it("preserves a canonical reappearance across an interruption at the post-move boundary", async () => {
+    const interruption = new Error("interrupt-after-canonical-reappearance");
+    const runner = new RecordingRunner();
+    const artifacts = await linuxFixture(runner, {
+      deleteClaimOwnerState: () => "dead",
+      definitionRemovalHooks: {
+        afterMovedUnlink: async () => {
+          await writeFile(artifacts.definition, "canonical-reappearance", { mode: 0o600 });
+          await chmod(artifacts.definition, 0o600);
+        },
+        afterCanonicalReappearance: () => Promise.reject(interruption),
+      },
+    });
+    await artifacts.manager.install();
+    runner.calls.splice(0);
+
+    await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+    });
+    const identity = await lstat(artifacts.definition, { bigint: true });
+    runner.calls.splice(0);
+
+    await expect(artifacts.manager.status()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+    });
+    const after = await lstat(artifacts.definition, { bigint: true });
+    expect(after.dev).toBe(identity.dev);
+    expect(after.ino).toBe(identity.ino);
+    expect(await readFile(artifacts.definition, "utf8")).toBe("canonical-reappearance");
+    expect(
+      (await readdir(path.dirname(artifacts.definition))).filter((entry) =>
+        entry.includes("delete-claim"),
+      ),
+    ).toEqual([]);
+    expect(runner.calls).toEqual([]);
+  });
 
   it.each(["live", "unknown"] as const)(
     "fails closed for a %s delete-claim owner before another native manager action",

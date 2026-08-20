@@ -62,6 +62,11 @@ export interface CreateServiceManagerOptions {
     readonly afterSync?: () => Promise<void>;
     readonly beforeUnlink?: () => Promise<void>;
     readonly afterUnlink?: () => Promise<void>;
+    readonly afterFinalValidationBeforeMove?: () => Promise<void>;
+    readonly afterMove?: () => Promise<void>;
+    readonly afterMoveSync?: () => Promise<void>;
+    readonly afterMovedUnlink?: () => Promise<void>;
+    readonly afterCanonicalReappearance?: () => Promise<void>;
   };
   readonly deleteClaimOwnerState?: () => "dead" | "live" | "unknown";
 }
