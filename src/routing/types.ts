@@ -7,7 +7,9 @@ import type {
 import type {
   ProviderAdapterCapabilities,
   ProviderKind,
+  ProviderRouteIdentity,
   ProviderRouteRequirement,
+  ProviderUsage,
 } from "../providers/types.js";
 
 export type LogicalModelClass =
@@ -272,3 +274,11 @@ export interface BlockedModelSelectionPlanV1 extends ModelSelectionPlanBindingV1
 }
 
 export type ModelSelectionPlanV1 = PlannedModelSelectionPlanV1 | BlockedModelSelectionPlanV1;
+
+export interface RoutingAttemptResult {
+  readonly attempt_id: string;
+  readonly route_identity: ProviderRouteIdentity | null;
+  readonly usage: ProviderUsage | null;
+  readonly duration_ms: number;
+  readonly effect_may_have_occurred: boolean;
+}
