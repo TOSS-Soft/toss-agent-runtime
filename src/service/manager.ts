@@ -10,7 +10,10 @@ import { renderServiceDefinition } from "./definition.js";
 import {
   createPrivateAtomicIfMissing,
   readPrivateRegularFile,
+  readPrivateRegularFileSnapshot,
+  recoverOwnedDefinitionClaims,
   removeOwnedDefinition,
+  type PrivateRegularFileSnapshot,
 } from "./definition-store.js";
 import { RuntimeServiceError } from "./errors.js";
 import { resolveServicePaths, SERVICE_LABEL, SYSTEMD_UNIT } from "./paths.js";
@@ -46,6 +49,16 @@ export interface CreateServiceManagerOptions {
   readonly randomSuffix: () => string;
   readonly runner?: CommandRunner;
   readonly beforeDefinitionPublish?: () => Promise<void>;
+  readonly isDefinitionCurrentUser?: (userId: number, candidate?: string) => boolean;
+  readonly definitionRemovalHooks?: {
+    readonly beforeClaim?: () => Promise<void>;
+    readonly beforeRename?: () => Promise<void>;
+    readonly afterRename?: () => Promise<void>;
+    readonly afterSync?: () => Promise<void>;
+    readonly beforeUnlink?: () => Promise<void>;
+    readonly afterUnlink?: () => Promise<void>;
+  };
+  readonly deleteClaimOwnerState?: () => "dead" | "live" | "unknown";
 }
 
 const EMPTY_STATUS: ServiceManagerStatus = {
@@ -303,10 +316,24 @@ class NativeServiceManager implements ServiceManager {
     }
   }
 
-  private async installedDefinition(allowRecoveredConfig = false): Promise<Uint8Array | undefined> {
-    let existing: Uint8Array | undefined;
+  private async installedDefinition(
+    allowRecoveredConfig = false,
+  ): Promise<PrivateRegularFileSnapshot | undefined> {
+    let existing: PrivateRegularFileSnapshot | undefined;
     try {
-      existing = await readPrivateRegularFile(this.paths.definition);
+      await recoverOwnedDefinitionClaims(this.paths.definition, {
+        ...(this.options.isDefinitionCurrentUser === undefined
+          ? {}
+          : { isCurrentUser: this.options.isDefinitionCurrentUser }),
+        ...(this.options.deleteClaimOwnerState === undefined
+          ? {}
+          : { claimOwnerState: this.options.deleteClaimOwnerState }),
+      });
+      existing = await readPrivateRegularFileSnapshot(this.paths.definition, {
+        ...(this.options.isDefinitionCurrentUser === undefined
+          ? {}
+          : { isCurrentUser: this.options.isDefinitionCurrentUser }),
+      });
     } catch (error) {
       definitionError(error);
     }
@@ -314,8 +341,8 @@ class NativeServiceManager implements ServiceManager {
       return undefined;
     }
     if (
-      !Buffer.from(existing).equals(this.definition) &&
-      (!allowRecoveredConfig || this.recoverConfigPath(existing) === undefined)
+      !Buffer.from(existing.bytes).equals(this.definition) &&
+      (!allowRecoveredConfig || this.recoverConfigPath(existing.bytes) === undefined)
     ) {
       definitionUnsafe();
     }
@@ -331,6 +358,9 @@ class NativeServiceManager implements ServiceManager {
         bytes: this.definition,
         randomSuffix: this.options.randomSuffix,
         parentPolicy: "owned-not-writable",
+        ...(this.options.isDefinitionCurrentUser === undefined
+          ? {}
+          : { isCurrentUser: this.options.isDefinitionCurrentUser }),
         ...(this.options.beforeDefinitionPublish === undefined
           ? {}
           : { beforePublish: this.options.beforeDefinitionPublish }),
@@ -448,8 +478,21 @@ class NativeServiceManager implements ServiceManager {
     }
     try {
       await removeOwnedDefinition(this.paths.definition, {
-        expectedBytes: acceptedDefinition,
+        expectedBytes: acceptedDefinition.bytes,
+        expectedIdentity: {
+          device: acceptedDefinition.device,
+          inode: acceptedDefinition.inode,
+        },
         randomSuffix: this.options.randomSuffix,
+        ...(this.options.isDefinitionCurrentUser === undefined
+          ? {}
+          : { isCurrentUser: this.options.isDefinitionCurrentUser }),
+        ...(this.options.definitionRemovalHooks === undefined
+          ? {}
+          : { hooks: this.options.definitionRemovalHooks }),
+        ...(this.options.deleteClaimOwnerState === undefined
+          ? {}
+          : { claimOwnerState: this.options.deleteClaimOwnerState }),
       });
     } catch (error) {
       definitionError(error);
@@ -463,7 +506,19 @@ class NativeServiceManager implements ServiceManager {
   async installedConfigPath(): Promise<string | null> {
     let existing: Uint8Array | undefined;
     try {
-      existing = await readPrivateRegularFile(this.paths.definition);
+      await recoverOwnedDefinitionClaims(this.paths.definition, {
+        ...(this.options.isDefinitionCurrentUser === undefined
+          ? {}
+          : { isCurrentUser: this.options.isDefinitionCurrentUser }),
+        ...(this.options.deleteClaimOwnerState === undefined
+          ? {}
+          : { claimOwnerState: this.options.deleteClaimOwnerState }),
+      });
+      existing = await readPrivateRegularFile(this.paths.definition, {
+        ...(this.options.isDefinitionCurrentUser === undefined
+          ? {}
+          : { isCurrentUser: this.options.isDefinitionCurrentUser }),
+      });
     } catch (error) {
       definitionError(error);
     }

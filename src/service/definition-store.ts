@@ -1,6 +1,16 @@
 import { constants, type BigIntStats, type PathLike } from "node:fs";
-import { randomUUID } from "node:crypto";
-import { link, lstat, mkdir, open, rename, unlink, type FileHandle } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  link,
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  rename,
+  rmdir,
+  unlink,
+  type FileHandle,
+} from "node:fs/promises";
 import path from "node:path";
 
 import { stringify } from "yaml";
@@ -294,7 +304,10 @@ export async function createPrivateAtomicIfMissing(
   return result === "published" ? "created" : "existing";
 }
 
-async function openPrivateRegularFile(filePath: string): Promise<FileHandle | undefined> {
+async function openPrivateRegularFile(
+  filePath: string,
+  isCurrentUser: CurrentUserCheck,
+): Promise<FileHandle | undefined> {
   assertAbsoluteTarget(filePath);
   const parentExists = await inspectDirectoryPath(
     path.dirname(filePath),
@@ -316,7 +329,7 @@ async function openPrivateRegularFile(filePath: string): Promise<FileHandle | un
     const metadata = await handle.stat({ bigint: true });
     if (
       !metadata.isFile() ||
-      !isCurrentUserOwner(metadata, filePath, defaultCurrentUserCheck) ||
+      !isCurrentUserOwner(metadata, filePath, isCurrentUser) ||
       !privateFileMode(metadata)
     ) {
       servicePathUnsafe();
@@ -331,6 +344,13 @@ async function openPrivateRegularFile(filePath: string): Promise<FileHandle | un
 
 export interface ReadPrivateRegularFileOptions {
   readonly beforeRead?: () => Promise<void>;
+  readonly isCurrentUser?: CurrentUserCheck;
+}
+
+export interface PrivateRegularFileSnapshot {
+  readonly bytes: Uint8Array;
+  readonly device: bigint;
+  readonly inode: bigint;
 }
 
 async function readBounded(handle: FileHandle): Promise<Uint8Array> {
@@ -345,18 +365,24 @@ async function readBounded(handle: FileHandle): Promise<Uint8Array> {
   return bytes.subarray(0, offset);
 }
 
-export async function readPrivateRegularFile(
+export async function readPrivateRegularFileSnapshot(
   filePath: string,
   options: ReadPrivateRegularFileOptions = {},
-): Promise<Uint8Array | undefined> {
+): Promise<PrivateRegularFileSnapshot | undefined> {
   try {
-    const handle = await openPrivateRegularFile(filePath);
+    const handle = await openPrivateRegularFile(
+      filePath,
+      options.isCurrentUser ?? defaultCurrentUserCheck,
+    );
     if (handle === undefined) return undefined;
     try {
-      const metadata = await handle.stat({ bigint: true });
-      if (metadata.size > BigInt(MAX_PRIVATE_REGULAR_FILE_BYTES)) servicePathUnsafe();
+      const opened = await handle.stat({ bigint: true });
+      if (opened.size > BigInt(MAX_PRIVATE_REGULAR_FILE_BYTES)) servicePathUnsafe();
       await options.beforeRead?.();
-      return await readBounded(handle);
+      const bytes = await readBounded(handle);
+      const current = await handle.stat({ bigint: true });
+      if (current.dev !== opened.dev || current.ino !== opened.ino) servicePathUnsafe();
+      return { bytes, device: current.dev, inode: current.ino };
     } finally {
       await handle.close();
     }
@@ -366,21 +392,324 @@ export async function readPrivateRegularFile(
   }
 }
 
-export interface RemoveOwnedDefinitionOptions {
-  readonly expectedBytes?: Uint8Array;
-  readonly randomSuffix?: () => string;
+export async function readPrivateRegularFile(
+  filePath: string,
+  options: ReadPrivateRegularFileOptions = {},
+): Promise<Uint8Array | undefined> {
+  const snapshot = await readPrivateRegularFileSnapshot(filePath, options);
+  return snapshot?.bytes;
 }
 
-async function restoreClaimedDefinition(
-  claimPath: string,
-  filePath: string,
-  parent: string,
-): Promise<void> {
+export interface RemoveOwnedDefinitionOptions {
+  readonly expectedBytes?: Uint8Array;
+  readonly expectedIdentity?: OwnedFileIdentity;
+  readonly randomSuffix?: () => string;
+  readonly isCurrentUser?: CurrentUserCheck;
+  readonly hooks?: {
+    readonly beforeClaim?: () => Promise<void>;
+    readonly beforeRename?: () => Promise<void>;
+    readonly afterRename?: () => Promise<void>;
+    readonly afterSync?: () => Promise<void>;
+    readonly beforeUnlink?: () => Promise<void>;
+    readonly afterUnlink?: () => Promise<void>;
+  };
+  readonly claimOwnerState?: (pid: number) => "dead" | "live" | "unknown";
+}
+
+const DELETE_CLAIM_STATE_FILE = "state.json";
+const DELETE_CLAIM_DISPLACED_FILE = "definition";
+const MAX_DELETE_CLAIMS = 8;
+const MAX_DELETE_CLAIM_BYTES = 1024;
+
+interface DeleteClaimState {
+  readonly schema_version: "service-definition-delete-claim.v1";
+  readonly document_type: "service-definition-delete-claim";
+  readonly phase: "prepared" | "deleting";
+  readonly pid: number;
+  readonly expected_device: string;
+  readonly expected_inode: string;
+  readonly expected_sha256: string;
+}
+
+function deleteClaimName(filePath: string, suffix: string): string {
+  return `.${path.basename(filePath)}.${suffix}.delete-claim`;
+}
+
+function deleteClaimNamePattern(filePath: string): RegExp {
+  const basename = path.basename(filePath).replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  return new RegExp(`^\\.${basename}\\.([A-Za-z0-9_-]{1,64})\\.delete-claim$`, "u");
+}
+
+function sameIdentity(left: OwnedFileIdentity, right: OwnedFileIdentity): boolean {
+  return left.device === right.device && left.inode === right.inode;
+}
+
+function sha256(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function claimStateBytes(state: DeleteClaimState): Uint8Array {
+  return Buffer.from(
+    `${JSON.stringify({
+      schema_version: state.schema_version,
+      document_type: state.document_type,
+      phase: state.phase,
+      pid: state.pid,
+      expected_device: state.expected_device,
+      expected_inode: state.expected_inode,
+      expected_sha256: state.expected_sha256,
+    })}\n`,
+    "utf8",
+  );
+}
+
+function parseClaimInteger(value: unknown): string | undefined {
+  if (typeof value !== "string" || !/^(?:0|[1-9][0-9]*)$/u.test(value)) return undefined;
   try {
-    await link(claimPath, filePath);
-    await unlink(claimPath);
-    await syncDirectory(parent, DEFAULT_OPERATIONS);
+    BigInt(value);
+    return value;
   } catch {
+    return undefined;
+  }
+}
+
+function parseDeleteClaimState(bytes: Uint8Array): DeleteClaimState {
+  if (bytes.byteLength > MAX_DELETE_CLAIM_BYTES) servicePathUnsafe();
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(Buffer.from(bytes).toString("utf8"));
+  } catch {
+    servicePathUnsafe();
+  }
+  if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded))
+    servicePathUnsafe();
+  const value = decoded as Record<string, unknown>;
+  const expectedDevice = parseClaimInteger(value.expected_device);
+  const expectedInode = parseClaimInteger(value.expected_inode);
+  const keys = Object.keys(value).sort();
+  if (
+    keys.join(",") !==
+    "document_type,expected_device,expected_inode,expected_sha256,phase,pid,schema_version"
+  ) {
+    servicePathUnsafe();
+  }
+  if (
+    value.schema_version !== "service-definition-delete-claim.v1" ||
+    value.document_type !== "service-definition-delete-claim" ||
+    (value.phase !== "prepared" && value.phase !== "deleting") ||
+    !Number.isSafeInteger(value.pid) ||
+    typeof value.pid !== "number" ||
+    value.pid <= 0 ||
+    expectedDevice === undefined ||
+    expectedInode === undefined ||
+    typeof value.expected_sha256 !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(value.expected_sha256)
+  ) {
+    servicePathUnsafe();
+  }
+  const state: DeleteClaimState = {
+    schema_version: "service-definition-delete-claim.v1",
+    document_type: "service-definition-delete-claim",
+    phase: value.phase,
+    pid: value.pid,
+    expected_device: expectedDevice,
+    expected_inode: expectedInode,
+    expected_sha256: value.expected_sha256,
+  };
+  if (!Buffer.from(claimStateBytes(state)).equals(Buffer.from(bytes))) servicePathUnsafe();
+  return state;
+}
+
+function snapshotMatches(
+  snapshot: PrivateRegularFileSnapshot,
+  state: Pick<DeleteClaimState, "expected_device" | "expected_inode" | "expected_sha256">,
+): boolean {
+  return (
+    snapshot.device === BigInt(state.expected_device) &&
+    snapshot.inode === BigInt(state.expected_inode) &&
+    sha256(snapshot.bytes) === state.expected_sha256
+  );
+}
+
+function expectedSnapshotMatches(
+  snapshot: PrivateRegularFileSnapshot,
+  options: RemoveOwnedDefinitionOptions,
+): boolean {
+  return (
+    (options.expectedBytes === undefined ||
+      Buffer.from(snapshot.bytes).equals(Buffer.from(options.expectedBytes))) &&
+    (options.expectedIdentity === undefined ||
+      sameIdentity({ device: snapshot.device, inode: snapshot.inode }, options.expectedIdentity))
+  );
+}
+
+function defaultClaimOwnerState(pid: number): "dead" | "live" | "unknown" {
+  try {
+    process.kill(pid, 0);
+    return "live";
+  } catch (error) {
+    if (hasErrorCode(error, "ESRCH")) return "dead";
+    return "unknown";
+  }
+}
+
+async function inspectPrivateClaimDirectory(
+  claimPath: string,
+  isCurrentUser: CurrentUserCheck,
+): Promise<void> {
+  const exists = await inspectDirectoryPath(
+    claimPath,
+    "private",
+    false,
+    DEFAULT_OPERATIONS,
+    isCurrentUser,
+  );
+  if (!exists) servicePathUnsafe();
+}
+
+async function claimEntries(claimPath: string): Promise<string[]> {
+  let entries: string[];
+  try {
+    entries = (await readdir(claimPath)).sort();
+  } catch {
+    servicePathUnsafe();
+  }
+  if (
+    entries.some(
+      (entry) => entry !== DELETE_CLAIM_STATE_FILE && entry !== DELETE_CLAIM_DISPLACED_FILE,
+    )
+  ) {
+    servicePathUnsafe();
+  }
+  return entries;
+}
+
+async function removeClaimDirectory(claimPath: string, entries: readonly string[]): Promise<void> {
+  try {
+    if (entries.includes(DELETE_CLAIM_DISPLACED_FILE)) {
+      await unlink(path.join(claimPath, DELETE_CLAIM_DISPLACED_FILE));
+      await syncDirectory(claimPath, DEFAULT_OPERATIONS);
+    }
+    if (entries.includes(DELETE_CLAIM_STATE_FILE)) {
+      await unlink(path.join(claimPath, DELETE_CLAIM_STATE_FILE));
+      await syncDirectory(claimPath, DEFAULT_OPERATIONS);
+    }
+    await rmdir(claimPath);
+    await syncDirectory(path.dirname(claimPath), DEFAULT_OPERATIONS);
+  } catch {
+    servicePathUnsafe();
+  }
+}
+
+async function currentPathExists(filePath: string): Promise<boolean> {
+  try {
+    await DEFAULT_OPERATIONS.lstat(filePath, { bigint: true });
+    return true;
+  } catch (error) {
+    if (isMissing(error)) return false;
+    servicePathUnsafe();
+  }
+}
+
+async function restoreDisplacedDefinition(
+  filePath: string,
+  claimPath: string,
+  displacedPath: string,
+): Promise<void> {
+  if (await currentPathExists(filePath)) servicePathUnsafe();
+  try {
+    await rename(displacedPath, filePath);
+    await syncDirectory(path.dirname(filePath), DEFAULT_OPERATIONS);
+    await removeClaimDirectory(claimPath, await claimEntries(claimPath));
+  } catch (error) {
+    if (error instanceof RuntimeServiceError) throw error;
+    servicePathUnsafe();
+  }
+}
+
+async function readDeleteClaimState(
+  statePath: string,
+  isCurrentUser: CurrentUserCheck,
+): Promise<DeleteClaimState> {
+  const snapshot = await readPrivateRegularFileSnapshot(statePath, { isCurrentUser });
+  if (snapshot === undefined) servicePathUnsafe();
+  return parseDeleteClaimState(snapshot.bytes);
+}
+
+async function recoverDeleteClaim(
+  filePath: string,
+  claimPath: string,
+  isCurrentUser: CurrentUserCheck,
+  claimOwnerState: (pid: number) => "dead" | "live" | "unknown",
+): Promise<void> {
+  await inspectPrivateClaimDirectory(claimPath, isCurrentUser);
+  const entries = await claimEntries(claimPath);
+  if (entries.length === 0) {
+    await removeClaimDirectory(claimPath, entries);
+    return;
+  }
+  if (!entries.includes(DELETE_CLAIM_STATE_FILE)) servicePathUnsafe();
+  const state = await readDeleteClaimState(
+    path.join(claimPath, DELETE_CLAIM_STATE_FILE),
+    isCurrentUser,
+  );
+  if (claimOwnerState(state.pid) !== "dead") servicePathUnsafe();
+  const displacedPath = path.join(claimPath, DELETE_CLAIM_DISPLACED_FILE);
+  const targetExists = await currentPathExists(filePath);
+  const displacedExists = entries.includes(DELETE_CLAIM_DISPLACED_FILE);
+
+  if (targetExists && displacedExists) servicePathUnsafe();
+  if (targetExists) {
+    if (state.phase !== "prepared") servicePathUnsafe();
+    const target = await readPrivateRegularFileSnapshot(filePath, { isCurrentUser });
+    if (target === undefined || !snapshotMatches(target, state)) servicePathUnsafe();
+    await removeClaimDirectory(claimPath, entries);
+    return;
+  }
+  if (displacedExists) {
+    const displaced = await readPrivateRegularFileSnapshot(displacedPath, { isCurrentUser });
+    if (displaced === undefined || !snapshotMatches(displaced, state)) servicePathUnsafe();
+    await removeClaimDirectory(claimPath, entries);
+    return;
+  }
+  if (state.phase !== "deleting") servicePathUnsafe();
+  await removeClaimDirectory(claimPath, entries);
+}
+
+export interface RecoverOwnedDefinitionClaimsOptions {
+  readonly isCurrentUser?: CurrentUserCheck;
+  readonly claimOwnerState?: (pid: number) => "dead" | "live" | "unknown";
+}
+
+export async function recoverOwnedDefinitionClaims(
+  filePath: string,
+  options: RecoverOwnedDefinitionClaimsOptions = {},
+): Promise<void> {
+  assertAbsoluteTarget(filePath);
+  const parent = path.dirname(filePath);
+  const isCurrentUser = options.isCurrentUser ?? defaultCurrentUserCheck;
+  try {
+    const parentExists = await inspectDirectoryPath(
+      parent,
+      "owned-not-writable",
+      false,
+      DEFAULT_OPERATIONS,
+      isCurrentUser,
+    );
+    if (!parentExists) return;
+    const pattern = deleteClaimNamePattern(filePath);
+    const claims = (await readdir(parent)).filter((entry) => pattern.test(entry)).sort();
+    if (claims.length > MAX_DELETE_CLAIMS) servicePathUnsafe();
+    for (const name of claims) {
+      await recoverDeleteClaim(
+        filePath,
+        path.join(parent, name),
+        isCurrentUser,
+        options.claimOwnerState ?? defaultClaimOwnerState,
+      );
+    }
+  } catch (error) {
+    if (error instanceof RuntimeServiceError) throw error;
     servicePathUnsafe();
   }
 }
@@ -391,63 +720,98 @@ export async function removeOwnedDefinition(
 ): Promise<void> {
   assertAbsoluteTarget(filePath);
   const parent = path.dirname(filePath);
-  let claimPath: string | undefined;
-  let claimed = false;
+  const isCurrentUser = options.isCurrentUser ?? defaultCurrentUserCheck;
   try {
-    const parentExists = await inspectDirectoryPath(
-      parent,
-      "owned-not-writable",
-      false,
-      DEFAULT_OPERATIONS,
-      defaultCurrentUserCheck,
-    );
-    if (!parentExists) return;
+    await recoverOwnedDefinitionClaims(filePath, {
+      ...(options.isCurrentUser === undefined ? {} : { isCurrentUser: options.isCurrentUser }),
+      ...(options.claimOwnerState === undefined
+        ? {}
+        : { claimOwnerState: options.claimOwnerState }),
+    });
+    const snapshot = await readPrivateRegularFileSnapshot(filePath, { isCurrentUser });
+    if (snapshot === undefined) return;
+    if (!expectedSnapshotMatches(snapshot, options)) servicePathUnsafe();
+    await options.hooks?.beforeClaim?.();
     const suffix = (options.randomSuffix ?? randomUUID)();
     if (!SAFE_SUFFIX.test(suffix)) servicePathUnsafe();
-    claimPath = path.join(parent, `.${path.basename(filePath)}.${suffix}.delete-claim`);
+    const claimPath = path.join(parent, deleteClaimName(filePath, suffix));
+    const statePath = path.join(claimPath, DELETE_CLAIM_STATE_FILE);
+    const displacedPath = path.join(claimPath, DELETE_CLAIM_DISPLACED_FILE);
     try {
-      await DEFAULT_OPERATIONS.lstat(claimPath, { bigint: true });
-      servicePathUnsafe();
-    } catch (error) {
-      if (!isMissing(error)) {
-        if (error instanceof RuntimeServiceError) throw error;
-        servicePathUnsafe();
-      }
-    }
-    try {
-      await rename(filePath, claimPath);
-      claimed = true;
-      await syncDirectory(parent, DEFAULT_OPERATIONS);
-    } catch (error) {
-      if (isMissing(error)) return;
+      await mkdir(claimPath, { mode: 0o700 });
+    } catch {
       servicePathUnsafe();
     }
-
-    let claimedBytes: Uint8Array | undefined;
+    await inspectPrivateClaimDirectory(claimPath, isCurrentUser);
+    await syncDirectory(parent, DEFAULT_OPERATIONS);
+    const state: DeleteClaimState = {
+      schema_version: "service-definition-delete-claim.v1",
+      document_type: "service-definition-delete-claim",
+      phase: "prepared",
+      pid: process.pid,
+      expected_device: snapshot.device.toString(),
+      expected_inode: snapshot.inode.toString(),
+      expected_sha256: sha256(snapshot.bytes),
+    };
+    const published = await createPrivateAtomicIfMissing({
+      target: statePath,
+      bytes: claimStateBytes(state),
+      randomSuffix: options.randomSuffix ?? randomUUID,
+      parentPolicy: "private",
+      isCurrentUser,
+    });
+    if (
+      published !== "created" ||
+      (await claimEntries(claimPath)).join(",") !== DELETE_CLAIM_STATE_FILE
+    ) {
+      servicePathUnsafe();
+    }
+    await syncDirectory(claimPath, DEFAULT_OPERATIONS);
+    const current = await readPrivateRegularFileSnapshot(filePath, { isCurrentUser });
+    if (
+      current === undefined ||
+      !sameIdentity(snapshot, current) ||
+      !expectedSnapshotMatches(current, options)
+    ) {
+      servicePathUnsafe();
+    }
+    if ((await claimEntries(claimPath)).join(",") !== DELETE_CLAIM_STATE_FILE) servicePathUnsafe();
+    await options.hooks?.beforeRename?.();
+    await rename(filePath, displacedPath);
+    await options.hooks?.afterRename?.();
+    await syncDirectory(claimPath, DEFAULT_OPERATIONS);
+    await syncDirectory(parent, DEFAULT_OPERATIONS);
+    await options.hooks?.afterSync?.();
+    let claimed: PrivateRegularFileSnapshot | undefined;
     try {
-      claimedBytes = await readPrivateRegularFile(claimPath);
-    } catch (error) {
-      await restoreClaimedDefinition(claimPath, filePath, parent);
-      claimed = false;
-      if (error instanceof RuntimeServiceError) throw error;
+      claimed = await readPrivateRegularFileSnapshot(displacedPath, { isCurrentUser });
+    } catch {
+      await restoreDisplacedDefinition(filePath, claimPath, displacedPath);
       servicePathUnsafe();
     }
     if (
-      claimedBytes === undefined ||
-      (options.expectedBytes !== undefined &&
-        !Buffer.from(claimedBytes).equals(Buffer.from(options.expectedBytes)))
+      claimed === undefined ||
+      !sameIdentity(snapshot, claimed) ||
+      !expectedSnapshotMatches(claimed, options)
     ) {
-      await restoreClaimedDefinition(claimPath, filePath, parent);
-      claimed = false;
+      await restoreDisplacedDefinition(filePath, claimPath, displacedPath);
       servicePathUnsafe();
     }
-    await unlink(claimPath);
-    claimed = false;
-    await syncDirectory(parent, DEFAULT_OPERATIONS);
+    const deleting: DeleteClaimState = { ...state, phase: "deleting" };
+    await writePrivateAtomic({
+      target: statePath,
+      bytes: claimStateBytes(deleting),
+      randomSuffix: options.randomSuffix ?? randomUUID,
+      parentPolicy: "private",
+      isCurrentUser,
+    });
+    await syncDirectory(claimPath, DEFAULT_OPERATIONS);
+    await options.hooks?.beforeUnlink?.();
+    await unlink(displacedPath);
+    await options.hooks?.afterUnlink?.();
+    await syncDirectory(claimPath, DEFAULT_OPERATIONS);
+    await removeClaimDirectory(claimPath, await claimEntries(claimPath));
   } catch (error) {
-    if (claimed && claimPath !== undefined) {
-      await restoreClaimedDefinition(claimPath, filePath, parent);
-    }
     if (error instanceof RuntimeServiceError) throw error;
     servicePathUnsafe();
   }
