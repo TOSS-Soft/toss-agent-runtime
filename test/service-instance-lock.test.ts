@@ -956,7 +956,10 @@ describe("runtime supervisor instance lock", () => {
       acquireInstanceLock(options({ identifySocket: () => Promise.resolve(otherId) })),
     ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
 
-    const later = new Date(now.getTime() + 86_400_000);
+    const retainedLock = await lstat(fixture.lockPath, { bigint: true });
+    const later = new Date(
+      Number(retainedLock.mtimeNs / 1_000_000n) + OWNERLESS_LOCK_STALE_AFTER_MS + 1,
+    );
     const lock = await acquireInstanceLock(
       options({
         instanceId: otherId,
