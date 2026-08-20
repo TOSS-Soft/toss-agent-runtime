@@ -32,6 +32,9 @@ const PUBLICATION_GUARD_PATTERN = /^\.c[0-9a-f]{64}$/u;
 const PUBLICATION_CLAIM_PATTERN = /^\.r[0-9a-f]{64}$/u;
 const PREVIOUS_STAGED_SOCKET_PATTERN = /^\.s[0-9a-z]{25}$/u;
 const STAGED_SOCKET_PATTERN = /^\.s[0-9a-z]{10}$/u;
+const SOCKET_CLAIM_PATTERN = /^\.x[0-9a-z]{10}$/u;
+const SOCKET_CLAIM_TOKEN_PATTERN = /^[0-9a-z]{10}$/u;
+const MAX_SOCKET_CLAIMS = 1;
 const internalServiceErrors = new WeakSet<RuntimeServiceError>();
 
 interface FileIdentity {
@@ -79,6 +82,15 @@ export interface ServiceControlOperationHooks {
   readonly beforeStagedSocketUnlink?: (candidatePath: string) => Promise<void>;
   /** @internal Test seam for deterministic staged-socket parent revalidation. */
   readonly afterStagedSocketParentSync?: (candidatePath: string) => Promise<void>;
+  /** @internal Test seam for deterministic socket-claim names. */
+  readonly createSocketClaimToken?: () => string;
+  /** @internal Test seam immediately before the controlled destination-absence check. */
+  readonly beforeSocketClaimDestinationCheck?: (
+    candidatePath: string,
+    claimPath: string,
+  ) => Promise<void>;
+  /** @internal Test seam after a socket claim has been synced and revalidated. */
+  readonly afterSocketClaimParentSync?: (candidatePath: string, claimPath: string) => Promise<void>;
   readonly onConnectionCountChanged?: (count: number) => void;
   readonly onConnectionClosed?: () => void;
 }
@@ -269,7 +281,8 @@ function isPublicationArtifactName(candidate: string): boolean {
     PUBLICATION_GUARD_PATTERN.test(candidate) ||
     PUBLICATION_CLAIM_PATTERN.test(candidate) ||
     PREVIOUS_STAGED_SOCKET_PATTERN.test(candidate) ||
-    STAGED_SOCKET_PATTERN.test(candidate)
+    STAGED_SOCKET_PATTERN.test(candidate) ||
+    SOCKET_CLAIM_PATTERN.test(candidate)
   );
 }
 
@@ -291,6 +304,49 @@ function stagedSocketName(serviceInstanceId: string): string {
   );
   const token = (entropy % 36n ** 10n).toString(36).padStart(10, "0");
   return `.s${token}`;
+}
+
+function identityBoundSocketClaimToken(identity: FileIdentity, variant: "0" | "1"): string {
+  const entropy = BigInt(
+    `0x${createHash("sha256")
+      .update(identity.device.toString(), "utf8")
+      .update("\u0000", "utf8")
+      .update(identity.inode.toString(), "utf8")
+      .update("\u0000", "utf8")
+      .update(variant, "utf8")
+      .digest("hex")}`,
+  );
+  return (entropy % 36n ** 10n).toString(36).padStart(10, "0");
+}
+
+function socketClaimToken(
+  candidatePath: string,
+  expected: FileIdentity,
+  hooks?: ServiceControlOperationHooks,
+): string {
+  try {
+    const supplied = hooks?.createSocketClaimToken?.();
+    if (supplied !== undefined) {
+      if (!SOCKET_CLAIM_TOKEN_PATTERN.test(supplied)) pathUnsafe();
+      return supplied;
+    }
+    const first = identityBoundSocketClaimToken(expected, "0");
+    const second = identityBoundSocketClaimToken(expected, "1");
+    if (first === second) pathUnsafe();
+    const candidateName = path.basename(candidatePath);
+    const token = SOCKET_CLAIM_PATTERN.test(candidateName)
+      ? candidateName === `.x${first}`
+        ? second
+        : candidateName === `.x${second}`
+          ? first
+          : pathUnsafe()
+      : first;
+    if (!SOCKET_CLAIM_TOKEN_PATTERN.test(token)) pathUnsafe();
+    return token;
+  } catch (error) {
+    if (error instanceof RuntimeServiceError && internalServiceErrors.has(error)) throw error;
+    return pathUnsafe();
+  }
 }
 
 function publicationClaimName(serviceInstanceId: string, candidateName: string): string {
@@ -577,25 +633,6 @@ async function socketHasListener(socketPath: string): Promise<boolean> {
   });
 }
 
-async function removeStaleSocket(
-  socketPath: string,
-  classifier?: PathOwnerClassifier,
-  currentUid?: () => number,
-): Promise<void> {
-  const expected = await privateSocketIdentity(socketPath, classifier, currentUid);
-  if (expected === undefined) return;
-  if (await socketHasListener(socketPath)) {
-    throw serviceError("RUNTIME_SERVICE_ALREADY_RUNNING");
-  }
-  const current = await privateSocketIdentity(socketPath, classifier, currentUid);
-  if (current === undefined || !sameIdentity(current, expected)) pathUnsafe();
-  try {
-    await unlink(socketPath);
-  } catch {
-    pathUnsafe();
-  }
-}
-
 async function assertRuntimeDirectoryHandle(options: {
   readonly handle: FileHandle;
   readonly socketPath: string;
@@ -662,17 +699,98 @@ async function openRuntimeDirectoryHandle(options: {
   }
 }
 
-async function reclaimStaleStagedSocket(options: {
+async function requireMissing(candidatePath: string): Promise<void> {
+  try {
+    await lstatBigInt(candidatePath);
+  } catch (error) {
+    if (isMissing(error)) return;
+    pathUnsafe();
+  }
+  pathUnsafe();
+}
+
+async function socketClaimNames(runtimePath: string): Promise<readonly string[]> {
+  return (await requiredEntries(runtimePath))
+    .filter((entry) => SOCKET_CLAIM_PATTERN.test(entry))
+    .sort();
+}
+
+function unlinkExactPrivateSocketSync(options: {
+  readonly candidatePath: string;
+  readonly expected: FileIdentity;
+  readonly classifier?: PathOwnerClassifier | undefined;
+  readonly currentUid?: (() => number) | undefined;
+}): void {
+  let before: BigIntStats;
+  try {
+    before = lstatSync(options.candidatePath, { bigint: true });
+  } catch {
+    pathUnsafe();
+  }
+  if (
+    before.isSymbolicLink() ||
+    !before.isSocket() ||
+    (before.mode & 0o777n) !== 0o600n ||
+    !sameIdentity(identityOf(before), options.expected) ||
+    classifyPathOwner(
+      options.classifier,
+      options.currentUid,
+      safeUserId(before.uid),
+      options.candidatePath,
+    ) !== "current-user"
+  ) {
+    pathUnsafe();
+  }
+
+  let final: BigIntStats;
+  try {
+    final = lstatSync(options.candidatePath, { bigint: true });
+  } catch {
+    pathUnsafe();
+  }
+  if (
+    final.isSymbolicLink() ||
+    !final.isSocket() ||
+    final.uid !== before.uid ||
+    (final.mode & 0o777n) !== 0o600n ||
+    !sameIdentity(identityOf(final), options.expected)
+  ) {
+    pathUnsafe();
+  }
+  try {
+    // Keep the last exact identity check and unlink in one synchronous turn. POSIX
+    // has no portable conditional unlink-by-inode primitive for Unix sockets.
+    unlinkSync(options.candidatePath);
+  } catch {
+    pathUnsafe();
+  }
+}
+
+async function claimAndRemoveStaleSocket(options: {
   readonly candidatePath: string;
   readonly socketPath: string;
   readonly runtimeIdentity: FileIdentity;
+  readonly allowMissing: boolean;
+  readonly staged: boolean;
   readonly classifier?: PathOwnerClassifier | undefined;
   readonly currentUid?: (() => number) | undefined;
   readonly hooks?: ServiceControlOperationHooks | undefined;
 }): Promise<void> {
-  const { candidatePath, classifier, currentUid, hooks, runtimeIdentity, socketPath } = options;
+  const {
+    allowMissing,
+    candidatePath,
+    classifier,
+    currentUid,
+    hooks,
+    runtimeIdentity,
+    socketPath,
+    staged,
+  } = options;
   const expected = await privateSocketIdentity(candidatePath, classifier, currentUid);
-  if (expected === undefined) pathUnsafe();
+  if (expected === undefined) {
+    if (allowMissing) return;
+    pathUnsafe();
+  }
   if (await socketHasListener(candidatePath)) {
     throw serviceError("RUNTIME_SERVICE_ALREADY_RUNNING");
   }
@@ -690,12 +808,25 @@ async function reclaimStaleStagedSocket(options: {
     currentUid,
     modelRuntimeIdentity: hooks?.modelRuntimeIdentity,
   });
+  const runtimePath = path.dirname(socketPath);
   try {
+    if (staged) {
+      try {
+        await hooks?.beforeStagedSocketUnlink?.(candidatePath);
+      } catch {
+        pathUnsafe();
+      }
+    }
+    const claimPath = path.join(
+      runtimePath,
+      `.x${socketClaimToken(candidatePath, expected, hooks)}`,
+    );
     try {
-      await hooks?.beforeStagedSocketUnlink?.(candidatePath);
+      await hooks?.beforeSocketClaimDestinationCheck?.(candidatePath, claimPath);
     } catch {
       pathUnsafe();
     }
+    await requireMissing(claimPath);
     const current = await privateSocketIdentity(candidatePath, classifier, currentUid);
     if (current === undefined || !sameIdentity(current, expected)) pathUnsafe();
     await assertRuntimeDirectoryHandle({
@@ -707,13 +838,20 @@ async function reclaimStaleStagedSocket(options: {
       modelRuntimeIdentity: hooks?.modelRuntimeIdentity,
     });
     try {
-      await unlink(candidatePath);
-      await runtimeHandle.sync();
+      await rename(candidatePath, claimPath);
     } catch {
       pathUnsafe();
     }
+
+    let moved: FileIdentity | undefined;
+    let movedFailure: unknown;
     try {
-      await hooks?.afterStagedSocketParentSync?.(candidatePath);
+      moved = await privateSocketIdentity(claimPath, classifier, currentUid);
+    } catch (error) {
+      movedFailure = error;
+    }
+    try {
+      await runtimeHandle.sync();
     } catch {
       pathUnsafe();
     }
@@ -725,18 +863,128 @@ async function reclaimStaleStagedSocket(options: {
       currentUid,
       modelRuntimeIdentity: hooks?.modelRuntimeIdentity,
     });
-    try {
-      await lstatBigInt(candidatePath);
+    if (movedFailure !== undefined) {
+      if (movedFailure instanceof RuntimeServiceError && internalServiceErrors.has(movedFailure)) {
+        throw movedFailure;
+      }
       pathUnsafe();
-    } catch (error) {
-      if (!isMissing(error)) {
-        if (error instanceof RuntimeServiceError && internalServiceErrors.has(error)) throw error;
+    }
+    if (moved === undefined || !sameIdentity(moved, expected)) pathUnsafe();
+    try {
+      await hooks?.afterSocketClaimParentSync?.(candidatePath, claimPath);
+    } catch {
+      pathUnsafe();
+    }
+    if (staged) {
+      try {
+        await hooks?.afterStagedSocketParentSync?.(candidatePath);
+      } catch {
         pathUnsafe();
       }
     }
+    await assertRuntimeDirectoryHandle({
+      handle: runtimeHandle,
+      socketPath,
+      expected: runtimeIdentity,
+      classifier,
+      currentUid,
+      modelRuntimeIdentity: hooks?.modelRuntimeIdentity,
+    });
+    await requireMissing(candidatePath);
+    const activeClaims = await socketClaimNames(runtimePath);
+    if (activeClaims.length !== 1 || path.join(runtimePath, activeClaims[0]!) !== claimPath) {
+      pathUnsafe();
+    }
+    if (await socketHasListener(claimPath)) {
+      throw serviceError("RUNTIME_SERVICE_ALREADY_RUNNING");
+    }
+    const finalClaim = await privateSocketIdentity(claimPath, classifier, currentUid);
+    if (finalClaim === undefined || !sameIdentity(finalClaim, expected)) pathUnsafe();
+    await assertRuntimeDirectoryHandle({
+      handle: runtimeHandle,
+      socketPath,
+      expected: runtimeIdentity,
+      classifier,
+      currentUid,
+      modelRuntimeIdentity: hooks?.modelRuntimeIdentity,
+    });
+    unlinkExactPrivateSocketSync({
+      candidatePath: claimPath,
+      expected,
+      classifier,
+      currentUid,
+    });
+    try {
+      await runtimeHandle.sync();
+    } catch {
+      pathUnsafe();
+    }
+    await assertRuntimeDirectoryHandle({
+      handle: runtimeHandle,
+      socketPath,
+      expected: runtimeIdentity,
+      classifier,
+      currentUid,
+      modelRuntimeIdentity: hooks?.modelRuntimeIdentity,
+    });
+    await requireMissing(claimPath);
+    if ((await socketClaimNames(runtimePath)).length !== 0) pathUnsafe();
   } finally {
-    await runtimeHandle.close();
+    try {
+      await runtimeHandle.close();
+    } catch {
+      // The directory operation is already complete or failed closed.
+    }
   }
+}
+
+async function reclaimStaleSocketClaims(options: {
+  readonly socketPath: string;
+  readonly runtimeIdentity: FileIdentity;
+  readonly classifier?: PathOwnerClassifier | undefined;
+  readonly currentUid?: (() => number) | undefined;
+  readonly hooks?: ServiceControlOperationHooks | undefined;
+}): Promise<void> {
+  const claims = await socketClaimNames(path.dirname(options.socketPath));
+  if (claims.length > MAX_SOCKET_CLAIMS) pathUnsafe();
+  if (claims.length === 1) {
+    await claimAndRemoveStaleSocket({
+      candidatePath: path.join(path.dirname(options.socketPath), claims[0]!),
+      allowMissing: false,
+      staged: false,
+      ...options,
+    });
+  }
+}
+
+async function removeStaleSocket(options: {
+  readonly socketPath: string;
+  readonly runtimeIdentity: FileIdentity;
+  readonly classifier?: PathOwnerClassifier | undefined;
+  readonly currentUid?: (() => number) | undefined;
+  readonly hooks?: ServiceControlOperationHooks | undefined;
+}): Promise<void> {
+  await claimAndRemoveStaleSocket({
+    candidatePath: options.socketPath,
+    allowMissing: true,
+    staged: false,
+    ...options,
+  });
+}
+
+async function reclaimStaleStagedSocket(options: {
+  readonly candidatePath: string;
+  readonly socketPath: string;
+  readonly runtimeIdentity: FileIdentity;
+  readonly classifier?: PathOwnerClassifier | undefined;
+  readonly currentUid?: (() => number) | undefined;
+  readonly hooks?: ServiceControlOperationHooks | undefined;
+}): Promise<void> {
+  await claimAndRemoveStaleSocket({
+    allowMissing: false,
+    staged: true,
+    ...options,
+  });
 }
 
 async function reclaimStaleStagedSockets(options: {
@@ -1213,7 +1461,20 @@ export function createServiceControlServer(
         options.operationHooks?.modelRuntimeIdentity,
       );
       ownedRuntime = runtimeIdentity;
-      await removeStaleSocket(options.socketPath, options.classifyPathOwner, options.currentUid);
+      await reclaimStaleSocketClaims({
+        socketPath: options.socketPath,
+        runtimeIdentity,
+        classifier: options.classifyPathOwner,
+        currentUid: options.currentUid,
+        hooks: options.operationHooks,
+      });
+      await removeStaleSocket({
+        socketPath: options.socketPath,
+        runtimeIdentity,
+        classifier: options.classifyPathOwner,
+        currentUid: options.currentUid,
+        hooks: options.operationHooks,
+      });
       await reclaimStaleStagedSockets({
         socketPath: options.socketPath,
         runtimeIdentity,

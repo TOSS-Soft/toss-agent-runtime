@@ -1,4 +1,5 @@
 import { once } from "node:events";
+import { renameSync } from "node:fs";
 import {
   chmod,
   link,
@@ -28,6 +29,7 @@ import {
   createServiceControlServer,
   probeServiceIdentity,
   requestServiceStatus,
+  type ServiceControlOperationHooks,
   type ServiceControlServer,
 } from "../src/service/control.js";
 
@@ -39,10 +41,20 @@ const currentPublicationGuard =
 const currentStagedSocket = ".siieudk9fi1";
 const previousStagedSocket = ".s8ii47i6hu9f6rrdwudifbfef5";
 const legacyStagedSocket = ".c8fcfb3a7";
+const socketClaimPattern = /^\.x[0-9a-z]{10}$/u;
 const temporaryDirectories: string[] = [];
 const controlServers: ServiceControlServer[] = [];
 const nativeServers: Server[] = [];
 const clientSockets = new Set<Socket>();
+
+type SocketClaimTestHooks = ServiceControlOperationHooks & {
+  readonly createSocketClaimToken?: () => string;
+  readonly beforeSocketClaimDestinationCheck?: (
+    candidatePath: string,
+    claimPath: string,
+  ) => Promise<void>;
+  readonly afterSocketClaimParentSync?: (candidatePath: string, claimPath: string) => Promise<void>;
+};
 
 let runtimePath: string;
 let temporaryRoot: string;
@@ -167,6 +179,47 @@ function classifyActualOwner(userId: number): "root" | "current-user" | "other" 
   return typeof process.getuid === "function" && process.getuid() === userId
     ? "current-user"
     : "other";
+}
+
+function replaceSocketOnSecondOwnershipCheck(options: {
+  readonly target: string;
+  readonly displaced: string;
+  readonly replacement: string;
+}): (userId: number, candidate: string) => "root" | "current-user" | "other" {
+  let targetChecks = 0;
+  return (userId, candidate) => {
+    if (candidate === options.target) {
+      targetChecks += 1;
+      if (targetChecks === 2) {
+        renameSync(options.target, options.displaced);
+        renameSync(options.replacement, options.target);
+      }
+    }
+    return classifyActualOwner(userId);
+  };
+}
+
+function replaceSocketOnMatchingOwnershipCheck(options: {
+  readonly matches: (candidate: string) => boolean;
+  readonly check: number;
+  readonly displaced: string;
+  readonly replacement: string;
+}): (userId: number, candidate: string) => "root" | "current-user" | "other" {
+  let targetChecks = 0;
+  return (userId, candidate) => {
+    if (options.matches(candidate)) {
+      targetChecks += 1;
+      if (targetChecks === options.check) {
+        renameSync(candidate, options.displaced);
+        renameSync(options.replacement, candidate);
+      }
+    }
+    return classifyActualOwner(userId);
+  };
+}
+
+function socketClaimEntries(entries: readonly string[]): readonly string[] {
+  return entries.filter((entry) => socketClaimPattern.test(entry)).sort();
 }
 
 async function sendRaw(bytes: string | Uint8Array): Promise<string> {
@@ -440,6 +493,274 @@ describe("private service control socket", () => {
     await expect(server.listen()).rejects.toMatchObject({
       code: "RUNTIME_SERVICE_PATH_UNSAFE",
     });
+    expect(await pathIsMissing(socketPath)).toBe(true);
+  });
+
+  it("preserves a public-socket replacement inserted after final validation", async () => {
+    const displaced = path.join(runtimePath, "displaced-public.sock");
+    const preparedReplacement = path.join(runtimePath, "prepared-public.sock");
+    await leaveClosedSocketLinks(socketPath);
+    const original = await snapshotPath(socketPath);
+    await leaveClosedSocketLinks(preparedReplacement);
+    const replacement = await snapshotPath(preparedReplacement);
+    const server = createServiceControlServer(
+      options({
+        classifyPathOwner: replaceSocketOnSecondOwnershipCheck({
+          target: socketPath,
+          displaced,
+          replacement: preparedReplacement,
+        }),
+      }),
+    );
+    controlServers.push(server);
+    let failure: unknown;
+
+    try {
+      await server.listen();
+    } catch (error) {
+      failure = error;
+    }
+
+    const claims = socketClaimEntries(await readdir(runtimePath));
+    expect(claims).toHaveLength(1);
+    expect(await snapshotPath(displaced)).toEqual(original);
+    expect(await snapshotPath(path.join(runtimePath, claims[0]!))).toEqual(replacement);
+    expect(await pathIsMissing(socketPath)).toBe(true);
+    expect(failure).toMatchObject({ code: "RUNTIME_SERVICE_PATH_UNSAFE" });
+
+    const retry = createServiceControlServer(options());
+    controlServers.push(retry);
+    await expect(retry.listen()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_PATH_UNSAFE",
+    });
+    expect(await snapshotPath(path.join(runtimePath, claims[0]!))).toEqual(replacement);
+  });
+
+  it("preserves a staged-socket replacement inserted after final validation", async () => {
+    const stagedPath = path.join(runtimePath, currentStagedSocket);
+    const displaced = path.join(runtimePath, "displaced-final-stage.sock");
+    const preparedReplacement = path.join(runtimePath, "prepared-stage.sock");
+    await leaveClosedSocketLinks(stagedPath);
+    const original = await snapshotPath(stagedPath);
+    await leaveClosedSocketLinks(preparedReplacement);
+    const replacement = await snapshotPath(preparedReplacement);
+    const server = createServiceControlServer(
+      options({
+        classifyPathOwner: replaceSocketOnSecondOwnershipCheck({
+          target: stagedPath,
+          displaced,
+          replacement: preparedReplacement,
+        }),
+      }),
+    );
+    controlServers.push(server);
+    let failure: unknown;
+
+    try {
+      await server.listen();
+    } catch (error) {
+      failure = error;
+    }
+
+    const claims = socketClaimEntries(await readdir(runtimePath));
+    expect(claims).toHaveLength(1);
+    expect(await snapshotPath(displaced)).toEqual(original);
+    expect(await snapshotPath(path.join(runtimePath, claims[0]!))).toEqual(replacement);
+    expect(await pathIsMissing(stagedPath)).toBe(true);
+    expect(await pathIsMissing(socketPath)).toBe(true);
+    expect(failure).toMatchObject({ code: "RUNTIME_SERVICE_PATH_UNSAFE" });
+
+    const retry = createServiceControlServer(options());
+    controlServers.push(retry);
+    await expect(retry.listen()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_PATH_UNSAFE",
+    });
+    expect(await snapshotPath(path.join(runtimePath, claims[0]!))).toEqual(replacement);
+  });
+
+  it("preserves a public-socket claim replacement inserted after final claim validation", async () => {
+    const claimPath = path.join(runtimePath, ".x0123456789");
+    const displaced = path.join(runtimePath, "displaced-public-claim.sock");
+    const preparedReplacement = path.join(runtimePath, "prepared-public-claim.sock");
+    await leaveClosedSocketLinks(socketPath);
+    const original = await snapshotPath(socketPath);
+    await leaveClosedSocketLinks(preparedReplacement);
+    const replacement = await snapshotPath(preparedReplacement);
+    const server = createServiceControlServer(
+      options({
+        classifyPathOwner: replaceSocketOnMatchingOwnershipCheck({
+          matches: (candidate) => candidate === claimPath,
+          check: 3,
+          displaced,
+          replacement: preparedReplacement,
+        }),
+        operationHooks: { createSocketClaimToken: () => "0123456789" },
+      }),
+    );
+    controlServers.push(server);
+
+    await expect(server.listen()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_PATH_UNSAFE",
+    });
+    expect(await snapshotPath(displaced)).toEqual(original);
+    expect(await snapshotPath(claimPath)).toEqual(replacement);
+    expect(await pathIsMissing(socketPath)).toBe(true);
+  });
+
+  it("preserves a staged-socket claim replacement inserted after final claim validation", async () => {
+    const stagedPath = path.join(runtimePath, currentStagedSocket);
+    const claimPath = path.join(runtimePath, ".x0123456789");
+    const displaced = path.join(runtimePath, "displaced-stage-claim.sock");
+    const preparedReplacement = path.join(runtimePath, "prepared-stage-claim.sock");
+    await leaveClosedSocketLinks(stagedPath);
+    const original = await snapshotPath(stagedPath);
+    await leaveClosedSocketLinks(preparedReplacement);
+    const replacement = await snapshotPath(preparedReplacement);
+    const server = createServiceControlServer(
+      options({
+        classifyPathOwner: replaceSocketOnMatchingOwnershipCheck({
+          matches: (candidate) => candidate === claimPath,
+          check: 3,
+          displaced,
+          replacement: preparedReplacement,
+        }),
+        operationHooks: { createSocketClaimToken: () => "0123456789" },
+      }),
+    );
+    controlServers.push(server);
+
+    await expect(server.listen()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_PATH_UNSAFE",
+    });
+    expect(await snapshotPath(displaced)).toEqual(original);
+    expect(await snapshotPath(claimPath)).toEqual(replacement);
+    expect(await pathIsMissing(stagedPath)).toBe(true);
+    expect(await pathIsMissing(socketPath)).toBe(true);
+  });
+
+  it("reclaims one private crash-left socket claim before publishing", async () => {
+    await leaveClosedSocketLinks(socketPath);
+    let claimPath: string | undefined;
+    const hooks: SocketClaimTestHooks = {
+      afterSocketClaimParentSync: (candidatePath, candidateClaimPath) => {
+        expect(candidatePath).toBe(socketPath);
+        claimPath = candidateClaimPath;
+        return Promise.reject(new Error("simulated socket-claim interruption"));
+      },
+    };
+    const interrupted = createServiceControlServer(options({ operationHooks: hooks }));
+    controlServers.push(interrupted);
+
+    await expect(interrupted.listen()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_PATH_UNSAFE",
+    });
+    expect(path.basename(claimPath!)).toMatch(socketClaimPattern);
+    expect((await lstat(claimPath!)).isSocket()).toBe(true);
+    expect(await pathIsMissing(socketPath)).toBe(true);
+
+    const server = await listenControl();
+
+    expect((await readdir(runtimePath)).sort()).toEqual([currentPublicationGuard, "runtime.sock"]);
+    await server.close();
+    expect(await readdir(runtimePath)).toEqual([]);
+  });
+
+  it("fails closed without moving a live crash-left socket claim", async () => {
+    const claimPath = path.join(runtimePath, ".xabcdefghij");
+    await listenNative(claimPath);
+    await chmod(claimPath, 0o600);
+    const before = await snapshotPath(claimPath);
+    const server = createServiceControlServer(options());
+    controlServers.push(server);
+
+    await expect(server.listen()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_ALREADY_RUNNING",
+    });
+    expect(await snapshotPath(claimPath)).toEqual(before);
+    expect(await pathIsMissing(socketPath)).toBe(true);
+  });
+
+  it("fails closed without changing an unsafe crash-left socket claim", async () => {
+    const claimPath = path.join(runtimePath, ".xabcdefghij");
+    await writeFile(claimPath, "preserve-claim", { mode: 0o600 });
+    const before = await snapshotPath(claimPath);
+    const server = createServiceControlServer(options());
+    controlServers.push(server);
+
+    await expect(server.listen()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_PATH_UNSAFE",
+    });
+    expect(await snapshotPath(claimPath)).toEqual(before);
+    expect(await pathIsMissing(socketPath)).toBe(true);
+  });
+
+  it("fails closed when more than one socket claim is present", async () => {
+    const first = path.join(runtimePath, ".xabcdefghij");
+    const second = path.join(runtimePath, ".xjihgfedcba");
+    await leaveClosedSocketLinks(first, second);
+    const firstBefore = await snapshotPath(first);
+    const secondBefore = await snapshotPath(second);
+    const server = createServiceControlServer(options());
+    controlServers.push(server);
+
+    await expect(server.listen()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_PATH_UNSAFE",
+    });
+    expect(await snapshotPath(first)).toEqual(firstBefore);
+    expect(await snapshotPath(second)).toEqual(secondBefore);
+    expect(await pathIsMissing(socketPath)).toBe(true);
+  });
+
+  it("preserves a socket-claim destination present at the controlled boundary", async () => {
+    const claimPath = path.join(runtimePath, ".x0123456789");
+    await leaveClosedSocketLinks(socketPath);
+    const publicBefore = await snapshotPath(socketPath);
+    let claimBefore: PathSnapshot | undefined;
+    const hooks: SocketClaimTestHooks = {
+      createSocketClaimToken: () => "0123456789",
+      beforeSocketClaimDestinationCheck: async (candidatePath, candidateClaimPath) => {
+        expect(candidatePath).toBe(socketPath);
+        expect(candidateClaimPath).toBe(claimPath);
+        await writeFile(candidateClaimPath, "preserve-destination", { mode: 0o600 });
+        claimBefore = await snapshotPath(candidateClaimPath);
+      },
+    };
+    const server = createServiceControlServer(options({ operationHooks: hooks }));
+    controlServers.push(server);
+
+    await expect(server.listen()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_PATH_UNSAFE",
+    });
+    expect(await snapshotPath(socketPath)).toEqual(publicBefore);
+    expect(await snapshotPath(claimPath)).toEqual(claimBefore);
+  });
+
+  it("preserves source reappearance after a staged socket is durably claimed", async () => {
+    const stagedPath = path.join(runtimePath, currentStagedSocket);
+    const preparedReplacement = path.join(runtimePath, "prepared-reappearance.sock");
+    await leaveClosedSocketLinks(stagedPath);
+    const original = await snapshotPath(stagedPath);
+    await leaveClosedSocketLinks(preparedReplacement);
+    const replacement = await snapshotPath(preparedReplacement);
+    const server = createServiceControlServer(
+      options({
+        operationHooks: {
+          afterStagedSocketParentSync: async (candidatePath) => {
+            expect(candidatePath).toBe(stagedPath);
+            await rename(preparedReplacement, candidatePath);
+          },
+        },
+      }),
+    );
+    controlServers.push(server);
+
+    await expect(server.listen()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_PATH_UNSAFE",
+    });
+    const claims = socketClaimEntries(await readdir(runtimePath));
+    expect(claims).toHaveLength(1);
+    expect(await snapshotPath(stagedPath)).toEqual(replacement);
+    expect(await snapshotPath(path.join(runtimePath, claims[0]!))).toEqual(original);
     expect(await pathIsMissing(socketPath)).toBe(true);
   });
 
