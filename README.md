@@ -1,8 +1,8 @@
 # TOSS Agent Runtime
 
-`@toss-software/agent-runtime` is the governed, provider-neutral execution runtime for TOSS. This development baseline publishes Runtime Contract Protocol v1, strict configuration loading, a truthful capability handshake, and the explicit per-user `toss-runtime` service-supervision foundation.
+`@toss-software/agent-runtime` is the governed, provider-neutral execution runtime for TOSS. This development baseline publishes Runtime Contract Protocol v1, strict configuration loading, a truthful capability handshake, immutable append-only run journals, and the explicit per-user `toss-runtime` service-supervision foundation.
 
-> Status: the package remains `0.0.0-development` until all v1 release waves and protected live-provider gates pass. The issue #28 service foundation is implemented, but #28 remains open until issue #1 supplies production-durable `INTERRUPTED` journal persistence. Issues #1, #29, and #30 and npm `1.0.0` remain incomplete. This baseline does not execute agents, call providers, run tools, or expose remote control.
+> Status: the package remains `0.0.0-development` until all v1 release waves and protected live-provider gates pass. Immutable run-journal persistence is implemented; issue #28 still requires its separate real macOS login/native crash-loop acceptance. Issues #29 and #30 and npm `1.0.0` remain incomplete. This baseline does not execute agents, call providers, run tools, or expose remote control.
 
 ## Requirements
 
@@ -49,19 +49,31 @@ Repository acceptance verifies deterministic launchd/systemd definitions, native
 
 `doctor` checks package, platform, Node, configuration, native manager state, restart backoff, and private socket health. A healthy active service with a matching socket identity passes the service check. Missing or stopped service state warns in development and fails in production; backoff, unsafe state, unavailable/degraded control, or identity mismatch fails. See the [Local Service Control v1 contract](docs/contracts/local-service-control-v1.md) for exact native commands, permissions, protocol bounds, stable failures, and shutdown ordering.
 
-`capabilities` remains deliberately fail-closed: an empty or unavailable capability is not an implementation promise. The supervised `serve` process owns the single-instance lock and private local status socket, but agent execution and durable run journals are not implemented in this foundation.
+`capabilities` remains deliberately fail-closed: an empty or unavailable capability is not an implementation promise. The supervised `serve` process owns the single-instance lock, private local status socket, and private append-only run-journal store. Active runs are durably recorded as `INTERRUPTED` before graceful shutdown removes the socket or lock. Agent execution remains unavailable until its later v1 waves.
 
 Stable exit codes are `0` success, `2` usage, `3` invalid input, `4` blocked/policy, `5` validation, `6` conflict/stale revision, `69` unavailable capability, and `70` internal failure.
 
 ## Library API
 
 ```ts
-import { parseExecutionRequest, validateExecutionChain } from "@toss-software/agent-runtime";
+import { randomUUID } from "node:crypto";
+
+import {
+  createRunJournalStore,
+  parseExecutionRequest,
+  validateExecutionChain,
+} from "@toss-software/agent-runtime";
 
 const parsed = parseExecutionRequest(requestBytes);
 if (!parsed.ok) {
   console.error(parsed.code, parsed.issues);
 }
+
+const journal = createRunJournalStore({
+  statePath: "/private/runtime-state",
+  now: () => new Date(),
+  randomId: randomUUID,
+});
 ```
 
 The public parser returns either a validated, deeply frozen domain value or a normalized failure. Input is bounded JSON; duplicate keys, unknown properties, unsupported schema versions, and unsafe JavaScript values are rejected.

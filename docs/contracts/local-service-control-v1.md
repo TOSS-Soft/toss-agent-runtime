@@ -10,9 +10,9 @@ remote control, provider/tool execution, project watching, and operational log
 management are outside this contract.
 
 This foundation does not complete Wave 2. Production-durable `INTERRUPTED`
-journal persistence remains pending issue #1, and issue #28 remains open until
-that integration passes. Issues #1, #29, and #30 and npm `1.0.0` remain
-incomplete.
+journal persistence is implemented through the private run-journal store.
+Issue #28 remains open for its separate real macOS login/native crash-loop
+acceptance. Issues #29 and #30 and npm `1.0.0` remain incomplete.
 
 ## Operator grammar and activation boundary
 
@@ -245,13 +245,14 @@ exit. Rejections from detached cleanup are handled. Graceful and other
 non-timeout shutdowns await the full sequence and preserve the first stable
 primary or finalizer failure.
 
-The supervisor test uses an injected durable `InterruptionRecorder` test double
-that creates a temporary `INTERRUPTED` marker, synchronizes its file, and
-synchronizes the parent directory publication before control drain,
-participant flush, socket close, or lock release can follow. Production
-currently supplies a no-op recorder. Production-durable `INTERRUPTED`
-persistence remains pending issue #1, and issue #28 remains open until that
-integration passes.
+Production uses the same private run-journal store as both recovery participant
+and interruption recorder. It stops external journal intake, verifies each
+active run's exact revision and head hash, appends and synchronizes an
+`INTERRUPTED` entry, and only then permits control drain, participant flush,
+socket close, or lock release. `FAILED`, `BLOCKED`, `COMPLETED`, `CANCELLED`,
+and already `INTERRUPTED` runs are not active shutdown work and remain
+byte-identical. Issue #28 remains open only for its separate real macOS
+login/native crash-loop acceptance.
 
 ## Uninstall preservation
 

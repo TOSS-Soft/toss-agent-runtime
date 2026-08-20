@@ -10,6 +10,7 @@ import {
   RuntimeConfigError,
 } from "../config/load.js";
 import type { LoadedConfig, RuntimeEnvironment } from "../config/types.js";
+import { createRunJournalStore } from "../journal/store.js";
 import type { SignalSource } from "../platform/signals.js";
 import { createBaselineCapabilities } from "../protocol/capabilities.js";
 import { canonicalJson, type JsonValue } from "../protocol/json.js";
@@ -249,6 +250,11 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
       }
       const loaded = await loadConfigured(configPath);
       const executableHash = await options.resolveExecutableHash();
+      const journal = createRunJournalStore({
+        statePath: loaded.config.paths.state,
+        now: options.now,
+        randomId: options.createServiceInstanceId,
+      });
       return runSupervisor({
         loaded,
         signals: options.signals,
@@ -260,15 +266,8 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
         socketProbe: {
           identify: (socketPath) => probeRuntimeServiceIdentity({ socketPath }),
         },
-        recoveryParticipants: [
-          {
-            recover: () => Promise.resolve(),
-            stopIntake: () => undefined,
-            flush: () => Promise.resolve(),
-          },
-        ],
-        // Durable interruption recording is introduced by the run-journal issue.
-        interruptionRecorder: { interruptActive: () => Promise.resolve() },
+        recoveryParticipants: [journal],
+        interruptionRecorder: journal,
         acquireLock: acquireInstanceLock,
         createControlServer: createServiceControlServer,
         onReady: () => {
