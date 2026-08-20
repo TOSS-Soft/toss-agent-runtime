@@ -220,6 +220,105 @@ describe("native per-user service manager", () => {
   );
 
   it.each([
+    ["afterStateStageWrite", "state.stage", "directory"],
+    ["afterStateStageWrite", "state.stage", "symlink"],
+    ["afterStateLink", "state", "directory"],
+    ["afterStateLink", "state", "symlink"],
+  ] as const)(
+    "preserves a %s replacement of %s at the %s failure boundary",
+    async (boundary, entry, replacementKind) => {
+      const runner = new RecordingRunner();
+      let replacementIdentity: { readonly dev: bigint; readonly ino: bigint } | undefined;
+      let replacementPath = "";
+      const artifacts = await linuxFixture(runner, {
+        definitionRemovalHooks: {
+          [boundary]: async () => {
+            const claimName = (await readdir(path.dirname(artifacts.definition))).find((name) =>
+              name.includes("delete-claim"),
+            );
+            expect(claimName).toBeDefined();
+            replacementPath = path.join(path.dirname(artifacts.definition), claimName!, entry);
+            await rm(replacementPath);
+            if (replacementKind === "directory") {
+              await mkdir(replacementPath, { mode: 0o700 });
+              await chmod(replacementPath, 0o700);
+            } else {
+              const target = path.join(
+                path.dirname(path.dirname(artifacts.definition)),
+                "stage-target",
+              );
+              await writeFile(target, "preserve", { mode: 0o600 });
+              await chmod(target, 0o600);
+              await symlink(target, replacementPath);
+            }
+            const metadata = await lstat(replacementPath, { bigint: true });
+            replacementIdentity = { dev: metadata.dev, ino: metadata.ino };
+          },
+        },
+      });
+      await artifacts.manager.install();
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      const after = await lstat(replacementPath, { bigint: true });
+      expect(after.dev).toBe(replacementIdentity?.dev);
+      expect(after.ino).toBe(replacementIdentity?.ino);
+      expect(after.isDirectory()).toBe(replacementKind === "directory");
+      expect(after.isSymbolicLink()).toBe(replacementKind === "symlink");
+      expect(
+        (await readdir(path.dirname(artifacts.definition))).filter((name) =>
+          name.includes("delete-claim"),
+        ),
+      ).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    ["afterStateStageWrite", "state.stage"],
+    ["afterStateLink", "state"],
+  ] as const)(
+    "preserves a replacement regular %s inode at the %s failure boundary",
+    async (boundary, entry) => {
+      const runner = new RecordingRunner();
+      let replacementIdentity: { readonly dev: bigint; readonly ino: bigint } | undefined;
+      let replacementPath = "";
+      const artifacts = await linuxFixture(runner, {
+        definitionRemovalHooks: {
+          [boundary]: async () => {
+            const claimName = (await readdir(path.dirname(artifacts.definition))).find((name) =>
+              name.includes("delete-claim"),
+            );
+            expect(claimName).toBeDefined();
+            replacementPath = path.join(path.dirname(artifacts.definition), claimName!, entry);
+            await rm(replacementPath);
+            await writeFile(replacementPath, "replacement", { mode: 0o600 });
+            await chmod(replacementPath, 0o600);
+            const metadata = await lstat(replacementPath, { bigint: true });
+            replacementIdentity = { dev: metadata.dev, ino: metadata.ino };
+          },
+        },
+      });
+      await artifacts.manager.install();
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      const after = await lstat(replacementPath, { bigint: true });
+      expect(after.isFile()).toBe(true);
+      expect(after.dev).toBe(replacementIdentity?.dev);
+      expect(after.ino).toBe(replacementIdentity?.ino);
+      expect(
+        (await readdir(path.dirname(artifacts.definition))).filter((name) =>
+          name.includes("delete-claim"),
+        ),
+      ).toHaveLength(1);
+    },
+  );
+
+  it.each([
     ["linux", "directory"],
     ["linux", "symlink"],
     ["linux", "cross-owner"],

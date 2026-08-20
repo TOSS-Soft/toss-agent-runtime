@@ -444,6 +444,11 @@ interface ClaimRecord {
   readonly pid: number;
 }
 
+interface ClaimStatePublication {
+  readonly stage?: PrivateRegularFileSnapshot;
+  readonly state?: PrivateRegularFileSnapshot;
+}
+
 function privateDirectoryMode(metadata: BigIntStats): boolean {
   return (safeStatNumber(metadata.mode) & 0o777) === 0o700;
 }
@@ -803,6 +808,46 @@ async function cleanAcceptedClaim(
   );
 }
 
+async function cleanExactUnlinkedClaim(
+  claim: ClaimRecord,
+  publication: ClaimStatePublication,
+  isCurrentUser: CurrentUserCheck,
+): Promise<boolean> {
+  const entries = await claimEntries(claim, isCurrentUser);
+  if (entries.includes(DELETE_CLAIM_DEFINITION_FILE)) return false;
+  const hasStage = entries.includes(DELETE_CLAIM_STAGE_FILE);
+  const hasState = entries.includes(DELETE_CLAIM_STATE_FILE);
+  if (hasStage && publication.stage === undefined) {
+    return false;
+  }
+  if (!hasStage && publication.stage !== undefined && publication.state === undefined) {
+    return false;
+  }
+  if (hasState !== (publication.state !== undefined)) {
+    return false;
+  }
+  if (hasStage && publication.stage !== undefined) {
+    const current = await readClaimFile(claim, DELETE_CLAIM_STAGE_FILE, isCurrentUser);
+    if (
+      !sameIdentity(current, publication.stage) ||
+      !Buffer.from(current.bytes).equals(publication.stage.bytes)
+    ) {
+      return false;
+    }
+  }
+  if (hasState && publication.state !== undefined) {
+    const current = await readClaimFile(claim, DELETE_CLAIM_STATE_FILE, isCurrentUser);
+    if (
+      !sameIdentity(current, publication.state) ||
+      !Buffer.from(current.bytes).equals(publication.state.bytes)
+    ) {
+      return false;
+    }
+  }
+  await cleanClaim(claim, entries, publication.state, undefined, publication.stage, isCurrentUser);
+  return true;
+}
+
 async function pathExists(filePath: string): Promise<boolean> {
   try {
     await lstat(filePath, { bigint: true });
@@ -819,9 +864,11 @@ async function publishClaimState(
   isCurrentUser: CurrentUserCheck,
   hooks: RemoveOwnedDefinitionOptions["hooks"],
   retainClaim: () => void,
+  recordPublication: (publication: ClaimStatePublication) => void,
 ): Promise<PrivateRegularFileSnapshot> {
   const stagePath = path.join(claim.path, DELETE_CLAIM_STAGE_FILE);
   const statePath = path.join(claim.path, DELETE_CLAIM_STATE_FILE);
+  let stage: PrivateRegularFileSnapshot;
   await verifyClaimDirectory(claim, isCurrentUser);
   try {
     const handle = await open(
@@ -841,6 +888,22 @@ async function publishClaimState(
       }
       await handle.writeFile(bytes);
       await handle.sync();
+      const persisted = await handle.stat({ bigint: true });
+      if (
+        !persisted.isFile() ||
+        !isCurrentUserOwner(persisted, stagePath, isCurrentUser) ||
+        !privateFileMode(persisted) ||
+        persisted.dev !== metadata.dev ||
+        persisted.ino !== metadata.ino ||
+        persisted.size !== BigInt(bytes.byteLength)
+      ) {
+        servicePathUnsafe();
+      }
+      stage = {
+        bytes: Uint8Array.from(bytes),
+        device: persisted.dev,
+        inode: persisted.ino,
+      };
     } finally {
       await handle.close();
     }
@@ -848,6 +911,7 @@ async function publishClaimState(
     if (error instanceof RuntimeServiceError) throw error;
     servicePathUnsafe();
   }
+  recordPublication({ stage });
   try {
     await hooks?.afterStateStageWrite?.();
   } catch {
@@ -855,13 +919,19 @@ async function publishClaimState(
     throw new Error("interrupted state-stage write");
   }
   await verifyClaimDirectory(claim, isCurrentUser);
-  const stage = await readClaimFile(claim, DELETE_CLAIM_STAGE_FILE, isCurrentUser);
-  if (!Buffer.from(stage.bytes).equals(bytes)) servicePathUnsafe();
+  const staged = await readClaimFile(claim, DELETE_CLAIM_STAGE_FILE, isCurrentUser);
+  if (!sameIdentity(staged, stage) || !Buffer.from(staged.bytes).equals(stage.bytes)) {
+    servicePathUnsafe();
+  }
   try {
     await link(stagePath, statePath);
   } catch {
     servicePathUnsafe();
   }
+  const state = await readClaimFile(claim, DELETE_CLAIM_STATE_FILE, isCurrentUser);
+  if (!sameIdentity(stage, state) || !Buffer.from(state.bytes).equals(stage.bytes))
+    servicePathUnsafe();
+  recordPublication({ stage, state });
   try {
     await hooks?.afterStateLink?.();
   } catch {
@@ -877,8 +947,10 @@ async function publishClaimState(
     retainClaim();
     throw new Error("interrupted state sync");
   }
-  const state = await readClaimFile(claim, DELETE_CLAIM_STATE_FILE, isCurrentUser);
-  if (!sameIdentity(stage, state) || !Buffer.from(state.bytes).equals(bytes)) servicePathUnsafe();
+  const currentState = await readClaimFile(claim, DELETE_CLAIM_STATE_FILE, isCurrentUser);
+  if (!sameIdentity(currentState, state) || !Buffer.from(currentState.bytes).equals(state.bytes)) {
+    servicePathUnsafe();
+  }
   try {
     await hooks?.beforeStateStageUnlink?.();
   } catch {
@@ -1014,6 +1086,7 @@ export async function removeOwnedDefinition(
   const isCurrentUser = options.isCurrentUser ?? defaultCurrentUserCheck;
   let claim: ClaimRecord | undefined;
   let state: PrivateRegularFileSnapshot | undefined;
+  let publication: ClaimStatePublication = {};
   let linked = false;
   let retainUnlinkedClaim = false;
   try {
@@ -1046,6 +1119,9 @@ export async function removeOwnedDefinition(
       options.hooks,
       () => {
         retainUnlinkedClaim = true;
+      },
+      (published) => {
+        publication = published;
       },
     );
     const current = await readPrivateRegularFileSnapshot(filePath, { isCurrentUser });
@@ -1185,16 +1261,7 @@ export async function removeOwnedDefinition(
   } catch (error) {
     if (!linked && !retainUnlinkedClaim && claim !== undefined) {
       try {
-        const entries = await claimEntries(claim, isCurrentUser);
-        const stage = entries.includes(DELETE_CLAIM_STAGE_FILE)
-          ? await readClaimFile(claim, DELETE_CLAIM_STAGE_FILE, isCurrentUser)
-          : undefined;
-        const stored = entries.includes(DELETE_CLAIM_STATE_FILE)
-          ? await readClaimFile(claim, DELETE_CLAIM_STATE_FILE, isCurrentUser)
-          : undefined;
-        if (!entries.includes(DELETE_CLAIM_DEFINITION_FILE)) {
-          await cleanClaim(claim, entries, stored, undefined, stage, isCurrentUser);
-        }
+        await cleanExactUnlinkedClaim(claim, publication, isCurrentUser);
       } catch {
         // A changed or malformed claim is retained and fails closed.
       }
