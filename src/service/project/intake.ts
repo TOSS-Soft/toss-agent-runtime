@@ -6,9 +6,9 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
-  readFileSync,
   readdirSync,
   readSync,
+  realpathSync,
   renameSync,
   unlinkSync,
   writeSync,
@@ -21,22 +21,18 @@ import {
   candidateJobKey,
   isSafeProjectRelativePath,
   parseCandidateJobIntent,
+  PROJECT_CANDIDATE_JSON_LIMITS,
 } from "./contracts.js";
 import { RuntimeProjectError } from "./errors.js";
-import type {
-  CandidateJobIntentV1,
-  ProjectChange,
-  ProjectPendingWindowV1,
-  ProjectRegistration,
-} from "./types.js";
+import type { CandidateJobIntentV1, ProjectChange, ProjectRegistration } from "./types.js";
 
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const HASH_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const DECIMAL_PATTERN = /^(0|[1-9][0-9]{0,19})$/u;
 const FINAL_PENDING_PATTERN =
-  /^([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/u;
+  /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.json$/iu;
 const STAGED_PENDING_PATTERN =
-  /^\.([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.stage$/u;
+  /^\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.stage$/iu;
 const DEBOUNCE_MS = 200;
 const MAX_DEBOUNCE_MS = 2_000;
 const MAX_PENDING_BYTES = 2 * 1024 * 1024;
@@ -52,6 +48,20 @@ interface FileSnapshot {
   readonly identity: FileIdentity;
 }
 
+interface ProjectPendingWindowV1 {
+  readonly protocol_version: "runtime-contract.v1";
+  readonly schema_version: "project-pending-window.v1";
+  readonly document_type: "project-pending-window";
+  readonly project_id: string;
+  readonly registry_revision: number;
+  readonly canonical_root: string;
+  readonly manifest_hash: `sha256:${string}`;
+  readonly opened_at: string;
+  readonly updated_at: string;
+  readonly deadline_at: string;
+  readonly changes: readonly ProjectChange[];
+}
+
 interface PendingState {
   document: ProjectPendingWindowV1;
   file: FileSnapshot;
@@ -60,10 +70,16 @@ interface PendingState {
 
 interface Coordinator {
   tail: Promise<unknown>;
+  readonly windows: Map<string, PendingState>;
+  publicationBlocked: boolean;
 }
 
 export interface ProjectIntakeOperationHooks {
+  readonly beforePendingFileSync?: (stagePath: string) => void;
   readonly afterPendingFileSync?: (stagePath: string) => void;
+  readonly beforeCandidateFileSync?: (candidatePath: string) => void;
+  readonly beforePrivateFileReplaySync?: (privatePath: string) => void;
+  readonly beforeDirectorySync?: (directoryPath: string) => void;
   readonly afterCandidateAppend?: (candidate: CandidateJobIntentV1) => void;
   readonly beforePendingUnlink?: (pendingPath: string) => void;
 }
@@ -77,6 +93,7 @@ export interface CreateProjectIntakeOptions {
 
 export interface ProjectIntake {
   record(registration: ProjectRegistration, change: ProjectChange): Promise<void>;
+  recordBatch(registration: ProjectRegistration, changes: readonly ProjectChange[]): Promise<void>;
   recover(registrations: readonly ProjectRegistration[]): Promise<void>;
   discard(projectId: string): Promise<void>;
   stopIntake(): void;
@@ -158,14 +175,36 @@ function assertDirectory(metadata: BigIntStats, exactPrivate: boolean): void {
   }
 }
 
-function syncDirectory(candidate: string): void {
+function syncDirectory(
+  candidate: string,
+  privateRoot: string,
+  beforeSync?: (directoryPath: string) => void,
+): void {
   let descriptor: number | undefined;
   try {
+    const before = lstatSync(candidate, { bigint: true });
+    assertDirectory(before, isAtOrBelow(candidate, privateRoot));
     descriptor = openSync(
       candidate,
       constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
     );
+    const held = fstatSync(descriptor, { bigint: true });
+    assertDirectory(held, isAtOrBelow(candidate, privateRoot));
+    if (!sameIdentity(identity(before), identity(held))) {
+      projectError("RUNTIME_PROJECT_PATH_UNSAFE");
+    }
+    beforeSync?.(candidate);
     fsyncSync(descriptor);
+    const after = lstatSync(candidate, { bigint: true });
+    const heldAfter = fstatSync(descriptor, { bigint: true });
+    assertDirectory(after, isAtOrBelow(candidate, privateRoot));
+    assertDirectory(heldAfter, isAtOrBelow(candidate, privateRoot));
+    if (
+      !sameIdentity(identity(before), identity(after)) ||
+      !sameIdentity(identity(before), identity(heldAfter))
+    ) {
+      projectError("RUNTIME_PROJECT_PATH_UNSAFE");
+    }
   } catch (error) {
     if (error instanceof RuntimeProjectError) throw error;
     projectError("RUNTIME_PROJECT_UNAVAILABLE");
@@ -174,7 +213,11 @@ function syncDirectory(candidate: string): void {
   }
 }
 
-function ensurePrivateDirectory(candidate: string, privateRoot: string): void {
+function ensurePrivateDirectory(
+  candidate: string,
+  privateRoot: string,
+  beforeSync?: (directoryPath: string) => void,
+): void {
   for (const current of directoryCandidates(candidate)) {
     let metadata: BigIntStats;
     try {
@@ -183,8 +226,6 @@ function ensurePrivateDirectory(candidate: string, privateRoot: string): void {
       if (errorCode(error) !== "ENOENT") projectError("RUNTIME_PROJECT_PATH_UNSAFE");
       try {
         mkdirSync(current, { mode: 0o700 });
-        syncDirectory(current);
-        syncDirectory(path.dirname(current));
         metadata = lstatSync(current, { bigint: true });
       } catch (mkdirError) {
         if (errorCode(mkdirError) !== "EEXIST") projectError("RUNTIME_PROJECT_UNAVAILABLE");
@@ -192,6 +233,13 @@ function ensurePrivateDirectory(candidate: string, privateRoot: string): void {
       }
     }
     assertDirectory(metadata, isAtOrBelow(current, privateRoot));
+    syncDirectory(current, privateRoot, beforeSync);
+    syncDirectory(path.dirname(current), privateRoot, beforeSync);
+    const after = lstatSync(current, { bigint: true });
+    assertDirectory(after, isAtOrBelow(current, privateRoot));
+    if (!sameIdentity(identity(metadata), identity(after))) {
+      projectError("RUNTIME_PROJECT_PATH_UNSAFE");
+    }
   }
 }
 
@@ -246,15 +294,33 @@ function exactBytes(
   if (!actual.equals(Buffer.from(expectedBytes))) projectError("RUNTIME_PROJECT_PATH_UNSAFE");
 }
 
-function readPrivateFile(candidate: string, maximumBytes: number): FileSnapshot | null {
+function readPrivateFile(
+  candidate: string,
+  maximumBytes: number,
+  privateRoot: string,
+  beforeFileSync?: (privatePath: string) => void,
+  beforeDirectorySync?: (directoryPath: string) => void,
+): FileSnapshot | null {
   let descriptor: number | undefined;
   try {
     const before = lstatSync(candidate, { bigint: true });
     const expectedIdentity = assertPrivateFile(before);
     if (before.size > BigInt(maximumBytes)) projectError("RUNTIME_PROJECT_INTAKE_CORRUPT");
     descriptor = openSync(candidate, constants.O_RDONLY | constants.O_NOFOLLOW);
-    assertPrivateFile(fstatSync(descriptor, { bigint: true }), expectedIdentity);
-    const bytes = readFileSync(descriptor);
+    const held = fstatSync(descriptor, { bigint: true });
+    assertPrivateFile(held, expectedIdentity);
+    if (held.size > BigInt(maximumBytes)) projectError("RUNTIME_PROJECT_INTAKE_CORRUPT");
+    const bytes = Buffer.alloc(Number(held.size));
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      const count = readSync(descriptor, bytes, offset, bytes.byteLength - offset, offset);
+      if (count === 0) projectError("RUNTIME_PROJECT_PATH_UNSAFE");
+      offset += count;
+    }
+    beforeFileSync?.(candidate);
+    fsyncSync(descriptor);
+    exactBytes(candidate, descriptor, expectedIdentity, bytes);
+    syncDirectory(path.dirname(candidate), privateRoot, beforeDirectorySync);
     exactBytes(candidate, descriptor, expectedIdentity, bytes);
     return { bytes, identity: expectedIdentity };
   } catch (error) {
@@ -267,7 +333,7 @@ function readPrivateFile(candidate: string, maximumBytes: number): FileSnapshot 
 }
 
 function canonicalBytes(value: unknown): Uint8Array {
-  return Buffer.from(canonicalJson(value), "utf8");
+  return Buffer.from(canonicalJson(value, PROJECT_CANDIDATE_JSON_LIMITS), "utf8");
 }
 
 function plainObject(value: JsonValue): value is { readonly [key: string]: JsonValue } {
@@ -300,6 +366,21 @@ function sortedChanges(changes: Iterable<ProjectChange>): readonly ProjectChange
   );
 }
 
+function reduceChange(
+  current: ProjectChange | undefined,
+  next: ProjectChange,
+): ProjectChange | null {
+  if (current === undefined) return next;
+  if (current.kind === "CREATED" && next.kind === "REMOVED") return null;
+  if (current.kind === "REMOVED" && next.kind !== "REMOVED") {
+    return Object.freeze({ kind: "CHANGED", path: next.path, identity: next.identity });
+  }
+  if (current.kind === "CREATED" && next.kind === "CHANGED") {
+    return Object.freeze({ kind: "CREATED", path: next.path, identity: next.identity });
+  }
+  return next;
+}
+
 function candidateFor(
   registration: ProjectRegistration,
   changes: readonly ProjectChange[],
@@ -328,7 +409,7 @@ function validatedCandidate(
   createdAt: string,
 ): CandidateJobIntentV1 {
   const candidate = candidateFor(registration, sortedChanges(changes), createdAt);
-  const parsed = parseCandidateJobIntent(canonicalJson(candidate));
+  const parsed = parseCandidateJobIntent(canonicalJson(candidate, PROJECT_CANDIDATE_JSON_LIMITS));
   if (!parsed.ok) projectError("RUNTIME_PROJECT_INVALID");
   return parsed.value;
 }
@@ -338,7 +419,7 @@ function parsePending(bytes: Uint8Array): ProjectPendingWindowV1 {
     const value = parseJsonBytes(bytes, {
       maxBytes: MAX_PENDING_BYTES,
       maxDepth: 16,
-      maxMembers: 20_000,
+      maxMembers: PROJECT_CANDIDATE_JSON_LIMITS.maxMembers,
     });
     const keys = [
       "canonical_root",
@@ -406,7 +487,11 @@ function parsePending(bytes: Uint8Array): ProjectPendingWindowV1 {
       deadline_at: value.deadline_at,
       changes: candidate.changes,
     });
-    if (!Buffer.from(bytes).equals(Buffer.from(canonicalJson(pending), "utf8"))) {
+    if (
+      !Buffer.from(bytes).equals(
+        Buffer.from(canonicalJson(pending, PROJECT_CANDIDATE_JSON_LIMITS), "utf8"),
+      )
+    ) {
       projectError("RUNTIME_PROJECT_INTAKE_CORRUPT");
     }
     return pending;
@@ -456,39 +541,70 @@ export function createProjectIntake(options: CreateProjectIntakeOptions): Projec
   const projectsPath = path.join(options.statePath, "projects");
   const pendingDirectory = path.join(projectsPath, "pending");
   const intakeDirectory = path.join(projectsPath, "intake");
+  const quarantineDirectory = path.join(projectsPath, "quarantine");
   const candidatesPath = path.join(intakeDirectory, "candidates.jsonl");
   const requestedStatePath = path.resolve(options.statePath);
-  const windows = new Map<string, PendingState>();
+  let windows = new Map<string, PendingState>();
   const candidates = new Map<string, CandidateJobIntentV1>();
   let candidateFile: FileSnapshot | null = null;
   let candidateLoaded = false;
   let stopped = false;
+  let sharedCoordinator: Coordinator | undefined;
   let coordinatorPromise: Promise<Coordinator> | undefined;
   const pendingOperations = new Set<Promise<unknown>>();
+  const readPrivate = (candidate: string, maximumBytes: number): FileSnapshot | null =>
+    readPrivateFile(
+      candidate,
+      maximumBytes,
+      requestedStatePath,
+      options.operationHooks?.beforePrivateFileReplaySync,
+      options.operationHooks?.beforeDirectorySync,
+    );
 
   const ensureRoots = (): void => {
-    ensurePrivateDirectory(options.statePath, options.statePath);
-    ensurePrivateDirectory(projectsPath, options.statePath);
-    ensurePrivateDirectory(pendingDirectory, options.statePath);
-    ensurePrivateDirectory(intakeDirectory, options.statePath);
+    const beforeSync = options.operationHooks?.beforeDirectorySync;
+    ensurePrivateDirectory(options.statePath, requestedStatePath, beforeSync);
+    ensurePrivateDirectory(projectsPath, requestedStatePath, beforeSync);
+    ensurePrivateDirectory(pendingDirectory, requestedStatePath, beforeSync);
+    ensurePrivateDirectory(intakeDirectory, requestedStatePath, beforeSync);
+    ensurePrivateDirectory(quarantineDirectory, requestedStatePath, beforeSync);
   };
 
   const coordinator = async (): Promise<Coordinator> => {
-    ensureRoots();
-    coordinatorPromise ??= Promise.resolve().then(() => {
-      let shared = coordinators.get(requestedStatePath)?.deref();
-      if (shared === undefined) {
-        shared = { tail: Promise.resolve() };
-        coordinators.set(requestedStatePath, new WeakRef(shared));
-      }
-      return shared;
-    });
+    if (coordinatorPromise === undefined) {
+      coordinatorPromise = Promise.resolve()
+        .then(() => {
+          ensureRoots();
+          let canonicalStatePath: string;
+          try {
+            canonicalStatePath = realpathSync(requestedStatePath);
+          } catch {
+            return projectError("RUNTIME_PROJECT_UNAVAILABLE");
+          }
+          let shared = coordinators.get(canonicalStatePath)?.deref();
+          if (shared === undefined) {
+            shared = { tail: Promise.resolve(), windows: new Map(), publicationBlocked: false };
+            coordinators.set(canonicalStatePath, new WeakRef(shared));
+          }
+          return shared;
+        })
+        .catch((error: unknown) => {
+          coordinatorPromise = undefined;
+          throw error;
+        });
+    }
     return coordinatorPromise;
   };
 
   const enqueue = <T>(operation: () => Promise<T> | T): Promise<T> => {
     const scheduled = coordinator().then(async (shared) => {
-      const current = shared.tail.catch(() => undefined).then(operation);
+      const current = shared.tail
+        .catch(() => undefined)
+        .then(() => {
+          sharedCoordinator = shared;
+          windows = shared.windows;
+          return operation();
+        });
       shared.tail = current;
       return current;
     });
@@ -497,23 +613,92 @@ export function createProjectIntake(options: CreateProjectIntakeOptions): Projec
     return scheduled;
   };
 
+  const recoverPartialCandidates = (
+    expected: FileSnapshot,
+    prefix: Uint8Array,
+    fragment: Uint8Array,
+  ): FileSnapshot => {
+    const randomId = options.randomId();
+    if (!UUID_PATTERN.test(randomId)) projectError("RUNTIME_PROJECT_INVALID");
+    const quarantinePath = path.join(quarantineDirectory, `project-intake-${randomId}.bin`);
+    const stagePath = path.join(intakeDirectory, `.candidates-recovery.${randomId}.stage`);
+    let quarantine: number | undefined;
+    let stage: number | undefined;
+    let current: number | undefined;
+    try {
+      quarantine = openSync(
+        quarantinePath,
+        constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW,
+        0o600,
+      );
+      const quarantineIdentity = assertPrivateFile(fstatSync(quarantine, { bigint: true }));
+      writeAll(quarantine, fragment);
+      fsyncSync(quarantine);
+      exactBytes(quarantinePath, quarantine, quarantineIdentity, fragment);
+      syncDirectory(
+        quarantineDirectory,
+        requestedStatePath,
+        options.operationHooks?.beforeDirectorySync,
+      );
+      exactBytes(quarantinePath, quarantine, quarantineIdentity, fragment);
+
+      stage = openSync(
+        stagePath,
+        constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW,
+        0o600,
+      );
+      const stageIdentity = assertPrivateFile(fstatSync(stage, { bigint: true }));
+      writeAll(stage, prefix);
+      fsyncSync(stage);
+      exactBytes(stagePath, stage, stageIdentity, prefix);
+      current = openSync(candidatesPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+      exactBytes(candidatesPath, current, expected.identity, expected.bytes);
+      renameSync(stagePath, candidatesPath);
+      exactBytes(candidatesPath, stage, stageIdentity, prefix);
+      syncDirectory(
+        intakeDirectory,
+        requestedStatePath,
+        options.operationHooks?.beforeDirectorySync,
+      );
+      exactBytes(candidatesPath, stage, stageIdentity, prefix);
+    } catch (error) {
+      if (error instanceof RuntimeProjectError) throw error;
+      projectError("RUNTIME_PROJECT_UNAVAILABLE");
+    } finally {
+      if (current !== undefined) closeSync(current);
+      if (stage !== undefined) closeSync(stage);
+      if (quarantine !== undefined) closeSync(quarantine);
+    }
+    const recovered = readPrivate(candidatesPath, MAX_CANDIDATE_BYTES);
+    if (recovered === null || !Buffer.from(recovered.bytes).equals(Buffer.from(prefix))) {
+      projectError("RUNTIME_PROJECT_INTAKE_CORRUPT");
+    }
+    return recovered;
+  };
+
   const loadCandidates = (): void => {
     if (candidateLoaded) return;
-    candidateFile = readPrivateFile(candidatesPath, MAX_CANDIDATE_BYTES);
+    candidateFile = readPrivate(candidatesPath, MAX_CANDIDATE_BYTES);
     candidates.clear();
     if (candidateFile !== null) {
       const buffer = Buffer.from(candidateFile.bytes);
-      if (buffer.byteLength === 0 || buffer.at(-1) !== 0x0a) {
+      if (buffer.byteLength === 0) projectError("RUNTIME_PROJECT_INTAKE_CORRUPT");
+      const lastNewline = buffer.lastIndexOf(0x0a);
+      const prefixLength = lastNewline < 0 ? 0 : lastNewline + 1;
+      const fragment = buffer.subarray(prefixLength);
+      if (fragment.byteLength > 0 && prefixLength === 0) {
         projectError("RUNTIME_PROJECT_INTAKE_CORRUPT");
       }
       let start = 0;
-      for (let end = 0; end < buffer.byteLength; end += 1) {
+      for (let end = 0; end < prefixLength; end += 1) {
         if (buffer[end] !== 0x0a) continue;
         const line = buffer.subarray(start, end);
         const parsed = parseCandidateJobIntent(line);
         if (
           !parsed.ok ||
-          !Buffer.from(canonicalJson(parsed.value), "utf8").equals(line) ||
+          !Buffer.from(canonicalJson(parsed.value, PROJECT_CANDIDATE_JSON_LIMITS), "utf8").equals(
+            line,
+          ) ||
           candidates.has(parsed.value.candidate_key)
         ) {
           projectError("RUNTIME_PROJECT_INTAKE_CORRUPT");
@@ -521,15 +706,51 @@ export function createProjectIntake(options: CreateProjectIntakeOptions): Projec
         candidates.set(parsed.value.candidate_key, parsed.value);
         start = end + 1;
       }
+      if (fragment.byteLength > 0) {
+        candidateFile = recoverPartialCandidates(
+          candidateFile,
+          buffer.subarray(0, prefixLength),
+          fragment,
+        );
+      }
     }
     candidateLoaded = true;
+  };
+
+  const synchronizeCandidateFile = (): void => {
+    if (candidateFile === null) projectError("RUNTIME_PROJECT_INTAKE_CORRUPT");
+    let descriptor: number | undefined;
+    try {
+      descriptor = openSync(candidatesPath, constants.O_RDWR | constants.O_NOFOLLOW);
+      exactBytes(candidatesPath, descriptor, candidateFile.identity, candidateFile.bytes);
+      options.operationHooks?.beforeCandidateFileSync?.(candidatesPath);
+      fsyncSync(descriptor);
+      exactBytes(candidatesPath, descriptor, candidateFile.identity, candidateFile.bytes);
+      syncDirectory(
+        intakeDirectory,
+        requestedStatePath,
+        options.operationHooks?.beforeDirectorySync,
+      );
+      exactBytes(candidatesPath, descriptor, candidateFile.identity, candidateFile.bytes);
+    } catch (error) {
+      if (error instanceof RuntimeProjectError) throw error;
+      throw error;
+    } finally {
+      if (descriptor !== undefined) closeSync(descriptor);
+    }
   };
 
   const appendCandidate = (candidate: CandidateJobIntentV1): void => {
     candidateLoaded = false;
     loadCandidates();
-    if (candidates.has(candidate.candidate_key)) return;
-    const line = Buffer.from(`${canonicalJson(candidate)}\n`, "utf8");
+    if (candidates.has(candidate.candidate_key)) {
+      synchronizeCandidateFile();
+      return;
+    }
+    const line = Buffer.from(
+      `${canonicalJson(candidate, PROJECT_CANDIDATE_JSON_LIMITS)}\n`,
+      "utf8",
+    );
     const priorBytes = candidateFile?.bytes ?? Buffer.alloc(0);
     if (priorBytes.byteLength + line.byteLength > MAX_CANDIDATE_BYTES) {
       projectError("RUNTIME_PROJECT_UNAVAILABLE");
@@ -544,9 +765,14 @@ export function createProjectIntake(options: CreateProjectIntakeOptions): Projec
         );
         const created = assertPrivateFile(fstatSync(descriptor, { bigint: true }));
         writeAll(descriptor, line);
+        options.operationHooks?.beforeCandidateFileSync?.(candidatesPath);
         fsyncSync(descriptor);
         exactBytes(candidatesPath, descriptor, created, line);
-        syncDirectory(intakeDirectory);
+        syncDirectory(
+          intakeDirectory,
+          requestedStatePath,
+          options.operationHooks?.beforeDirectorySync,
+        );
         exactBytes(candidatesPath, descriptor, created, line);
         candidateFile = { bytes: line, identity: created };
       } else {
@@ -557,6 +783,7 @@ export function createProjectIntake(options: CreateProjectIntakeOptions): Projec
         exactBytes(candidatesPath, descriptor, candidateFile.identity, candidateFile.bytes);
         writeAll(descriptor, line);
         const combined = Buffer.concat([Buffer.from(candidateFile.bytes), line]);
+        options.operationHooks?.beforeCandidateFileSync?.(candidatesPath);
         fsyncSync(descriptor);
         exactBytes(candidatesPath, descriptor, candidateFile.identity, combined);
         candidateFile = { bytes: combined, identity: candidateFile.identity };
@@ -574,6 +801,26 @@ export function createProjectIntake(options: CreateProjectIntakeOptions): Projec
   const pendingPath = (projectId: string): string =>
     path.join(pendingDirectory, `${projectId}.json`);
 
+  const refreshWindow = (projectId: string): PendingState | undefined => {
+    const previous = windows.get(projectId);
+    if (previous?.timer !== undefined) clearTimeout(previous.timer);
+    const file = readPrivate(pendingPath(projectId), MAX_PENDING_BYTES);
+    if (file === null) {
+      syncDirectory(
+        pendingDirectory,
+        requestedStatePath,
+        options.operationHooks?.beforeDirectorySync,
+      );
+      windows.delete(projectId);
+      return undefined;
+    }
+    const document = parsePending(file.bytes);
+    if (document.project_id !== projectId) projectError("RUNTIME_PROJECT_INTAKE_CORRUPT");
+    const state: PendingState = { document, file };
+    windows.set(projectId, state);
+    return state;
+  };
+
   const publishPending = (
     document: ProjectPendingWindowV1,
     expected: FileSnapshot | null,
@@ -585,6 +832,7 @@ export function createProjectIntake(options: CreateProjectIntakeOptions): Projec
     const bytes = canonicalBytes(document);
     if (bytes.byteLength > MAX_PENDING_BYTES) projectError("RUNTIME_PROJECT_UNAVAILABLE");
     let stage: number | undefined;
+    let stageIdentity: FileIdentity | undefined;
     let current: number | undefined;
     try {
       stage = openSync(
@@ -592,15 +840,20 @@ export function createProjectIntake(options: CreateProjectIntakeOptions): Projec
         constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW,
         0o600,
       );
-      const stageIdentity = assertPrivateFile(fstatSync(stage, { bigint: true }));
+      stageIdentity = assertPrivateFile(fstatSync(stage, { bigint: true }));
       writeAll(stage, bytes);
+      options.operationHooks?.beforePendingFileSync?.(stagePath);
       fsyncSync(stage);
       exactBytes(stagePath, stage, stageIdentity, bytes);
-      syncDirectory(pendingDirectory);
+      syncDirectory(
+        pendingDirectory,
+        requestedStatePath,
+        options.operationHooks?.beforeDirectorySync,
+      );
       exactBytes(stagePath, stage, stageIdentity, bytes);
       options.operationHooks?.afterPendingFileSync?.(stagePath);
       if (expected === null) {
-        if (readPrivateFile(finalPath, MAX_PENDING_BYTES) !== null) {
+        if (readPrivate(finalPath, MAX_PENDING_BYTES) !== null) {
           projectError("RUNTIME_PROJECT_INTAKE_CORRUPT");
         }
       } else {
@@ -609,10 +862,59 @@ export function createProjectIntake(options: CreateProjectIntakeOptions): Projec
       }
       renameSync(stagePath, finalPath);
       exactBytes(finalPath, stage, stageIdentity, bytes);
-      syncDirectory(pendingDirectory);
+      syncDirectory(
+        pendingDirectory,
+        requestedStatePath,
+        options.operationHooks?.beforeDirectorySync,
+      );
       exactBytes(finalPath, stage, stageIdentity, bytes);
       return { bytes, identity: stageIdentity };
     } catch (error) {
+      if (stage !== undefined && stageIdentity !== undefined) {
+        try {
+          let stageExists = true;
+          try {
+            assertPrivateFile(lstatSync(stagePath, { bigint: true }), stageIdentity);
+          } catch (stageError) {
+            if (errorCode(stageError) !== "ENOENT") throw stageError;
+            stageExists = false;
+          }
+          if (stageExists) {
+            unlinkSync(stagePath);
+            syncDirectory(
+              pendingDirectory,
+              requestedStatePath,
+              options.operationHooks?.beforeDirectorySync,
+            );
+            try {
+              lstatSync(stagePath, { bigint: true });
+              projectError("RUNTIME_PROJECT_PATH_UNSAFE");
+            } catch (absenceError) {
+              if (errorCode(absenceError) !== "ENOENT") throw absenceError;
+            }
+          } else {
+            exactBytes(finalPath, stage, stageIdentity, bytes);
+            fsyncSync(stage);
+            exactBytes(finalPath, stage, stageIdentity, bytes);
+            syncDirectory(
+              pendingDirectory,
+              requestedStatePath,
+              options.operationHooks?.beforeDirectorySync,
+            );
+            exactBytes(finalPath, stage, stageIdentity, bytes);
+            return { bytes, identity: stageIdentity };
+          }
+        } catch {
+          if (sharedCoordinator !== undefined) sharedCoordinator.publicationBlocked = true;
+          for (const state of windows.values()) {
+            if (state.timer !== undefined) clearTimeout(state.timer);
+            delete state.timer;
+          }
+        }
+      }
+      if (stage !== undefined && stageIdentity === undefined && sharedCoordinator !== undefined) {
+        sharedCoordinator.publicationBlocked = true;
+      }
       if (error instanceof RuntimeProjectError) throw error;
       throw error;
     } finally {
@@ -630,11 +932,26 @@ export function createProjectIntake(options: CreateProjectIntakeOptions): Projec
       options.operationHooks?.beforePendingUnlink?.(candidate);
       exactBytes(candidate, descriptor, state.file.identity, state.file.bytes);
       unlinkSync(candidate);
-      syncDirectory(pendingDirectory);
-      if (readPrivateFile(candidate, MAX_PENDING_BYTES) !== null) {
+      syncDirectory(
+        pendingDirectory,
+        requestedStatePath,
+        options.operationHooks?.beforeDirectorySync,
+      );
+      if (readPrivate(candidate, MAX_PENDING_BYTES) !== null) {
         projectError("RUNTIME_PROJECT_PATH_UNSAFE");
       }
     } catch (error) {
+      if (errorCode(error) === "ENOENT") {
+        syncDirectory(
+          pendingDirectory,
+          requestedStatePath,
+          options.operationHooks?.beforeDirectorySync,
+        );
+        if (readPrivate(candidate, MAX_PENDING_BYTES) !== null) {
+          projectError("RUNTIME_PROJECT_PATH_UNSAFE");
+        }
+        return;
+      }
       if (error instanceof RuntimeProjectError) throw error;
       throw error;
     } finally {
@@ -671,7 +988,10 @@ export function createProjectIntake(options: CreateProjectIntakeOptions): Projec
     const delay = Math.max(0, Math.min(updated + DEBOUNCE_MS, deadline) - now);
     state.timer = setTimeout(() => {
       delete state.timer;
-      void enqueue(() => flushWindow(state.document.project_id)).catch(() => undefined);
+      void enqueue(() => {
+        refreshWindow(state.document.project_id);
+        flushWindow(state.document.project_id);
+      }).catch(() => undefined);
     }, delay);
   };
 
@@ -681,8 +1001,23 @@ export function createProjectIntake(options: CreateProjectIntakeOptions): Projec
       descriptor = openSync(candidate, constants.O_RDONLY | constants.O_NOFOLLOW);
       exactBytes(candidate, descriptor, snapshot.identity, snapshot.bytes);
       unlinkSync(candidate);
-      syncDirectory(pendingDirectory);
+      syncDirectory(
+        pendingDirectory,
+        requestedStatePath,
+        options.operationHooks?.beforeDirectorySync,
+      );
     } catch (error) {
+      if (errorCode(error) === "ENOENT") {
+        syncDirectory(
+          pendingDirectory,
+          requestedStatePath,
+          options.operationHooks?.beforeDirectorySync,
+        );
+        if (readPrivate(candidate, MAX_PENDING_BYTES) !== null) {
+          projectError("RUNTIME_PROJECT_PATH_UNSAFE");
+        }
+        return;
+      }
       if (error instanceof RuntimeProjectError) throw error;
       projectError("RUNTIME_PROJECT_UNAVAILABLE");
     } finally {
@@ -692,6 +1027,10 @@ export function createProjectIntake(options: CreateProjectIntakeOptions): Projec
 
   const recoverFiles = (registrations: readonly ProjectRegistration[]): void => {
     loadCandidates();
+    for (const state of windows.values()) {
+      if (state.timer !== undefined) clearTimeout(state.timer);
+    }
+    windows.clear();
     const active = new Map(registrations.map((entry) => [entry.project_id, entry]));
     const finals = new Map<string, { path: string; snapshot: FileSnapshot }>();
     const stages = new Map<string, { path: string; snapshot: FileSnapshot }>();
@@ -704,7 +1043,7 @@ export function createProjectIntake(options: CreateProjectIntakeOptions): Projec
       const projectId = finalMatch?.[1] ?? stageMatch?.[1];
       if (projectId === undefined) projectError("RUNTIME_PROJECT_INTAKE_CORRUPT");
       const candidate = path.join(pendingDirectory, name);
-      const snapshot = readPrivateFile(candidate, MAX_PENDING_BYTES);
+      const snapshot = readPrivate(candidate, MAX_PENDING_BYTES);
       if (snapshot === null) projectError("RUNTIME_PROJECT_INTAKE_CORRUPT");
       if (finalMatch !== null) {
         if (finals.has(projectId)) projectError("RUNTIME_PROJECT_INTAKE_CORRUPT");
@@ -731,8 +1070,12 @@ export function createProjectIntake(options: CreateProjectIntakeOptions): Projec
         }
       }
       renameSync(staged.path, pendingPath(projectId));
-      syncDirectory(pendingDirectory);
-      const published = readPrivateFile(pendingPath(projectId), MAX_PENDING_BYTES);
+      syncDirectory(
+        pendingDirectory,
+        requestedStatePath,
+        options.operationHooks?.beforeDirectorySync,
+      );
+      const published = readPrivate(pendingPath(projectId), MAX_PENDING_BYTES);
       if (published === null || !sameIdentity(published.identity, staged.snapshot.identity)) {
         projectError("RUNTIME_PROJECT_PATH_UNSAFE");
       }
@@ -751,47 +1094,62 @@ export function createProjectIntake(options: CreateProjectIntakeOptions): Projec
     for (const projectId of [...windows.keys()].sort()) flushWindow(projectId);
   };
 
-  return {
-    record(registration, change) {
-      if (stopped) return Promise.reject(new RuntimeProjectError("RUNTIME_PROJECT_UNAVAILABLE"));
-      return enqueue(() => {
-        if (stopped || registration.state !== "ACTIVE") {
-          projectError("RUNTIME_PROJECT_UNAVAILABLE");
-        }
-        assertChange(change);
-        const now = options.now();
-        if (Number.isNaN(now.getTime())) projectError("RUNTIME_PROJECT_INVALID");
-        if (
-          !UUID_PATTERN.test(registration.project_id) ||
-          !Number.isSafeInteger(registration.registry_revision) ||
-          registration.registry_revision < 1 ||
-          !HASH_PATTERN.test(registration.manifest_hash) ||
-          !path.isAbsolute(registration.canonical_root) ||
-          path.normalize(registration.canonical_root) !== registration.canonical_root
-        ) {
-          projectError("RUNTIME_PROJECT_INVALID");
-        }
-        const normalizedChange = validatedCandidate(registration, [change], now.toISOString())
-          .changes[0];
-        if (normalizedChange === undefined) projectError("RUNTIME_PROJECT_INVALID");
-        loadCandidates();
-        let existing = windows.get(registration.project_id);
-        if (existing !== undefined && !matchingRegistration(existing.document, registration)) {
-          projectError("RUNTIME_PROJECT_INTAKE_CORRUPT");
-        }
-        if (existing !== undefined && now.getTime() >= Date.parse(existing.document.deadline_at)) {
-          flushWindow(registration.project_id);
-          existing = undefined;
-        }
-        const changes = new Map(
-          existing?.document.changes.map((entry) => [entry.path, entry]) ?? [],
-        );
-        changes.set(normalizedChange.path, normalizedChange);
-        if (changes.size > 4096) projectError("RUNTIME_PROJECT_UNAVAILABLE");
+  const recordBatch = (
+    registration: ProjectRegistration,
+    requestedChanges: readonly ProjectChange[],
+  ): Promise<void> => {
+    if (stopped) {
+      return Promise.reject(new RuntimeProjectError("RUNTIME_PROJECT_UNAVAILABLE"));
+    }
+    return enqueue(() => {
+      if (stopped || sharedCoordinator?.publicationBlocked || registration.state !== "ACTIVE") {
+        projectError("RUNTIME_PROJECT_UNAVAILABLE");
+      }
+      const now = options.now();
+      if (Number.isNaN(now.getTime())) projectError("RUNTIME_PROJECT_INVALID");
+      if (
+        !UUID_PATTERN.test(registration.project_id) ||
+        !Number.isSafeInteger(registration.registry_revision) ||
+        registration.registry_revision < 1 ||
+        !HASH_PATTERN.test(registration.manifest_hash) ||
+        !path.isAbsolute(registration.canonical_root) ||
+        path.normalize(registration.canonical_root) !== registration.canonical_root
+      ) {
+        projectError("RUNTIME_PROJECT_INVALID");
+      }
+      const normalizedChanges = sortedChanges(
+        requestedChanges.map((change) => {
+          assertChange(change);
+          const normalized = validatedCandidate(registration, [change], now.toISOString())
+            .changes[0];
+          if (normalized === undefined) projectError("RUNTIME_PROJECT_INVALID");
+          return normalized;
+        }),
+      );
+      if (normalizedChanges.length === 0) return;
+      loadCandidates();
+      let existing = refreshWindow(registration.project_id);
+      if (existing !== undefined && !matchingRegistration(existing.document, registration)) {
+        projectError("RUNTIME_PROJECT_INTAKE_CORRUPT");
+      }
+      if (existing !== undefined && now.getTime() >= Date.parse(existing.document.deadline_at)) {
+        flushWindow(registration.project_id);
+        existing = undefined;
+      }
+      let changes = new Map(existing?.document.changes.map((entry) => [entry.path, entry]) ?? []);
+      let changeBytes = new Map(
+        [...changes].map(([relativePath, change]) => [
+          relativePath,
+          Buffer.byteLength(canonicalJson(change, PROJECT_CANDIDATE_JSON_LIMITS), "utf8"),
+        ]),
+      );
+      let totalChangeBytes = [...changeBytes.values()].reduce((total, bytes) => total + bytes, 0);
+
+      const documentFor = (documentChanges: readonly ProjectChange[]): ProjectPendingWindowV1 => {
         const openedAt = existing?.document.opened_at ?? now.toISOString();
         const deadlineAt =
           existing?.document.deadline_at ?? new Date(now.getTime() + MAX_DEBOUNCE_MS).toISOString();
-        const document: ProjectPendingWindowV1 = Object.freeze({
+        return Object.freeze({
           protocol_version: "runtime-contract.v1",
           schema_version: "project-pending-window.v1",
           document_type: "project-pending-window",
@@ -802,26 +1160,103 @@ export function createProjectIntake(options: CreateProjectIntakeOptions): Projec
           opened_at: openedAt,
           updated_at: now.toISOString(),
           deadline_at: deadlineAt,
-          changes: sortedChanges(changes.values()),
+          changes: documentChanges,
         });
+      };
+
+      const emptyPendingBytes = canonicalBytes(documentFor([])).byteLength;
+      const emptyCandidateBytes = Buffer.byteLength(
+        canonicalJson(
+          candidateFor(registration, [], now.toISOString()),
+          PROJECT_CANDIDATE_JSON_LIMITS,
+        ),
+        "utf8",
+      );
+      const windowFits = (count: number, serializedChangeBytes: number): boolean => {
+        const arrayBytes = serializedChangeBytes + Math.max(0, count - 1);
+        return (
+          count <= 4096 &&
+          emptyPendingBytes + arrayBytes <= MAX_PENDING_BYTES &&
+          emptyCandidateBytes + arrayBytes + 1 <= MAX_PENDING_BYTES
+        );
+      };
+
+      const publishWindow = (): void => {
+        if (changes.size === 0) return;
+        const document = documentFor(sortedChanges(changes.values()));
         const file = publishPending(document, existing?.file ?? null);
         const state: PendingState = { document, file };
         if (existing?.timer !== undefined) clearTimeout(existing.timer);
         windows.set(registration.project_id, state);
         arm(state);
-      });
+        existing = state;
+      };
+
+      for (const change of normalizedChanges) {
+        const current = changes.get(change.path);
+        let reduced = reduceChange(current, change);
+        if (reduced === null) {
+          changes.delete(change.path);
+          totalChangeBytes -= changeBytes.get(change.path) ?? 0;
+          changeBytes.delete(change.path);
+          continue;
+        }
+        let serialized = Buffer.byteLength(
+          canonicalJson(reduced, PROJECT_CANDIDATE_JSON_LIMITS),
+          "utf8",
+        );
+        const proposedCount = current === undefined ? changes.size + 1 : changes.size;
+        const proposedBytes = totalChangeBytes - (changeBytes.get(change.path) ?? 0) + serialized;
+        if (!windowFits(proposedCount, proposedBytes)) {
+          if (changes.size === 0) projectError("RUNTIME_PROJECT_UNAVAILABLE");
+          publishWindow();
+          flushWindow(registration.project_id);
+          existing = undefined;
+          changes = new Map();
+          changeBytes = new Map();
+          totalChangeBytes = 0;
+          reduced = change;
+          serialized = Buffer.byteLength(
+            canonicalJson(reduced, PROJECT_CANDIDATE_JSON_LIMITS),
+            "utf8",
+          );
+          if (!windowFits(1, serialized)) projectError("RUNTIME_PROJECT_UNAVAILABLE");
+        }
+        totalChangeBytes -= changeBytes.get(change.path) ?? 0;
+        changes.set(change.path, reduced);
+        changeBytes.set(change.path, serialized);
+        totalChangeBytes += serialized;
+      }
+      if (changes.size === 0) {
+        if (existing?.timer !== undefined) clearTimeout(existing.timer);
+        if (existing !== undefined) removeExactPending(existing);
+        windows.delete(registration.project_id);
+        return;
+      }
+      publishWindow();
+    });
+  };
+
+  return {
+    record(registration, change) {
+      return recordBatch(registration, [change]);
     },
+    recordBatch,
     recover(registrations) {
-      return enqueue(() => recoverFiles(registrations));
+      return enqueue(() => {
+        recoverFiles(registrations);
+        if (sharedCoordinator !== undefined) sharedCoordinator.publicationBlocked = false;
+      });
     },
     discard(projectId) {
       return enqueue(() => {
         if (!UUID_PATTERN.test(projectId)) projectError("RUNTIME_PROJECT_INVALID");
-        const state = windows.get(projectId);
+        const canonicalId = projectId.toLowerCase();
+        const state = refreshWindow(canonicalId);
         if (state === undefined) return;
         if (state.timer !== undefined) clearTimeout(state.timer);
         removeExactPending(state);
-        windows.delete(projectId);
+        windows.delete(canonicalId);
       });
     },
     stopIntake() {
@@ -833,7 +1268,15 @@ export function createProjectIntake(options: CreateProjectIntakeOptions): Projec
     },
     flush(signal) {
       return enqueue(() => {
-        if (signal.aborted) projectError("RUNTIME_PROJECT_UNAVAILABLE");
+        if (signal.aborted || sharedCoordinator?.publicationBlocked) {
+          projectError("RUNTIME_PROJECT_UNAVAILABLE");
+        }
+        const persistedProjectIds = readdirSync(pendingDirectory)
+          .map((name) => FINAL_PENDING_PATTERN.exec(name)?.[1])
+          .filter((projectId): projectId is string => projectId !== undefined);
+        for (const projectId of new Set([...windows.keys(), ...persistedProjectIds])) {
+          refreshWindow(projectId);
+        }
         for (const projectId of [...windows.keys()].sort()) {
           if (signal.aborted) projectError("RUNTIME_PROJECT_UNAVAILABLE");
           flushWindow(projectId);

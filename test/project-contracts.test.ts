@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { createBaselineCapabilities } from "../src/protocol/capabilities.js";
 import { canonicalJson } from "../src/protocol/json.js";
 import {
   candidateJobKey,
@@ -25,6 +26,8 @@ const REGISTRY_HASHABLE: HashableProjectRegistryEntryV1 = {
   document_type: "project-registry-entry",
   registry_revision: 1,
   previous_entry_hash: ZERO_HASH,
+  operation_id: "00000000-0000-4000-8000-000000000090",
+  operation_hash: `sha256:${"9".repeat(64)}`,
   project_id: PROJECT_ID,
   canonical_root: "/tmp/toss-project",
   manifest_hash: MANIFEST_HASH,
@@ -53,6 +56,22 @@ const CANDIDATE: CandidateJobIntentV1 = {
 };
 
 describe("project intake contracts", () => {
+  it("advertises every accepted project document schema in runtime capabilities", () => {
+    const capabilities = createBaselineCapabilities({
+      os: "darwin",
+      arch: "arm64",
+      node: "22.23.1",
+    });
+
+    expect(capabilities.supported_schemas).toEqual(
+      expect.arrayContaining([
+        "candidate-job-intent.v1",
+        "project-registry-entry.v1",
+        "project-watch-manifest.v1",
+      ]),
+    );
+  });
+
   it("exposes only stable safe project failures", () => {
     expect(new RuntimeProjectError("RUNTIME_PROJECT_PATH_UNSAFE")).toMatchObject({
       code: "RUNTIME_PROJECT_PATH_UNSAFE",
@@ -65,6 +84,12 @@ describe("project intake contracts", () => {
       category: "unavailable",
       retryable: true,
       safe_message: "Project is unavailable",
+    });
+    expect(new RuntimeProjectError("RUNTIME_OPERATION_CONFLICT")).toMatchObject({
+      code: "RUNTIME_OPERATION_CONFLICT",
+      category: "stale-revision",
+      retryable: false,
+      safe_message: "Project operation conflicts with an existing operation",
     });
   });
 
@@ -113,6 +138,8 @@ describe("project intake contracts", () => {
     ["dot segment", "watch_paths: [src/./inside]\n"],
     ["empty segment", "watch_paths: [src//inside]\n"],
     ["backslash", String.raw`watch_paths: [src\inside]`],
+    ["nested git metadata", "watch_paths: [src/.git]\n"],
+    ["nested runtime metadata", "watch_paths: [src/.toss/runtime]\n"],
   ])("rejects a manifest with %s", (_name, body) => {
     const input = `schema_version: project-watch-manifest.v1\n${body}`;
     expect(parseProjectWatchManifest(input)).toMatchObject({
@@ -131,11 +158,11 @@ describe("project intake contracts", () => {
 
   it("parses an exact hash-bound registry entry", () => {
     expect(hashProjectRegistryEntry(REGISTRY_HASHABLE)).toBe(
-      "sha256:f2bb266ef504127ab5e016ceda9940911f67068b1a7d95f19a70ef442155b454",
+      "sha256:1f6fe6c338ec3fa90993211aa34365926faa04a9786dc41ca430a7e7d2a6d828",
     );
     const entry = {
       ...REGISTRY_HASHABLE,
-      entry_hash: "sha256:f2bb266ef504127ab5e016ceda9940911f67068b1a7d95f19a70ef442155b454",
+      entry_hash: "sha256:1f6fe6c338ec3fa90993211aa34365926faa04a9786dc41ca430a7e7d2a6d828",
     } as const;
 
     expect(parseProjectRegistryEntry(canonicalJson(entry))).toEqual({ ok: true, value: entry });
@@ -172,6 +199,34 @@ describe("project intake contracts", () => {
         }),
       ),
     ).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
+  });
+
+  it.each([
+    [
+      "two changes for the same path",
+      [
+        { ...CANDIDATE.changes[0]!, kind: "CREATED" as const },
+        { kind: "REMOVED" as const, path: "src/index.ts", identity: null },
+      ],
+    ],
+    [
+      "a created path without an identity",
+      [{ kind: "CREATED" as const, path: "src/index.ts", identity: null }],
+    ],
+    ["a removed path with an identity", [{ ...CANDIDATE.changes[0]!, kind: "REMOVED" as const }]],
+    ["a nested git metadata path", [{ ...CANDIDATE.changes[0]!, path: "src/.git/config" }]],
+    [
+      "a nested runtime metadata path",
+      [{ ...CANDIDATE.changes[0]!, path: "src/.toss/runtime/state.json" }],
+    ],
+  ])("rejects %s even when the candidate key matches", (_name, changes) => {
+    const value = { ...CANDIDATE, changes };
+    const candidate = { ...value, candidate_key: candidateJobKey(value) };
+
+    expect(parseCandidateJobIntent(canonicalJson(candidate))).toMatchObject({
+      ok: false,
+      code: "RUNTIME_DOCUMENT_INVALID",
+    });
   });
 
   it.each([

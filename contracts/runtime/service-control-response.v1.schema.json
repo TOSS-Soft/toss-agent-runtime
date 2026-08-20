@@ -79,7 +79,7 @@
         "kind": { "const": "project-list" },
         "registrations": {
           "type": "array",
-          "maxItems": 4096,
+          "maxItems": 12,
           "items": { "$ref": "#/$defs/project_registration" }
         }
       }
@@ -167,6 +167,16 @@
             "category": { "const": "unavailable" },
             "retryable": { "const": true },
             "safe_message": { "const": "Runtime service is unavailable" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_OPERATION_CONFLICT" },
+            "category": { "const": "stale-revision" },
+            "retryable": { "const": false },
+            "safe_message": {
+              "const": "Project operation conflicts with an existing operation"
+            }
           }
         },
         {

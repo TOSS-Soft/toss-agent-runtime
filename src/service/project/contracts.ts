@@ -14,6 +14,7 @@ import {
   DEFAULT_JSON_LIMITS,
   parseJsonBytes,
   sha256,
+  type JsonLimits,
   type JsonValue,
 } from "../../protocol/json.js";
 import type { ValidationFailure, ValidationIssue, ValidationResult } from "../../protocol/types.js";
@@ -26,6 +27,11 @@ import type {
 } from "./types.js";
 
 const MAX_PROJECT_DOCUMENT_BYTES = 65_536;
+export const PROJECT_CANDIDATE_JSON_LIMITS: JsonLimits = Object.freeze({
+  ...DEFAULT_JSON_LIMITS,
+  maxBytes: 32 * 1024 * 1024,
+  maxMembers: 40_000,
+});
 const Ajv2020 = Ajv2020Module.default;
 const addFormats = addFormatsModule.default;
 const ajv = new Ajv2020({
@@ -71,15 +77,11 @@ function invalid(
 function parseJsonContract<T>(
   input: string | Uint8Array,
   validator: ValidateFunction,
+  limits: JsonLimits = { ...DEFAULT_JSON_LIMITS, maxBytes: MAX_PROJECT_DOCUMENT_BYTES },
 ): ValidationResult<T> {
   let candidate: JsonValue;
   try {
-    candidate = deepFreezeJson(
-      parseJsonBytes(input, {
-        ...DEFAULT_JSON_LIMITS,
-        maxBytes: MAX_PROJECT_DOCUMENT_BYTES,
-      }),
-    );
+    candidate = deepFreezeJson(parseJsonBytes(input, limits), limits);
   } catch {
     return invalid("", "json", "invalid JSON input");
   }
@@ -107,11 +109,9 @@ export function isSafeProjectRelativePath(candidate: string): boolean {
   if (segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")) {
     return false;
   }
-  return (
-    candidate !== ".git" &&
-    !candidate.startsWith(".git/") &&
-    candidate !== ".toss/runtime" &&
-    !candidate.startsWith(".toss/runtime/")
+  return !segments.some(
+    (segment, index) =>
+      segment === ".git" || (segment === ".toss" && segments[index + 1] === "runtime"),
   );
 }
 
@@ -205,21 +205,42 @@ export function candidateJobKey(
     "project_id" | "registry_revision" | "manifest_hash" | "changes"
   >,
 ): `sha256:${string}` {
-  return sha256({
-    project_id: candidate.project_id,
-    registry_revision: candidate.registry_revision,
-    manifest_hash: candidate.manifest_hash,
-    changes: candidate.changes,
-  });
+  return sha256(
+    {
+      project_id: candidate.project_id,
+      registry_revision: candidate.registry_revision,
+      manifest_hash: candidate.manifest_hash,
+      changes: candidate.changes,
+    },
+    PROJECT_CANDIDATE_JSON_LIMITS,
+  );
 }
 
 export function parseCandidateJobIntent(
   input: string | Uint8Array,
 ): ValidationResult<CandidateJobIntentV1> {
-  const parsed = parseJsonContract<CandidateJobIntentV1>(input, validateCandidate);
+  const parsed = parseJsonContract<CandidateJobIntentV1>(
+    input,
+    validateCandidate,
+    PROJECT_CANDIDATE_JSON_LIMITS,
+  );
   if (!parsed.ok) return parsed;
   if (parsed.value.changes.some((change) => !isSafeProjectRelativePath(change.path))) {
     return invalid("/changes", "relativePath", "candidate paths must be safe and relative");
+  }
+  if (
+    !unique(parsed.value.changes.map((change) => change.path)) ||
+    parsed.value.changes.some(
+      (change) =>
+        (change.kind === "REMOVED" && change.identity !== null) ||
+        (change.kind !== "REMOVED" && change.identity === null),
+    )
+  ) {
+    return invalid(
+      "/changes",
+      "semantic",
+      "candidate changes must contain one coherent transition per path",
+    );
   }
   const order = parsed.value.changes.map(changeOrder);
   const sorted = [...order].sort((left, right) => Buffer.from(left).compare(Buffer.from(right)));

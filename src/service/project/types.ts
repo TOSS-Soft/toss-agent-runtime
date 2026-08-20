@@ -1,5 +1,8 @@
 export type ProjectRegistryState = "ACTIVE" | "UNREGISTERED" | "BLOCKED_PROJECT_UNAVAILABLE";
 
+export const MAX_ACTIVE_PROJECT_REGISTRATIONS = 12;
+export const MAX_PROJECT_ROOT_BYTES = 4_096;
+
 export type ProjectChangeKind = "CREATED" | "CHANGED" | "REMOVED";
 
 export interface ProjectWatchManifestV1 {
@@ -14,6 +17,8 @@ export interface HashableProjectRegistryEntryV1 {
   readonly document_type: "project-registry-entry";
   readonly registry_revision: number;
   readonly previous_entry_hash: `sha256:${string}`;
+  readonly operation_id: string;
+  readonly operation_hash: `sha256:${string}`;
   readonly project_id: string;
   readonly canonical_root: string;
   readonly manifest_hash: `sha256:${string}`;
@@ -58,18 +63,4 @@ export interface ProjectRegistration {
   readonly canonical_root: string;
   readonly manifest_hash: `sha256:${string}`;
   readonly state: ProjectRegistryState;
-}
-
-export interface ProjectPendingWindowV1 {
-  readonly protocol_version: "runtime-contract.v1";
-  readonly schema_version: "project-pending-window.v1";
-  readonly document_type: "project-pending-window";
-  readonly project_id: string;
-  readonly registry_revision: number;
-  readonly canonical_root: string;
-  readonly manifest_hash: `sha256:${string}`;
-  readonly opened_at: string;
-  readonly updated_at: string;
-  readonly deadline_at: string;
-  readonly changes: readonly ProjectChange[];
 }

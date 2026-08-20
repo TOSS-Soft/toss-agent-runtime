@@ -100,8 +100,7 @@ export {
   parseProjectWatchManifest,
 } from "./service/project/contracts.js";
 export { RuntimeProjectError, type RuntimeProjectErrorCode } from "./service/project/errors.js";
-export type { ProjectIntake } from "./service/project/intake.js";
-export type { ProjectRegistry } from "./service/project/registry.js";
+export type { ProjectIntake, ProjectRegistry } from "./service/project/interfaces.js";
 export type {
   CandidateJobIntentV1,
   HashableProjectRegistryEntryV1,

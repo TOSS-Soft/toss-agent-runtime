@@ -9,6 +9,7 @@
     "schema_version": { "const": "service-control-request.v1" },
     "document_type": { "const": "service-control-request" },
     "request_id": { "type": "string", "format": "uuid" },
+    "operation_id": { "type": "string", "format": "uuid" },
     "command": {
       "type": "string",
       "enum": ["status", "project-register", "project-unregister", "project-list"]
@@ -20,19 +21,20 @@
     {
       "properties": {
         "command": { "const": "status" },
+        "operation_id": false,
         "root": false,
         "project_id": false
       }
     },
     {
-      "required": ["root"],
+      "required": ["operation_id", "root"],
       "properties": {
         "command": { "const": "project-register" },
         "project_id": false
       }
     },
     {
-      "required": ["project_id"],
+      "required": ["operation_id", "project_id"],
       "properties": {
         "command": { "const": "project-unregister" },
         "root": false
@@ -41,6 +43,7 @@
     {
       "properties": {
         "command": { "const": "project-list" },
+        "operation_id": false,
         "root": false,
         "project_id": false
       }

@@ -309,13 +309,13 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
               if (request.command === "project-register") {
                 return {
                   kind: "project-registration",
-                  registration: await projects.register(request.root),
+                  registration: await projects.register(request.root, request.operation_id),
                 };
               }
               if (request.command === "project-unregister") {
                 return {
                   kind: "project-registration",
-                  registration: await projects.unregister(request.project_id),
+                  registration: await projects.unregister(request.project_id, request.operation_id),
                 };
               }
               return { kind: "project-list", registrations: await projects.list() };
@@ -484,7 +484,8 @@ function serviceFailure(commandName: string, json: boolean, error: unknown): Cli
 }
 
 function projectErrorExitCode(code: RuntimeProjectErrorCode): Exclude<ExitCode, 0> {
-  if (code === "RUNTIME_PROJECT_INVALID" || code === "RUNTIME_PROJECT_NOT_FOUND") return 2;
+  if (code === "RUNTIME_OPERATION_CONFLICT") return 6;
+  if (code === "RUNTIME_PROJECT_INVALID" || code === "RUNTIME_PROJECT_NOT_FOUND") return 3;
   if (code === "RUNTIME_PROJECT_UNAVAILABLE") return 69;
   return 5;
 }

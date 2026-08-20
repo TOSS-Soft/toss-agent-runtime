@@ -24,6 +24,11 @@ async function fixture(): Promise<{
   const projectRoot = path.join(root, "project");
   const outsideRoot = path.join(root, "outside");
   await mkdir(path.join(projectRoot, "src", "generated"), { recursive: true, mode: 0o700 });
+  await mkdir(path.join(projectRoot, "src", ".git"), { mode: 0o700 });
+  await mkdir(path.join(projectRoot, "src", ".toss", "runtime"), {
+    recursive: true,
+    mode: 0o700,
+  });
   await mkdir(path.join(projectRoot, ".git"), { mode: 0o700 });
   await mkdir(path.join(projectRoot, ".toss", "runtime"), { recursive: true, mode: 0o700 });
   await mkdir(path.join(projectRoot, "state"), { mode: 0o700 });
@@ -32,6 +37,10 @@ async function fixture(): Promise<{
     writeFile(path.join(projectRoot, "src", "z.ts"), "z", { mode: 0o600 }),
     writeFile(path.join(projectRoot, "src", "a.ts"), "a", { mode: 0o600 }),
     writeFile(path.join(projectRoot, "src", "generated", "ignored.ts"), "ignored", {
+      mode: 0o600,
+    }),
+    writeFile(path.join(projectRoot, "src", ".git", "config"), "ignored", { mode: 0o600 }),
+    writeFile(path.join(projectRoot, "src", ".toss", "runtime", "generated"), "ignored", {
       mode: 0o600,
     }),
     writeFile(path.join(projectRoot, "package.json"), "{}", { mode: 0o600 }),
@@ -86,7 +95,13 @@ describe("project watch scope boundaries", () => {
     ).toBeNull();
     expect(classifyProjectChange(scope, path.join(projectRoot, ".git", "config"))).toBeNull();
     expect(
+      classifyProjectChange(scope, path.join(projectRoot, "src", ".git", "config")),
+    ).toBeNull();
+    expect(
       classifyProjectChange(scope, path.join(projectRoot, ".toss", "runtime", "generated")),
+    ).toBeNull();
+    expect(
+      classifyProjectChange(scope, path.join(projectRoot, "src", ".toss", "runtime", "generated")),
     ).toBeNull();
     expect(
       classifyProjectChange(scope, path.join(projectRoot, "state", "runtime-owned")),

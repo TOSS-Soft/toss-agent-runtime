@@ -12,7 +12,7 @@ import type {
   ValidationIssue,
   ValidationResult,
 } from "../protocol/types.js";
-import type { ProjectRegistration } from "./project/types.js";
+import { MAX_PROJECT_ROOT_BYTES, type ProjectRegistration } from "./project/types.js";
 
 const Ajv2020 = Ajv2020Module.default;
 const addFormats = addFormatsModule.default;
@@ -46,11 +46,13 @@ export interface ServiceStatusRequestV1 extends ServiceControlRequestBaseV1 {
 
 export interface ServiceProjectRegisterRequestV1 extends ServiceControlRequestBaseV1 {
   readonly command: "project-register";
+  readonly operation_id: string;
   readonly root: string;
 }
 
 export interface ServiceProjectUnregisterRequestV1 extends ServiceControlRequestBaseV1 {
   readonly command: "project-unregister";
+  readonly operation_id: string;
   readonly project_id: string;
 }
 
@@ -189,6 +191,7 @@ export function parseServiceControlRequest(
     parsed.value.command === "project-register" &&
     (!path.isAbsolute(parsed.value.root) ||
       path.normalize(parsed.value.root) !== parsed.value.root ||
+      Buffer.byteLength(parsed.value.root, "utf8") > MAX_PROJECT_ROOT_BYTES ||
       /[\u0000-\u001f\u007f]/u.test(parsed.value.root))
   ) {
     return {
@@ -219,6 +222,7 @@ export function parseServiceControlResponse(
       (registration) =>
         !path.isAbsolute(registration.canonical_root) ||
         path.normalize(registration.canonical_root) !== registration.canonical_root ||
+        Buffer.byteLength(registration.canonical_root, "utf8") > MAX_PROJECT_ROOT_BYTES ||
         /[\u0000-\u001f\u007f]/u.test(registration.canonical_root),
     )
   ) {

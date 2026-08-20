@@ -64,19 +64,15 @@ const REQUIRED_FILES = Object.freeze([
   "dist/src/service/project/contracts.js",
   "dist/src/service/project/errors.d.ts",
   "dist/src/service/project/errors.js",
-  "dist/src/service/project/index.d.ts",
   "dist/src/service/project/index.js",
-  "dist/src/service/project/intake.d.ts",
   "dist/src/service/project/intake.js",
-  "dist/src/service/project/paths.d.ts",
+  "dist/src/service/project/interfaces.d.ts",
+  "dist/src/service/project/interfaces.js",
   "dist/src/service/project/paths.js",
-  "dist/src/service/project/private-files.d.ts",
   "dist/src/service/project/private-files.js",
-  "dist/src/service/project/registry.d.ts",
   "dist/src/service/project/registry.js",
   "dist/src/service/project/types.d.ts",
   "dist/src/service/project/types.js",
-  "dist/src/service/project/watcher.d.ts",
   "dist/src/service/project/watcher.js",
   "dist/src/index.d.ts",
   "dist/src/index.js",
@@ -211,6 +207,16 @@ function assertPackageFiles(files) {
         publishedPath,
       ),
       `Secret-shaped file name leaked: ${publishedPath}`,
+    );
+    assert(
+      !/^dist\/src\/service\/project\/.*\.(?:js|d\.ts)\.map$/u.test(publishedPath),
+      `Project source map leaked: ${publishedPath}`,
+    );
+    assert(
+      !/^dist\/src\/service\/project\/(?:index|intake|paths|private-files|registry|watcher)\.d\.ts$/u.test(
+        publishedPath,
+      ),
+      `Private project declaration leaked: ${publishedPath}`,
     );
   }
 }
@@ -782,6 +788,22 @@ try {
     "agent-runtime",
   );
   const api = await import(pathToFileURL(path.join(installedRoot, "dist", "src", "index.js")).href);
+  const projectInterfaces = await readFile(
+    path.join(installedRoot, "dist", "src", "service", "project", "interfaces.d.ts"),
+    "utf8",
+  );
+  assert(
+    projectInterfaces.includes("interface ProjectRegistry"),
+    "ProjectRegistry declaration missing",
+  );
+  assert(
+    projectInterfaces.includes("interface ProjectIntake"),
+    "ProjectIntake declaration missing",
+  );
+  assert(
+    !/operationHooks|statePath|CreateProject/u.test(projectInterfaces),
+    "Public project declarations exposed filesystem construction hooks",
+  );
   await assertInstalledLauncherEnforcesExecuteMode(executable, temporaryDirectory);
   const help = await execInstalledLauncher(executable, ["--help"], {
     cwd: temporaryDirectory,

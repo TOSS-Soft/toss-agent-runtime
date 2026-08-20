@@ -246,13 +246,17 @@ export function assertPlainJson(
   normalizedJson(value, limits, { members: 0 }, 0);
 }
 
-export function canonicalJson(value: unknown): string {
-  const normalized = normalizedJson(value, DEFAULT_JSON_LIMITS, { members: 0 }, 0);
+export function canonicalJson(value: unknown, limits: JsonLimits = DEFAULT_JSON_LIMITS): string {
+  validateLimits(limits);
+  const normalized = normalizedJson(value, limits, { members: 0 }, 0);
   return JSON.stringify(normalized);
 }
 
-export function sha256(value: unknown): `sha256:${string}` {
-  return `sha256:${createHash("sha256").update(canonicalJson(value), "utf8").digest("hex")}`;
+export function sha256(
+  value: unknown,
+  limits: JsonLimits = DEFAULT_JSON_LIMITS,
+): `sha256:${string}` {
+  return `sha256:${createHash("sha256").update(canonicalJson(value, limits), "utf8").digest("hex")}`;
 }
 
 function freezeJson(value: JsonValue): void {
@@ -272,8 +276,11 @@ function freezeJson(value: JsonValue): void {
   Object.freeze(value);
 }
 
-export function deepFreezeJson<T extends JsonValue>(value: T): T {
-  assertPlainJson(value);
+export function deepFreezeJson<T extends JsonValue>(
+  value: T,
+  limits: JsonLimits = DEFAULT_JSON_LIMITS,
+): T {
+  assertPlainJson(value, limits);
   freezeJson(value);
   return value;
 }

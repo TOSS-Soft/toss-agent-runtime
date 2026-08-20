@@ -163,6 +163,7 @@ immediately without a structured-response guarantee.
 - a UUID `request_id`;
 - `command: "status"`, `command: "project-register"`,
   `command: "project-unregister"`, or `command: "project-list"`;
+- a UUID `operation_id` only for register and unregister;
 - an absolute `root` only for register; or
 - a UUID `project_id` only for unregister.
 
@@ -181,12 +182,25 @@ the ID with different canonical bytes returns
 `RUNTIME_SERVICE_CONTROL_CONFLICT` and does not replace the original cache
 entry. The cache is in-memory and scoped to one service instance.
 
+Every register or unregister request also carries a distinct durable
+`operation_id`. The project registry persists that identifier with a canonical
+operation hash and the resulting registration. Repeating the same operation ID
+after restart returns the original result without another registry append;
+reusing it for different canonical input returns `RUNTIME_OPERATION_CONFLICT`. Status and
+list requests do not accept an operation ID.
+
 Project mutations are dispatched only after a validated local request reaches
 the supervised daemon; the CLI never writes registry or intake files directly.
+Canonical project roots are limited to 4,096 UTF-8 bytes. The registry admits
+at most 12 simultaneously active projects, so the complete, sorted
+`project-list` response always fits the 64 KiB control frame; a thirteenth
+activation fails with fixed `RUNTIME_PROJECT_UNAVAILABLE` before durable state
+is appended.
 The daemon binds a canonical root and closed `.toss/project.yaml`, arms only
 declared watch scopes, coalesces changes at 200 ms with a hard 2 second maximum,
 and durably publishes deduplicated candidate intents. Built-in ignores include
-`.git`, `.toss/runtime`, and runtime-owned state. Recovery restores valid
+`.git` and `.toss/runtime` at every nested level, plus runtime-owned state.
+Recovery restores valid
 registry/pending state before readiness. A missing or replaced root is blocked
 without automatic relocation. Project watchers can propose candidates only and
 cannot bypass governance, execution, provider, tool, or acceptance gates.
@@ -213,6 +227,7 @@ Project operations additionally use these fixed failures:
 
 | Project error                      | Exit | Meaning                                       |
 | ---------------------------------- | ---: | --------------------------------------------- |
+| `RUNTIME_OPERATION_CONFLICT`       |    6 | Operation ID was reused with different input  |
 | `RUNTIME_PROJECT_INVALID`          |    3 | Project input or manifest is invalid          |
 | `RUNTIME_PROJECT_NOT_FOUND`        |    3 | Project registration does not exist           |
 | `RUNTIME_PROJECT_PATH_UNSAFE`      |    5 | Root, manifest, or filesystem state is unsafe |

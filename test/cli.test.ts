@@ -353,6 +353,27 @@ describe("baseline CLI", () => {
         safe_message: "Project registry is corrupt",
       },
     });
+
+    const conflict = await runCli(["project", "list", "--json"], {
+      ...services,
+      requestProjectOperation: () =>
+        Promise.reject(new RuntimeProjectError("RUNTIME_OPERATION_CONFLICT")),
+    });
+    expect(conflict.exitCode).toBe(6);
+    expect(JSON.parse(conflict.stdout)).toMatchObject({
+      error: { code: "RUNTIME_OPERATION_CONFLICT", category: "stale-revision" },
+    });
+
+    for (const code of ["RUNTIME_PROJECT_INVALID", "RUNTIME_PROJECT_NOT_FOUND"] as const) {
+      const invalidInput = await runCli(["project", "list", "--json"], {
+        ...services,
+        requestProjectOperation: () => Promise.reject(new RuntimeProjectError(code)),
+      });
+      expect(invalidInput.exitCode).toBe(3);
+      expect(JSON.parse(invalidInput.stdout)).toMatchObject({
+        error: { code, category: "invalid-input" },
+      });
+    }
   });
 
   it.each(["install", "start", "stop", "restart", "status", "uninstall"] as const)(

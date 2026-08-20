@@ -133,6 +133,7 @@ function projectRequest(
     document_type: "service-control-request",
     request_id: requestId,
     command,
+    ...(command === "project-list" ? {} : { operation_id: fixedOperationId }),
     ...argument,
   })}\n`;
 }
@@ -144,6 +145,7 @@ const projectRegistration = {
   manifest_hash: `sha256:${"a".repeat(64)}` as const,
   state: "ACTIVE",
 } as const;
+const fixedOperationId = "00000000-0000-4000-8000-000000000090";
 
 function numberedRequestId(index: number): string {
   return `018f0f64-7b21-7d4f-8c3d-${index.toString(16).padStart(12, "0")}`;
@@ -1474,6 +1476,28 @@ describe("private service control socket", () => {
     expect(drained).toBe(true);
   });
 
+  it("does not dispatch a request completed after accepting has stopped", async () => {
+    let handlerCalls = 0;
+    const server = await listenControl({
+      handleProjectRequest: () => {
+        handlerCalls += 1;
+        return Promise.resolve({ kind: "project-list", registrations: [projectRegistration] });
+      },
+    });
+    const socket = await openHalfOpenClient();
+    const response = responseFrom(socket);
+
+    server.stopAccepting();
+    socket.end(projectRequest("project-list"));
+
+    expect(JSON.parse(await response)).toMatchObject({
+      request_id: fixedRequestId,
+      ok: false,
+      error: { code: "RUNTIME_SERVICE_UNAVAILABLE" },
+    });
+    expect(handlerCalls).toBe(0);
+  });
+
   it("returns a fixed conflict when an existing request id has different canonical bytes", async () => {
     await listenControl();
     await sendRaw(statusRequest(fixedRequestId));
@@ -1838,16 +1862,71 @@ describe("private service control socket", () => {
     ).resolves.toEqual({ kind: "project-list", registrations: [projectRegistration] });
   });
 
-  it("returns one normalized project failure through the control client", async () => {
+  it("returns a structured failure when a project list exceeds the transport bound", async () => {
+    const registrations = Array.from({ length: 13 }, (_, index) => ({
+      ...projectRegistration,
+      project_id: `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+      canonical_root: `/private/tmp/project-${index + 1}`,
+    }));
     await listenControl({
-      handleProjectRequest: () =>
-        Promise.reject(new RuntimeProjectError("RUNTIME_PROJECT_NOT_FOUND")),
+      handleProjectRequest: () => Promise.resolve({ kind: "project-list", registrations }),
     });
 
     await expect(
       requestProjectOperation({
         socketPath,
         requestId: fixedRequestId,
+        idleTimeoutMs: 5_000,
+        operation: { command: "project-list" },
+      }),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_UNAVAILABLE" });
+  });
+
+  it("round-trips a version 7 durable operation id over the private socket", async () => {
+    const operationId = "018F0B7A-5F2D-7ABC-8DEF-0123456789AC";
+    const genericRegistration = {
+      ...projectRegistration,
+      project_id: "018f0b7a-5f2d-7abc-8def-0123456789ab",
+      state: "UNREGISTERED" as const,
+    };
+    await listenControl({
+      handleProjectRequest: (request) => {
+        expect(request).toMatchObject({
+          command: "project-unregister",
+          operation_id: operationId.toLowerCase(),
+          project_id: genericRegistration.project_id,
+        });
+        return Promise.resolve({ kind: "project-registration", registration: genericRegistration });
+      },
+    });
+
+    await expect(
+      requestProjectOperation({
+        socketPath,
+        requestId: fixedRequestId,
+        operationId,
+        idleTimeoutMs: 5_000,
+        operation: {
+          command: "project-unregister",
+          project_id: genericRegistration.project_id.toUpperCase(),
+        },
+      }),
+    ).resolves.toEqual({ kind: "project-registration", registration: genericRegistration });
+  });
+
+  it("returns one normalized project failure through the control client", async () => {
+    await listenControl({
+      handleProjectRequest: (request) => {
+        expect(request).toMatchObject({ operation_id: fixedOperationId });
+        return Promise.reject(new RuntimeProjectError("RUNTIME_PROJECT_NOT_FOUND"));
+      },
+    });
+
+    await expect(
+      requestProjectOperation({
+        socketPath,
+        requestId: fixedRequestId,
+        operationId: fixedOperationId,
         idleTimeoutMs: 5_000,
         operation: {
           command: "project-unregister",
@@ -1857,6 +1936,30 @@ describe("private service control socket", () => {
     ).rejects.toMatchObject({
       code: "RUNTIME_PROJECT_NOT_FOUND",
       safe_message: "Project registration was not found",
+    });
+  });
+
+  it("round-trips a durable operation conflict through the real control socket", async () => {
+    await listenControl({
+      handleProjectRequest: () =>
+        Promise.reject(new RuntimeProjectError("RUNTIME_OPERATION_CONFLICT")),
+    });
+
+    await expect(
+      requestProjectOperation({
+        socketPath,
+        requestId: fixedRequestId,
+        operationId: fixedOperationId,
+        idleTimeoutMs: 5_000,
+        operation: {
+          command: "project-unregister",
+          project_id: projectRegistration.project_id,
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "RUNTIME_OPERATION_CONFLICT",
+      category: "stale-revision",
+      safe_message: "Project operation conflicts with an existing operation",
     });
   });
 

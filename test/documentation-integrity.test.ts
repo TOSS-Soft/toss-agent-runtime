@@ -26,6 +26,18 @@ async function readExample(name: string): Promise<Uint8Array> {
 }
 
 describe("published protocol artifacts", () => {
+  it("keeps the lockfile root platform metadata aligned with the macOS-only package", async () => {
+    const packageManifest = JSON.parse(await readFile("package.json", "utf8")) as {
+      readonly os: readonly string[];
+    };
+    const lockfile = JSON.parse(await readFile("package-lock.json", "utf8")) as {
+      readonly packages: Readonly<Record<string, { readonly os?: readonly string[] }>>;
+    };
+
+    expect(packageManifest.os).toEqual(["darwin"]);
+    expect(lockfile.packages[""]?.os).toEqual(packageManifest.os);
+  });
+
   it("keeps the packaged capability example aligned with baseline schemas", async () => {
     const result = parseRuntimeCapabilities(await readExample("runtime-capabilities"));
     const baseline = createBaselineCapabilities({ os: "linux", arch: "x64", node: "22.23.1" });

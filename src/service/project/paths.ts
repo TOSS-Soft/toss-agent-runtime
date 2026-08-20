@@ -46,6 +46,10 @@ interface ScanBudget {
   metadataBytes: number;
 }
 
+function isMissing(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
 function projectError(code: ConstructorParameters<typeof RuntimeProjectError>[0]): never {
   throw new RuntimeProjectError(code);
 }
@@ -60,6 +64,22 @@ function bytewise(left: string, right: string): number {
 
 function containedBy(candidate: string, parent: string): boolean {
   return candidate === parent || candidate.startsWith(`${parent}/`);
+}
+
+function containsPath(candidate: string, nested: string): boolean {
+  return (
+    candidate === nested ||
+    candidate.startsWith(`${nested}/`) ||
+    candidate.endsWith(`/${nested}`) ||
+    candidate.includes(`/${nested}/`)
+  );
+}
+
+function isIgnored(scope: CompiledProjectScope, relativePath: string): boolean {
+  return (
+    BUILT_IN_IGNORES.some((ignored) => containsPath(relativePath, ignored)) ||
+    scope.ignorePaths.some((ignored) => containedBy(relativePath, ignored))
+  );
 }
 
 function rootRelative(canonicalRoot: string, absolutePath: string): string | null {
@@ -108,6 +128,7 @@ function assertPathComponents(canonicalRoot: string, relativePath: string): void
     }
   } catch (error) {
     if (error instanceof RuntimeProjectError) throw error;
+    if (isMissing(error)) return;
     projectError("RUNTIME_PROJECT_PATH_UNSAFE");
   }
 }
@@ -207,7 +228,7 @@ export function classifyProjectChange(
   assertRoot(scope);
   const relative = rootRelative(scope.canonicalRoot, absolutePath);
   if (relative === null) return null;
-  if (scope.ignorePaths.some((ignored) => containedBy(relative, ignored))) return null;
+  if (isIgnored(scope, relative)) return null;
   if (!scope.watchPaths.some((watched) => containedBy(relative, watched))) return null;
   return relative;
 }
@@ -248,12 +269,16 @@ function scanEntry(
   changes: Map<string, ProjectChange>,
   budget: ScanBudget,
 ): void {
-  if (scope.ignorePaths.some((ignored) => containedBy(relativePath, ignored))) return;
+  if (isIgnored(scope, relativePath)) return;
   consumeBudget(budget, relativePath);
   let before: BigIntStats;
   try {
     before = lstatSync(absolutePath, { bigint: true });
-  } catch {
+  } catch (error) {
+    if (isMissing(error)) {
+      assertRoot(scope);
+      return;
+    }
     throw new RuntimeProjectError("RUNTIME_PROJECT_PATH_UNSAFE");
   }
   if (before.isSymbolicLink()) {
@@ -274,6 +299,7 @@ function scanEntry(
       const names = readdirSync(absolutePath).sort(bytewise);
       for (const name of names) {
         const childRelative = `${relativePath}/${name}`;
+        if (isIgnored(scope, childRelative)) continue;
         if (!isSafeProjectRelativePath(childRelative)) {
           projectError("RUNTIME_PROJECT_PATH_UNSAFE");
         }
@@ -290,6 +316,10 @@ function scanEntry(
         projectError("RUNTIME_PROJECT_PATH_UNSAFE");
       }
     } catch (error) {
+      if (isMissing(error)) {
+        assertRoot(scope);
+        return;
+      }
       if (error instanceof RuntimeProjectError) throw error;
       projectError("RUNTIME_PROJECT_PATH_UNSAFE");
     } finally {
@@ -319,6 +349,10 @@ function scanEntry(
       Object.freeze({ kind: "CHANGED", path: relativePath, identity: fileIdentity(held) }),
     );
   } catch (error) {
+    if (isMissing(error)) {
+      assertRoot(scope);
+      return;
+    }
     if (error instanceof RuntimeProjectError) throw error;
     projectError("RUNTIME_PROJECT_PATH_UNSAFE");
   } finally {
@@ -331,7 +365,7 @@ export function scanDeclaredScope(scope: CompiledProjectScope): readonly Project
   const changes = new Map<string, ProjectChange>();
   const budget: ScanBudget = { entries: 0, metadataBytes: 0 };
   for (const watchPath of scope.watchPaths) {
-    if (scope.ignorePaths.some((ignored) => containedBy(watchPath, ignored))) continue;
+    if (isIgnored(scope, watchPath)) continue;
     scanEntry(
       scope,
       path.join(scope.canonicalRoot, ...watchPath.split("/")),

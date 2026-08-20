@@ -85,6 +85,12 @@ scan unregistered projects. Watch and ignore paths MUST NOT be absolute, escape
 the registered root, traverse symlinks, include `.git` or `.toss/runtime`, or
 reach runtime-owned state.
 
+Every state-changing registry entry binds one UUID operation ID and the SHA-256
+hash of its canonical command input. An exact operation replay returns its
+persisted result across daemon restarts without appending a new revision. Reuse
+of an operation ID for different input fails closed. This durable replay rule is
+independent of the live control socket's bounded request-ID cache.
+
 Normalized file changes are bytewise sorted and recorded in
 `candidate-job-intent.v1`. Its `candidate_key` hashes the exact project ID,
 registry revision, manifest hash, and normalized changes. Repeating the same

@@ -1,6 +1,7 @@
 import type { RuntimeError } from "../../protocol/types.js";
 
 export type RuntimeProjectErrorCode =
+  | "RUNTIME_OPERATION_CONFLICT"
   | "RUNTIME_PROJECT_INVALID"
   | "RUNTIME_PROJECT_PATH_UNSAFE"
   | "RUNTIME_PROJECT_NOT_FOUND"
@@ -18,6 +19,11 @@ const ERRORS: Readonly<
     }>
   >
 > = {
+  RUNTIME_OPERATION_CONFLICT: {
+    category: "stale-revision",
+    retryable: false,
+    safeMessage: "Project operation conflicts with an existing operation",
+  },
   RUNTIME_PROJECT_INVALID: {
     category: "invalid-input",
     retryable: false,

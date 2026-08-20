@@ -7,7 +7,6 @@ import {
   mkdirSync,
   openSync,
   readSync,
-  readFileSync,
   realpathSync,
   renameSync,
   writeSync,
@@ -41,6 +40,12 @@ export interface PrivateRegistryFiles {
     fragment: Uint8Array,
     randomId: string,
   ): void;
+}
+
+export interface CreatePrivateRegistryFilesOptions {
+  readonly fileName?: string;
+  readonly artifactPrefix?: string;
+  readonly beforeDirectorySync?: (directoryPath: string) => void;
 }
 
 function pathUnsafe(): never {
@@ -107,14 +112,34 @@ function assertDirectory(metadata: BigIntStats, candidate: string, exactPrivate:
   if (metadata.uid !== 0n || ((mode & 0o022) !== 0 && (mode & 0o1000) === 0)) pathUnsafe();
 }
 
-function syncDirectory(candidate: string): void {
+function syncDirectory(
+  candidate: string,
+  privateRoot: string,
+  beforeSync?: (directoryPath: string) => void,
+): void {
   let descriptor: number | undefined;
   try {
+    const before = lstatSync(candidate, { bigint: true });
+    assertDirectory(before, candidate, isAtOrBelow(candidate, privateRoot));
     descriptor = openSync(
       candidate,
       constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
     );
+    const held = fstatSync(descriptor, { bigint: true });
+    assertDirectory(held, candidate, isAtOrBelow(candidate, privateRoot));
+    if (!sameIdentity(identity(before), identity(held))) pathUnsafe();
+    beforeSync?.(candidate);
     fsyncSync(descriptor);
+    const after = lstatSync(candidate, { bigint: true });
+    const heldAfter = fstatSync(descriptor, { bigint: true });
+    assertDirectory(after, candidate, isAtOrBelow(candidate, privateRoot));
+    assertDirectory(heldAfter, candidate, isAtOrBelow(candidate, privateRoot));
+    if (
+      !sameIdentity(identity(before), identity(after)) ||
+      !sameIdentity(identity(before), identity(heldAfter))
+    ) {
+      pathUnsafe();
+    }
   } catch (error) {
     if (error instanceof RuntimeProjectError) throw error;
     unavailable();
@@ -123,7 +148,11 @@ function syncDirectory(candidate: string): void {
   }
 }
 
-function ensurePrivateDirectory(candidate: string, privateRoot: string): void {
+function ensurePrivateDirectory(
+  candidate: string,
+  privateRoot: string,
+  beforeSync?: (directoryPath: string) => void,
+): void {
   for (const current of directoryCandidates(candidate)) {
     let metadata: BigIntStats;
     try {
@@ -132,8 +161,6 @@ function ensurePrivateDirectory(candidate: string, privateRoot: string): void {
       if (code(error) !== "ENOENT") pathUnsafe();
       try {
         mkdirSync(current, { mode: 0o700 });
-        syncDirectory(current);
-        syncDirectory(path.dirname(current));
         metadata = lstatSync(current, { bigint: true });
       } catch (mkdirError) {
         if (code(mkdirError) !== "EEXIST") unavailable();
@@ -141,6 +168,11 @@ function ensurePrivateDirectory(candidate: string, privateRoot: string): void {
       }
     }
     assertDirectory(metadata, current, isAtOrBelow(current, privateRoot));
+    syncDirectory(current, privateRoot, beforeSync);
+    syncDirectory(path.dirname(current), privateRoot, beforeSync);
+    const after = lstatSync(current, { bigint: true });
+    assertDirectory(after, current, isAtOrBelow(current, privateRoot));
+    if (!sameIdentity(identity(metadata), identity(after))) pathUnsafe();
   }
 }
 
@@ -197,16 +229,31 @@ function exactBytes(
   }
 }
 
-function openPrivateRead(candidate: string): PrivateFileSnapshot | null {
+function openPrivateRead(
+  candidate: string,
+  privateRoot: string,
+  beforeDirectorySync?: (directoryPath: string) => void,
+): PrivateFileSnapshot | null {
   let descriptor: number | undefined;
   try {
     const pathMetadata = lstatSync(candidate, { bigint: true });
     const expectedIdentity = assertPrivateFile(pathMetadata);
     descriptor = openSync(candidate, constants.O_RDONLY | constants.O_NOFOLLOW);
-    assertPrivateFile(fstatSync(descriptor, { bigint: true }), expectedIdentity);
-    const bytes = readFileSync(descriptor);
-    if (bytes.byteLength > MAX_REGISTRY_BYTES) unavailable();
+    const held = fstatSync(descriptor, { bigint: true });
+    assertPrivateFile(held, expectedIdentity);
+    if (pathMetadata.size > BigInt(MAX_REGISTRY_BYTES) || held.size > BigInt(MAX_REGISTRY_BYTES)) {
+      unavailable();
+    }
+    const bytes = Buffer.alloc(Number(held.size));
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      const bytesRead = readSync(descriptor, bytes, offset, bytes.byteLength - offset, offset);
+      if (bytesRead === 0) pathUnsafe();
+      offset += bytesRead;
+    }
     fsyncSync(descriptor);
+    exactBytes(candidate, descriptor, expectedIdentity, bytes);
+    syncDirectory(path.dirname(candidate), privateRoot, beforeDirectorySync);
     exactBytes(candidate, descriptor, expectedIdentity, bytes);
     return { bytes, identity: expectedIdentity };
   } catch (error) {
@@ -218,17 +265,25 @@ function openPrivateRead(candidate: string): PrivateFileSnapshot | null {
   }
 }
 
-export function createPrivateRegistryFiles(statePath: string): PrivateRegistryFiles {
+export function createPrivateRegistryFiles(
+  statePath: string,
+  options: CreatePrivateRegistryFilesOptions = {},
+): PrivateRegistryFiles {
   const projectsPath = path.join(statePath, "projects");
   const directoryPath = path.join(projectsPath, "registry");
   const quarantinePath = path.join(projectsPath, "quarantine");
-  const registryPath = path.join(directoryPath, "entries.jsonl");
+  const fileName = options.fileName ?? "entries.jsonl";
+  const artifactPrefix = options.artifactPrefix ?? "project-registry";
+  if (!/^[a-z][a-z0-9-]*\.jsonl$/u.test(fileName) || !/^[a-z][a-z0-9-]*$/u.test(artifactPrefix)) {
+    pathUnsafe();
+  }
+  const registryPath = path.join(directoryPath, fileName);
 
   const ensureRoots = (): void => {
-    ensurePrivateDirectory(statePath, statePath);
-    ensurePrivateDirectory(projectsPath, statePath);
-    ensurePrivateDirectory(directoryPath, statePath);
-    ensurePrivateDirectory(quarantinePath, statePath);
+    ensurePrivateDirectory(statePath, statePath, options.beforeDirectorySync);
+    ensurePrivateDirectory(projectsPath, statePath, options.beforeDirectorySync);
+    ensurePrivateDirectory(directoryPath, statePath, options.beforeDirectorySync);
+    ensurePrivateDirectory(quarantinePath, statePath, options.beforeDirectorySync);
   };
 
   return {
@@ -237,7 +292,7 @@ export function createPrivateRegistryFiles(statePath: string): PrivateRegistryFi
     ensureRoots,
     read() {
       ensureRoots();
-      return openPrivateRead(registryPath);
+      return openPrivateRead(registryPath, statePath, options.beforeDirectorySync);
     },
     append(expected, bytes) {
       ensureRoots();
@@ -254,7 +309,7 @@ export function createPrivateRegistryFiles(statePath: string): PrivateRegistryFi
           writeAll(descriptor, bytes);
           fsyncSync(descriptor);
           exactBytes(registryPath, descriptor, created, bytes);
-          syncDirectory(directoryPath);
+          syncDirectory(directoryPath, statePath, options.beforeDirectorySync);
           exactBytes(registryPath, descriptor, created, bytes);
           return;
         }
@@ -276,8 +331,11 @@ export function createPrivateRegistryFiles(statePath: string): PrivateRegistryFi
     },
     recoverPartial(expected, prefix, fragment, randomId) {
       ensureRoots();
-      const quarantineFile = path.join(quarantinePath, `project-registry-${randomId}.bin`);
-      const stagePath = path.join(directoryPath, `.entries-recovery.${randomId}.stage`);
+      const quarantineFile = path.join(quarantinePath, `${artifactPrefix}-${randomId}.bin`);
+      const stagePath = path.join(
+        directoryPath,
+        `.${fileName.slice(0, -".jsonl".length)}-recovery.${randomId}.stage`,
+      );
       let quarantine: number | undefined;
       let stage: number | undefined;
       let current: number | undefined;
@@ -291,7 +349,7 @@ export function createPrivateRegistryFiles(statePath: string): PrivateRegistryFi
         writeAll(quarantine, fragment);
         fsyncSync(quarantine);
         exactBytes(quarantineFile, quarantine, quarantineIdentity, fragment);
-        syncDirectory(quarantinePath);
+        syncDirectory(quarantinePath, statePath, options.beforeDirectorySync);
         exactBytes(quarantineFile, quarantine, quarantineIdentity, fragment);
 
         stage = openSync(
@@ -307,7 +365,7 @@ export function createPrivateRegistryFiles(statePath: string): PrivateRegistryFi
         exactBytes(registryPath, current, expected.identity, expected.bytes);
         renameSync(stagePath, registryPath);
         exactBytes(registryPath, stage, stageIdentity, prefix);
-        syncDirectory(directoryPath);
+        syncDirectory(directoryPath, statePath, options.beforeDirectorySync);
         exactBytes(registryPath, stage, stageIdentity, prefix);
       } catch (error) {
         if (error instanceof RuntimeProjectError) throw error;
@@ -330,9 +388,15 @@ export function canonicalProjectRoot(candidate: string): string {
     pathUnsafe();
   }
   try {
-    const finalMetadata = lstatSync(candidate, { bigint: true });
-    if (finalMetadata.isSymbolicLink()) pathUnsafe();
+    const parsed = path.parse(candidate);
+    let current = parsed.root;
+    for (const segment of candidate.slice(parsed.root.length).split(path.sep)) {
+      if (segment.length === 0 || segment === "." || segment === "..") pathUnsafe();
+      current = path.join(current, segment);
+      if (lstatSync(current, { bigint: true }).isSymbolicLink()) pathUnsafe();
+    }
     const canonical = realpathSync(candidate);
+    if (canonical !== candidate) pathUnsafe();
     const metadata = lstatSync(canonical, { bigint: true });
     const uid = currentUid();
     if (
