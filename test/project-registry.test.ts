@@ -134,6 +134,37 @@ describe("private append-only project registry", () => {
     expect((await readFile(registryPath, "utf8")).trimEnd().split("\n")).toHaveLength(1);
   });
 
+  it("preserves stable identity across a blocked root and explicit re-registration", async () => {
+    const { statePath, projectRoot } = await fixture();
+    const projects = registry(statePath);
+    const first = await projects.register(projectRoot);
+
+    const blocked = await projects.blockUnavailable(first.project_id);
+    expect(blocked).toMatchObject({
+      project_id: first.project_id,
+      registry_revision: 2,
+      state: "BLOCKED_PROJECT_UNAVAILABLE",
+    });
+    expect(await projects.list()).toEqual([]);
+    const reactivated = await projects.register(projectRoot);
+    expect(reactivated).toMatchObject({
+      project_id: first.project_id,
+      registry_revision: 3,
+      state: "ACTIVE",
+    });
+    const entries = (
+      await readFile(path.join(statePath, "projects", "registry", "entries.jsonl"), "utf8")
+    )
+      .trimEnd()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { readonly reason_code: string });
+    expect(entries.map((entry) => entry.reason_code)).toEqual([
+      "PROJECT_REGISTERED",
+      "PROJECT_ROOT_UNAVAILABLE",
+      "PROJECT_REGISTERED",
+    ]);
+  });
+
   it("recovers only a partial final record and quarantines its exact bytes", async () => {
     const { statePath, projectRoot } = await fixture();
     const first = registry(statePath);

@@ -39,6 +39,7 @@ export interface ProjectRegistry {
   recover(): Promise<void>;
   register(root: string): Promise<ProjectRegistration>;
   unregister(projectId: string): Promise<ProjectRegistration>;
+  blockUnavailable(projectId: string): Promise<ProjectRegistration>;
   list(): Promise<readonly ProjectRegistration[]>;
   get(projectId: string): Promise<ProjectRegistration | null>;
   stopIntake(): void;
@@ -183,6 +184,20 @@ function bindProject(
   }
 }
 
+export function loadRegisteredProjectManifest(
+  registration: ProjectRegistration,
+): ProjectWatchManifestV1 {
+  if (registration.state !== "ACTIVE") projectError("RUNTIME_PROJECT_UNAVAILABLE");
+  const binding = bindProject(registration.canonical_root);
+  if (
+    binding.canonicalRoot !== registration.canonical_root ||
+    binding.manifestHash !== registration.manifest_hash
+  ) {
+    projectError("RUNTIME_PROJECT_UNAVAILABLE");
+  }
+  return binding.manifest;
+}
+
 function parseHistoryBytes(bytes: Uint8Array): {
   readonly entries: readonly ProjectRegistryEntryV1[];
   readonly prefixLength: number;
@@ -232,12 +247,15 @@ function validateHistory(entries: readonly ProjectRegistryEntryV1[]): {
       projectError("RUNTIME_PROJECT_REGISTRY_CORRUPT");
     }
     const prior = active.get(entry.project_id);
-    if (
-      (entry.state === "ACTIVE" &&
-        entry.reason_code !==
-          (prior === undefined ? "PROJECT_REGISTERED" : "PROJECT_MANIFEST_UPDATED")) ||
-      (entry.state !== "ACTIVE" && prior === undefined)
-    ) {
+    const expectedReason =
+      entry.state === "ACTIVE"
+        ? prior === undefined
+          ? "PROJECT_REGISTERED"
+          : "PROJECT_MANIFEST_UPDATED"
+        : entry.state === "UNREGISTERED"
+          ? "PROJECT_UNREGISTERED"
+          : "PROJECT_ROOT_UNAVAILABLE";
+    if (entry.reason_code !== expectedReason || (entry.state !== "ACTIVE" && prior === undefined)) {
       projectError("RUNTIME_PROJECT_REGISTRY_CORRUPT");
     }
     rootIds.set(entry.canonical_root, entry.project_id);
@@ -376,6 +394,27 @@ export function createProjectRegistry(options: CreateProjectRegistryOptions): Pr
           manifestHash: current.manifest_hash,
           state: "UNREGISTERED",
           reasonCode: "PROJECT_UNREGISTERED",
+          history: history.entries,
+          now: options.now,
+        });
+        append(history, entry);
+        return registration(entry);
+      });
+    },
+    blockUnavailable(projectId) {
+      if (intakeStopped)
+        return Promise.reject(new RuntimeProjectError("RUNTIME_PROJECT_UNAVAILABLE"));
+      return enqueue(() => {
+        if (!UUID_PATTERN.test(projectId)) projectError("RUNTIME_PROJECT_NOT_FOUND");
+        const history = load();
+        const current = history.active.get(projectId);
+        if (current === undefined) projectError("RUNTIME_PROJECT_NOT_FOUND");
+        const entry = entryFor({
+          projectId,
+          canonicalRoot: current.canonical_root,
+          manifestHash: current.manifest_hash,
+          state: "BLOCKED_PROJECT_UNAVAILABLE",
+          reasonCode: "PROJECT_ROOT_UNAVAILABLE",
           history: history.entries,
           now: options.now,
         });
