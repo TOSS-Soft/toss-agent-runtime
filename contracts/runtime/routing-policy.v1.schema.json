@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toss.software/schemas/runtime/v1/routing-policy.v1.schema.json",
+  "title": "TOSS routing policy v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "schema_version",
+    "document_type",
+    "policy_id",
+    "revision",
+    "rules",
+    "document_hash"
+  ],
+  "properties": {
+    "protocol_version": { "const": "runtime-contract.v1" },
+    "schema_version": { "const": "routing-policy.v1" },
+    "document_type": { "const": "routing-policy" },
+    "policy_id": {
+      "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/identifier"
+    },
+    "revision": { "$ref": "#/$defs/positive_safe_integer" },
+    "rules": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 256,
+      "items": { "$ref": "#/$defs/rule" }
+    },
+    "document_hash": {
+      "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/sha256"
+    }
+  },
+  "$defs": {
+    "positive_safe_integer": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "nonnegative_safe_integer": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "logical_model_class": {
+      "type": "string",
+      "enum": [
+        "economy",
+        "balanced-code",
+        "deep-reasoning",
+        "long-context",
+        "vision",
+        "independent-review"
+      ]
+    },
+    "routing_capability": {
+      "type": "string",
+      "enum": [
+        "independent-review",
+        "json-schema",
+        "long-context",
+        "reasoning",
+        "streaming",
+        "text",
+        "tools",
+        "vision"
+      ]
+    },
+    "latency_class": {
+      "type": "string",
+      "enum": ["interactive", "standard", "extended"]
+    },
+    "task_phase_match": {
+      "type": "string",
+      "enum": ["analysis", "implementation", "review", "*"]
+    },
+    "task_complexity_match": {
+      "type": "string",
+      "enum": ["low", "medium", "high", "critical", "*"]
+    },
+    "task_risk": {
+      "type": "string",
+      "enum": ["architecture", "irreversible", "security"]
+    },
+    "task_risk_match": {
+      "oneOf": [
+        { "const": "*" },
+        {
+          "type": "array",
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/task_risk" }
+        }
+      ]
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule_id",
+        "priority",
+        "match",
+        "worker_class_preference",
+        "required_capabilities",
+        "max_latency_class",
+        "review",
+        "max_fallbacks",
+        "circuit"
+      ],
+      "properties": {
+        "rule_id": {
+          "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/identifier"
+        },
+        "priority": { "$ref": "#/$defs/nonnegative_safe_integer" },
+        "match": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["phase", "complexity", "risks"],
+          "properties": {
+            "phase": { "$ref": "#/$defs/task_phase_match" },
+            "complexity": { "$ref": "#/$defs/task_complexity_match" },
+            "risks": { "$ref": "#/$defs/task_risk_match" }
+          }
+        },
+        "worker_class_preference": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/logical_model_class" }
+        },
+        "required_capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/routing_capability" }
+        },
+        "max_latency_class": { "$ref": "#/$defs/latency_class" },
+        "review": { "type": "string", "enum": ["none", "independent"] },
+        "max_fallbacks": { "type": "integer", "minimum": 0, "maximum": 15 },
+        "circuit": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["consecutive_failure_threshold", "cooldown_ms"],
+          "properties": {
+            "consecutive_failure_threshold": { "type": "integer", "minimum": 1, "maximum": 100 },
+            "cooldown_ms": { "type": "integer", "minimum": 1, "maximum": 86400000 }
+          }
+        }
+      }
+    },
+    "routing_override": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "override_id",
+        "issued_at",
+        "catalog_hash",
+        "policy_hash",
+        "target_entry_id",
+        "reason_code"
+      ],
+      "properties": {
+        "version": { "const": "routing-override.v1" },
+        "override_id": {
+          "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/identifier"
+        },
+        "issued_at": {
+          "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/utc_timestamp"
+        },
+        "catalog_hash": {
+          "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/sha256"
+        },
+        "policy_hash": {
+          "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/sha256"
+        },
+        "target_entry_id": {
+          "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/identifier"
+        },
+        "reason_code": {
+          "type": "string",
+          "enum": ["capacity-control", "cost-control", "incident-mitigation", "latency-control"]
+        }
+      }
+    }
+  }
+}

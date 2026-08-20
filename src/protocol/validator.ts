@@ -3,6 +3,7 @@ import addFormatsModule from "ajv-formats";
 
 import agentgatewayCapabilitiesSchema from "../../contracts/runtime/agentgateway-capabilities.v1.schema.json" with { type: "json" };
 import modelCatalogSchema from "../../contracts/runtime/model-catalog.v1.schema.json" with { type: "json" };
+import routingPolicySchema from "../../contracts/runtime/routing-policy.v1.schema.json" with { type: "json" };
 import commonSchema from "../../contracts/runtime/runtime-common.v1.schema.json" with { type: "json" };
 import executionEventSchema from "../../contracts/runtime/execution-event.v1.schema.json" with { type: "json" };
 import executionRequestSchema from "../../contracts/runtime/execution-request.v1.schema.json" with { type: "json" };
@@ -27,6 +28,8 @@ import type {
 } from "./types.js";
 
 const COMMON_SCHEMA_ID = "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json";
+const ROUTING_POLICY_SCHEMA_ID =
+  "https://toss.software/schemas/runtime/v1/routing-policy.v1.schema.json";
 const Ajv2020 = Ajv2020Module.default;
 const addFormats = addFormatsModule.default;
 
@@ -34,6 +37,7 @@ const REGISTERED_SCHEMAS: Readonly<Record<string, string>> = {
   "agentgateway-capabilities.v1":
     "https://toss.software/schemas/runtime/v1/agentgateway-capabilities.v1.schema.json",
   "model-catalog.v1": "https://toss.software/schemas/runtime/v1/model-catalog.v1.schema.json",
+  "routing-policy.v1": ROUTING_POLICY_SCHEMA_ID,
   "execution-request.v1":
     "https://toss.software/schemas/runtime/v1/execution-request.v1.schema.json",
   "execution-event.v1": "https://toss.software/schemas/runtime/v1/execution-event.v1.schema.json",
@@ -48,9 +52,10 @@ const REGISTERED_SCHEMAS: Readonly<Record<string, string>> = {
 };
 
 const FRAGMENTS = {
-  "artifact-reference": "artifact_reference",
-  "runtime-error": "runtime_error",
-  "trace-context": "trace_context",
+  "artifact-reference": `${COMMON_SCHEMA_ID}#/$defs/artifact_reference`,
+  "runtime-error": `${COMMON_SCHEMA_ID}#/$defs/runtime_error`,
+  "trace-context": `${COMMON_SCHEMA_ID}#/$defs/trace_context`,
+  "routing-override": `${ROUTING_POLICY_SCHEMA_ID}#/$defs/routing_override`,
 } as const;
 
 export type FragmentName = keyof typeof FRAGMENTS;
@@ -108,6 +113,7 @@ export function createProtocolValidator(): ProtocolValidator {
   ajv.addSchema(commonSchema);
   ajv.addSchema(agentgatewayCapabilitiesSchema);
   ajv.addSchema(modelCatalogSchema);
+  ajv.addSchema(routingPolicySchema);
   ajv.addSchema(executionEventSchema);
   ajv.addSchema(executionRequestSchema);
   ajv.addSchema(executionResultSchema);
@@ -117,10 +123,10 @@ export function createProtocolValidator(): ProtocolValidator {
   ajv.addSchema(runtimeCapabilitiesSchema);
 
   const fragmentValidators = Object.fromEntries(
-    Object.entries(FRAGMENTS).map(([name, definition]) => {
-      const validator = ajv.getSchema(`${COMMON_SCHEMA_ID}#/$defs/${definition}`);
+    Object.entries(FRAGMENTS).map(([name, schemaReference]) => {
+      const validator = ajv.getSchema(schemaReference);
       if (validator === undefined) {
-        throw new Error(`Common schema fragment is not registered: ${definition}`);
+        throw new Error(`Schema fragment is not registered: ${schemaReference}`);
       }
       return [name, validator];
     }),
