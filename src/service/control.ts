@@ -30,7 +30,8 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 const LEGACY_PUBLICATION_GUARD_PATTERN = /^\.c[0-9a-f]{8}$/u;
 const PUBLICATION_GUARD_PATTERN = /^\.c[0-9a-f]{64}$/u;
 const PUBLICATION_CLAIM_PATTERN = /^\.r[0-9a-f]{64}$/u;
-const STAGED_SOCKET_PATTERN = /^\.s[0-9a-z]{25}$/u;
+const PREVIOUS_STAGED_SOCKET_PATTERN = /^\.s[0-9a-z]{25}$/u;
+const STAGED_SOCKET_PATTERN = /^\.s[0-9a-z]{10}$/u;
 const internalServiceErrors = new WeakSet<RuntimeServiceError>();
 
 interface FileIdentity {
@@ -267,12 +268,17 @@ function isPublicationArtifactName(candidate: string): boolean {
     LEGACY_PUBLICATION_GUARD_PATTERN.test(candidate) ||
     PUBLICATION_GUARD_PATTERN.test(candidate) ||
     PUBLICATION_CLAIM_PATTERN.test(candidate) ||
+    PREVIOUS_STAGED_SOCKET_PATTERN.test(candidate) ||
     STAGED_SOCKET_PATTERN.test(candidate)
   );
 }
 
 function isPossibleStagedSocketName(candidate: string): boolean {
-  return LEGACY_PUBLICATION_GUARD_PATTERN.test(candidate) || STAGED_SOCKET_PATTERN.test(candidate);
+  return (
+    LEGACY_PUBLICATION_GUARD_PATTERN.test(candidate) ||
+    PREVIOUS_STAGED_SOCKET_PATTERN.test(candidate) ||
+    STAGED_SOCKET_PATTERN.test(candidate)
+  );
 }
 
 function publicationGuardName(serviceInstanceId: string): string {
@@ -280,8 +286,11 @@ function publicationGuardName(serviceInstanceId: string): string {
 }
 
 function stagedSocketName(serviceInstanceId: string): string {
-  const entropy = createHash("sha256").update(serviceInstanceId, "utf8").digest("hex").slice(0, 32);
-  return `.s${BigInt(`0x${entropy}`).toString(36).padStart(25, "0")}`;
+  const entropy = BigInt(
+    `0x${createHash("sha256").update(serviceInstanceId, "utf8").digest("hex")}`,
+  );
+  const token = (entropy % 36n ** 10n).toString(36).padStart(10, "0");
+  return `.s${token}`;
 }
 
 function publicationClaimName(serviceInstanceId: string, candidateName: string): string {

@@ -36,7 +36,8 @@ const fixedRequestId = "018f0f64-7b21-7d4f-8c3d-4a30413d5f42";
 const otherRequestId = "018f0f64-7b21-7d4f-8c3d-4a30413d5f43";
 const currentPublicationGuard =
   ".c8fcfb3a77b48dbef2c3eab57379addc10c8368ab3418574a3d8dc1c68536feb9";
-const currentStagedSocket = ".s8ii47i6hu9f6rrdwudifbfef5";
+const currentStagedSocket = ".siieudk9fi1";
+const previousStagedSocket = ".s8ii47i6hu9f6rrdwudifbfef5";
 const legacyStagedSocket = ".c8fcfb3a7";
 const temporaryDirectories: string[] = [];
 const controlServers: ServiceControlServer[] = [];
@@ -198,6 +199,55 @@ async function closeNative(server: Server): Promise<void> {
   });
   const index = nativeServers.indexOf(server);
   if (index >= 0) nativeServers.splice(index, 1);
+}
+
+async function nativePathBindsExactly(candidate: string): Promise<boolean> {
+  const server = createServer();
+  const listened = await new Promise<boolean>((resolve) => {
+    const onError = (): void => {
+      server.off("listening", onListening);
+      resolve(false);
+    };
+    const onListening = (): void => {
+      server.off("error", onError);
+      resolve(true);
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(candidate);
+  });
+  if (!listened) return false;
+  let exact = false;
+  try {
+    exact = (await lstat(candidate)).isSocket();
+  } catch {
+    // Some Unix implementations accept then truncate an overlong pathname.
+  }
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  return exact;
+}
+
+async function findNativeSocketPathBoundary(
+  basename: string,
+): Promise<{ readonly exact: string; readonly firstInexact: string }> {
+  let exact: string | undefined;
+  for (let padding = 0; padding < 256; padding += 1) {
+    const candidateRuntime = path.join(temporaryRoot, `b${"x".repeat(padding)}`);
+    await mkdir(candidateRuntime, { mode: 0o700 });
+    await chmod(candidateRuntime, 0o700);
+    const candidate = path.join(candidateRuntime, basename);
+    if (await nativePathBindsExactly(candidate)) {
+      if (exact !== undefined) await rmdir(path.dirname(exact));
+      exact = candidate;
+      continue;
+    }
+    await rm(candidateRuntime, { force: true, recursive: true });
+    await mkdir(candidateRuntime, { mode: 0o700 });
+    await chmod(candidateRuntime, 0o700);
+    if (exact === undefined) throw new Error("native Unix socket path boundary was too short");
+    return { exact, firstInexact: candidate };
+  }
+  throw new Error("native Unix socket path boundary was not found");
 }
 
 async function leaveClosedSocketLinks(...candidates: readonly string[]): Promise<void> {
@@ -393,7 +443,46 @@ describe("private service control socket", () => {
     expect(await pathIsMissing(socketPath)).toBe(true);
   });
 
-  it.each([legacyStagedSocket, currentStagedSocket])(
+  it("publishes and reclaims at the native exact Unix socket path boundary", async () => {
+    const boundary = await findNativeSocketPathBoundary("runtime.sock");
+    expect(Buffer.byteLength(boundary.firstInexact)).toBe(Buffer.byteLength(boundary.exact) + 1);
+    expect(await nativePathBindsExactly(boundary.firstInexact)).toBe(false);
+    expect(await nativePathBindsExactly(boundary.exact)).toBe(true);
+    runtimePath = path.dirname(boundary.exact);
+    socketPath = boundary.exact;
+    let stagedPath: string | undefined;
+    const server = await listenControl({
+      operationHooks: {
+        beforePublish: async () => {
+          for (const entry of await readdir(runtimePath)) {
+            const candidate = path.join(runtimePath, entry);
+            if ((await lstat(candidate)).isSocket()) stagedPath = candidate;
+          }
+        },
+      },
+    });
+
+    expect(stagedPath).toBeDefined();
+    expect(path.basename(stagedPath!)).toBe(currentStagedSocket);
+    expect(Buffer.byteLength(stagedPath!)).toBeLessThanOrEqual(Buffer.byteLength(socketPath));
+    expect((await lstat(socketPath)).isSocket()).toBe(true);
+    await server.close();
+
+    const crashed = await listenNative(socketPath);
+    await chmod(socketPath, 0o600);
+    await link(socketPath, stagedPath!);
+    await unlink(socketPath);
+    await closeNative(crashed);
+    expect((await lstat(stagedPath!)).isSocket()).toBe(true);
+
+    const recovered = await listenControl();
+    expect(await pathIsMissing(stagedPath!)).toBe(true);
+    expect((await lstat(socketPath)).isSocket()).toBe(true);
+    await recovered.close();
+    expect(await readdir(runtimePath)).toEqual([]);
+  });
+
+  it.each([legacyStagedSocket, previousStagedSocket, currentStagedSocket])(
     "reclaims a crashed staged socket before publication: %s",
     async (stagedName) => {
       const stagedPath = path.join(runtimePath, stagedName);
@@ -411,7 +500,7 @@ describe("private service control socket", () => {
     },
   );
 
-  it.each([legacyStagedSocket, currentStagedSocket])(
+  it.each([legacyStagedSocket, previousStagedSocket, currentStagedSocket])(
     "reclaims a crash between hard-link publication and staged unlink: %s",
     async (stagedName) => {
       const stagedPath = path.join(runtimePath, stagedName);
@@ -435,7 +524,7 @@ describe("private service control socket", () => {
     },
   );
 
-  it.each([legacyStagedSocket, currentStagedSocket])(
+  it.each([legacyStagedSocket, previousStagedSocket, currentStagedSocket])(
     "fails closed without removing a live staged socket: %s",
     async (stagedName) => {
       const stagedPath = path.join(runtimePath, stagedName);
