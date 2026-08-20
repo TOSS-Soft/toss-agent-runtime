@@ -2,6 +2,29 @@ import path from "node:path";
 
 export const SERVICE_LABEL = "software.toss.agent-runtime";
 export const SYSTEMD_UNIT = "toss-agent-runtime.service";
+const UNIX_SOCKET_PATH_BYTE_LIMIT = Object.freeze({ darwin: 104, linux: 107 });
+const ACTIVE_INTERNAL_SOCKET_BASENAMES = Object.freeze([".s0000000000", ".x0000000000"] as const);
+
+export type ServiceSocketPlatform = keyof typeof UNIX_SOCKET_PATH_BYTE_LIMIT;
+
+export function isServiceSocketPlatform(value: string): value is ServiceSocketPlatform {
+  return value === "darwin" || value === "linux";
+}
+
+export function serviceSocketLayoutFits(options: {
+  readonly socketPath: string;
+  readonly platform: ServiceSocketPlatform;
+  /** @internal Deterministic ABI-budget seam for portable tests. */
+  readonly pathByteLimit?: number;
+}): boolean {
+  const pathByteLimit = options.pathByteLimit ?? UNIX_SOCKET_PATH_BYTE_LIMIT[options.platform];
+  if (!Number.isSafeInteger(pathByteLimit) || pathByteLimit <= 0) return false;
+  const runtimePath = path.dirname(options.socketPath);
+  return [
+    options.socketPath,
+    ...ACTIVE_INTERNAL_SOCKET_BASENAMES.map((basename) => path.join(runtimePath, basename)),
+  ].every((candidate) => Buffer.byteLength(candidate, "utf8") <= pathByteLimit);
+}
 
 export interface ServicePaths {
   readonly definition: string;

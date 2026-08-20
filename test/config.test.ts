@@ -10,7 +10,6 @@ import {
   truncate,
   writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -26,7 +25,9 @@ const temporaryDirectories: string[] = [];
 const RUNTIME_CONFIG_BYTE_CAP = 2 * 1024 * 1024;
 
 async function temporaryDirectory(): Promise<string> {
-  const directory = await realpath(await mkdtemp(path.join(tmpdir(), "toss-runtime-config-")));
+  const directory = await realpath(
+    await mkdtemp(path.join(await realpath("/tmp"), "toss-runtime-config-")),
+  );
   temporaryDirectories.push(directory);
   return directory;
 }
@@ -49,6 +50,10 @@ provider_profiles: []
 mcp_profiles: []
 secret_references: {}
 `;
+}
+
+function validYamlWithSocket(root: string, socket: string): string {
+  return validYaml(root).replace(`socket: ${root}/runtime.sock`, `socket: ${socket}`);
 }
 
 function linuxConfigRoot(home: string): string {
@@ -113,6 +118,20 @@ describe("runtime configuration", () => {
     expect(result.config.paths.state).toBe(path.join(root, ".local", "state", "toss", "runtime"));
   });
 
+  it("validates the default socket layout before returning a missing-file fallback", async () => {
+    const root = await temporaryDirectory();
+    const socket = defaultConfig("darwin", root).paths.socket;
+
+    await expect(
+      loadConfig({
+        env: {},
+        platform: "darwin",
+        home: root,
+        socketPathByteLimit: Buffer.byteLength(socket) - 1,
+      }),
+    ).rejects.toMatchObject({ code: "RUNTIME_CONFIG_INVALID" });
+  });
+
   it("resolves the standard config path from the platform-specific private root", () => {
     expect(resolveDefaultConfigPath("darwin", "/Users/test", {})).toBe(
       "/Users/test/Library/Application Support/TOSS/runtime/config.yaml",
@@ -137,6 +156,69 @@ describe("runtime configuration", () => {
     expect(config.paths.state).toBe("/home/test/.local/state/toss/runtime");
     expect(config.paths.logs).toBe("/home/test/.local/state/toss/runtime/logs");
     expect(config.paths.socket).toBe("/home/test/.local/state/toss/runtime/runtime.sock");
+  });
+
+  it("rejects a native-fit public socket whose internal siblings exceed an injected budget", async () => {
+    const root = await temporaryDirectory();
+    const socket = path.join(root, "a");
+    const configPath = path.join(root, "short-public.yaml");
+    await writeFile(configPath, validYamlWithSocket(root, socket), { mode: 0o600 });
+    let error: unknown;
+
+    try {
+      await loadConfig({
+        explicitPath: configPath,
+        env: {},
+        platform: "linux",
+        home: root,
+        socketPathByteLimit: Buffer.byteLength(socket),
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(RuntimeConfigError);
+    expect(error).toMatchObject({ code: "RUNTIME_CONFIG_INVALID" });
+    expect(String(error)).not.toContain(socket);
+    expect(String(error)).not.toContain(String(Buffer.byteLength(socket)));
+  });
+
+  it("counts multibyte parent and basename characters as UTF-8 socket-path bytes", async () => {
+    const root = await temporaryDirectory();
+    const runtime = path.join(root, "🚀");
+    const socket = path.join(runtime, "é");
+    const internalSibling = path.join(runtime, ".s0123456789");
+    const configPath = path.join(root, "multibyte-socket.yaml");
+    await writeFile(configPath, validYamlWithSocket(root, socket), { mode: 0o600 });
+
+    await expect(
+      loadConfig({
+        explicitPath: configPath,
+        env: {},
+        platform: "linux",
+        home: root,
+        socketPathByteLimit: Buffer.byteLength(internalSibling) - 1,
+      }),
+    ).rejects.toMatchObject({ code: "RUNTIME_CONFIG_INVALID" });
+    await expect(lstat(runtime)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("accepts a short public socket when every internal sibling fits the exact injected budget", async () => {
+    const root = await temporaryDirectory();
+    const socket = path.join(root, "a");
+    const internalSibling = path.join(root, ".x0123456789");
+    const configPath = path.join(root, "short-public-valid.yaml");
+    await writeFile(configPath, validYamlWithSocket(root, socket), { mode: 0o600 });
+
+    const loaded = await loadConfig({
+      explicitPath: configPath,
+      env: {},
+      platform: "linux",
+      home: root,
+      socketPathByteLimit: Buffer.byteLength(internalSibling),
+    });
+
+    expect(loaded.config.paths.socket).toBe(socket);
   });
 
   it("rejects inline secret material without echoing the value", async () => {

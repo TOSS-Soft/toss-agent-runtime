@@ -803,6 +803,79 @@ describe("private service control socket", () => {
     expect(await readdir(runtimePath)).toEqual([]);
   });
 
+  it.runIf(process.platform === "darwin")(
+    "rejects a native-exact short public path before its longer internal stage is created",
+    async () => {
+      const boundary = await findNativeSocketPathBoundary("a");
+      runtimePath = path.dirname(boundary.exact);
+      socketPath = boundary.exact;
+      const internalStage = path.join(runtimePath, currentStagedSocket);
+      expect(await nativePathBindsExactly(socketPath)).toBe(true);
+      expect(Buffer.byteLength(socketPath)).toBe(104);
+      expect(Buffer.byteLength(internalStage)).toBeGreaterThan(
+        Buffer.byteLength(boundary.firstInexact),
+      );
+      const server = createServiceControlServer(options());
+      controlServers.push(server);
+
+      await expect(server.listen()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_PATH_UNSAFE",
+      });
+      expect(await readdir(runtimePath)).toEqual([]);
+      expect(statusCalls).toBe(0);
+    },
+  );
+
+  it("rejects an injected socket layout budget before creating runtime artifacts", async () => {
+    socketPath = path.join(runtimePath, "a");
+    const server = createServiceControlServer(
+      options({
+        socketPathPlatform: "darwin",
+        socketPathByteLimit: Buffer.byteLength(socketPath),
+      }),
+    );
+    controlServers.push(server);
+
+    await expect(server.listen()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_PATH_UNSAFE",
+    });
+    expect(await readdir(runtimePath)).toEqual([]);
+    expect(statusCalls).toBe(0);
+  });
+
+  it("counts multibyte runtime and basename characters as UTF-8 socket-path bytes", async () => {
+    runtimePath = path.join(runtimePath, "🚀");
+    await mkdir(runtimePath, { mode: 0o700 });
+    await chmod(runtimePath, 0o700);
+    socketPath = path.join(runtimePath, "é");
+    const internalClaim = path.join(runtimePath, ".x0123456789");
+    const server = createServiceControlServer(
+      options({
+        socketPathPlatform: "linux",
+        socketPathByteLimit: Buffer.byteLength(internalClaim) - 1,
+      }),
+    );
+    controlServers.push(server);
+
+    await expect(server.listen()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_PATH_UNSAFE",
+    });
+    expect(await readdir(runtimePath)).toEqual([]);
+  });
+
+  it("accepts a short public socket at the exact injected internal-sibling budget", async () => {
+    socketPath = path.join(runtimePath, "a");
+    const internalStage = path.join(runtimePath, currentStagedSocket);
+    const server = await listenControl({
+      socketPathPlatform: "linux",
+      socketPathByteLimit: Buffer.byteLength(internalStage),
+    });
+
+    expect((await lstat(socketPath)).isSocket()).toBe(true);
+    await server.close();
+    expect(await readdir(runtimePath)).toEqual([]);
+  });
+
   it.each([legacyStagedSocket, previousStagedSocket, currentStagedSocket])(
     "reclaims a crashed staged socket before publication: %s",
     async (stagedName) => {

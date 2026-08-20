@@ -24,6 +24,7 @@ import {
   type ServiceStatusV1,
 } from "./contracts.js";
 import { RuntimeServiceError, type RuntimeServiceErrorCode } from "./errors.js";
+import { isServiceSocketPlatform, serviceSocketLayoutFits } from "./paths.js";
 
 const RESPONSE_FRAME_BYTES = MAX_CONTROL_MESSAGE_BYTES + 1;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
@@ -61,6 +62,10 @@ export interface CreateServiceControlServerOptions {
   readonly idleTimeoutMs: 5_000;
   readonly maxConnections: 32;
   readonly cacheSize: 256;
+  /** @internal Deterministic current-platform seam for portable path-budget tests. */
+  readonly socketPathPlatform?: "darwin" | "linux";
+  /** @internal Deterministic Unix-socket ABI-budget seam for portable tests. */
+  readonly socketPathByteLimit?: number;
   readonly classifyPathOwner?: PathOwnerClassifier;
   /** @internal Test seam for modeling the current process UID. */
   readonly currentUid?: () => number;
@@ -210,6 +215,23 @@ function assertSocketPath(candidate: string): void {
     candidate === path.parse(candidate).root ||
     path.basename(candidate).length === 0 ||
     /[\u0000-\u001f\u007f]/u.test(candidate)
+  ) {
+    pathUnsafe();
+  }
+}
+
+function assertServiceSocketLayout(options: CreateServiceControlServerOptions): void {
+  assertSocketPath(options.socketPath);
+  const platform = options.socketPathPlatform ?? process.platform;
+  if (!isServiceSocketPlatform(platform)) unavailable();
+  if (
+    !serviceSocketLayoutFits({
+      socketPath: options.socketPath,
+      platform,
+      ...(options.socketPathByteLimit === undefined
+        ? {}
+        : { pathByteLimit: options.socketPathByteLimit }),
+    })
   ) {
     pathUnsafe();
   }
@@ -1454,6 +1476,7 @@ export function createServiceControlServer(
     if (listenPromise !== undefined) return listenPromise;
     listenPromise = (async () => {
       if (closing || !validatedConfiguration(options)) unavailable();
+      assertServiceSocketLayout(options);
       const runtimeIdentity = await assertPrivateRuntimeDirectory(
         options.socketPath,
         options.classifyPathOwner,

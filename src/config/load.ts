@@ -19,6 +19,7 @@ import type {
   RuntimeEnvironment,
   RuntimePlatform,
 } from "./types.js";
+import { serviceSocketLayoutFits } from "../service/paths.js";
 
 const Ajv2020 = Ajv2020Module.default;
 const ajv = new Ajv2020({
@@ -137,7 +138,34 @@ function parseConfigBytes(filePath: string, input: Uint8Array): JsonValue {
   return value;
 }
 
-function assertConfig(value: JsonValue): RuntimeConfigV1 {
+function assertServiceSocketLayout(options: {
+  readonly socketPath: string;
+  readonly platform: RuntimePlatform;
+  readonly socketPathByteLimit?: number | undefined;
+}): void {
+  if (
+    !serviceSocketLayoutFits({
+      socketPath: options.socketPath,
+      platform: options.platform,
+      ...(options.socketPathByteLimit === undefined
+        ? {}
+        : { pathByteLimit: options.socketPathByteLimit }),
+    })
+  ) {
+    throw new RuntimeConfigError(
+      "RUNTIME_CONFIG_INVALID",
+      "Configuration service socket path exceeds platform support",
+    );
+  }
+}
+
+function assertConfig(
+  value: JsonValue,
+  options: {
+    readonly platform: RuntimePlatform;
+    readonly socketPathByteLimit?: number | undefined;
+  },
+): RuntimeConfigV1 {
   if (!validateConfig(value)) {
     const issues = (validateConfig.errors ?? [])
       .map((error) => `${error.instancePath || "/"}: ${error.keyword}`)
@@ -157,6 +185,11 @@ function assertConfig(value: JsonValue): RuntimeConfigV1 {
       );
     }
   }
+  assertServiceSocketLayout({
+    socketPath: config.paths.socket,
+    platform: options.platform,
+    socketPathByteLimit: options.socketPathByteLimit,
+  });
   return config;
 }
 
@@ -343,6 +376,8 @@ export async function loadConfig(options: {
   readonly env: RuntimeEnvironment;
   readonly platform: RuntimePlatform;
   readonly home: string;
+  /** @internal Deterministic Unix-socket ABI-budget seam for portable tests. */
+  readonly socketPathByteLimit?: number;
   /** @internal Deterministic race hook used only by real-filesystem tests. */
   readonly beforeRead?: () => Promise<void>;
 }): Promise<LoadedConfig> {
@@ -361,8 +396,14 @@ export async function loadConfig(options: {
     handle = await open(selectedPath, constants.O_RDONLY | constants.O_NOFOLLOW);
   } catch (error) {
     if (!required && isMissingFile(error)) {
+      const config = defaultConfig(options.platform, options.home, options.env);
+      assertServiceSocketLayout({
+        socketPath: config.paths.socket,
+        platform: options.platform,
+        socketPathByteLimit: options.socketPathByteLimit,
+      });
       return {
-        config: defaultConfig(options.platform, options.home, options.env),
+        config,
         source: "defaults",
       };
     }
@@ -409,7 +450,7 @@ export async function loadConfig(options: {
 
   let config: RuntimeConfigV1;
   try {
-    config = assertConfig(parseConfigBytes(selectedPath, input));
+    config = assertConfig(parseConfigBytes(selectedPath, input), options);
   } catch (error) {
     if (error instanceof RuntimeConfigError) {
       throw error;

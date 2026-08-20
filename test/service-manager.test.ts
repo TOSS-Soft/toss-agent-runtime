@@ -11,7 +11,6 @@ import {
   truncate,
   writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -80,7 +79,10 @@ interface FixtureOptions {
 }
 
 async function temporaryDirectory(): Promise<string> {
-  const directory = await realpath(await mkdtemp(path.join(tmpdir(), "toss-runtime-manager-")));
+  // This suite exercises manager semantics; socket ABI boundaries live in config/control tests.
+  const directory = await realpath(
+    await mkdtemp(path.join(await realpath("/tmp"), "toss-runtime-manager-")),
+  );
   temporaryDirectories.push(directory);
   return directory;
 }

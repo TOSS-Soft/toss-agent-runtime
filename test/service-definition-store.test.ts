@@ -16,7 +16,6 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -31,8 +30,10 @@ import {
 
 const temporaryDirectories: string[] = [];
 
-async function temporaryDirectory(parent = tmpdir()): Promise<string> {
-  const directory = await realpath(await mkdtemp(path.join(parent, "toss-runtime-store-")));
+async function temporaryDirectory(parent?: string): Promise<string> {
+  // This suite exercises storage semantics; socket ABI boundaries live in config/control tests.
+  const temporaryRoot = parent ?? (await realpath("/tmp"));
+  const directory = await realpath(await mkdtemp(path.join(temporaryRoot, "toss-runtime-store-")));
   temporaryDirectories.push(directory);
   return directory;
 }
