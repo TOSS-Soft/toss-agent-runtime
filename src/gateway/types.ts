@@ -85,6 +85,32 @@ export interface AgentgatewayClient {
   health(): Promise<AgentgatewayClientHealth>;
 }
 
+export type GatewayObservationStatusClass = "2xx" | "3xx" | "4xx" | "5xx" | "network";
+
+export interface GatewayObservation {
+  readonly run_id: string;
+  readonly request_id: string;
+  readonly route_id: string | null;
+  readonly streaming: boolean;
+  readonly request_bytes: number;
+  readonly response_bytes: number;
+  readonly message_count: number;
+  readonly content_block_count: number;
+  readonly tool_count: number;
+  readonly status_class: GatewayObservationStatusClass;
+  readonly duration_ms: number;
+}
+
+export interface CreateAgentgatewayTransportOptions {
+  readonly selectedProfile: SelectedAgentgatewayProfile;
+  readonly credentialReference: SecretReference;
+  readonly credentialProvider: GatewayCredentialProvider;
+  readonly fetch: AgentgatewayFetch;
+  readonly now: () => Date;
+  readonly monotonicNow: () => number;
+  readonly onObservation?: (observation: GatewayObservation) => void;
+}
+
 export interface ParseAgentgatewayCapabilitiesOptions {
   readonly now: () => Date;
 }

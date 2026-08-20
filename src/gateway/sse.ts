@@ -81,6 +81,7 @@ async function cancelReader(reader: ReadableStreamDefaultReader<Uint8Array>): Pr
 export async function* parseBoundedSse(
   body: ReadableStream<Uint8Array>,
   signal: AbortSignal,
+  onBytes?: (total: number) => void,
 ): AsyncIterable<JsonValue> {
   if (!(signal instanceof AbortSignal) || signal.aborted) {
     throw agentgatewayError("RUNTIME_PROVIDER_CANCELLED");
@@ -127,6 +128,11 @@ export async function* parseBoundedSse(
       if (result.done) break;
       if (!(result.value instanceof Uint8Array)) throw invalid();
       totalBytes += result.value.byteLength;
+      try {
+        onBytes?.(totalBytes);
+      } catch {
+        // Internal measurement cannot change the SSE result.
+      }
       if (!Number.isSafeInteger(totalBytes) || totalBytes > MAX_TOTAL_BYTES) throw invalid();
       try {
         buffer += decoder.decode(result.value, { stream: true });

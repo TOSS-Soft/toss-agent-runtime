@@ -27,9 +27,12 @@ export type {
   AgentgatewayHealthValidationResult,
   AgentgatewayProfileV1,
   AgentgatewayRouteV1,
+  CreateAgentgatewayTransportOptions,
   GatewayCredentialCoordinator,
   GatewayCredentialLease,
   GatewayCredentialProvider,
+  GatewayObservation,
+  GatewayObservationStatusClass,
   ParseAgentgatewayCapabilitiesOptions,
   SelectedAgentgatewayProfile,
 } from "./types.js";

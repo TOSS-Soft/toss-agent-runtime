@@ -162,6 +162,7 @@ function transport(options: {
     credentialProvider: options.credentialProvider ?? credentials(),
     fetch: options.fetch ?? globalThis.fetch,
     now,
+    monotonicNow: () => 0,
   });
 }
 
@@ -572,6 +573,54 @@ describe("agentgateway non-streaming transport", () => {
     ).rejects.toEqual(new RuntimeProviderError("RUNTIME_PROVIDER_GATEWAY_INVALID"));
     expect(toStringCalls).toBe(0);
   });
+
+  it.each([
+    [401, undefined, "RUNTIME_PROVIDER_AUTHENTICATION"],
+    [403, undefined, "RUNTIME_PROVIDER_AUTHENTICATION"],
+    [404, undefined, "RUNTIME_PROVIDER_ROUTE_NOT_FOUND"],
+    [429, undefined, "RUNTIME_PROVIDER_RATE_LIMIT"],
+    [502, "gateway", "RUNTIME_PROVIDER_GATEWAY_UNAVAILABLE"],
+    [503, "gateway", "RUNTIME_PROVIDER_GATEWAY_UNAVAILABLE"],
+    [504, "gateway", "RUNTIME_PROVIDER_GATEWAY_UNAVAILABLE"],
+    [500, "provider", "RUNTIME_PROVIDER_TRANSIENT"],
+    [500, undefined, "RUNTIME_PROVIDER_GATEWAY_UNAVAILABLE"],
+    [500, "invalid-source", "RUNTIME_PROVIDER_GATEWAY_UNAVAILABLE"],
+    [418, undefined, "RUNTIME_PROVIDER_GATEWAY_INVALID"],
+  ] as const)(
+    "maps Responses HTTP %i source %s to %s without reading native body",
+    async (status, source, code) => {
+      const capability = capabilityDocument();
+      const nativeBody = `${virtualToken}-native-body-${status}-must-not-leak`;
+      let call = 0;
+      const fetch = vi.fn<AgentgatewayFetch>(() => {
+        call += 1;
+        return Promise.resolve(
+          call === 1
+            ? new Response(canonicalJson(capability), { status: 200 })
+            : new Response(nativeBody, {
+                status,
+                headers: {
+                  "x-native-secret": `${virtualToken}-must-not-leak`,
+                  ...(source === undefined ? {} : { "x-toss-error-source": source }),
+                },
+              }),
+        );
+      });
+      let error: unknown;
+      try {
+        await transport({ endpoint: "https://gateway.example.test/runtime", fetch }).complete(
+          deepFreezeJson({ model: "balanced-code", stream: false }),
+          context(),
+        );
+      } catch (caught) {
+        error = caught;
+      }
+
+      expect(error).toEqual(new RuntimeProviderError(code));
+      expect(String(error)).not.toContain(nativeBody);
+      expect(JSON.stringify(error)).not.toContain(virtualToken);
+    },
+  );
 });
 
 describe("agentgateway bounded streaming transport", () => {

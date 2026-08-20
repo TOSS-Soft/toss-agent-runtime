@@ -1,4 +1,3 @@
-import type { SecretReference } from "../config/types.js";
 import {
   canonicalJson,
   deepFreezeJson,
@@ -23,14 +22,13 @@ import {
 } from "./attestation.js";
 import { createAgentgatewayClient, readBoundedAgentgatewayResponse } from "./client.js";
 import { createGatewayCredentialCoordinator } from "./credentials.js";
-import { agentgatewayError, classifyAgentgatewayHttpStatus } from "./errors.js";
+import { agentgatewayError, classifyAgentgatewayResponseStatus } from "./errors.js";
 import { parseBoundedSse } from "./sse.js";
 import type {
-  AgentgatewayCapabilitiesV1,
-  AgentgatewayFetch,
   AgentgatewayFetchOptions,
-  GatewayCredentialProvider,
-  SelectedAgentgatewayProfile,
+  CreateAgentgatewayTransportOptions,
+  GatewayObservation,
+  GatewayObservationStatusClass,
 } from "./types.js";
 
 const RESPONSE_BYTES = 8 * 1024 * 1024;
@@ -274,18 +272,15 @@ function normalizeFailure(error: unknown, signal: AbortSignal): RuntimeProviderE
 }
 
 function classifyResponseFailure(response: Response): RuntimeProviderError {
+  let source: unknown = null;
   if (response.status >= 500 && response.status <= 599) {
-    let source: string | null;
     try {
       source = response.headers.get("x-toss-error-source");
     } catch {
       source = null;
     }
-    return source === "provider"
-      ? agentgatewayError("RUNTIME_PROVIDER_TRANSIENT")
-      : agentgatewayError("RUNTIME_PROVIDER_GATEWAY_UNAVAILABLE");
   }
-  return classifyAgentgatewayHttpStatus(response.status);
+  return classifyAgentgatewayResponseStatus(response.status, source);
 }
 
 function rejectRedirectedResponse(response: Response, expectedUrl: string): void {
@@ -349,27 +344,166 @@ function streamEventType(value: JsonValue): string {
   return descriptor.value;
 }
 
+interface PendingObservation {
+  readonly start: number | null;
+  readonly run_id: string;
+  readonly request_id: string;
+  readonly streaming: boolean;
+  readonly request_bytes: number;
+  readonly message_count: number;
+  readonly content_block_count: number;
+  readonly tool_count: number;
+  route_id: string | null;
+  response_bytes: number;
+  status_class: GatewayObservationStatusClass;
+  emitted: boolean;
+}
+
+function safeMonotonicNow(options: CreateAgentgatewayTransportOptions): number | null {
+  try {
+    const value = options.monotonicNow();
+    return Number.isFinite(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function arrayLength(value: unknown): number {
+  if (!Array.isArray(value)) return 0;
+  const length: unknown = Object.getOwnPropertyDescriptor(value, "length")?.value;
+  return Number.isSafeInteger(length) && Number(length) >= 0 ? Number(length) : 0;
+}
+
+function requestStructure(input: JsonValue): {
+  readonly message_count: number;
+  readonly content_block_count: number;
+  readonly tool_count: number;
+} {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    return { message_count: 0, content_block_count: 0, tool_count: 0 };
+  }
+  const root = Object.getOwnPropertyDescriptors(input);
+  const entries: unknown = root.input?.value;
+  let messageCount = 0;
+  let contentBlockCount = 0;
+  if (Array.isArray(entries)) {
+    const descriptors = Object.getOwnPropertyDescriptors(entries);
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry: unknown = descriptors[String(index)]?.value;
+      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
+      const fields = Object.getOwnPropertyDescriptors(entry);
+      const content: unknown = fields.content?.value;
+      if (typeof fields.role?.value === "string" && Array.isArray(content)) {
+        messageCount += 1;
+        contentBlockCount += arrayLength(content);
+      } else if (fields.type?.value === "function_call_output") {
+        contentBlockCount += 1;
+      }
+    }
+  }
+  return {
+    message_count: messageCount,
+    content_block_count: contentBlockCount,
+    tool_count: arrayLength(root.tools?.value),
+  };
+}
+
+function createPendingObservation(options: {
+  readonly transport: CreateAgentgatewayTransportOptions;
+  readonly context: ReturnType<typeof normalizedContext>;
+  readonly input: JsonValue;
+  readonly body: string;
+  readonly streaming: boolean;
+}): PendingObservation | null {
+  if (
+    options.transport.selectedProfile.profile.body_observability !== "redacted-metadata" ||
+    typeof options.transport.onObservation !== "function"
+  ) {
+    return null;
+  }
+  try {
+    const structure = requestStructure(options.input);
+    return {
+      start: safeMonotonicNow(options.transport),
+      run_id: options.context.run_id,
+      request_id: options.context.request_id,
+      streaming: options.streaming,
+      request_bytes: Buffer.byteLength(options.body, "utf8"),
+      response_bytes: 0,
+      message_count: structure.message_count,
+      content_block_count: structure.content_block_count,
+      tool_count: structure.tool_count,
+      route_id: null,
+      status_class: "network",
+      emitted: false,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function statusClass(status: number): GatewayObservationStatusClass {
+  if (status >= 200 && status <= 599) {
+    return `${Math.floor(status / 100)}xx` as GatewayObservationStatusClass;
+  }
+  return "network";
+}
+
+function finishObservation(
+  options: CreateAgentgatewayTransportOptions,
+  pending: PendingObservation | null,
+): void {
+  if (pending === null || pending.emitted || typeof options.onObservation !== "function") return;
+  pending.emitted = true;
+  const end = safeMonotonicNow(options);
+  const elapsed = pending.start === null || end === null ? Number.NaN : end - pending.start;
+  const rounded = Number.isFinite(elapsed) && elapsed >= 0 ? Math.floor(elapsed) : 0;
+  const duration = Number.isSafeInteger(rounded) ? rounded : 0;
+  const observation: GatewayObservation = Object.freeze({
+    run_id: pending.run_id,
+    request_id: pending.request_id,
+    route_id: pending.route_id,
+    streaming: pending.streaming,
+    request_bytes: pending.request_bytes,
+    response_bytes: pending.response_bytes,
+    message_count: pending.message_count,
+    content_block_count: pending.content_block_count,
+    tool_count: pending.tool_count,
+    status_class: pending.status_class,
+    duration_ms: duration,
+  });
+  try {
+    options.onObservation(observation);
+  } catch {
+    // Observability cannot change the provider outcome.
+  }
+}
+
 async function* validatedStreamEvents(
   body: ReadableStream<Uint8Array>,
   signal: AbortSignal,
+  pending: PendingObservation | null,
+  options: CreateAgentgatewayTransportOptions,
 ): AsyncIterable<JsonValue> {
   let terminal = false;
-  for await (const event of parseBoundedSse(body, signal)) {
-    if (terminal) throw agentgatewayError("RUNTIME_PROVIDER_GATEWAY_INVALID");
-    const type = streamEventType(event);
-    if (type === "response.completed" || type === "error") terminal = true;
-    yield event;
+  try {
+    for await (const event of parseBoundedSse(body, signal, (total) => {
+      if (pending !== null) pending.response_bytes = total;
+    })) {
+      if (terminal) throw agentgatewayError("RUNTIME_PROVIDER_GATEWAY_INVALID");
+      const type = streamEventType(event);
+      if (type === "response.completed" || type === "error") terminal = true;
+      yield event;
+    }
+    if (!terminal) throw agentgatewayError("RUNTIME_PROVIDER_GATEWAY_INVALID");
+  } finally {
+    finishObservation(options, pending);
   }
-  if (!terminal) throw agentgatewayError("RUNTIME_PROVIDER_GATEWAY_INVALID");
 }
 
-export function createAgentgatewayTransport(options: {
-  readonly selectedProfile: SelectedAgentgatewayProfile;
-  readonly credentialReference: SecretReference;
-  readonly credentialProvider: GatewayCredentialProvider;
-  readonly fetch: AgentgatewayFetch;
-  readonly now: () => Date;
-}): ProviderWireTransport {
+export function createAgentgatewayTransport(
+  options: CreateAgentgatewayTransportOptions,
+): ProviderWireTransport {
   if (!IDENTIFIER_PATTERN.test(options.selectedProfile.name)) {
     throw agentgatewayError("RUNTIME_PROVIDER_GATEWAY_INVALID");
   }
@@ -394,8 +528,8 @@ export function createAgentgatewayTransport(options: {
   ): Promise<{
     readonly response: Response;
     readonly context: ReturnType<typeof normalizedContext>;
-    readonly capability: AgentgatewayCapabilitiesV1;
     readonly routeIdentity: ProviderRouteIdentity;
+    readonly observation: PendingObservation | null;
   }> {
     let context: ReturnType<typeof normalizedContext>;
     let body: string;
@@ -409,6 +543,13 @@ export function createAgentgatewayTransport(options: {
       if (error instanceof RuntimeProviderError) throw error;
       throw agentgatewayError("RUNTIME_PROVIDER_GATEWAY_INVALID");
     }
+    const observation = createPendingObservation({
+      transport: options,
+      context,
+      input,
+      body,
+      streaming,
+    });
 
     let response: Response | undefined;
     try {
@@ -431,6 +572,7 @@ export function createAgentgatewayTransport(options: {
         body,
       };
       response = await options.fetch(responseUrl, request);
+      if (observation !== null) observation.status_class = statusClass(response.status);
       rejectRedirectedResponse(response, responseUrl);
       if (response.status < 200 || response.status >= 300) {
         throw classifyResponseFailure(response);
@@ -442,9 +584,11 @@ export function createAgentgatewayTransport(options: {
         requirementHash,
         gatewayProfile: options.selectedProfile.name,
       });
-      return { response, context, capability, routeIdentity };
+      if (observation !== null) observation.route_id = routeIdentity.route_id;
+      return { response, context, routeIdentity, observation };
     } catch (error) {
       await cancelResponseBody(response);
+      finishObservation(options, observation);
       throw normalizeFailure(error, context.signal);
     }
   }
@@ -460,7 +604,9 @@ export function createAgentgatewayTransport(options: {
         try {
           payload = deepFreezeJson(
             parseJsonBytes(
-              await readBoundedAgentgatewayResponse(prepared.response, RESPONSE_BYTES),
+              await readBoundedAgentgatewayResponse(prepared.response, RESPONSE_BYTES, (total) => {
+                if (prepared.observation !== null) prepared.observation.response_bytes = total;
+              }),
               RESPONSE_LIMITS,
             ),
             RESPONSE_LIMITS,
@@ -469,8 +615,10 @@ export function createAgentgatewayTransport(options: {
           if (error instanceof RuntimeProviderError) throw error;
           throw agentgatewayError("RUNTIME_PROVIDER_GATEWAY_INVALID");
         }
+        finishObservation(options, prepared.observation);
         return Object.freeze({ payload, route_identity: prepared.routeIdentity });
       } catch (error) {
+        finishObservation(options, prepared.observation);
         throw normalizeFailure(error, prepared.context.signal);
       }
     },
@@ -479,14 +627,21 @@ export function createAgentgatewayTransport(options: {
       const contentType = responseContentType(prepared.response);
       if (!/^text\/event-stream(?:;[ \t]*charset=utf-8)?$/iu.test(contentType ?? "")) {
         await cancelResponseBody(prepared.response);
+        finishObservation(options, prepared.observation);
         throw agentgatewayError("RUNTIME_PROVIDER_GATEWAY_INVALID");
       }
       if (prepared.response.body === null) {
+        finishObservation(options, prepared.observation);
         throw agentgatewayError("RUNTIME_PROVIDER_GATEWAY_INVALID");
       }
       return Object.freeze({
         route_identity: prepared.routeIdentity,
-        events: validatedStreamEvents(prepared.response.body, prepared.context.signal),
+        events: validatedStreamEvents(
+          prepared.response.body,
+          prepared.context.signal,
+          prepared.observation,
+          options,
+        ),
       });
     },
     health() {

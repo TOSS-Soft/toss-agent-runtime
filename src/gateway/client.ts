@@ -41,6 +41,7 @@ async function cancelReader(reader: ReadableStreamDefaultReader<Uint8Array>): Pr
 export async function readBoundedAgentgatewayResponse(
   response: Response,
   maxBytes: number,
+  onBytes?: (total: number) => void,
 ): Promise<Uint8Array> {
   const body = response.body;
   if (body === null) return new Uint8Array();
@@ -62,6 +63,11 @@ export async function readBoundedAgentgatewayResponse(
         throw agentgatewayError("RUNTIME_PROVIDER_GATEWAY_INVALID");
       }
       total += result.value.byteLength;
+      try {
+        onBytes?.(total);
+      } catch {
+        // Internal measurement cannot change the bounded read result.
+      }
       if (!Number.isSafeInteger(total) || total > maxBytes) {
         await cancelReader(reader);
         throw agentgatewayError("RUNTIME_PROVIDER_GATEWAY_INVALID");

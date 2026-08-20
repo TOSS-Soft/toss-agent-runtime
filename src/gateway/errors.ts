@@ -15,3 +15,15 @@ export function classifyAgentgatewayHttpStatus(status: number): RuntimeProviderE
   }
   return agentgatewayError("RUNTIME_PROVIDER_GATEWAY_INVALID");
 }
+
+export function classifyAgentgatewayResponseStatus(
+  status: number,
+  errorSource: unknown,
+): RuntimeProviderError {
+  if (status >= 500 && status <= 599) {
+    return errorSource === "provider"
+      ? agentgatewayError("RUNTIME_PROVIDER_TRANSIENT")
+      : agentgatewayError("RUNTIME_PROVIDER_GATEWAY_UNAVAILABLE");
+  }
+  return classifyAgentgatewayHttpStatus(status);
+}
