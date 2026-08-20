@@ -24,16 +24,16 @@ import {
   type ServiceStatusV1,
 } from "./contracts.js";
 import { RuntimeServiceError, type RuntimeServiceErrorCode } from "./errors.js";
-import { isServiceSocketPlatform, serviceSocketLayoutFits } from "./paths.js";
+import {
+  isServiceControlArtifactBasename,
+  isServiceControlSocketClaimBasename,
+  isServiceControlStagedArtifactBasename,
+  isServiceSocketPlatform,
+  serviceSocketLayoutFits,
+} from "./paths.js";
 
 const RESPONSE_FRAME_BYTES = MAX_CONTROL_MESSAGE_BYTES + 1;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
-const LEGACY_PUBLICATION_GUARD_PATTERN = /^\.c[0-9a-f]{8}$/u;
-const PUBLICATION_GUARD_PATTERN = /^\.c[0-9a-f]{64}$/u;
-const PUBLICATION_CLAIM_PATTERN = /^\.r[0-9a-f]{64}$/u;
-const PREVIOUS_STAGED_SOCKET_PATTERN = /^\.s[0-9a-z]{25}$/u;
-const STAGED_SOCKET_PATTERN = /^\.s[0-9a-z]{10}$/u;
-const SOCKET_CLAIM_PATTERN = /^\.x[0-9a-z]{10}$/u;
 const SOCKET_CLAIM_TOKEN_PATTERN = /^[0-9a-z]{10}$/u;
 const MAX_SOCKET_CLAIMS = 1;
 const internalServiceErrors = new WeakSet<RuntimeServiceError>();
@@ -297,25 +297,6 @@ async function assertPrivateRuntimeDirectory(
   return runtimeIdentity;
 }
 
-function isPublicationArtifactName(candidate: string): boolean {
-  return (
-    LEGACY_PUBLICATION_GUARD_PATTERN.test(candidate) ||
-    PUBLICATION_GUARD_PATTERN.test(candidate) ||
-    PUBLICATION_CLAIM_PATTERN.test(candidate) ||
-    PREVIOUS_STAGED_SOCKET_PATTERN.test(candidate) ||
-    STAGED_SOCKET_PATTERN.test(candidate) ||
-    SOCKET_CLAIM_PATTERN.test(candidate)
-  );
-}
-
-function isPossibleStagedSocketName(candidate: string): boolean {
-  return (
-    LEGACY_PUBLICATION_GUARD_PATTERN.test(candidate) ||
-    PREVIOUS_STAGED_SOCKET_PATTERN.test(candidate) ||
-    STAGED_SOCKET_PATTERN.test(candidate)
-  );
-}
-
 function publicationGuardName(serviceInstanceId: string): string {
   return `.c${createHash("sha256").update(serviceInstanceId, "utf8").digest("hex")}`;
 }
@@ -356,7 +337,7 @@ function socketClaimToken(
     const second = identityBoundSocketClaimToken(expected, "1");
     if (first === second) pathUnsafe();
     const candidateName = path.basename(candidatePath);
-    const token = SOCKET_CLAIM_PATTERN.test(candidateName)
+    const token = isServiceControlSocketClaimBasename(candidateName)
       ? candidateName === `.x${first}`
         ? second
         : candidateName === `.x${second}`
@@ -543,12 +524,14 @@ async function reclaimStalePublicationGuards(options: {
 }): Promise<void> {
   const { classifier, currentUid, hooks, runtimeIdentity, serviceInstanceId, socketPath } = options;
   const runtimePath = path.dirname(socketPath);
-  const candidates = (await requiredEntries(runtimePath)).filter(isPublicationArtifactName).sort();
+  const candidates = (await requiredEntries(runtimePath))
+    .filter(isServiceControlArtifactBasename)
+    .sort();
 
   for (const candidateName of candidates) {
     const candidatePath = path.join(runtimePath, candidateName);
     if (
-      isPossibleStagedSocketName(candidateName) &&
+      isServiceControlStagedArtifactBasename(candidateName) &&
       !(await requiredMetadata(candidatePath)).isDirectory()
     ) {
       continue;
@@ -607,7 +590,7 @@ async function reclaimStalePublicationGuards(options: {
     currentUid,
     modelRuntimeIdentity: hooks?.modelRuntimeIdentity,
   });
-  if ((await requiredEntries(runtimePath)).some(isPublicationArtifactName)) pathUnsafe();
+  if ((await requiredEntries(runtimePath)).some(isServiceControlArtifactBasename)) pathUnsafe();
 }
 
 async function privateSocketIdentity(
@@ -732,9 +715,7 @@ async function requireMissing(candidatePath: string): Promise<void> {
 }
 
 async function socketClaimNames(runtimePath: string): Promise<readonly string[]> {
-  return (await requiredEntries(runtimePath))
-    .filter((entry) => SOCKET_CLAIM_PATTERN.test(entry))
-    .sort();
+  return (await requiredEntries(runtimePath)).filter(isServiceControlSocketClaimBasename).sort();
 }
 
 function unlinkExactPrivateSocketSync(options: {
@@ -1017,7 +998,9 @@ async function reclaimStaleStagedSockets(options: {
   readonly hooks?: ServiceControlOperationHooks | undefined;
 }): Promise<void> {
   const runtimePath = path.dirname(options.socketPath);
-  const candidates = (await requiredEntries(runtimePath)).filter(isPossibleStagedSocketName).sort();
+  const candidates = (await requiredEntries(runtimePath))
+    .filter(isServiceControlStagedArtifactBasename)
+    .sort();
   for (const candidateName of candidates) {
     const candidatePath = path.join(runtimePath, candidateName);
     if ((await requiredMetadata(candidatePath)).isDirectory()) continue;

@@ -20,9 +20,34 @@ import {
   resolveDefaultConfigPath,
   RuntimeConfigError,
 } from "../src/config/load.js";
+import * as servicePaths from "../src/service/paths.js";
 
 const temporaryDirectories: string[] = [];
 const RUNTIME_CONFIG_BYTE_CAP = 2 * 1024 * 1024;
+const reservedArtifactBasenames = {
+  legacyPublicationGuard: ".c1234abcd",
+  publicationGuard: `.c${"a".repeat(64)}`,
+  publicationClaim: `.r${"a".repeat(64)}`,
+  previousStagedSocket: `.s${"a".repeat(25)}`,
+  stagedSocket: ".sabcdefghij",
+  socketClaim: ".xabcdefghij",
+} as const;
+const nearMissArtifactBasenames = [
+  "xabcdefghij",
+  ".xabcdefghi",
+  ".xabcdefghijk",
+  ".xabcdefghiA",
+  ".xabcdefghié",
+  ".sabcdefghi",
+  ".sabcdefghijk",
+  `.s${"a".repeat(24)}`,
+  `.s${"a".repeat(26)}`,
+  ".cgggggggg",
+  `.c${"a".repeat(63)}`,
+  `.c${"a".repeat(63)}g`,
+  `.r${"a".repeat(63)}`,
+  `.r${"a".repeat(63)}g`,
+] as const;
 
 async function temporaryDirectory(): Promise<string> {
   const directory = await realpath(
@@ -93,6 +118,47 @@ afterEach(async () => {
 });
 
 describe("runtime configuration", () => {
+  it("keeps the shared control-artifact registry and scanner predicates in exact parity", () => {
+    const pathsModule = servicePaths as typeof servicePaths & {
+      readonly SERVICE_CONTROL_ARTIFACT_PATTERNS?: Readonly<Record<string, RegExp>>;
+      readonly isServiceControlArtifactBasename?: (candidate: string) => boolean;
+      readonly isServiceControlStagedArtifactBasename?: (candidate: string) => boolean;
+      readonly isServiceControlSocketClaimBasename?: (candidate: string) => boolean;
+    };
+    const registry = pathsModule.SERVICE_CONTROL_ARTIFACT_PATTERNS;
+    const isArtifact = pathsModule.isServiceControlArtifactBasename;
+    const isStaged = pathsModule.isServiceControlStagedArtifactBasename;
+    const isSocketClaim = pathsModule.isServiceControlSocketClaimBasename;
+
+    expect(registry).toBeDefined();
+    expect(isArtifact).toBeTypeOf("function");
+    expect(isStaged).toBeTypeOf("function");
+    expect(isSocketClaim).toBeTypeOf("function");
+    if (
+      registry === undefined ||
+      isArtifact === undefined ||
+      isStaged === undefined ||
+      isSocketClaim === undefined
+    ) {
+      return;
+    }
+
+    expect(Object.isFrozen(registry)).toBe(true);
+    expect(Object.keys(registry).sort()).toEqual(Object.keys(reservedArtifactBasenames).sort());
+    for (const [name, basename] of Object.entries(reservedArtifactBasenames)) {
+      const pattern = registry[name];
+      expect(pattern, name).toBeInstanceOf(RegExp);
+      expect(Object.isFrozen(pattern), name).toBe(true);
+      expect(pattern!.global, name).toBe(false);
+      expect(pattern!.test(basename), name).toBe(true);
+      expect(isArtifact(basename), name).toBe(true);
+      expect(isStaged(basename), name).toBe(
+        ["legacyPublicationGuard", "previousStagedSocket", "stagedSocket"].includes(name),
+      );
+      expect(isSocketClaim(basename), name).toBe(name === "socketClaim");
+    }
+  });
+
   it("prefers an explicit path over the environment path", async () => {
     const root = await temporaryDirectory();
     const explicitPath = path.join(root, "explicit.yaml");
@@ -220,6 +286,53 @@ describe("runtime configuration", () => {
 
     expect(loaded.config.paths.socket).toBe(socket);
   });
+
+  it.each(Object.entries(reservedArtifactBasenames))(
+    "rejects the reserved %s public socket basename during config validation",
+    async (_name, basename) => {
+      const root = await temporaryDirectory();
+      const socket = path.join(root, basename);
+      const configPath = path.join(root, "reserved-socket.yaml");
+      await writeFile(configPath, validYamlWithSocket(root, socket), { mode: 0o600 });
+      let error: unknown;
+
+      try {
+        await loadConfig({
+          explicitPath: configPath,
+          env: {},
+          platform: "linux",
+          home: root,
+          socketPathByteLimit: 4096,
+        });
+      } catch (caught) {
+        error = caught;
+      }
+
+      expect(error).toBeInstanceOf(RuntimeConfigError);
+      expect(error).toMatchObject({ code: "RUNTIME_CONFIG_INVALID" });
+      expect(String(error)).not.toContain(basename);
+    },
+  );
+
+  it.each(nearMissArtifactBasenames)(
+    "allows the non-reserved public socket basename %s during config validation",
+    async (basename) => {
+      const root = await temporaryDirectory();
+      const socket = path.join(root, basename);
+      const configPath = path.join(root, "near-miss-socket.yaml");
+      await writeFile(configPath, validYamlWithSocket(root, socket), { mode: 0o600 });
+
+      const loaded = await loadConfig({
+        explicitPath: configPath,
+        env: {},
+        platform: "linux",
+        home: root,
+        socketPathByteLimit: 4096,
+      });
+
+      expect(loaded.config.paths.socket).toBe(socket);
+    },
+  );
 
   it("rejects inline secret material without echoing the value", async () => {
     const root = await temporaryDirectory();

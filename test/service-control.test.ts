@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { renameSync } from "node:fs";
 import {
@@ -42,6 +43,30 @@ const currentStagedSocket = ".siieudk9fi1";
 const previousStagedSocket = ".s8ii47i6hu9f6rrdwudifbfef5";
 const legacyStagedSocket = ".c8fcfb3a7";
 const socketClaimPattern = /^\.x[0-9a-z]{10}$/u;
+const reservedArtifactBasenames = [
+  ".c1234abcd",
+  `.c${"a".repeat(64)}`,
+  `.r${"a".repeat(64)}`,
+  `.s${"a".repeat(25)}`,
+  ".sabcdefghij",
+  ".xabcdefghij",
+] as const;
+const nearMissArtifactBasenames = [
+  "xabcdefghij",
+  ".xabcdefghi",
+  ".xabcdefghijk",
+  ".xabcdefghiA",
+  ".xabcdefghié",
+  ".sabcdefghi",
+  ".sabcdefghijk",
+  `.s${"a".repeat(24)}`,
+  `.s${"a".repeat(26)}`,
+  ".cgggggggg",
+  `.c${"a".repeat(63)}`,
+  `.c${"a".repeat(63)}g`,
+  `.r${"a".repeat(63)}`,
+  `.r${"a".repeat(63)}g`,
+] as const;
 const temporaryDirectories: string[] = [];
 const controlServers: ServiceControlServer[] = [];
 const nativeServers: Server[] = [];
@@ -301,6 +326,30 @@ async function findNativeSocketPathBoundary(
     return { exact, firstInexact: candidate };
   }
   throw new Error("native Unix socket path boundary was not found");
+}
+
+async function useShortRuntimePath(basename: string): Promise<void> {
+  const root = await realpath(await mkdtemp(path.join(await realpath("/tmp"), "trc-short-")));
+  temporaryDirectories.push(root);
+  await chmod(root, 0o700);
+  temporaryRoot = root;
+  runtimePath = path.join(root, "r");
+  await mkdir(runtimePath, { mode: 0o700 });
+  await chmod(runtimePath, 0o700);
+  socketPath = path.join(runtimePath, basename);
+}
+
+function firstIdentityBoundSocketClaimName(device: bigint, inode: bigint): string {
+  const entropy = BigInt(
+    `0x${createHash("sha256")
+      .update(device.toString(), "utf8")
+      .update("\u0000", "utf8")
+      .update(inode.toString(), "utf8")
+      .update("\u0000", "utf8")
+      .update("0", "utf8")
+      .digest("hex")}`,
+  );
+  return `.x${(entropy % 36n ** 10n).toString(36).padStart(10, "0")}`;
 }
 
 async function leaveClosedSocketLinks(...candidates: readonly string[]): Promise<void> {
@@ -874,6 +923,56 @@ describe("private service control socket", () => {
     expect((await lstat(socketPath)).isSocket()).toBe(true);
     await server.close();
     expect(await readdir(runtimePath)).toEqual([]);
+  });
+
+  it.each(reservedArtifactBasenames)(
+    "rejects the reserved public socket basename %s before creating artifacts",
+    async (basename) => {
+      await useShortRuntimePath(basename);
+      const server = createServiceControlServer(options());
+      controlServers.push(server);
+
+      await expect(server.listen()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_PATH_UNSAFE",
+      });
+      expect(await readdir(runtimePath)).toEqual([]);
+      expect(statusCalls).toBe(0);
+    },
+  );
+
+  it.each(nearMissArtifactBasenames)(
+    "allows the non-reserved public socket basename %s",
+    async (basename) => {
+      await useShortRuntimePath(basename);
+      const server = await listenControl();
+
+      expect((await lstat(socketPath)).isSocket()).toBe(true);
+      await server.close();
+      expect(await readdir(runtimePath)).toEqual([]);
+    },
+  );
+
+  it("preserves a crash-left public socket whose basename equals its recovery claim token", async () => {
+    await useShortRuntimePath("source.sock");
+    const crashed = await listenNative(socketPath);
+    await chmod(socketPath, 0o600);
+    const crashedIdentity = await lstat(socketPath, { bigint: true });
+    const reservedPath = path.join(
+      runtimePath,
+      firstIdentityBoundSocketClaimName(crashedIdentity.dev, crashedIdentity.ino),
+    );
+    await link(socketPath, reservedPath);
+    await closeNative(crashed);
+    socketPath = reservedPath;
+    const before = await snapshotPath(socketPath);
+    const server = createServiceControlServer(options());
+    controlServers.push(server);
+
+    await expect(server.listen()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_PATH_UNSAFE",
+    });
+    expect(await snapshotPath(socketPath)).toEqual(before);
+    expect(await readdir(runtimePath)).toEqual([path.basename(socketPath)]);
   });
 
   it.each([legacyStagedSocket, previousStagedSocket, currentStagedSocket])(

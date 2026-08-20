@@ -5,6 +5,40 @@ export const SYSTEMD_UNIT = "toss-agent-runtime.service";
 const UNIX_SOCKET_PATH_BYTE_LIMIT = Object.freeze({ darwin: 104, linux: 107 });
 const ACTIVE_INTERNAL_SOCKET_BASENAMES = Object.freeze([".s0000000000", ".x0000000000"] as const);
 
+export const SERVICE_CONTROL_ARTIFACT_PATTERNS = Object.freeze({
+  legacyPublicationGuard: Object.freeze(/^\.c[0-9a-f]{8}$/u),
+  publicationGuard: Object.freeze(/^\.c[0-9a-f]{64}$/u),
+  publicationClaim: Object.freeze(/^\.r[0-9a-f]{64}$/u),
+  previousStagedSocket: Object.freeze(/^\.s[0-9a-z]{25}$/u),
+  stagedSocket: Object.freeze(/^\.s[0-9a-z]{10}$/u),
+  socketClaim: Object.freeze(/^\.x[0-9a-z]{10}$/u),
+});
+
+const SERVICE_CONTROL_ARTIFACT_PATTERN_LIST = Object.freeze(
+  Object.values(SERVICE_CONTROL_ARTIFACT_PATTERNS),
+);
+const SERVICE_CONTROL_STAGED_ARTIFACT_PATTERN_LIST = Object.freeze([
+  SERVICE_CONTROL_ARTIFACT_PATTERNS.legacyPublicationGuard,
+  SERVICE_CONTROL_ARTIFACT_PATTERNS.previousStagedSocket,
+  SERVICE_CONTROL_ARTIFACT_PATTERNS.stagedSocket,
+]);
+
+function matchesAny(candidate: string, patterns: readonly RegExp[]): boolean {
+  return patterns.some((pattern) => pattern.test(candidate));
+}
+
+export function isServiceControlArtifactBasename(candidate: string): boolean {
+  return matchesAny(candidate, SERVICE_CONTROL_ARTIFACT_PATTERN_LIST);
+}
+
+export function isServiceControlStagedArtifactBasename(candidate: string): boolean {
+  return matchesAny(candidate, SERVICE_CONTROL_STAGED_ARTIFACT_PATTERN_LIST);
+}
+
+export function isServiceControlSocketClaimBasename(candidate: string): boolean {
+  return SERVICE_CONTROL_ARTIFACT_PATTERNS.socketClaim.test(candidate);
+}
+
 export type ServiceSocketPlatform = keyof typeof UNIX_SOCKET_PATH_BYTE_LIMIT;
 
 export function isServiceSocketPlatform(value: string): value is ServiceSocketPlatform {
@@ -19,6 +53,7 @@ export function serviceSocketLayoutFits(options: {
 }): boolean {
   const pathByteLimit = options.pathByteLimit ?? UNIX_SOCKET_PATH_BYTE_LIMIT[options.platform];
   if (!Number.isSafeInteger(pathByteLimit) || pathByteLimit <= 0) return false;
+  if (isServiceControlArtifactBasename(path.basename(options.socketPath))) return false;
   const runtimePath = path.dirname(options.socketPath);
   return [
     options.socketPath,
