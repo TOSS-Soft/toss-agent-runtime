@@ -128,13 +128,16 @@ The macOS definition uses label `software.toss.agent-runtime`, `RunAtLoad`,
 `KeepAlive` only after unsuccessful exits, `ThrottleInterval=5`, and an
 absolute program argument vector. The Linux user unit uses
 `Restart=on-failure`, `RestartSec=5s`, `StartLimitIntervalSec=60s`,
-`StartLimitBurst=5`, `UMask=0077`, and absolute `ExecStart` arguments. The
-definition may set only `LANG`, `LC_ALL`, and `TZ`; the resolved config path is
-an argument, not an environment value. The Wave 2 process does not enumerate
-or persist inherited environment. Later secret resolvers may read only the
-exact variable names declared by validated secret references at the final use
-boundary. Definitions never embed secret values, provider credentials,
-arbitrary environment, or shell command strings.
+`StartLimitBurst=8`, `UMask=0077`, and absolute `ExecStart` arguments. Eight
+starts at t0, t5, t10, t15, t20, t25, t30, and t35 preserve one complete
+restart interval after the conservative 30-second ownerless-lock recovery
+threshold, even if the exact t30 boundary misses. The definition may set only
+`LANG`, `LC_ALL`, and `TZ`; the resolved config path is an argument, not an
+environment value. The Wave 2 process does not enumerate or persist inherited
+environment. Later secret resolvers may read only the exact variable names
+declared by validated secret references at the final use boundary. Definitions
+never embed secret values, provider credentials, arbitrary environment, or
+shell command strings.
 
 The instance lock is an atomically created directory containing a bounded
 `service-lock.v1` owner document with PID, service instance ID, executable

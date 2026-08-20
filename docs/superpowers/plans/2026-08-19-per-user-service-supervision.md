@@ -252,7 +252,7 @@ describe("native service definitions", () => {
     expect(value).toContain("WantedBy=default.target");
     expect(value).toContain("Restart=on-failure");
     expect(value).toContain("RestartSec=5s");
-    expect(value).toContain("StartLimitBurst=5");
+    expect(value).toContain("StartLimitBurst=8");
     expect(value).toContain("UMask=0077");
     expect(value).not.toContain("must-not-persist");
   });
@@ -314,7 +314,7 @@ The systemd output contains these exact sections and keys:
 [Unit]
 Description=TOSS Agent Runtime
 StartLimitIntervalSec=60s
-StartLimitBurst=5
+StartLimitBurst=8
 
 [Service]
 Type=simple
@@ -326,6 +326,10 @@ UMask=0077
 [Install]
 WantedBy=default.target
 ```
+
+The eight allowed starts occur at t0, t5, t10, t15, t20, t25, t30, and t35.
+This retains the conservative 30-second ownerless-lock threshold while leaving
+one complete `RestartSec` margin after it if the exact t30 boundary misses.
 
 Implement systemd argument escaping for backslash, double quote, newline
 rejection, and `%` doubling. Reject nonabsolute executable/config paths.

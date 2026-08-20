@@ -76,11 +76,13 @@ The launchd definition has label `software.toss.agent-runtime`,
 `RunAtLoad=true`, unsuccessful-exit-only `KeepAlive`,
 `ThrottleInterval=5`, and `ProcessType=Background`. The Linux unit has
 `Restart=on-failure`, `RestartSec=5s`, `StartLimitIntervalSec=60s`,
-`StartLimitBurst=5`, and `UMask=0077`. Thus Linux admits a burst of five start
-attempts within 60 seconds with five seconds between failure restarts; launchd
-throttles restart attempts by five seconds. Manager status exposes whether
-backoff is active, the restart count, and the last exit code when the platform
-reports them.
+`StartLimitBurst=8`, and `UMask=0077`. Thus Linux admits eight starts within 60
+seconds at t0, t5, t10, t15, t20, t25, t30, and t35. The final attempt is one
+complete restart interval beyond the conservative 30-second ownerless-lock
+recovery threshold, so an exact-boundary miss does not exhaust automatic
+restart. Launchd continues to throttle restart attempts by five seconds and is
+otherwise unchanged. Manager status exposes whether backoff is active, the
+restart count, and the last exit code when the platform reports them.
 
 An existing definition must be a private regular file and must round-trip to
 the exact expected renderer for the same platform, current UID, Node path, CLI

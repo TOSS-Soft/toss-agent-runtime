@@ -39,6 +39,8 @@ export interface InstanceLockOperationHooks {
   readonly afterDocumentStagePartialWrite?: (kind: InstanceLockDocumentKind) => Promise<void>;
   readonly afterDocumentStageSync?: (kind: InstanceLockDocumentKind) => Promise<void>;
   readonly afterDocumentPublishSync?: (kind: InstanceLockDocumentKind) => Promise<void>;
+  readonly afterRetainedLockDirectorySync?: () => Promise<void>;
+  readonly afterRemovedLockRuntimeDirectorySync?: () => Promise<void>;
 }
 
 export type InstanceLockDocumentKind = "owner" | "owner-claim" | "ownerless-claim";
@@ -64,6 +66,8 @@ export interface FileIdentity {
   readonly device: bigint;
   readonly inode: bigint;
 }
+
+export const OWNERLESS_LOCK_STALE_AFTER_MS = 30_000 as const;
 
 export function fileIdentityMatches(left: FileIdentity, right: FileIdentity): boolean {
   return left.device === right.device && left.inode === right.inode;
@@ -112,7 +116,7 @@ interface OpenedStage {
 }
 
 const OWNER_FILE_NAME = "owner.json";
-const OWNERLESS_STALE_AFTER_NS = 30_000_000_000n;
+const OWNERLESS_STALE_AFTER_NS = BigInt(OWNERLESS_LOCK_STALE_AFTER_MS) * 1_000_000n;
 const UUID_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const ARTIFACT_SERVICE_INSTANCE_ID_PATTERN = new RegExp(`^${UUID_PATTERN}$`);
 const OWNER_CLAIM_PATTERN = new RegExp(`^\\.owner-claim\\.(${UUID_PATTERN})\\.json$`);
@@ -653,6 +657,97 @@ async function assertRemovalContext(options: {
   );
 }
 
+async function unlinkRemovalArtifactAndSync(options: {
+  readonly artifactPath: string;
+  readonly expectedEntriesAfter: readonly string[];
+  readonly lockPath: string;
+  readonly directory: OpenedDirectory;
+  readonly isCurrentUser: CurrentUserCheck;
+  readonly runtimeIdentity: FileIdentity;
+  readonly hooks?: InstanceLockOperationHooks;
+}): Promise<void> {
+  const {
+    artifactPath,
+    directory,
+    expectedEntriesAfter,
+    hooks,
+    isCurrentUser,
+    lockPath,
+    runtimeIdentity,
+  } = options;
+  let afterSync: (() => Promise<void>) | undefined;
+  try {
+    afterSync = hooks?.afterRetainedLockDirectorySync;
+  } catch {
+    lockAmbiguous();
+  }
+  try {
+    await unlink(artifactPath);
+    await directory.handle.sync();
+  } catch {
+    lockAmbiguous();
+  }
+  await assertRemovalContext({ lockPath, directory, isCurrentUser, runtimeIdentity });
+  await exactEntries(lockPath, expectedEntriesAfter);
+  await runOperationHook(afterSync);
+}
+
+async function removeLockDirectoryAndSyncRuntime(options: {
+  readonly lockPath: string;
+  readonly directory: OpenedDirectory;
+  readonly isCurrentUser: CurrentUserCheck;
+  readonly runtimeIdentity: FileIdentity;
+  readonly hooks?: InstanceLockOperationHooks;
+}): Promise<void> {
+  const { directory, hooks, isCurrentUser, lockPath, runtimeIdentity } = options;
+  await assertRemovalContext({ lockPath, directory, isCurrentUser, runtimeIdentity });
+  await exactEntries(lockPath, []);
+  try {
+    await rmdir(lockPath);
+  } catch {
+    lockAmbiguous();
+  }
+
+  const runtimePath = path.dirname(lockPath);
+  const runtimeDirectory = await openPrivateDirectory(runtimePath, isCurrentUser);
+  if (runtimeDirectory === undefined) lockAmbiguous();
+  try {
+    if (!fileIdentityMatches(runtimeDirectory.identity, runtimeIdentity)) lockAmbiguous();
+    let afterSync: (() => Promise<void>) | undefined;
+    try {
+      afterSync = hooks?.afterRemovedLockRuntimeDirectorySync;
+    } catch {
+      lockAmbiguous();
+    }
+    try {
+      await runtimeDirectory.handle.sync();
+      const metadata = await runtimeDirectory.handle.stat({ bigint: true });
+      if (
+        !metadata.isDirectory() ||
+        !ownershipCheck(isCurrentUser, metadata.uid, runtimePath) ||
+        (metadata.mode & 0o777n) !== 0o700n
+      ) {
+        servicePathUnsafe();
+      }
+      if (!fileIdentityMatches(identityOf(metadata), runtimeIdentity)) lockAmbiguous();
+    } catch (error) {
+      if (isInternalServiceError(error)) throw error;
+      lockAmbiguous();
+    }
+    await assertCurrentIdentity(
+      runtimePath,
+      runtimeIdentity,
+      "directory",
+      0o700,
+      isCurrentUser,
+      true,
+    );
+    await runOperationHook(afterSync);
+  } finally {
+    await runtimeDirectory.handle.close();
+  }
+}
+
 function sameOwner(actual: OpenedOwner, expected: OpenedOwner): boolean {
   return (
     fileIdentityMatches(actual.identity, expected.identity) &&
@@ -933,6 +1028,7 @@ async function removeClaimedLock(options: {
   readonly displaced: OpenedOwner;
   readonly isCurrentUser: CurrentUserCheck;
   readonly runtimeIdentity: FileIdentity;
+  readonly hooks?: InstanceLockOperationHooks;
 }): Promise<void> {
   const {
     claimPath,
@@ -940,6 +1036,7 @@ async function removeClaimedLock(options: {
     directory,
     claim,
     displaced,
+    hooks,
     isCurrentUser,
     lockPath,
     runtimeIdentity,
@@ -951,21 +1048,35 @@ async function removeClaimedLock(options: {
   assertSameOwner(currentDisplaced, displaced);
   await assertRemovalContext({ lockPath, directory, isCurrentUser, runtimeIdentity });
   await exactEntries(lockPath, [path.basename(claimPath), path.basename(displacedPath)]);
-  try {
-    await unlink(displacedPath);
-  } catch {
-    lockAmbiguous();
-  }
+  await unlinkRemovalArtifactAndSync({
+    artifactPath: displacedPath,
+    expectedEntriesAfter: [path.basename(claimPath)],
+    lockPath,
+    directory,
+    isCurrentUser,
+    runtimeIdentity,
+    ...(hooks === undefined ? {} : { hooks }),
+  });
   const finalClaim = await readPrivateClaim(claimPath, isCurrentUser);
   if (finalClaim === undefined || !sameClaim(finalClaim, claim)) lockAmbiguous();
   await assertRemovalContext({ lockPath, directory, isCurrentUser, runtimeIdentity });
   await exactEntries(lockPath, [path.basename(claimPath)]);
-  try {
-    await unlink(claimPath);
-    await rmdir(lockPath);
-  } catch {
-    lockAmbiguous();
-  }
+  await unlinkRemovalArtifactAndSync({
+    artifactPath: claimPath,
+    expectedEntriesAfter: [],
+    lockPath,
+    directory,
+    isCurrentUser,
+    runtimeIdentity,
+    ...(hooks === undefined ? {} : { hooks }),
+  });
+  await removeLockDirectoryAndSyncRuntime({
+    lockPath,
+    directory,
+    isCurrentUser,
+    runtimeIdentity,
+    ...(hooks === undefined ? {} : { hooks }),
+  });
 }
 
 function assertOwnerlessStale(modifiedAtNs: bigint, nowNs: bigint): void {
@@ -986,9 +1097,18 @@ async function removeExactClaimFile(options: {
   readonly isCurrentUser: CurrentUserCheck;
   readonly runtimeIdentity: FileIdentity;
   readonly removeDirectory: boolean;
+  readonly hooks?: InstanceLockOperationHooks;
 }): Promise<void> {
-  const { acquire, claim, claimPath, directory, isCurrentUser, removeDirectory, runtimeIdentity } =
-    options;
+  const {
+    acquire,
+    claim,
+    claimPath,
+    directory,
+    hooks,
+    isCurrentUser,
+    removeDirectory,
+    runtimeIdentity,
+  } = options;
   const current = await readPrivateClaim(claimPath, isCurrentUser);
   if (current === undefined || !sameClaim(current, claim)) lockAmbiguous();
   await assertRemovalContext({
@@ -998,11 +1118,23 @@ async function removeExactClaimFile(options: {
     runtimeIdentity,
   });
   await exactEntries(acquire.lockPath, [path.basename(claimPath)]);
-  try {
-    await unlink(claimPath);
-    if (removeDirectory) await rmdir(acquire.lockPath);
-  } catch {
-    lockAmbiguous();
+  await unlinkRemovalArtifactAndSync({
+    artifactPath: claimPath,
+    expectedEntriesAfter: [],
+    lockPath: acquire.lockPath,
+    directory,
+    isCurrentUser,
+    runtimeIdentity,
+    ...(hooks === undefined ? {} : { hooks }),
+  });
+  if (removeDirectory) {
+    await removeLockDirectoryAndSyncRuntime({
+      lockPath: acquire.lockPath,
+      directory,
+      isCurrentUser,
+      runtimeIdentity,
+      ...(hooks === undefined ? {} : { hooks }),
+    });
   }
 }
 
@@ -1070,6 +1202,7 @@ async function reclaimOwnerlessLock(options: {
       isCurrentUser,
       runtimeIdentity,
       removeDirectory: false,
+      ...(hooks === undefined ? {} : { hooks }),
     });
     throw error;
   }
@@ -1082,6 +1215,7 @@ async function reclaimOwnerlessLock(options: {
       isCurrentUser,
       runtimeIdentity,
       removeDirectory: false,
+      ...(hooks === undefined ? {} : { hooks }),
     });
     lockAmbiguous();
   }
@@ -1094,6 +1228,7 @@ async function reclaimOwnerlessLock(options: {
     isCurrentUser,
     runtimeIdentity,
     removeDirectory: true,
+    ...(hooks === undefined ? {} : { hooks }),
   });
 }
 
@@ -1163,8 +1298,9 @@ async function recoverDocumentStage(options: {
   readonly nowNs: bigint;
   readonly isCurrentUser: CurrentUserCheck;
   readonly runtimeIdentity: FileIdentity;
+  readonly hooks?: InstanceLockOperationHooks;
 }): Promise<"retry" | "reclaimed"> {
-  const { acquire, directory, isCurrentUser, nowNs, runtimeIdentity, state } = options;
+  const { acquire, directory, hooks, isCurrentUser, nowNs, runtimeIdentity, state } = options;
   const { descriptor, finalName } = state;
   const stagePath = path.join(acquire.lockPath, descriptor.name);
   const stage = await readPrivateBytes(stagePath, isCurrentUser);
@@ -1240,19 +1376,26 @@ async function recoverDocumentStage(options: {
   if (descriptor.kind === "owner-claim") expectedEntries.push(OWNER_FILE_NAME);
   if (finalName !== undefined) expectedEntries.push(finalName);
   await exactEntries(acquire.lockPath, expectedEntries);
-  try {
-    await unlink(stagePath);
-    await directory.handle.sync();
-  } catch {
-    lockAmbiguous();
-  }
+  const entriesAfter = descriptor.kind === "owner-claim" ? [OWNER_FILE_NAME] : [];
+  if (finalName !== undefined) entriesAfter.push(finalName);
+  await unlinkRemovalArtifactAndSync({
+    artifactPath: stagePath,
+    expectedEntriesAfter: entriesAfter,
+    lockPath: acquire.lockPath,
+    directory,
+    isCurrentUser,
+    runtimeIdentity,
+    ...(hooks === undefined ? {} : { hooks }),
+  });
 
   if (finalName !== undefined || descriptor.kind === "owner-claim") return "retry";
-  try {
-    await rmdir(acquire.lockPath);
-  } catch {
-    lockAmbiguous();
-  }
+  await removeLockDirectoryAndSyncRuntime({
+    lockPath: acquire.lockPath,
+    directory,
+    isCurrentUser,
+    runtimeIdentity,
+    ...(hooks === undefined ? {} : { hooks }),
+  });
   return "reclaimed";
 }
 
@@ -1297,8 +1440,9 @@ async function recoverOwnerClaim(options: {
   readonly nowNs: bigint;
   readonly isCurrentUser: CurrentUserCheck;
   readonly runtimeIdentity: FileIdentity;
+  readonly hooks?: InstanceLockOperationHooks;
 }): Promise<"retry" | "reclaimed"> {
-  const { acquire, directory, isCurrentUser, nowNs, runtimeIdentity, state } = options;
+  const { acquire, directory, hooks, isCurrentUser, nowNs, runtimeIdentity, state } = options;
   const claimPath = path.join(acquire.lockPath, state.claimName);
   const claim = await readPrivateClaim(claimPath, isCurrentUser);
   if (
@@ -1353,19 +1497,27 @@ async function recoverOwnerClaim(options: {
   await exactEntries(acquire.lockPath, expected);
 
   if (state.ownerPresent) {
-    try {
-      await unlink(claimPath);
-    } catch {
-      lockAmbiguous();
-    }
+    await unlinkRemovalArtifactAndSync({
+      artifactPath: claimPath,
+      expectedEntriesAfter: [OWNER_FILE_NAME],
+      lockPath: acquire.lockPath,
+      directory,
+      isCurrentUser,
+      runtimeIdentity,
+      ...(hooks === undefined ? {} : { hooks }),
+    });
     return "retry";
   }
   if (originalPath !== undefined) {
-    try {
-      await unlink(originalPath);
-    } catch {
-      lockAmbiguous();
-    }
+    await unlinkRemovalArtifactAndSync({
+      artifactPath: originalPath,
+      expectedEntriesAfter: [state.claimName],
+      lockPath: acquire.lockPath,
+      directory,
+      isCurrentUser,
+      runtimeIdentity,
+      ...(hooks === undefined ? {} : { hooks }),
+    });
     const finalClaim = await readPrivateClaim(claimPath, isCurrentUser);
     if (finalClaim === undefined || !sameClaim(finalClaim, claim)) lockAmbiguous();
     await assertRemovalContext({
@@ -1376,12 +1528,22 @@ async function recoverOwnerClaim(options: {
     });
     await exactEntries(acquire.lockPath, [state.claimName]);
   }
-  try {
-    await unlink(claimPath);
-    await rmdir(acquire.lockPath);
-  } catch {
-    lockAmbiguous();
-  }
+  await unlinkRemovalArtifactAndSync({
+    artifactPath: claimPath,
+    expectedEntriesAfter: [],
+    lockPath: acquire.lockPath,
+    directory,
+    isCurrentUser,
+    runtimeIdentity,
+    ...(hooks === undefined ? {} : { hooks }),
+  });
+  await removeLockDirectoryAndSyncRuntime({
+    lockPath: acquire.lockPath,
+    directory,
+    isCurrentUser,
+    runtimeIdentity,
+    ...(hooks === undefined ? {} : { hooks }),
+  });
   return "reclaimed";
 }
 
@@ -1392,8 +1554,9 @@ async function recoverOwnerlessClaim(options: {
   readonly nowNs: bigint;
   readonly isCurrentUser: CurrentUserCheck;
   readonly runtimeIdentity: FileIdentity;
+  readonly hooks?: InstanceLockOperationHooks;
 }): Promise<void> {
-  const { acquire, directory, isCurrentUser, nowNs, runtimeIdentity, state } = options;
+  const { acquire, directory, hooks, isCurrentUser, nowNs, runtimeIdentity, state } = options;
   const claimPath = path.join(acquire.lockPath, state.claimName);
   const claim = await readPrivateClaim(claimPath, isCurrentUser);
   if (
@@ -1420,6 +1583,7 @@ async function recoverOwnerlessClaim(options: {
     isCurrentUser,
     runtimeIdentity,
     removeDirectory: true,
+    ...(hooks === undefined ? {} : { hooks }),
   });
 }
 
@@ -1452,6 +1616,7 @@ async function inspectAndReclaim(options: {
           nowNs,
           isCurrentUser,
           runtimeIdentity,
+          ...(hooks === undefined ? {} : { hooks }),
         });
         if (recovery === "reclaimed") return;
         continue;
@@ -1497,6 +1662,7 @@ async function inspectAndReclaim(options: {
           directory,
           isCurrentUser,
           runtimeIdentity,
+          ...(hooks === undefined ? {} : { hooks }),
           ...claimed,
         });
         return;
@@ -1509,6 +1675,7 @@ async function inspectAndReclaim(options: {
           nowNs,
           isCurrentUser,
           runtimeIdentity,
+          ...(hooks === undefined ? {} : { hooks }),
         });
         return;
       }
@@ -1519,6 +1686,7 @@ async function inspectAndReclaim(options: {
         nowNs,
         isCurrentUser,
         runtimeIdentity,
+        ...(hooks === undefined ? {} : { hooks }),
       });
       if (recovery === "reclaimed") return;
     }
@@ -1627,6 +1795,7 @@ async function releaseAcquiredLock(options: {
       directory,
       isCurrentUser,
       runtimeIdentity,
+      ...(hooks === undefined ? {} : { hooks }),
       ...claimed,
     });
   } finally {

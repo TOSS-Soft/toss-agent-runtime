@@ -21,7 +21,7 @@ describe("native service definitions", () => {
       `[Unit]
 Description=TOSS Agent Runtime
 StartLimitIntervalSec=60s
-StartLimitBurst=5
+StartLimitBurst=8
 
 [Service]
 Type=simple

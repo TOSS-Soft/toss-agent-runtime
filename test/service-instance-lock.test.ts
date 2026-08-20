@@ -19,10 +19,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { canonicalJson } from "../src/protocol/json.js";
 import type { ServiceLockV1 } from "../src/service/contracts.js";
+import { renderSystemdUserUnit } from "../src/service/definition.js";
 import { RuntimeServiceError } from "../src/service/errors.js";
 import {
   acquireInstanceLock,
   fileIdentityMatches,
+  OWNERLESS_LOCK_STALE_AFTER_MS,
   type ProcessLiveness,
 } from "../src/service/instance-lock.js";
 
@@ -64,6 +66,8 @@ interface TestOperationHooks {
   readonly afterDocumentStagePartialWrite?: (kind: TestDocumentKind) => Promise<void>;
   readonly afterDocumentStageSync?: (kind: TestDocumentKind) => Promise<void>;
   readonly afterDocumentPublishSync?: (kind: TestDocumentKind) => Promise<void>;
+  readonly afterRetainedLockDirectorySync?: () => Promise<void>;
+  readonly afterRemovedLockRuntimeDirectorySync?: () => Promise<void>;
 }
 
 type TestDocumentKind = "owner" | "owner-claim" | "ownerless-claim";
@@ -820,6 +824,47 @@ describe("runtime supervisor instance lock", () => {
     expect(await readdir(fixture.lockPath)).toEqual([]);
   });
 
+  it("admits ownerless recovery before the rendered Linux restart burst exhausts", async () => {
+    const unit = renderSystemdUserUnit({
+      platform: "linux",
+      uid: 501,
+      nodePath: "/opt/node/bin/node",
+      cliPath: "/opt/toss/bin/toss-runtime.js",
+      configPath: "/home/test/.config/toss/runtime/config.yaml",
+      environment: {},
+    });
+    const restartSeconds = Number(/^RestartSec=(\d+)s$/mu.exec(unit)?.[1]);
+    const startLimitBurst = Number(/^StartLimitBurst=(\d+)$/mu.exec(unit)?.[1]);
+    expect(Number.isSafeInteger(restartSeconds) && restartSeconds > 0).toBe(true);
+    expect(Number.isSafeInteger(startLimitBurst) && startLimitBurst > 0).toBe(true);
+    expect((startLimitBurst - 1) * restartSeconds * 1_000).toBeGreaterThanOrEqual(
+      OWNERLESS_LOCK_STALE_AFTER_MS + restartSeconds * 1_000,
+    );
+
+    await mkdir(fixture.lockPath, { mode: 0o700 });
+    await chmod(fixture.lockPath, 0o700);
+    await utimes(fixture.lockPath, new Date(now.getTime() + 1), new Date(now.getTime() + 1));
+
+    const attemptOffsets: number[] = [];
+    let acquired: Awaited<ReturnType<typeof acquireInstanceLock>> | undefined;
+    for (let attempt = 0; attempt < startLimitBurst; attempt += 1) {
+      const elapsedMs = attempt * restartSeconds * 1_000;
+      attemptOffsets.push(elapsedMs);
+      try {
+        acquired = await acquireInstanceLock(
+          options({ now: () => new Date(now.getTime() + elapsedMs) }),
+        );
+        break;
+      } catch (error) {
+        expect(error).toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+      }
+    }
+
+    expect(attemptOffsets).toEqual([0, 5_000, 10_000, 15_000, 20_000, 25_000, 30_000, 35_000]);
+    expect(acquired?.owner.service_instance_id).toBe(newId);
+    await acquired?.release();
+  });
+
   it("reclaims a missing owner older than 30 seconds only with no listener", async () => {
     await mkdir(fixture.lockPath, { mode: 0o700 });
     await chmod(fixture.lockPath, 0o700);
@@ -844,6 +889,61 @@ describe("runtime supervisor instance lock", () => {
       acquireInstanceLock(options({ identifySocket: () => Promise.resolve(otherId) })),
     ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
     expect(await readdir(fixture.lockPath)).toEqual([]);
+  });
+
+  it("syncs a retained lock directory before a failed ownerless attempt completes", async () => {
+    await mkdir(fixture.lockPath, { mode: 0o700 });
+    await chmod(fixture.lockPath, 0o700);
+    const stale = new Date(now.getTime() - 30_001);
+    await utimes(fixture.lockPath, stale, stale);
+    const events: string[] = [];
+
+    const error = await acquireInstanceLock(
+      options({
+        identifySocket: () => Promise.resolve(otherId),
+        operationHooks: {
+          afterRetainedLockDirectorySync: async () => {
+            expect(await readdir(fixture.lockPath)).toEqual([]);
+            expect((await lstat(fixture.lockPath)).isDirectory()).toBe(true);
+            events.push("lock-directory-synced");
+          },
+        },
+      }),
+    ).catch((caught: unknown) => caught);
+    events.push("acquire-failed");
+
+    expect(error).toMatchObject({ code: "RUNTIME_SERVICE_LOCK_AMBIGUOUS" });
+    expect(events).toEqual(["lock-directory-synced", "acquire-failed"]);
+  });
+
+  it("syncs the runtime parent after lock removal before acquire and release complete", async () => {
+    await mkdir(fixture.lockPath, { mode: 0o700 });
+    await chmod(fixture.lockPath, 0o700);
+    const stale = new Date(now.getTime() - 30_001);
+    await utimes(fixture.lockPath, stale, stale);
+    const events: string[] = [];
+
+    const lock = await acquireInstanceLock(
+      options({
+        operationHooks: {
+          afterRemovedLockRuntimeDirectorySync: async () => {
+            expect(await missing(fixture.lockPath)).toBe(true);
+            expect((await lstat(fixture.runtimePath)).mode & 0o777).toBe(0o700);
+            events.push("runtime-directory-synced");
+          },
+        },
+      }),
+    );
+    events.push("acquired");
+    await lock.release();
+    events.push("released");
+
+    expect(events).toEqual([
+      "runtime-directory-synced",
+      "acquired",
+      "runtime-directory-synced",
+      "released",
+    ]);
   });
 
   it("retries an ownerless lock after a listener disappears", async () => {
