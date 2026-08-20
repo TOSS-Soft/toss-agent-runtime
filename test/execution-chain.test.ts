@@ -43,7 +43,8 @@ describe("Runtime Contract Protocol v1 chain", () => {
     expect(document.execution_topologies).toEqual([]);
     expect(document.model_classes).toEqual([]);
     expect(document.mcp_profiles).toEqual([]);
-    expect(document.provider_transports).toEqual(["openai", "anthropic", "gemini"]);
+    expect(document.provider_transports).toEqual(["agentgateway", "openai", "anthropic", "gemini"]);
+    expect(document.supported_schemas).toContain("agentgateway-capabilities.v1");
     expect(document.features).toEqual({
       providers: "available",
       routing: "unavailable",

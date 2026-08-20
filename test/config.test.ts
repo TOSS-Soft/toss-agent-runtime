@@ -58,6 +58,22 @@ async function temporaryDirectory(): Promise<string> {
 }
 
 function validYaml(root: string, mode: "development" | "production" = "development"): string {
+  const gatewayProfiles =
+    mode === "production"
+      ? `gateway_profiles:
+  gateway-production:
+    protocol: toss-agentgateway.v1
+    endpoint: https://gateway.example.test
+    credential_reference: gateway-virtual-token
+    body_observability: "off"`
+      : "gateway_profiles: {}";
+  const secretReferences =
+    mode === "production"
+      ? `secret_references:
+  gateway-virtual-token:
+    source: command
+    key: TOSS_AGENTGATEWAY_TOKEN`
+      : "secret_references: {}";
   return `schema_version: runtime-config.v1
 document_type: runtime-config
 mode: ${mode}
@@ -71,10 +87,32 @@ logs:
   retention_days: 7
   max_bytes: 104857600
 gateway_profile: ${mode === "production" ? "gateway-production" : "null"}
+${gatewayProfiles}
 provider_profiles: []
 mcp_profiles: []
-secret_references: {}
+${secretReferences}
 `;
+}
+
+function developmentGatewayYaml(root: string, endpoint: string): string {
+  return validYaml(root)
+    .replace("gateway_profile: null", "gateway_profile: gateway-development")
+    .replace(
+      "gateway_profiles: {}",
+      `gateway_profiles:
+  gateway-development:
+    protocol: toss-agentgateway.v1
+    endpoint: ${endpoint}
+    credential_reference: gateway-virtual-token
+    body_observability: "off"`,
+    )
+    .replace(
+      "secret_references: {}",
+      `secret_references:
+  gateway-virtual-token:
+    source: env
+    key: TOSS_AGENTGATEWAY_TOKEN`,
+    );
 }
 
 function validYamlWithSocket(root: string, socket: string): string {
@@ -182,6 +220,107 @@ describe("runtime configuration", () => {
     expect(result.source).toBe("defaults");
     expect(result.config.logs).toEqual({ level: "info", retention_days: 7, max_bytes: 104857600 });
     expect(result.config.paths.state).toBe(path.join(root, ".local", "state", "toss", "runtime"));
+    expect(result.config.gateway_profiles).toEqual({});
+    expect(Object.isFrozen(result.config.gateway_profiles)).toBe(true);
+  });
+
+  it("accepts one selected HTTPS production gateway with a command credential", async () => {
+    const home = await temporaryDirectory();
+    const configPath = await writeProductionConfig(home, "gateway-production.yaml");
+
+    const result = await loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home });
+
+    expect(result.config.gateway_profile).toBe("gateway-production");
+    expect(result.config.gateway_profiles["gateway-production"]).toEqual({
+      protocol: "toss-agentgateway.v1",
+      endpoint: "https://gateway.example.test",
+      credential_reference: "gateway-virtual-token",
+      body_observability: "off",
+    });
+  });
+
+  it.each([
+    [
+      "missing selected profile",
+      (yaml: string) =>
+        yaml.replace("gateway_profile: gateway-production", "gateway_profile: missing"),
+    ],
+    [
+      "missing credential reference",
+      (yaml: string) =>
+        yaml.replace(
+          "credential_reference: gateway-virtual-token",
+          "credential_reference: missing",
+        ),
+    ],
+    ["environment credential", (yaml: string) => yaml.replace("source: command", "source: env")],
+    [
+      "HTTP endpoint",
+      (yaml: string) => yaml.replace("https://gateway.example.test", "http://gateway.example.test"),
+    ],
+    [
+      "endpoint userinfo",
+      (yaml: string) =>
+        yaml.replace("https://gateway.example.test", "https://user@gateway.example.test"),
+    ],
+    [
+      "endpoint query",
+      (yaml: string) =>
+        yaml.replace("https://gateway.example.test", "https://gateway.example.test?q=1"),
+    ],
+    [
+      "endpoint fragment",
+      (yaml: string) =>
+        yaml.replace("https://gateway.example.test", "https://gateway.example.test#x"),
+    ],
+    [
+      "direct provider profile",
+      (yaml: string) => yaml.replace("provider_profiles: []", "provider_profiles: [direct-openai]"),
+    ],
+  ] as const)("rejects production %s without reflecting the endpoint", async (_name, mutate) => {
+    const home = await temporaryDirectory();
+    const yaml = mutate(validYaml(linuxStateRoot(home), "production"));
+    const configPath = await writeProductionConfig(home, "invalid-gateway.yaml", yaml);
+
+    let error: unknown;
+    try {
+      await loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toMatchObject({ code: "RUNTIME_CONFIG_INVALID" });
+    expect(String(error)).not.toContain("gateway.example.test");
+  });
+
+  it.each(["http://127.0.0.1:8080", "http://[::1]:8080", "http://localhost:8080/base/"])(
+    "accepts development loopback gateway endpoint %s",
+    async (endpoint) => {
+      const root = await temporaryDirectory();
+      const configPath = path.join(root, "development-gateway.yaml");
+      await writeFile(configPath, developmentGatewayYaml(root, endpoint), { mode: 0o600 });
+
+      const result = await loadConfig({
+        explicitPath: configPath,
+        env: {},
+        platform: "linux",
+        home: root,
+      });
+
+      expect(result.config.gateway_profiles["gateway-development"]?.endpoint).toBe(endpoint);
+    },
+  );
+
+  it("rejects a development non-loopback HTTP gateway", async () => {
+    const root = await temporaryDirectory();
+    const configPath = path.join(root, "development-non-loopback.yaml");
+    await writeFile(configPath, developmentGatewayYaml(root, "http://gateway.example.test"), {
+      mode: 0o600,
+    });
+
+    await expect(
+      loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home: root }),
+    ).rejects.toMatchObject({ code: "RUNTIME_CONFIG_INVALID" });
   });
 
   it("validates the default socket layout before returning a missing-file fallback", async () => {

@@ -70,6 +70,28 @@ export {
   type ProtocolValidator,
 } from "./protocol/validator.js";
 export {
+  createAgentgatewayTransport,
+  hashAgentgatewayCapabilities,
+  hashProviderRouteRequirement,
+  parseAgentgatewayCapabilities,
+  parseAgentgatewayHealth,
+} from "./gateway/index.js";
+export type {
+  AgentgatewayBodyObservability,
+  AgentgatewayCapabilitiesV1,
+  AgentgatewayCapabilitiesValidationResult,
+  AgentgatewayClientHealth,
+  AgentgatewayHealth,
+  AgentgatewayHealthValidationResult,
+  AgentgatewayProfileV1,
+  AgentgatewayRouteV1,
+  GatewayCredentialLease,
+  GatewayCredentialProvider,
+  GatewayObservation,
+  GatewayObservationStatusClass,
+  ParseAgentgatewayCapabilitiesOptions,
+} from "./gateway/index.js";
+export {
   createRunJournalStore,
   decideRunTransition,
   findUnresolvedSideEffects,
@@ -166,9 +188,13 @@ export type {
   ProviderReasoningEffort,
   ProviderRequest,
   ProviderResponseFormat,
+  ProviderRouteIdentity,
+  ProviderRouteRequirement,
   ProviderToolCall,
   ProviderToolDefinition,
   ProviderUsage,
   ProviderWireContext,
+  ProviderWireResponse,
+  ProviderWireStream,
   ProviderWireTransport,
 } from "./providers/index.js";

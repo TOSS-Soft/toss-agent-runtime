@@ -7,15 +7,30 @@ import {
   PROTOCOL_VERSION,
   RuntimeProjectError,
   RuntimeProviderError,
+  createAgentgatewayTransport,
   createAnthropicAdapter,
   createGeminiAdapter,
   createOpenAIAdapter,
-  parseProviderEvent,
+  hashAgentgatewayCapabilities,
+  parseAgentgatewayCapabilities,
   parseCandidateJobIntent,
   parseProjectRegistryEntry,
   parseProjectWatchManifest,
+  parseProviderEvent,
+  type AgentgatewayCapabilitiesV1,
+  type AgentgatewayClientHealth,
+  type AgentgatewayHealth,
+  type AgentgatewayProfileV1,
+  type AgentgatewayRouteV1,
+  type GatewayCredentialProvider,
+  type GatewayObservation,
+  type GatewayObservationStatusClass,
   type ProjectIntake,
   type ProjectRegistry,
+  type ProviderCompletion,
+  type ProviderRouteIdentity,
+  type ProviderWireResponse,
+  type ProviderWireStream,
 } from "../src/index.js";
 
 describe("package metadata", () => {
@@ -47,8 +62,51 @@ describe("package metadata", () => {
       category: "rate-limit",
       retryable: true,
     });
+    expectTypeOf<
+      ProviderWireResponse["route_identity"]
+    >().toEqualTypeOf<ProviderRouteIdentity | null>();
+    expectTypeOf<
+      ProviderWireStream["route_identity"]
+    >().toEqualTypeOf<ProviderRouteIdentity | null>();
+    expectTypeOf<
+      ProviderCompletion["route_identity"]
+    >().toEqualTypeOf<ProviderRouteIdentity | null>();
     expect(packageApi).not.toHaveProperty("openai");
     expect(packageApi).not.toHaveProperty("anthropic");
     expect(packageApi).not.toHaveProperty("gemini");
+  });
+
+  it("exports the safe agentgateway surface without transport internals", () => {
+    expect(createAgentgatewayTransport).toBeTypeOf("function");
+    expect(parseAgentgatewayCapabilities).toBeTypeOf("function");
+    expect(hashAgentgatewayCapabilities).toBeTypeOf("function");
+
+    expectTypeOf<AgentgatewayProfileV1["protocol"]>().toEqualTypeOf<"toss-agentgateway.v1">();
+    expectTypeOf<AgentgatewayCapabilitiesV1["routes"]>().toEqualTypeOf<
+      readonly AgentgatewayRouteV1[]
+    >();
+    expectTypeOf<AgentgatewayHealth["status"]>().toEqualTypeOf<
+      "healthy" | "degraded" | "unavailable"
+    >();
+    expectTypeOf<AgentgatewayClientHealth>().toMatchTypeOf<
+      AgentgatewayHealth | Readonly<{ status: "unavailable" }>
+    >();
+    expectTypeOf<GatewayCredentialProvider["resolve"]>().toBeFunction();
+    expectTypeOf<
+      GatewayObservation["status_class"]
+    >().toEqualTypeOf<GatewayObservationStatusClass>();
+
+    for (const internalName of [
+      "agentgatewayError",
+      "classifyAgentgatewayHttpStatus",
+      "createAgentgatewayClient",
+      "createGatewayCredentialCoordinator",
+      "parseAgentgatewayAttestation",
+      "parseBoundedSse",
+      "readBoundedAgentgatewayResponse",
+      "startFakeAgentgateway",
+    ]) {
+      expect(packageApi).not.toHaveProperty(internalName);
+    }
   });
 });

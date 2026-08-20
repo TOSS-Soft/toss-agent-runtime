@@ -7,8 +7,12 @@ import {
   RuntimeProviderError,
   type ProviderAdapterCapabilities,
   type ProviderEventV1,
+  type ProviderExecutionOptions,
   type ProviderRequest,
+  type ProviderRouteIdentity,
   type ProviderWireContext,
+  type ProviderWireResponse,
+  type ProviderWireStream,
   type ProviderWireTransport,
 } from "../src/providers/index.js";
 import type { JsonValue } from "../src/protocol/json.js";
@@ -32,8 +36,34 @@ const capabilities: ProviderAdapterCapabilities = {
   max_output_tokens: 16_384,
 };
 
+const execution = {
+  run_id: "RUN-001",
+  trace: {
+    trace_id: "1".repeat(32),
+    span_id: "2".repeat(16),
+    trace_flags: 1,
+  },
+} satisfies ProviderExecutionOptions;
+
+const routeIdentity: ProviderRouteIdentity = {
+  transport: "agentgateway",
+  gateway_profile: "gateway-production",
+  gateway_revision: 7,
+  route_id: "balanced-openai-primary",
+  requested_model: "balanced-code",
+  resolved_provider: "openai",
+  resolved_model: "gpt-5",
+  capability_document_hash: `sha256:${"a".repeat(64)}`,
+  requirement_hash: `sha256:${"b".repeat(64)}`,
+  gateway_request_id: "gw_req_1",
+};
+
 class FakeTransport implements ProviderWireTransport {
-  readonly calls: { kind: "complete" | "stream" | "cancel"; input: JsonValue | string }[] = [];
+  readonly calls: {
+    kind: "complete" | "stream" | "cancel";
+    input: JsonValue | string;
+    context?: ProviderWireContext;
+  }[] = [];
   completeResult: unknown = {
     id: "resp_1",
     model: "gpt-5",
@@ -41,16 +71,24 @@ class FakeTransport implements ProviderWireTransport {
     output: [{ type: "message", content: [{ type: "output_text", text: "ok" }] }],
     usage: { input_tokens: 1, output_tokens: 1 },
   };
+  streamResult: readonly unknown[] = [];
+  routeIdentity: ProviderRouteIdentity | null = null;
 
-  complete(input: JsonValue, _context: ProviderWireContext): Promise<unknown> {
-    void _context;
-    this.calls.push({ kind: "complete", input });
-    return Promise.resolve(this.completeResult);
+  complete(input: JsonValue, context: ProviderWireContext): Promise<ProviderWireResponse> {
+    this.calls.push({ kind: "complete", input, context });
+    return Promise.resolve({ payload: this.completeResult, route_identity: this.routeIdentity });
   }
 
-  async *stream(input: JsonValue): AsyncIterable<unknown> {
-    this.calls.push({ kind: "stream", input });
-    await Promise.resolve();
+  stream(input: JsonValue, context: ProviderWireContext): Promise<ProviderWireStream> {
+    this.calls.push({ kind: "stream", input, context });
+    const events = this.streamResult;
+    return Promise.resolve({
+      route_identity: this.routeIdentity,
+      events: (async function* () {
+        await Promise.resolve();
+        for (const event of events) yield event;
+      })(),
+    });
   }
 
   cancel(requestId: string): Promise<void> {
@@ -117,9 +155,10 @@ describe("provider adapter lifecycle", () => {
 
       const operation = stream
         ? async () => {
-            for await (const providerEvent of instance.stream(candidate)) void providerEvent;
+            for await (const providerEvent of instance.stream(candidate, execution))
+              void providerEvent;
           }
-        : () => instance.complete(candidate);
+        : () => instance.complete(candidate, execution);
       await expect(operation()).rejects.toEqual(
         new RuntimeProviderError("RUNTIME_PROVIDER_UNSUPPORTED"),
       );
@@ -127,15 +166,160 @@ describe("provider adapter lifecycle", () => {
     },
   );
 
+  it.each([
+    ["missing execution", undefined],
+    ["missing run identity", { trace: execution.trace }],
+    ["malformed run identity", { ...execution, run_id: "1-invalid" }],
+    [
+      "malformed trace identity",
+      { ...execution, trace: { ...execution.trace, trace_id: "not-a-trace-id" } },
+    ],
+    ["out-of-range trace flags", { ...execution, trace: { ...execution.trace, trace_flags: 256 } }],
+  ])("rejects %s before the wire transport", async (_name, candidate) => {
+    const transport = new FakeTransport();
+    const instance = adapter(transport);
+
+    await expect(instance.complete(request, candidate as ProviderExecutionOptions)).rejects.toEqual(
+      new RuntimeProviderError("RUNTIME_PROVIDER_INVALID"),
+    );
+    expect(transport.calls).toEqual([]);
+  });
+
+  it("passes exact correlation and route requirements without exposing wire wrappers", async () => {
+    const transport = new FakeTransport();
+    transport.routeIdentity = routeIdentity;
+    const nativeSecret = "native-wrapper-must-not-leak";
+    transport.complete = (input, context) => {
+      transport.calls.push({ kind: "complete", input, context });
+      return Promise.resolve({
+        payload: transport.completeResult,
+        route_identity: routeIdentity,
+        headers: { authorization: nativeSecret },
+        token: nativeSecret,
+      } as ProviderWireResponse);
+    };
+    const instance = adapter(transport);
+
+    const completion = await instance.complete(request, execution);
+    const call = transport.calls[0];
+
+    expect(call?.context).toMatchObject({
+      request_id: request.request_id,
+      run_id: execution.run_id,
+      trace: execution.trace,
+      timeout_ms: request.timeout_ms,
+      requirement: {
+        schema_version: "gateway-route-requirement.v1",
+        alias: request.model,
+        tools: false,
+        json_schema: false,
+        vision: false,
+        reasoning: false,
+        streaming: false,
+        max_output_tokens: request.max_output_tokens,
+      },
+    });
+    expect(call?.context?.signal).toBeInstanceOf(AbortSignal);
+    expect(completion.route_identity).toEqual(routeIdentity);
+    expect(Object.isFrozen(completion.route_identity)).toBe(true);
+    expect(JSON.stringify(completion)).not.toContain(nativeSecret);
+  });
+
+  it("injects the stream wrapper route only into the first normalized event", async () => {
+    const transport = new FakeTransport();
+    transport.routeIdentity = routeIdentity;
+    transport.streamResult = [
+      { type: "response.created", response: { id: "resp_1" } },
+      { type: "response.completed", response: { status: "completed" } },
+    ];
+    const instance = adapter(transport);
+    const events: ProviderEventV1[] = [];
+
+    for await (const event of instance.stream(request, execution)) events.push(event);
+
+    expect(events[0]).toMatchObject({
+      event_type: "response-start",
+      data: { route_identity: routeIdentity },
+    });
+    expect(events[1]?.data).not.toHaveProperty("route_identity");
+    expect(collectProviderEvents(events).route_identity).toEqual(routeIdentity);
+    expect(transport.calls[0]?.context?.requirement.streaming).toBe(true);
+  });
+
+  it("races stream setup against the adapter-owned deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const transport = new FakeTransport();
+      transport.stream = (_input, context) =>
+        new Promise((_resolve, reject) => {
+          context.signal.addEventListener(
+            "abort",
+            () => reject(new Error("native stream setup abort must not win")),
+            { once: true },
+          );
+        });
+      const instance = adapter(transport);
+      const operation = (async () => {
+        for await (const event of instance.stream({ ...request, timeout_ms: 10 }, execution)) {
+          void event;
+        }
+      })();
+      const expectation = expect(operation).rejects.toEqual(
+        new RuntimeProviderError("RUNTIME_PROVIDER_TIMEOUT"),
+      );
+
+      await vi.advanceTimersByTimeAsync(10);
+      await expectation;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns the wire iterator exactly once when a consumer stops early", async () => {
+    const transport = new FakeTransport();
+    let returned = 0;
+    transport.stream = () =>
+      Promise.resolve({
+        route_identity: null,
+        events: {
+          [Symbol.asyncIterator]() {
+            let yielded = false;
+            return {
+              next() {
+                if (yielded) return Promise.resolve({ done: true, value: undefined });
+                yielded = true;
+                return Promise.resolve({
+                  done: false,
+                  value: { type: "response.created", response: { id: "resp_1" } },
+                });
+              },
+              return() {
+                returned += 1;
+                return Promise.resolve({ done: true, value: undefined });
+              },
+            };
+          },
+        },
+      });
+    const instance = adapter(transport);
+
+    for await (const event of instance.stream(request, execution)) {
+      expect(event.event_type).toBe("response-start");
+      break;
+    }
+
+    expect(returned).toBe(1);
+  });
+
   it("rejects an externally cancelled request before transport", async () => {
     const transport = new FakeTransport();
     const instance = adapter(transport);
     const controller = new AbortController();
     controller.abort();
 
-    await expect(instance.complete(request, { signal: controller.signal })).rejects.toEqual(
-      new RuntimeProviderError("RUNTIME_PROVIDER_CANCELLED"),
-    );
+    await expect(
+      instance.complete(request, { ...execution, signal: controller.signal }),
+    ).rejects.toEqual(new RuntimeProviderError("RUNTIME_PROVIDER_CANCELLED"));
     expect(transport.calls).toEqual([]);
   });
 
@@ -151,7 +335,7 @@ describe("provider adapter lifecycle", () => {
         );
       });
     const instance = adapter(transport);
-    const operation = instance.complete({ ...request, timeout_ms: 10 });
+    const operation = instance.complete({ ...request, timeout_ms: 10 }, execution);
     const expectation = expect(operation).rejects.toEqual(
       new RuntimeProviderError("RUNTIME_PROVIDER_TIMEOUT"),
     );
@@ -173,7 +357,7 @@ describe("provider adapter lifecycle", () => {
       });
     const instance = adapter(transport);
     const controller = new AbortController();
-    const operation = instance.complete(request, { signal: controller.signal });
+    const operation = instance.complete(request, { ...execution, signal: controller.signal });
 
     controller.abort();
 
@@ -194,7 +378,7 @@ describe("provider adapter lifecycle", () => {
     transport.complete = () => Promise.reject(nativeError);
     const instance = adapter(transport);
 
-    await expect(instance.complete(request)).rejects.toEqual(
+    await expect(instance.complete(request, execution)).rejects.toEqual(
       new RuntimeProviderError("RUNTIME_PROVIDER_INTERNAL"),
     );
     expect(getterCalls).toBe(0);
@@ -210,7 +394,7 @@ describe("provider adapter lifecycle", () => {
     transport.complete = () => Promise.reject(nativeError);
     const instance = adapter(transport);
 
-    await expect(instance.complete(request)).rejects.toEqual(
+    await expect(instance.complete(request, execution)).rejects.toEqual(
       new RuntimeProviderError("RUNTIME_PROVIDER_INTERNAL"),
     );
   });
@@ -235,7 +419,7 @@ describe("provider adapter lifecycle", () => {
     transport.completeResult = native;
     const instance = adapter(transport);
 
-    const completion = await instance.complete(request);
+    const completion = await instance.complete(request, execution);
     expect(completion.text).toBe("plain");
     expect(Object.getPrototypeOf(completion)).toBe(Object.prototype);
     expect(Object.isFrozen(completion)).toBe(true);
@@ -246,14 +430,11 @@ describe("provider adapter lifecycle", () => {
 
   it("normalizes a first streamed provider failure as start plus terminal error", async () => {
     const transport = new FakeTransport();
-    transport.stream = async function* () {
-      await Promise.resolve();
-      yield { type: "error", error: { status: 429, message: "must-not-leak" } };
-    };
+    transport.streamResult = [{ type: "error", error: { status: 429, message: "must-not-leak" } }];
     const instance = adapter(transport);
     const events: ProviderEventV1[] = [];
 
-    for await (const event of instance.stream(request)) events.push(event);
+    for await (const event of instance.stream(request, execution)) events.push(event);
 
     expect(events.map((event) => event.event_type)).toEqual(["response-start", "response-error"]);
     expect(() => collectProviderEvents(events)).toThrow(

@@ -12,6 +12,7 @@
     "shutdown_timeout_ms",
     "logs",
     "gateway_profile",
+    "gateway_profiles",
     "provider_profiles",
     "mcp_profiles",
     "secret_references"
@@ -45,6 +46,28 @@
       "type": ["string", "null"],
       "pattern": "^[A-Za-z][A-Za-z0-9._:-]{0,127}$"
     },
+    "gateway_profiles": {
+      "type": "object",
+      "maxProperties": 64,
+      "propertyNames": { "pattern": "^[A-Za-z][A-Za-z0-9._:-]{0,127}$" },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["protocol", "endpoint", "credential_reference", "body_observability"],
+        "properties": {
+          "protocol": { "const": "toss-agentgateway.v1" },
+          "endpoint": { "type": "string", "minLength": 1, "maxLength": 2048 },
+          "credential_reference": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9._:-]{0,127}$"
+          },
+          "body_observability": {
+            "type": "string",
+            "enum": ["off", "redacted-metadata"]
+          }
+        }
+      }
+    },
     "provider_profiles": {
       "type": "array",
       "uniqueItems": true,
@@ -77,7 +100,8 @@
       "if": { "properties": { "mode": { "const": "production" } }, "required": ["mode"] },
       "then": {
         "properties": {
-          "gateway_profile": { "type": "string", "minLength": 1 }
+          "gateway_profile": { "type": "string", "minLength": 1 },
+          "provider_profiles": { "type": "array", "maxItems": 0 }
         }
       }
     }

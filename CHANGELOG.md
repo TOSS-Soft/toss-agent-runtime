@@ -16,6 +16,7 @@ All notable changes to this project are documented here. The format follows Keep
 - Explicit project registry, closed manifest-controlled macOS watching, bounded debounce, restart-safe pending intake, and deduplicated candidate job intents (#29).
 - Closed `operational-event.v1` envelopes, one synchronized writer queue, crash-safe rotation/recovery, bounded retention, deterministic filters and human/JSON/follow rendering, sticky degraded health, and structural metadata redaction (#30).
 - Closed `provider-event.v1` normalization, capability preflight, stable provider failures, and recorded-fixture OpenAI/Anthropic/Gemini streaming and non-streaming adapters over injected wire transports (#5).
+- Authenticated agentgateway transport with short-lived virtual credentials, fresh capability discovery, required correlation, route attestation, downgrade rejection, bounded JSON/SSE handling, and opt-in redacted structural observations (#3).
 - Native launchd/systemd definition validation and installed-package supervision smoke tests for duplicate instances, permissions, status, signals, cleanup, and process reaping.
 - Deterministic package-content tests and credential-free Node.js 22/24 CI baseline.
 - Commit-bound acceptance evidence for the Runtime Contract Protocol/package baseline (#2 and #4).
@@ -35,9 +36,10 @@ All notable changes to this project are documented here. The format follows Keep
 - Bound local control requests and responses to 64 KiB canonical JSON and return only fixed, non-reflective service failures.
 - Return the forced shutdown outcome at its configured deadline even when socket close or lock release never settles, while continuing finalizers in fail-closed socket/lock/umask order.
 - Bind registered projects to exact canonical root and manifest identities; reject symlink/root escapes, uncontrolled scans, unsafe registry state, and watcher feedback paths.
+- Keep gateway tokens, raw headers, response bodies, prompts, provider diagnostics, and credential-cache internals out of public values while disabling redirects and automatic retries.
 
 ### Known limitations
 
 - Automatic login-session activation and actual native crash-loop observation remain platform-integration pending; deterministic definitions, syntax lint, exact manager arrays, parsers, doctor checks, and direct supervisor smoke do not replace those gates.
-- Routing, live authenticated provider transport, skills, MCP, agent execution, review, and execution evidence capture remain unavailable until later v1 waves.
+- Routing policy/fallback, skills, MCP, agent execution, review, and execution evidence capture remain unavailable until later v1 waves.
 - The package is not publishable as `1.0.0` until protected live-provider and agentgateway release gates are implemented and pass.

@@ -165,6 +165,7 @@ beforeEach(async () => {
         shutdown_timeout_ms: 1000,
         logs: { level: "info", retention_days: 7, max_bytes: 104857600 },
         gateway_profile: null,
+        gateway_profiles: {},
         provider_profiles: [],
         mcp_profiles: [],
         secret_references: {},

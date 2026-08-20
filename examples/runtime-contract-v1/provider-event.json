@@ -14,6 +14,18 @@
     "lossy_fields": ["service_tier"]
   },
   "data": {
-    "response_id": "resp_1"
+    "response_id": "resp_1",
+    "route_identity": {
+      "transport": "agentgateway",
+      "gateway_profile": "gateway-production",
+      "gateway_revision": 7,
+      "route_id": "balanced-openai-primary",
+      "requested_model": "balanced-code",
+      "resolved_provider": "openai",
+      "resolved_model": "gpt-5.2",
+      "capability_document_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "requirement_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "gateway_request_id": "gw_req_1"
+    }
   }
 }

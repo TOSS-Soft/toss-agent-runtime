@@ -11,9 +11,12 @@ import {
   type ProviderAdapter,
   type ProviderAdapterCapabilities,
   type ProviderEventV1,
+  type ProviderExecutionOptions,
   type ProviderKind,
   type ProviderRequest,
   type ProviderWireContext,
+  type ProviderWireResponse,
+  type ProviderWireStream,
   type ProviderWireTransport,
 } from "../src/providers/index.js";
 import type { JsonValue } from "../src/protocol/json.js";
@@ -34,17 +37,32 @@ class FixtureTransport implements ProviderWireTransport {
     private readonly streamFixture: readonly unknown[],
   ) {}
 
-  complete(input: JsonValue, context: ProviderWireContext): Promise<unknown> {
+  complete(input: JsonValue, context: ProviderWireContext): Promise<ProviderWireResponse> {
     this.calls.push({ kind: "complete", input, context });
-    return Promise.resolve(this.completeFixture);
+    return Promise.resolve({ payload: this.completeFixture, route_identity: null });
   }
 
-  async *stream(input: JsonValue, context: ProviderWireContext): AsyncIterable<unknown> {
+  stream(input: JsonValue, context: ProviderWireContext): Promise<ProviderWireStream> {
     this.calls.push({ kind: "stream", input, context });
-    await Promise.resolve();
-    for (const event of this.streamFixture) yield event;
+    const events = this.streamFixture;
+    return Promise.resolve({
+      route_identity: null,
+      events: (async function* () {
+        await Promise.resolve();
+        for (const event of events) yield event;
+      })(),
+    });
   }
 }
+
+const execution = {
+  run_id: "RUN-001",
+  trace: {
+    trace_id: "1".repeat(32),
+    span_id: "2".repeat(16),
+    trace_flags: 1,
+  },
+} satisfies ProviderExecutionOptions;
 
 const createAdapter = {
   openai: createOpenAIAdapter,
@@ -123,9 +141,9 @@ describe("recorded provider conformance", () => {
       const { adapter, transport } = await configured(provider);
       const input = request(provider);
 
-      const complete = await adapter.complete(input);
+      const complete = await adapter.complete(input, execution);
       const events: ProviderEventV1[] = [];
-      for await (const event of adapter.stream(input)) events.push(event);
+      for await (const event of adapter.stream(input, execution)) events.push(event);
       const streamed = collectProviderEvents(events);
 
       const expected = {
@@ -145,6 +163,7 @@ describe("recorded provider conformance", () => {
         },
         finish_reason: "tool-calls",
         structured_output: null,
+        route_identity: null,
       };
       expect(complete).toEqual(expected);
       expect(streamed).toEqual(expected);
@@ -157,8 +176,19 @@ describe("recorded provider conformance", () => {
       for (const call of transport.calls) {
         expect(call.input).toHaveProperty(nativeRequestKeys[provider]);
         expect(call.context.request_id).toBe(input.request_id);
+        expect(call.context.run_id).toBe(execution.run_id);
+        expect(call.context.trace).toEqual(execution.trace);
         expect(call.context.timeout_ms).toBe(input.timeout_ms);
         expect(call.context.signal).toBeInstanceOf(AbortSignal);
+        expect(call.context.requirement).toMatchObject({
+          schema_version: "gateway-route-requirement.v1",
+          alias: input.model,
+          tools: true,
+          json_schema: true,
+          reasoning: true,
+          streaming: call.kind === "stream",
+          max_output_tokens: input.max_output_tokens,
+        });
       }
       expect(JSON.stringify(complete)).not.toContain("default");
       expect(JSON.stringify(complete)).not.toContain("omitted");

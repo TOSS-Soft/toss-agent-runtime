@@ -1,4 +1,6 @@
 import { canonicalJson, deepFreezeJson, parseJsonBytes, type JsonValue } from "../protocol/json.js";
+import type { TraceContext } from "../protocol/types.js";
+import { createProtocolValidator } from "../protocol/validator.js";
 import { collectProviderEvents, parseProviderEvent } from "./contracts.js";
 import { RuntimeProviderError, type RuntimeProviderErrorCode } from "./errors.js";
 import type {
@@ -10,6 +12,8 @@ import type {
   ProviderHealth,
   ProviderKind,
   ProviderRequest,
+  ProviderRouteIdentity,
+  ProviderRouteRequirement,
   ProviderWireContext,
   ProviderWireTransport,
 } from "./types.js";
@@ -40,8 +44,10 @@ export interface CreateProviderAdapterOptions {
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const RUN_ID_PATTERN = /^[A-Za-z][A-Za-z0-9._:-]{0,127}$/;
 const MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
 const NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_.:-]{0,127}$/;
+const protocolValidator = createProtocolValidator();
 
 function providerError(code: RuntimeProviderErrorCode): never {
   throw new RuntimeProviderError(code);
@@ -63,6 +69,83 @@ function exactKeys(value: { readonly [key: string]: JsonValue }, allowed: readon
 
 function safeString(value: JsonValue | undefined, max: number): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= max;
+}
+
+function ownDataProperties(
+  value: unknown,
+  allowed: readonly string[],
+): Readonly<Record<string, unknown>> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    providerError("RUNTIME_PROVIDER_INVALID");
+  }
+  let prototype: object | null;
+  let descriptors: PropertyDescriptorMap;
+  try {
+    prototype = Object.getPrototypeOf(value) as object | null;
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    providerError("RUNTIME_PROVIDER_INVALID");
+  }
+  if (prototype !== Object.prototype) providerError("RUNTIME_PROVIDER_INVALID");
+  const accepted = new Set(allowed);
+  const result: Record<string, unknown> = {};
+  for (const [key, descriptor] of Object.entries(descriptors)) {
+    if (!accepted.has(key) || descriptor.get !== undefined || descriptor.set !== undefined) {
+      providerError("RUNTIME_PROVIDER_INVALID");
+    }
+    result[key] = descriptor.value;
+  }
+  return result;
+}
+
+interface NormalizedExecution {
+  readonly run_id: string;
+  readonly trace: TraceContext;
+  readonly signal?: AbortSignal;
+}
+
+function normalizeExecution(value: unknown): NormalizedExecution {
+  const execution = ownDataProperties(value, ["run_id", "trace", "signal"]);
+  if (typeof execution.run_id !== "string" || !RUN_ID_PATTERN.test(execution.run_id)) {
+    providerError("RUNTIME_PROVIDER_INVALID");
+  }
+  const trace = ownDataProperties(execution.trace, [
+    "trace_id",
+    "span_id",
+    "trace_flags",
+    "trace_state",
+  ]);
+  const traceCandidate = {
+    trace_id: trace.trace_id,
+    span_id: trace.span_id,
+    trace_flags: trace.trace_flags,
+    ...(trace.trace_state === undefined ? {} : { trace_state: trace.trace_state }),
+  };
+  const traceResult = protocolValidator.validateFragment("trace-context", traceCandidate);
+  if (!traceResult.ok) providerError("RUNTIME_PROVIDER_INVALID");
+  if (execution.signal !== undefined && !(execution.signal instanceof AbortSignal)) {
+    providerError("RUNTIME_PROVIDER_INVALID");
+  }
+  return Object.freeze({
+    run_id: execution.run_id,
+    trace: traceResult.value as unknown as TraceContext,
+    ...(execution.signal === undefined ? {} : { signal: execution.signal }),
+  });
+}
+
+function routeRequirement(request: ProviderRequest, streaming: boolean): ProviderRouteRequirement {
+  return Object.freeze({
+    schema_version: "gateway-route-requirement.v1",
+    alias: request.model,
+    tools: (request.tools?.length ?? 0) > 0,
+    json_schema: request.response_format?.type === "json-schema",
+    vision: request.messages.some((message) =>
+      message.content.some((block) => block.type === "image"),
+    ),
+    reasoning: request.reasoning !== undefined && request.reasoning !== "none",
+    streaming,
+    max_output_tokens: request.max_output_tokens,
+  });
 }
 
 function normalizeRequest(input: ProviderRequest): ProviderRequest {
@@ -307,14 +390,29 @@ function makeEvent(
   return result.value;
 }
 
+function withRouteIdentity(
+  template: ProviderEventTemplate,
+  routeIdentity: ProviderRouteIdentity | null,
+): ProviderEventTemplate {
+  if (routeIdentity === null || template.event_type !== "response-start") return template;
+  return {
+    ...template,
+    data: { ...template.data, route_identity: routeIdentity },
+  };
+}
+
 interface DeadlineScope {
   readonly context: ProviderWireContext;
   readonly aborted: Promise<never>;
   readonly cleanup: () => void;
 }
 
-function deadlineScope(request: ProviderRequest, signal: AbortSignal | undefined): DeadlineScope {
-  if (signal?.aborted) providerError("RUNTIME_PROVIDER_CANCELLED");
+function deadlineScope(
+  request: ProviderRequest,
+  execution: NormalizedExecution,
+  requirement: ProviderRouteRequirement,
+): DeadlineScope {
+  if (execution.signal?.aborted) providerError("RUNTIME_PROVIDER_CANCELLED");
   const controller = new AbortController();
   let rejectAbort: ((reason: RuntimeProviderError) => void) | undefined;
   const aborted = new Promise<never>((_resolve, reject) => {
@@ -332,17 +430,20 @@ function deadlineScope(request: ProviderRequest, signal: AbortSignal | undefined
     rejectAbort?.(new RuntimeProviderError("RUNTIME_PROVIDER_CANCELLED"));
     controller.abort();
   };
-  signal?.addEventListener("abort", onAbort, { once: true });
+  execution.signal?.addEventListener("abort", onAbort, { once: true });
   return {
     context: {
       request_id: request.request_id,
+      run_id: execution.run_id,
+      trace: execution.trace,
+      requirement,
       signal: controller.signal,
       timeout_ms: request.timeout_ms,
     },
     aborted,
     cleanup: () => {
       clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
+      execution.signal?.removeEventListener("abort", onAbort);
     },
   };
 }
@@ -367,19 +468,28 @@ export function createProviderAdapter(
   return Object.freeze({
     provider: mapper.provider,
     capabilities,
-    async complete(input: ProviderRequest, execution: ProviderExecutionOptions = {}) {
+    async complete(input: ProviderRequest, execution: ProviderExecutionOptions) {
       const request = normalizeRequest(input);
+      const correlated = normalizeExecution(execution);
       preflight(request, capabilities, false);
-      const scope = deadlineScope(request, execution.signal);
+      const scope = deadlineScope(request, correlated, routeRequirement(request, false));
       try {
         const wireRequest = mapper.translate(request, false);
-        const native = await Promise.race([
+        const response = await Promise.race([
           options.transport.complete(wireRequest, scope.context),
           scope.aborted,
         ]);
         const events = mapper
-          .complete(native, request)
-          .map((template, sequence) => makeEvent(mapper, request, template, sequence, options));
+          .complete(response.payload, request)
+          .map((template, sequence) =>
+            makeEvent(
+              mapper,
+              request,
+              sequence === 0 ? withRouteIdentity(template, response.route_identity) : template,
+              sequence,
+              options,
+            ),
+          );
         return collectProviderEvents(events);
       } catch (error) {
         if (error instanceof RuntimeProviderError) throw error;
@@ -388,37 +498,55 @@ export function createProviderAdapter(
         scope.cleanup();
       }
     },
-    async *stream(input: ProviderRequest, execution: ProviderExecutionOptions = {}) {
+    async *stream(input: ProviderRequest, execution: ProviderExecutionOptions) {
       const request = normalizeRequest(input);
+      const correlated = normalizeExecution(execution);
       preflight(request, capabilities, true);
-      const scope = deadlineScope(request, execution.signal);
+      const scope = deadlineScope(request, correlated, routeRequirement(request, true));
       let sequence = 0;
       const state = new Map<string, JsonValue>();
+      let iterator: AsyncIterator<unknown> | undefined;
+      let iteratorDone = false;
+      let routeInjected = false;
       try {
         const wireRequest = mapper.translate(request, true);
-        const iterator = options.transport
-          .stream(wireRequest, scope.context)
-          [Symbol.asyncIterator]();
+        const response = await Promise.race([
+          options.transport.stream(wireRequest, scope.context),
+          scope.aborted,
+        ]);
+        iterator = response.events[Symbol.asyncIterator]();
         while (true) {
           const next = await Promise.race([iterator.next(), scope.aborted]);
-          if (next.done) break;
+          if (next.done) {
+            iteratorDone = true;
+            break;
+          }
           const templates = mapper.stream(next.value, request, state);
           if (sequence === 0 && templates[0]?.event_type === "response-error") {
             yield makeEvent(
               mapper,
               request,
-              {
-                event_type: "response-start",
-                data: {},
-                native_event: templates[0].native_event,
-              },
+              withRouteIdentity(
+                {
+                  event_type: "response-start",
+                  data: {},
+                  native_event: templates[0].native_event,
+                },
+                response.route_identity,
+              ),
               sequence,
               options,
             );
+            routeInjected = response.route_identity !== null;
             sequence += 1;
           }
           for (const template of templates) {
-            yield makeEvent(mapper, request, template, sequence, options);
+            const routed =
+              !routeInjected && template.event_type === "response-start"
+                ? withRouteIdentity(template, response.route_identity)
+                : template;
+            if (template.event_type === "response-start") routeInjected = true;
+            yield makeEvent(mapper, request, routed, sequence, options);
             sequence += 1;
           }
         }
@@ -426,6 +554,13 @@ export function createProviderAdapter(
         if (error instanceof RuntimeProviderError) throw error;
         throw classifyProviderFailure(failureDescriptor(error));
       } finally {
+        if (!iteratorDone && iterator?.return !== undefined) {
+          try {
+            await iterator.return();
+          } catch {
+            // The stable provider result already owns cancellation/error precedence.
+          }
+        }
         scope.cleanup();
       }
     },

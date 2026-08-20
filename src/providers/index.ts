@@ -29,9 +29,13 @@ export type {
   ProviderReasoningEffort,
   ProviderRequest,
   ProviderResponseFormat,
+  ProviderRouteIdentity,
+  ProviderRouteRequirement,
   ProviderToolDefinition,
   ProviderToolCall,
   ProviderUsage,
   ProviderWireContext,
+  ProviderWireResponse,
+  ProviderWireStream,
   ProviderWireTransport,
 } from "./types.js";

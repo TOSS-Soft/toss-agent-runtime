@@ -3,6 +3,11 @@
   "protocol_version": "runtime-contract.v1",
   "schemas": [
     {
+      "schema_version": "agentgateway-capabilities.v1",
+      "path": "contracts/runtime/agentgateway-capabilities.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/agentgateway-capabilities.v1.schema.json"
+    },
+    {
       "schema_version": "candidate-job-intent.v1",
       "path": "contracts/runtime/candidate-job-intent.v1.schema.json",
       "id": "https://toss.software/schemas/runtime/v1/candidate-job-intent.v1.schema.json"

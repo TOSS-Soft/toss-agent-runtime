@@ -91,6 +91,7 @@ export function defaultConfig(
     shutdown_timeout_ms: 30_000,
     logs: { level: "info", retention_days: 7, max_bytes: 104_857_600 },
     gateway_profile: null,
+    gateway_profiles: {},
     provider_profiles: [],
     mcp_profiles: [],
     secret_references: {},
@@ -159,6 +160,67 @@ function assertServiceSocketLayout(options: {
   }
 }
 
+function invalidGatewayProfile(): never {
+  throw new RuntimeConfigError(
+    "RUNTIME_CONFIG_INVALID",
+    "Agentgateway profile configuration is invalid",
+  );
+}
+
+function assertGatewayProfiles(config: RuntimeConfigV1): void {
+  for (const profile of Object.values(config.gateway_profiles)) {
+    if (
+      Buffer.byteLength(profile.endpoint, "utf8") > 2048 ||
+      profile.endpoint !== profile.endpoint.trim() ||
+      /[\u0000-\u001f\u007f]/u.test(profile.endpoint)
+    ) {
+      invalidGatewayProfile();
+    }
+    let endpoint: URL;
+    try {
+      endpoint = new URL(profile.endpoint);
+    } catch {
+      invalidGatewayProfile();
+    }
+    if (
+      endpoint.username !== "" ||
+      endpoint.password !== "" ||
+      endpoint.search !== "" ||
+      endpoint.hash !== ""
+    ) {
+      invalidGatewayProfile();
+    }
+    if (endpoint.protocol === "http:") {
+      if (
+        config.mode !== "development" ||
+        !["localhost", "127.0.0.1", "[::1]"].includes(endpoint.hostname)
+      ) {
+        invalidGatewayProfile();
+      }
+    } else if (endpoint.protocol !== "https:") {
+      invalidGatewayProfile();
+    }
+
+    const credential = config.secret_references[profile.credential_reference];
+    if (
+      credential === undefined ||
+      (config.mode === "production" && credential.source !== "command")
+    ) {
+      invalidGatewayProfile();
+    }
+  }
+
+  if (
+    config.gateway_profile !== null &&
+    config.gateway_profiles[config.gateway_profile] === undefined
+  ) {
+    invalidGatewayProfile();
+  }
+  if (config.mode === "production" && config.provider_profiles.length !== 0) {
+    invalidGatewayProfile();
+  }
+}
+
 function assertConfig(
   value: JsonValue,
   options: {
@@ -190,6 +252,7 @@ function assertConfig(
     platform: options.platform,
     socketPathByteLimit: options.socketPathByteLimit,
   });
+  assertGatewayProfiles(config);
   return config;
 }
 
