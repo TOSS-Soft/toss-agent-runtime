@@ -1,6 +1,7 @@
 import { once } from "node:events";
 import {
   chmod,
+  link,
   lstat,
   mkdir,
   mkdtemp,
@@ -12,6 +13,7 @@ import {
   rmdir,
   rm,
   symlink,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { createConnection, createServer, type Server, Socket } from "node:net";
@@ -34,6 +36,8 @@ const fixedRequestId = "018f0f64-7b21-7d4f-8c3d-4a30413d5f42";
 const otherRequestId = "018f0f64-7b21-7d4f-8c3d-4a30413d5f43";
 const currentPublicationGuard =
   ".c8fcfb3a77b48dbef2c3eab57379addc10c8368ab3418574a3d8dc1c68536feb9";
+const currentStagedSocket = ".s8ii47i6hu9f6rrdwudifbfef5";
+const legacyStagedSocket = ".c8fcfb3a7";
 const temporaryDirectories: string[] = [];
 const controlServers: ServiceControlServer[] = [];
 const nativeServers: Server[] = [];
@@ -196,6 +200,15 @@ async function closeNative(server: Server): Promise<void> {
   if (index >= 0) nativeServers.splice(index, 1);
 }
 
+async function leaveClosedSocketLinks(...candidates: readonly string[]): Promise<void> {
+  const source = path.join(runtimePath, "crash-source.sock");
+  const server = await listenNative(source);
+  await chmod(source, 0o600);
+  for (const candidate of candidates) await link(source, candidate);
+  await unlink(source);
+  await closeNative(server);
+}
+
 async function pathIsMissing(candidate: string): Promise<boolean> {
   try {
     await lstat(candidate);
@@ -292,6 +305,25 @@ describe("private service control socket", () => {
     expect(metadata.mode & 0o777).toBe(0o600);
   });
 
+  it("allows a modeled root process through a leading UID-0 sticky directory", async () => {
+    await chmod(temporaryRoot, 0o1777);
+    const server = createServiceControlServer(
+      options({
+        classifyPathOwner: () => 0,
+        currentUid: () => 0,
+      }),
+    );
+    controlServers.push(server);
+
+    await server.listen();
+
+    const runtime = await lstat(runtimePath);
+    const socket = await lstat(socketPath);
+    expect(runtime.mode & 0o777).toBe(0o700);
+    expect(socket.isSocket()).toBe(true);
+    expect(socket.mode & 0o777).toBe(0o600);
+  });
+
   it("rejects an injected non-root, non-current owner in the runtime ancestry", async () => {
     const filesystemRoot = path.parse(runtimePath).root;
     const server = createServiceControlServer(
@@ -358,6 +390,145 @@ describe("private service control socket", () => {
     await expect(server.listen()).rejects.toMatchObject({
       code: "RUNTIME_SERVICE_PATH_UNSAFE",
     });
+    expect(await pathIsMissing(socketPath)).toBe(true);
+  });
+
+  it.each([legacyStagedSocket, currentStagedSocket])(
+    "reclaims a crashed staged socket before publication: %s",
+    async (stagedName) => {
+      const stagedPath = path.join(runtimePath, stagedName);
+      await leaveClosedSocketLinks(stagedPath);
+      expect((await lstat(stagedPath)).isSocket()).toBe(true);
+
+      const server = await listenControl();
+
+      expect((await readdir(runtimePath)).sort()).toEqual([
+        currentPublicationGuard,
+        "runtime.sock",
+      ]);
+      await server.close();
+      expect(await readdir(runtimePath)).toEqual([]);
+    },
+  );
+
+  it.each([legacyStagedSocket, currentStagedSocket])(
+    "reclaims a crash between hard-link publication and staged unlink: %s",
+    async (stagedName) => {
+      const stagedPath = path.join(runtimePath, stagedName);
+      await leaveClosedSocketLinks(stagedPath, socketPath);
+      const stagedBefore = await snapshotPath(stagedPath);
+      const publicBefore = await snapshotPath(socketPath);
+      expect(stagedBefore.kind).toBe("socket");
+      expect(publicBefore.kind).toBe("socket");
+      expect(publicBefore.device).toBe(stagedBefore.device);
+      expect(publicBefore.inode).toBe(stagedBefore.inode);
+
+      const server = await listenControl();
+
+      expect((await readdir(runtimePath)).sort()).toEqual([
+        currentPublicationGuard,
+        "runtime.sock",
+      ]);
+      expect((await lstat(socketPath)).isSocket()).toBe(true);
+      await server.close();
+      expect(await readdir(runtimePath)).toEqual([]);
+    },
+  );
+
+  it.each([legacyStagedSocket, currentStagedSocket])(
+    "fails closed without removing a live staged socket: %s",
+    async (stagedName) => {
+      const stagedPath = path.join(runtimePath, stagedName);
+      await listenNative(stagedPath);
+      await chmod(stagedPath, 0o600);
+      const before = await snapshotPath(stagedPath);
+      const server = createServiceControlServer(options());
+      controlServers.push(server);
+
+      await expect(server.listen()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_ALREADY_RUNNING",
+      });
+      expect(await snapshotPath(stagedPath)).toEqual(before);
+      expect(await pathIsMissing(socketPath)).toBe(true);
+    },
+  );
+
+  it.each(["symlink", "regular file", "wrong-mode socket"] as const)(
+    "fails closed without changing an unsafe recognized staged socket: %s",
+    async (kind) => {
+      const stagedPath = path.join(runtimePath, currentStagedSocket);
+      if (kind === "symlink") {
+        const target = path.join(runtimePath, "staged-target");
+        await writeFile(target, "preserve-target", { mode: 0o600 });
+        await symlink(target, stagedPath);
+      } else if (kind === "regular file") {
+        await writeFile(stagedPath, "preserve-file", { mode: 0o600 });
+      } else {
+        await leaveClosedSocketLinks(stagedPath);
+        await chmod(stagedPath, 0o644);
+      }
+      const before = await snapshotPath(stagedPath);
+      const server = createServiceControlServer(options());
+      controlServers.push(server);
+
+      await expect(server.listen()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_PATH_UNSAFE",
+      });
+      expect(await snapshotPath(stagedPath)).toEqual(before);
+      expect(await pathIsMissing(socketPath)).toBe(true);
+    },
+  );
+
+  it("preserves a staged-socket replacement inserted after the listener probe", async () => {
+    const stagedPath = path.join(runtimePath, currentStagedSocket);
+    const displaced = path.join(runtimePath, "displaced-staged.sock");
+    await leaveClosedSocketLinks(stagedPath);
+    let replacement: PathSnapshot | undefined;
+    const server = createServiceControlServer(
+      options({
+        operationHooks: {
+          beforeStagedSocketUnlink: async (candidatePath) => {
+            expect(candidatePath).toBe(stagedPath);
+            await rename(candidatePath, displaced);
+            await writeFile(candidatePath, "preserve-replacement", { mode: 0o600 });
+            replacement = await snapshotPath(candidatePath);
+          },
+        },
+      }),
+    );
+    controlServers.push(server);
+
+    await expect(server.listen()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_PATH_UNSAFE",
+    });
+    expect(await snapshotPath(stagedPath)).toEqual(replacement);
+    expect((await lstat(displaced)).isSocket()).toBe(true);
+    expect(await pathIsMissing(socketPath)).toBe(true);
+  });
+
+  it("revalidates the synced runtime parent after staged-socket removal", async () => {
+    const stagedPath = path.join(runtimePath, currentStagedSocket);
+    const displacedRuntime = `${runtimePath}.displaced`;
+    await leaveClosedSocketLinks(stagedPath);
+    const server = createServiceControlServer(
+      options({
+        operationHooks: {
+          afterStagedSocketParentSync: async (candidatePath) => {
+            expect(candidatePath).toBe(stagedPath);
+            await rename(runtimePath, displacedRuntime);
+            await mkdir(runtimePath, { mode: 0o700 });
+            await chmod(runtimePath, 0o700);
+          },
+        },
+      }),
+    );
+    controlServers.push(server);
+
+    await expect(server.listen()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_PATH_UNSAFE",
+    });
+    expect(await readdir(runtimePath)).toEqual([]);
+    expect(await pathIsMissing(path.join(displacedRuntime, currentStagedSocket))).toBe(true);
     expect(await pathIsMissing(socketPath)).toBe(true);
   });
 
@@ -857,7 +1028,7 @@ describe("private service control socket", () => {
   });
 
   it("preserves a short bind-path replacement without falsely completing close", async () => {
-    const shortBindPath = path.join(runtimePath, ".c8fcfb3a7");
+    const shortBindPath = path.join(runtimePath, currentStagedSocket);
     expect(await pathIsMissing(shortBindPath)).toBe(true);
     let replacement: PathSnapshot | undefined;
     let injected = false;

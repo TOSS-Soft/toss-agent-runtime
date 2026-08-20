@@ -1,6 +1,17 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, lstatSync, unlinkSync, type BigIntStats } from "node:fs";
-import { chmod, link, lstat, mkdir, open, readdir, rename, rmdir, unlink } from "node:fs/promises";
+import {
+  chmod,
+  link,
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  rename,
+  rmdir,
+  unlink,
+  type FileHandle,
+} from "node:fs/promises";
 import { createConnection, createServer, type Socket } from "node:net";
 import path from "node:path";
 
@@ -19,6 +30,7 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 const LEGACY_PUBLICATION_GUARD_PATTERN = /^\.c[0-9a-f]{8}$/u;
 const PUBLICATION_GUARD_PATTERN = /^\.c[0-9a-f]{64}$/u;
 const PUBLICATION_CLAIM_PATTERN = /^\.r[0-9a-f]{64}$/u;
+const STAGED_SOCKET_PATTERN = /^\.s[0-9a-z]{25}$/u;
 const internalServiceErrors = new WeakSet<RuntimeServiceError>();
 
 interface FileIdentity {
@@ -62,6 +74,10 @@ export interface ServiceControlOperationHooks {
   readonly afterPublicationGuardClaim?: (candidatePath: string, claimPath: string) => Promise<void>;
   /** @internal Test seam for deterministic native-close publication races. */
   readonly beforePublicationGuardCloseClaim?: (candidatePath: string) => Promise<void>;
+  /** @internal Test seam for deterministic staged-socket replacement races. */
+  readonly beforeStagedSocketUnlink?: (candidatePath: string) => Promise<void>;
+  /** @internal Test seam for deterministic staged-socket parent revalidation. */
+  readonly afterStagedSocketParentSync?: (candidatePath: string) => Promise<void>;
   readonly onConnectionCountChanged?: (count: number) => void;
   readonly onConnectionClosed?: () => void;
 }
@@ -123,12 +139,15 @@ function classifyPathOwner(
   currentUid: (() => number) | undefined,
   userId: number,
   candidate: string,
+  leadingAncestor = false,
 ): PathOwner {
   try {
     const classified = classifier?.(userId, candidate) ?? userId;
     const owner =
       typeof classified === "number"
-        ? defaultPathOwner(classified, (currentUid ?? processCurrentUid)())
+        ? leadingAncestor && classified === 0
+          ? "root"
+          : defaultPathOwner(classified, (currentUid ?? processCurrentUid)())
         : classified;
     if (owner !== "root" && owner !== "current-user" && owner !== "other") pathUnsafe();
     return owner;
@@ -214,7 +233,13 @@ async function assertPrivateRuntimeDirectory(
     }
     if (metadata.isSymbolicLink() || !metadata.isDirectory()) pathUnsafe();
 
-    const owner = classifyPathOwner(classifier, currentUid, safeUserId(metadata.uid), candidate);
+    const owner = classifyPathOwner(
+      classifier,
+      currentUid,
+      safeUserId(metadata.uid),
+      candidate,
+      index !== candidates.length - 1,
+    );
     if (owner === "root" && !reachedCurrentUserDirectory) {
       if ((metadata.mode & 0o022n) !== 0n && (metadata.mode & 0o1000n) === 0n) pathUnsafe();
     } else if (owner === "current-user") {
@@ -241,12 +266,22 @@ function isPublicationArtifactName(candidate: string): boolean {
   return (
     LEGACY_PUBLICATION_GUARD_PATTERN.test(candidate) ||
     PUBLICATION_GUARD_PATTERN.test(candidate) ||
-    PUBLICATION_CLAIM_PATTERN.test(candidate)
+    PUBLICATION_CLAIM_PATTERN.test(candidate) ||
+    STAGED_SOCKET_PATTERN.test(candidate)
   );
+}
+
+function isPossibleStagedSocketName(candidate: string): boolean {
+  return LEGACY_PUBLICATION_GUARD_PATTERN.test(candidate) || STAGED_SOCKET_PATTERN.test(candidate);
 }
 
 function publicationGuardName(serviceInstanceId: string): string {
   return `.c${createHash("sha256").update(serviceInstanceId, "utf8").digest("hex")}`;
+}
+
+function stagedSocketName(serviceInstanceId: string): string {
+  const entropy = createHash("sha256").update(serviceInstanceId, "utf8").digest("hex").slice(0, 32);
+  return `.s${BigInt(`0x${entropy}`).toString(36).padStart(25, "0")}`;
 }
 
 function publicationClaimName(serviceInstanceId: string, candidateName: string): string {
@@ -425,6 +460,12 @@ async function reclaimStalePublicationGuards(options: {
 
   for (const candidateName of candidates) {
     const candidatePath = path.join(runtimePath, candidateName);
+    if (
+      isPossibleStagedSocketName(candidateName) &&
+      !(await requiredMetadata(candidatePath)).isDirectory()
+    ) {
+      continue;
+    }
     const expectedGuard = await inspectEmptyPublicationGuard({
       candidate: candidatePath,
       classifier,
@@ -546,6 +587,165 @@ async function removeStaleSocket(
   }
 }
 
+async function assertRuntimeDirectoryHandle(options: {
+  readonly handle: FileHandle;
+  readonly socketPath: string;
+  readonly expected: FileIdentity;
+  readonly classifier?: PathOwnerClassifier | undefined;
+  readonly currentUid?: (() => number) | undefined;
+  readonly modelRuntimeIdentity?: ServiceControlOperationHooks["modelRuntimeIdentity"] | undefined;
+}): Promise<void> {
+  const runtimePath = path.dirname(options.socketPath);
+  let metadata;
+  try {
+    metadata = await options.handle.stat({ bigint: true });
+  } catch {
+    pathUnsafe();
+  }
+  if (
+    !metadata.isDirectory() ||
+    classifyPathOwner(
+      options.classifier,
+      options.currentUid,
+      safeUserId(metadata.uid),
+      runtimePath,
+    ) !== "current-user" ||
+    (metadata.mode & 0o777n) !== 0o700n ||
+    !sameIdentity(
+      runtimeIdentityOf(metadata, runtimePath, options.modelRuntimeIdentity),
+      options.expected,
+    )
+  ) {
+    pathUnsafe();
+  }
+  await assertUnchangedRuntimeDirectory({
+    socketPath: options.socketPath,
+    expected: options.expected,
+    classifier: options.classifier,
+    currentUid: options.currentUid,
+    modelRuntimeIdentity: options.modelRuntimeIdentity,
+  });
+}
+
+async function openRuntimeDirectoryHandle(options: {
+  readonly socketPath: string;
+  readonly expected: FileIdentity;
+  readonly classifier?: PathOwnerClassifier | undefined;
+  readonly currentUid?: (() => number) | undefined;
+  readonly modelRuntimeIdentity?: ServiceControlOperationHooks["modelRuntimeIdentity"] | undefined;
+}): Promise<FileHandle> {
+  let handle;
+  try {
+    handle = await open(
+      path.dirname(options.socketPath),
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+  } catch {
+    pathUnsafe();
+  }
+  try {
+    await assertRuntimeDirectoryHandle({ handle, ...options });
+    return handle;
+  } catch (error) {
+    await handle.close();
+    if (error instanceof RuntimeServiceError && internalServiceErrors.has(error)) throw error;
+    pathUnsafe();
+  }
+}
+
+async function reclaimStaleStagedSocket(options: {
+  readonly candidatePath: string;
+  readonly socketPath: string;
+  readonly runtimeIdentity: FileIdentity;
+  readonly classifier?: PathOwnerClassifier | undefined;
+  readonly currentUid?: (() => number) | undefined;
+  readonly hooks?: ServiceControlOperationHooks | undefined;
+}): Promise<void> {
+  const { candidatePath, classifier, currentUid, hooks, runtimeIdentity, socketPath } = options;
+  const expected = await privateSocketIdentity(candidatePath, classifier, currentUid);
+  if (expected === undefined) pathUnsafe();
+  if (await socketHasListener(candidatePath)) {
+    throw serviceError("RUNTIME_SERVICE_ALREADY_RUNNING");
+  }
+  await assertUnchangedRuntimeDirectory({
+    socketPath,
+    expected: runtimeIdentity,
+    classifier,
+    currentUid,
+    modelRuntimeIdentity: hooks?.modelRuntimeIdentity,
+  });
+  const runtimeHandle = await openRuntimeDirectoryHandle({
+    socketPath,
+    expected: runtimeIdentity,
+    classifier,
+    currentUid,
+    modelRuntimeIdentity: hooks?.modelRuntimeIdentity,
+  });
+  try {
+    try {
+      await hooks?.beforeStagedSocketUnlink?.(candidatePath);
+    } catch {
+      pathUnsafe();
+    }
+    const current = await privateSocketIdentity(candidatePath, classifier, currentUid);
+    if (current === undefined || !sameIdentity(current, expected)) pathUnsafe();
+    await assertRuntimeDirectoryHandle({
+      handle: runtimeHandle,
+      socketPath,
+      expected: runtimeIdentity,
+      classifier,
+      currentUid,
+      modelRuntimeIdentity: hooks?.modelRuntimeIdentity,
+    });
+    try {
+      await unlink(candidatePath);
+      await runtimeHandle.sync();
+    } catch {
+      pathUnsafe();
+    }
+    try {
+      await hooks?.afterStagedSocketParentSync?.(candidatePath);
+    } catch {
+      pathUnsafe();
+    }
+    await assertRuntimeDirectoryHandle({
+      handle: runtimeHandle,
+      socketPath,
+      expected: runtimeIdentity,
+      classifier,
+      currentUid,
+      modelRuntimeIdentity: hooks?.modelRuntimeIdentity,
+    });
+    try {
+      await lstatBigInt(candidatePath);
+      pathUnsafe();
+    } catch (error) {
+      if (!isMissing(error)) {
+        if (error instanceof RuntimeServiceError && internalServiceErrors.has(error)) throw error;
+        pathUnsafe();
+      }
+    }
+  } finally {
+    await runtimeHandle.close();
+  }
+}
+
+async function reclaimStaleStagedSockets(options: {
+  readonly socketPath: string;
+  readonly runtimeIdentity: FileIdentity;
+  readonly classifier?: PathOwnerClassifier | undefined;
+  readonly currentUid?: (() => number) | undefined;
+  readonly hooks?: ServiceControlOperationHooks | undefined;
+}): Promise<void> {
+  const runtimePath = path.dirname(options.socketPath);
+  const candidates = (await requiredEntries(runtimePath)).filter(isPossibleStagedSocketName).sort();
+  for (const candidateName of candidates) {
+    const candidatePath = path.join(runtimePath, candidateName);
+    if ((await requiredMetadata(candidatePath)).isDirectory()) continue;
+    await reclaimStaleStagedSocket({ candidatePath, ...options });
+  }
+}
+
 function plainError(code: RuntimeServiceErrorCode): Readonly<{
   code: RuntimeServiceErrorCode;
   category: RuntimeServiceError["category"];
@@ -640,7 +840,7 @@ export function createServiceControlServer(
   );
   const stagingSocketPath = path.join(
     path.dirname(options.socketPath),
-    `.c${createHash("sha256").update(options.serviceInstanceId, "utf8").digest("hex").slice(0, 8)}`,
+    stagedSocketName(options.serviceInstanceId),
   );
   let ownedSocket: FileIdentity | undefined;
   let publicationGuard: FileIdentity | undefined;
@@ -1005,6 +1205,13 @@ export function createServiceControlServer(
       );
       ownedRuntime = runtimeIdentity;
       await removeStaleSocket(options.socketPath, options.classifyPathOwner, options.currentUid);
+      await reclaimStaleStagedSockets({
+        socketPath: options.socketPath,
+        runtimeIdentity,
+        classifier: options.classifyPathOwner,
+        currentUid: options.currentUid,
+        hooks: options.operationHooks,
+      });
       await reclaimStalePublicationGuards({
         socketPath: options.socketPath,
         serviceInstanceId: options.serviceInstanceId,
