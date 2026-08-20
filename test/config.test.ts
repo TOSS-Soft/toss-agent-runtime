@@ -1,8 +1,10 @@
 import {
   appendFile,
   chmod,
+  lstat,
   mkdir,
   mkdtemp,
+  realpath,
   rm,
   symlink,
   truncate,
@@ -24,7 +26,7 @@ const temporaryDirectories: string[] = [];
 const RUNTIME_CONFIG_BYTE_CAP = 2 * 1024 * 1024;
 
 async function temporaryDirectory(): Promise<string> {
-  const directory = await mkdtemp(path.join(tmpdir(), "toss-runtime-config-"));
+  const directory = await realpath(await mkdtemp(path.join(tmpdir(), "toss-runtime-config-")));
   temporaryDirectories.push(directory);
   return directory;
 }
@@ -316,6 +318,72 @@ describe("runtime configuration", () => {
     await expect(
       loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home }),
     ).rejects.toMatchObject({ code: "RUNTIME_CONFIG_UNSAFE" });
+  });
+
+  it("rejects a symlinked ancestor before the approved production config root", async () => {
+    const home = await temporaryDirectory();
+    const outside = await temporaryDirectory();
+    const configRoot = path.join(outside, "toss", "runtime");
+    await mkdir(configRoot, { recursive: true, mode: 0o700 });
+    await symlink(outside, path.join(home, ".config"));
+    const configPath = path.join(home, ".config", "toss", "runtime", "production.yaml");
+    await writeFile(configPath, validYaml(linuxStateRoot(home), "production"), { mode: 0o600 });
+
+    await expect(
+      loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home }),
+    ).rejects.toMatchObject({ code: "RUNTIME_CONFIG_UNSAFE" });
+  });
+
+  it("rejects a symlinked production state ancestor before a missing approved suffix", async () => {
+    const home = await temporaryDirectory();
+    const outside = await temporaryDirectory();
+    await symlink(outside, path.join(home, ".local"));
+    const configPath = await writeProductionConfig(home, "production-state-link.yaml");
+
+    await expect(
+      loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home }),
+    ).rejects.toMatchObject({ code: "RUNTIME_CONFIG_UNSAFE" });
+  });
+
+  it("rejects a symlinked production runtime ancestor before a missing approved suffix", async () => {
+    const home = await temporaryDirectory();
+    const outside = await temporaryDirectory();
+    const runtimeLink = path.join(home, "run");
+    await symlink(outside, runtimeLink);
+    const socket = path.join(runtimeLink, "toss", "runtime", "runtime.sock");
+    const configPath = await writeProductionConfig(
+      home,
+      "production-runtime-link.yaml",
+      validYaml(linuxStateRoot(home), "production").replace(
+        `socket: ${linuxStateRoot(home)}/runtime.sock`,
+        `socket: ${socket}`,
+      ),
+    );
+
+    await expect(
+      loadConfig({
+        explicitPath: configPath,
+        env: { XDG_RUNTIME_DIR: runtimeLink },
+        platform: "linux",
+        home,
+      }),
+    ).rejects.toMatchObject({ code: "RUNTIME_CONFIG_UNSAFE" });
+  });
+
+  it("accepts production roots below root-owned non-writable and sticky ancestors", async () => {
+    const trustedTemporaryRoot = await realpath("/tmp");
+    const metadata = await lstat(trustedTemporaryRoot);
+    expect(metadata.uid).toBe(0);
+    expect(metadata.mode & 0o1000).toBe(0o1000);
+    const home = await realpath(
+      await mkdtemp(path.join(trustedTemporaryRoot, "toss-runtime-config-trusted-")),
+    );
+    temporaryDirectories.push(home);
+    const configPath = await writeProductionConfig(home, "production-trusted-ancestors.yaml");
+
+    await expect(
+      loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home }),
+    ).resolves.toMatchObject({ source: configPath, config: { mode: "production" } });
   });
 
   it("rejects a production config outside approved per-user roots", async () => {

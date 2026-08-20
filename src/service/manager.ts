@@ -209,12 +209,18 @@ function parseProperties(output: string): ReadonlyMap<string, string> {
   return properties;
 }
 
+function parseSafeNonnegativeInteger(value: string | undefined): number | undefined {
+  if (value === undefined || !/^(?:0|[1-9][0-9]*)$/.test(value)) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
 function parseNonnegativeInteger(value: string | undefined): number {
-  return value !== undefined && /^(?:0|[1-9][0-9]*)$/.test(value) ? Number(value) : 0;
+  return parseSafeNonnegativeInteger(value) ?? 0;
 }
 
 function parseExitCode(value: string | undefined): number | null {
-  return value !== undefined && /^-?(?:0|[1-9][0-9]*)$/.test(value) ? Number(value) : null;
+  return parseSafeNonnegativeInteger(value) ?? null;
 }
 
 function linuxStatus(result: CommandResult): ServiceManagerStatus {

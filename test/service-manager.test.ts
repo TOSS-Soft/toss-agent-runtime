@@ -1203,6 +1203,52 @@ describe("native per-user service manager", () => {
     ]);
   });
 
+  it.each([
+    [
+      "linux",
+      (value: string) =>
+        `LoadState=loaded\nUnitFileState=enabled\nActiveState=inactive\nSubState=dead\nResult=success\nNRestarts=${value}\nExecMainStatus=${value}\n`,
+    ],
+    ["darwin", (value: string) => `state = exited\nruns = ${value}\nlast exit code = ${value}\n`],
+  ] as const)(
+    "normalizes unsafe native %s status integers to deterministic fallback values",
+    async (platform, output) => {
+      const runner = new RecordingRunner([
+        { exitCode: 0, stdout: output("9".repeat(400)), stderr: "" },
+      ]);
+      const { manager } = await (platform === "linux" ? linuxFixture : darwinFixture)(runner);
+      await manager.install();
+      runner.calls.splice(0);
+
+      await expect(manager.status()).resolves.toEqual({
+        installed: true,
+        enabled: true,
+        active: false,
+        backoff: false,
+        restartCount: 0,
+        lastExitCode: null,
+      });
+    },
+  );
+
+  it.each([
+    [
+      "linux",
+      "LoadState=loaded\nUnitFileState=enabled\nActiveState=inactive\nSubState=dead\nResult=success\nNRestarts=-1\nExecMainStatus=-1\n",
+    ],
+    ["darwin", "state = exited\nruns = -1\nlast exit code = -1\n"],
+  ] as const)("rejects negative native %s status integers", async (platform, output) => {
+    const runner = new RecordingRunner([{ exitCode: 0, stdout: output, stderr: "" }]);
+    const { manager } = await (platform === "linux" ? linuxFixture : darwinFixture)(runner);
+    await manager.install();
+    runner.calls.splice(0);
+
+    await expect(manager.status()).resolves.toMatchObject({
+      restartCount: 0,
+      lastExitCode: null,
+    });
+  });
+
   it("returns an absent status without invoking a manager for a missing definition", async () => {
     const runner = new RecordingRunner();
     const { manager } = await linuxFixture(runner);

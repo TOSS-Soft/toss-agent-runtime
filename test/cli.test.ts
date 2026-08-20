@@ -881,6 +881,69 @@ describe("baseline CLI", () => {
     }
   });
 
+  it("renders oversized native status integers as safe JSON fallback values", async () => {
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-runtime-cli-status-")));
+    const cliPath = path.join(root, "cli.js");
+    const configPath = path.join(root, ".config", "toss", "runtime", "config.yaml");
+    const oversized = "9".repeat(400);
+    await writeFile(cliPath, "", { mode: 0o600 });
+    const runner = {
+      run() {
+        return Promise.resolve({
+          exitCode: 0,
+          stdout:
+            `LoadState=loaded\nUnitFileState=enabled\nActiveState=inactive\nSubState=dead\n` +
+            `Result=success\nNRestarts=${oversized}\nExecMainStatus=${oversized}\n`,
+          stderr: "",
+        });
+      },
+    };
+    try {
+      const installer = createServiceManager({
+        platform: "linux",
+        home: root,
+        env: {},
+        uid: 501,
+        currentUid: () => 501,
+        nodePath: process.execPath,
+        cliPath,
+        configPath,
+        randomSuffix: () => "definition",
+        runner,
+      });
+      await installer.install();
+      const mainServices = createMainServices({
+        platform,
+        env: {},
+        home: root,
+        signals: { subscribe: () => () => undefined },
+        pid: 4217,
+        now: () => new Date("2026-08-20T10:00:00.000Z"),
+        createServiceInstanceId: () => healthySocketStatus.service_instance_id,
+        resolveExecutableHash: () => Promise.resolve("a".repeat(64)),
+        sendReady: () => undefined,
+        nodePath: process.execPath,
+        cliPath,
+        uid: 501,
+        loadConfig: () =>
+          Promise.resolve({ config: defaultConfig("linux", root), source: "status-integer-test" }),
+        createServiceManager: (options) =>
+          createServiceManager({ ...options, currentUid: () => 501, runner }),
+      });
+
+      const output = await runCli(["service", "status", "--json"], mainServices);
+
+      expect(output).toMatchObject({ exitCode: 0, stderr: "" });
+      expect(JSON.parse(output.stdout)).toMatchObject({
+        command: "service status",
+        ok: true,
+        data: { restartCount: 0, lastExitCode: null },
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it.each([
     [
       "unsafe definition",

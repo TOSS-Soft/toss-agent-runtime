@@ -259,15 +259,23 @@ async function assertPrivateDirectoryPath(
   roots: readonly string[],
 ): Promise<void> {
   const root = selectApprovedRoot(candidate, roots);
-  const relative = path.relative(root, candidate);
+  const parsed = path.parse(candidate);
+  const relative = candidate.slice(parsed.root.length);
   const segments = relative === "" ? [] : relative.split(path.sep);
-  const pathsToCheck: string[] = [root];
-  let current = root;
+  const pathsToCheck: string[] = [parsed.root];
+  let current = parsed.root;
   for (const segment of segments) {
+    if (segment.length === 0 || segment === "." || segment === "..") {
+      throw new RuntimeConfigError(
+        "RUNTIME_CONFIG_UNSAFE",
+        "Production runtime directory could not be inspected safely",
+      );
+    }
     current = path.join(current, segment);
     pathsToCheck.push(current);
   }
 
+  let reachedCurrentUserDirectory = false;
   for (const directoryPath of pathsToCheck) {
     let metadata;
     try {
@@ -279,12 +287,33 @@ async function assertPrivateDirectoryPath(
         "Production runtime directory could not be inspected safely",
       );
     }
-    if (
-      metadata.isSymbolicLink() ||
-      !metadata.isDirectory() ||
-      !currentUserOwns(metadata.uid) ||
-      (metadata.mode & 0o077) !== 0
-    ) {
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      throw new RuntimeConfigError(
+        "RUNTIME_CONFIG_UNSAFE",
+        "Production runtime directories must be private and owned by the current user",
+      );
+    }
+    const ownedByCurrentUser = currentUserOwns(metadata.uid);
+    const trustedSystemAncestor = metadata.uid === 0 && !reachedCurrentUserDirectory;
+    if (trustedSystemAncestor) {
+      const writable = (metadata.mode & 0o022) !== 0;
+      const sticky = (metadata.mode & 0o1000) !== 0;
+      if (writable && !sticky) {
+        throw new RuntimeConfigError(
+          "RUNTIME_CONFIG_UNSAFE",
+          "Production runtime directories must be private and owned by the current user",
+        );
+      }
+    } else {
+      if (!ownedByCurrentUser || (metadata.mode & 0o022) !== 0) {
+        throw new RuntimeConfigError(
+          "RUNTIME_CONFIG_UNSAFE",
+          "Production runtime directories must be private and owned by the current user",
+        );
+      }
+      reachedCurrentUserDirectory = true;
+    }
+    if (isWithin(root, directoryPath) && (!ownedByCurrentUser || (metadata.mode & 0o077) !== 0)) {
       throw new RuntimeConfigError(
         "RUNTIME_CONFIG_UNSAFE",
         "Production runtime directories must be private and owned by the current user",
