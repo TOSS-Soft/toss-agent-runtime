@@ -115,7 +115,7 @@ watch_paths:
   - package.json
 ignore_paths:
   - dist
-  - "*.tmp"
+  - tmp
 ```
 
 Assert rejection of unknown keys, YAML aliases/tags/multiple documents, duplicate paths, empty arrays, absolute paths, `.`/`..`/empty/control-character segments, and inputs over 64 KiB. Registry tests must recompute `entry_hash` and reject changed revision, root, state, or manifest hash. Candidate tests must enforce kind `PROJECT_CHANGED`, bytewise-sorted unique changes, exact registry/manifest identity, SHA-256 candidate key, bounded safe file identity strings, and closed metadata.
