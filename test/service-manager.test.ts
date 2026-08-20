@@ -3,6 +3,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   realpath,
   rm,
@@ -623,6 +624,94 @@ describe("native per-user service manager", () => {
     await expect(readFile(artifacts.pendingIntake, "utf8")).resolves.toBe("preserve");
     await expect(readFile(artifacts.operationalLog, "utf8")).resolves.toBe("preserve");
   });
+
+  it.each([
+    ["linux", "stop", ["--user", "stop", "toss-agent-runtime.service"]],
+    ["linux", "disable", ["--user", "disable", "toss-agent-runtime.service"]],
+    ["darwin", "bootout", ["bootout", "gui/501/software.toss.agent-runtime"]],
+  ] as const)(
+    "preserves a definition replaced after %s %s and cleans its uninstall claim before recovery",
+    async (platform, replacementBoundary, boundaryArguments) => {
+      let definition = "";
+      let replaced = false;
+      const runner: CommandRunner & { calls: { file: string; args: readonly string[] }[] } = {
+        calls: [],
+        async run(file, args) {
+          this.calls.push({ file, args: [...args] });
+          if (
+            !replaced &&
+            ((platform === "linux" && args[1] === replacementBoundary) ||
+              (platform === "darwin" && args[0] === replacementBoundary))
+          ) {
+            replaced = true;
+            await writeFile(definition, "replacement-after-native-mutation", { mode: 0o600 });
+            await chmod(definition, 0o600);
+          }
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      };
+      const makeFixture = platform === "linux" ? linuxFixture : darwinFixture;
+      const artifacts = await makeFixture(runner);
+      definition = artifacts.definition;
+      await artifacts.manager.install();
+      const acceptedDefinition = await readFile(definition);
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      expect(runner.calls).toEqual(
+        platform === "linux"
+          ? [
+              {
+                file: "/usr/bin/systemctl",
+                args: ["--user", "stop", "toss-agent-runtime.service"],
+              },
+              {
+                file: "/usr/bin/systemctl",
+                args: ["--user", "disable", "toss-agent-runtime.service"],
+              },
+            ]
+          : [{ file: "/bin/launchctl", args: boundaryArguments }],
+      );
+      expect(await readFile(definition, "utf8")).toBe("replacement-after-native-mutation");
+      expect(await readdir(path.dirname(definition))).toEqual([path.basename(definition)]);
+
+      await writeFile(definition, acceptedDefinition, { mode: 0o600 });
+      await chmod(definition, 0o600);
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.uninstall()).resolves.toEqual({
+        installed: false,
+        enabled: false,
+        active: false,
+        backoff: false,
+        restartCount: 0,
+        lastExitCode: null,
+      });
+      await expect(lstat(definition)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(runner.calls).toEqual(
+        platform === "linux"
+          ? [
+              {
+                file: "/usr/bin/systemctl",
+                args: ["--user", "stop", "toss-agent-runtime.service"],
+              },
+              {
+                file: "/usr/bin/systemctl",
+                args: ["--user", "disable", "toss-agent-runtime.service"],
+              },
+              { file: "/usr/bin/systemctl", args: ["--user", "daemon-reload"] },
+            ]
+          : [
+              {
+                file: "/bin/launchctl",
+                args: ["bootout", "gui/501/software.toss.agent-runtime"],
+              },
+            ],
+      );
+    },
+  );
 
   it("rejects an incompatible installed definition without replacing it", async () => {
     const runner = new RecordingRunner();

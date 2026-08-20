@@ -303,7 +303,7 @@ class NativeServiceManager implements ServiceManager {
     }
   }
 
-  private async installedDefinition(allowRecoveredConfig = false): Promise<boolean> {
+  private async installedDefinition(allowRecoveredConfig = false): Promise<Uint8Array | undefined> {
     let existing: Uint8Array | undefined;
     try {
       existing = await readPrivateRegularFile(this.paths.definition);
@@ -311,7 +311,7 @@ class NativeServiceManager implements ServiceManager {
       definitionError(error);
     }
     if (existing === undefined) {
-      return false;
+      return undefined;
     }
     if (
       !Buffer.from(existing).equals(this.definition) &&
@@ -319,11 +319,11 @@ class NativeServiceManager implements ServiceManager {
     ) {
       definitionUnsafe();
     }
-    return true;
+    return existing;
   }
 
   private async ensureDefinition(): Promise<void> {
-    if (await this.installedDefinition()) return;
+    if ((await this.installedDefinition()) !== undefined) return;
     let result: "created" | "existing";
     try {
       result = await createPrivateAtomicIfMissing({
@@ -338,7 +338,8 @@ class NativeServiceManager implements ServiceManager {
     } catch (error) {
       definitionError(error);
     }
-    if (result === "existing" && !(await this.installedDefinition())) definitionUnsafe();
+    if (result === "existing" && (await this.installedDefinition()) === undefined)
+      definitionUnsafe();
   }
 
   private async command(
@@ -433,7 +434,8 @@ class NativeServiceManager implements ServiceManager {
   }
 
   async uninstall(): Promise<ServiceManagerStatus> {
-    if (!(await this.installedDefinition(true))) return EMPTY_STATUS;
+    const acceptedDefinition = await this.installedDefinition(true);
+    if (acceptedDefinition === undefined) return EMPTY_STATUS;
     if (this.options.platform === "linux") {
       await this.command(LINUX_EXECUTABLE, ["--user", "stop", SYSTEMD_UNIT], "linux-stop");
       await this.command(LINUX_EXECUTABLE, ["--user", "disable", SYSTEMD_UNIT], "linux-disable");
@@ -445,7 +447,10 @@ class NativeServiceManager implements ServiceManager {
       );
     }
     try {
-      await removeOwnedDefinition(this.paths.definition);
+      await removeOwnedDefinition(this.paths.definition, {
+        expectedBytes: acceptedDefinition,
+        randomSuffix: this.options.randomSuffix,
+      });
     } catch (error) {
       definitionError(error);
     }

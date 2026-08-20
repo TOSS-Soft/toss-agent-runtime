@@ -1,4 +1,4 @@
-import type { Stats } from "node:fs";
+import type { BigIntStats } from "node:fs";
 import {
   appendFile,
   chmod,
@@ -42,6 +42,13 @@ async function privateFile(filePath: string, contents: string): Promise<void> {
   await chmod(filePath, 0o600);
 }
 
+function lstatBigInt(
+  candidate: Parameters<typeof lstat>[0],
+  options: { bigint: true },
+): Promise<BigIntStats> {
+  return lstat(candidate, options);
+}
+
 function validYaml(root: string): string {
   return `schema_version: runtime-config.v1
 document_type: runtime-config
@@ -64,18 +71,18 @@ secret_references: {}
 
 function modeledRootOwnedOperations(rootOwnedPath: string, permissions: number) {
   return {
-    lstat: async (candidate: Parameters<typeof lstat>[0]) => {
-      const metadata = await lstat(candidate);
+    lstat: async (candidate: Parameters<typeof lstat>[0], options: { bigint: true }) => {
+      const metadata = await lstat(candidate, options);
       const candidatePath = String(candidate);
       const relative = path.relative(candidatePath, rootOwnedPath);
       const leadingAncestor =
         relative === "" || (!path.isAbsolute(relative) && !relative.startsWith(`..${path.sep}`));
       if (!leadingAncestor) return metadata;
-      const modeled = Object.create(metadata) as Stats;
-      Object.defineProperty(modeled, "uid", { value: 0 });
+      const modeled = Object.create(metadata) as BigIntStats;
+      Object.defineProperty(modeled, "uid", { value: 0n });
       if (candidatePath === rootOwnedPath) {
         Object.defineProperty(modeled, "mode", {
-          value: (metadata.mode & ~0o7777) | permissions,
+          value: (metadata.mode & ~0o7777n) | BigInt(permissions),
         });
       }
       return modeled;
@@ -407,7 +414,7 @@ describe("private service definition storage", () => {
       randomSuffix: () => "fixed",
       parentPolicy: "owned-not-writable",
       operations: {
-        lstat,
+        lstat: lstatBigInt,
         mkdir,
         unlink,
         rename: async (source, destination) => {
@@ -449,7 +456,7 @@ describe("private service definition storage", () => {
         randomSuffix: () => "fixed",
         parentPolicy: "owned-not-writable",
         operations: {
-          lstat,
+          lstat: lstatBigInt,
           mkdir,
           open,
           unlink,
@@ -483,6 +490,64 @@ describe("private service definition storage", () => {
 
     expect(await readFile(target, "utf8")).toBe("preserve");
     expect(await readdir(root)).toEqual(["definition.service"]);
+  });
+
+  it("does not clean a temporary file when large inode identities differ beyond safe integers", async () => {
+    const root = await temporaryDirectory();
+    const target = path.join(root, "definition.service");
+    const temporary = path.join(root, ".definition.service.fixed.tmp");
+    const createdIdentity = BigInt(Number.MAX_SAFE_INTEGER) + 1n;
+    const replacedIdentity = BigInt(Number.MAX_SAFE_INTEGER) + 2n;
+    await privateFile(target, "preserve");
+
+    await expect(
+      writePrivateAtomic({
+        target,
+        bytes: new TextEncoder().encode("replacement"),
+        randomSuffix: () => "fixed",
+        parentPolicy: "owned-not-writable",
+        operations: {
+          lstat: async (candidate: Parameters<typeof lstat>[0], options: { bigint: true }) => {
+            const metadata = await lstat(candidate, options);
+            if (String(candidate) !== temporary) return metadata;
+            const modeled = Object.create(metadata) as BigIntStats;
+            Object.defineProperties(modeled, {
+              dev: { value: replacedIdentity },
+              ino: { value: replacedIdentity },
+            });
+            return modeled;
+          },
+          mkdir,
+          open: async (
+            filePath: Parameters<typeof open>[0],
+            flags: Parameters<typeof open>[1],
+            mode: Parameters<typeof open>[2],
+          ) => {
+            const handle = await open(filePath, flags, mode);
+            const stat = handle.stat.bind(handle);
+            Object.defineProperty(handle, "stat", {
+              value: async (options?: Parameters<typeof handle.stat>[0]) => {
+                const metadata =
+                  options?.bigint === true ? await stat({ bigint: true }) : await stat();
+                if (String(filePath) !== temporary) return metadata;
+                const modeled = Object.create(metadata) as BigIntStats;
+                Object.defineProperties(modeled, {
+                  dev: { value: createdIdentity },
+                  ino: { value: createdIdentity },
+                });
+                return modeled;
+              },
+            });
+            return handle;
+          },
+          unlink,
+          rename: () => Promise.reject(new Error("injected rename failure")),
+        },
+      }),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_PATH_UNSAFE" });
+
+    expect(await readFile(target, "utf8")).toBe("preserve");
+    expect(await readFile(temporary, "utf8")).toBe("replacement");
   });
 
   it("does not delete a colliding caller-owned temporary path", async () => {

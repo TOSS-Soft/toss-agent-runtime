@@ -1,4 +1,5 @@
-import { constants, type PathLike, type Stats } from "node:fs";
+import { constants, type BigIntStats, type PathLike } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { link, lstat, mkdir, open, rename, unlink, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 
@@ -17,7 +18,7 @@ export type ParentPolicy = "private" | "owned-not-writable";
 type CurrentUserCheck = (userId: number, candidate?: string) => boolean;
 
 interface StoreOperations {
-  readonly lstat: (candidate: PathLike) => Promise<Stats>;
+  readonly lstat: (candidate: PathLike, options: { bigint: true }) => Promise<BigIntStats>;
   readonly mkdir: typeof mkdir;
   readonly open: typeof open;
   readonly rename: typeof rename;
@@ -25,11 +26,17 @@ interface StoreOperations {
 }
 
 interface OwnedFileIdentity {
-  readonly device: number;
-  readonly inode: number;
+  readonly device: bigint;
+  readonly inode: bigint;
 }
 
-const DEFAULT_OPERATIONS: StoreOperations = { lstat, mkdir, open, rename, unlink };
+const DEFAULT_OPERATIONS: StoreOperations = {
+  lstat: (candidate, options) => lstat(candidate, options),
+  mkdir,
+  open,
+  rename,
+  unlink,
+};
 const SAFE_SUFFIX = /^[A-Za-z0-9_-]{1,64}$/;
 const MAX_PRIVATE_REGULAR_FILE_BYTES = 65_536;
 
@@ -51,6 +58,23 @@ function defaultCurrentUserCheck(userId: number): boolean {
 
 function isPrivateFileMode(mode: number): boolean {
   return (mode & 0o777) === 0o600;
+}
+
+function safeStatNumber(value: bigint): number {
+  if (value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) servicePathUnsafe();
+  return Number(value);
+}
+
+function isCurrentUserOwner(
+  metadata: BigIntStats,
+  candidate: string,
+  isCurrentUser: CurrentUserCheck,
+): boolean {
+  return isCurrentUser(safeStatNumber(metadata.uid), candidate);
+}
+
+function privateFileMode(metadata: BigIntStats): boolean {
+  return isPrivateFileMode(safeStatNumber(metadata.mode));
 }
 
 function assertAbsoluteTarget(target: string): void {
@@ -78,14 +102,14 @@ async function inspectDirectoryPath(
     let created = false;
     let metadata;
     try {
-      metadata = await operations.lstat(current);
+      metadata = await operations.lstat(current, { bigint: true });
     } catch (error) {
       if (!create && isMissing(error)) return false;
       if (!isMissing(error)) servicePathUnsafe();
       try {
         await operations.mkdir(current, { mode: 0o700 });
         created = true;
-        metadata = await operations.lstat(current);
+        metadata = await operations.lstat(current, { bigint: true });
       } catch {
         servicePathUnsafe();
       }
@@ -93,23 +117,25 @@ async function inspectDirectoryPath(
 
     if (metadata.isSymbolicLink()) servicePathUnsafe();
     if (!metadata.isDirectory()) servicePathUnsafe();
-    const ownedByCurrentUser = isCurrentUser(metadata.uid, current);
-    const trustedSystemAncestor = metadata.uid === 0 && !reachedCurrentUserDirectory;
+    const mode = safeStatNumber(metadata.mode);
+    const ownedByCurrentUser = isCurrentUserOwner(metadata, current, isCurrentUser);
+    const trustedSystemAncestor =
+      safeStatNumber(metadata.uid) === 0 && !reachedCurrentUserDirectory;
     if (trustedSystemAncestor) {
-      if ((metadata.mode & 0o022) !== 0 && (metadata.mode & 0o1000) === 0) {
+      if ((mode & 0o022) !== 0 && (mode & 0o1000) === 0) {
         servicePathUnsafe();
       }
     } else {
-      if (!ownedByCurrentUser || (metadata.mode & 0o022) !== 0) servicePathUnsafe();
+      if (!ownedByCurrentUser || (mode & 0o022) !== 0) servicePathUnsafe();
       reachedCurrentUserDirectory = true;
     }
-    if (created && (!ownedByCurrentUser || (metadata.mode & 0o777) !== 0o700)) {
+    if (created && (!ownedByCurrentUser || (mode & 0o777) !== 0o700)) {
       servicePathUnsafe();
     }
     if (final) {
       if (!ownedByCurrentUser) servicePathUnsafe();
-      const mode = metadata.mode & 0o777;
-      if (policy === "private" ? mode !== 0o700 : (mode & 0o022) !== 0) {
+      const permissions = mode & 0o777;
+      if (policy === "private" ? permissions !== 0o700 : (permissions & 0o022) !== 0) {
         servicePathUnsafe();
       }
     }
@@ -124,7 +150,7 @@ async function inspectReplaceableTarget(
 ): Promise<boolean> {
   let metadata;
   try {
-    metadata = await operations.lstat(target);
+    metadata = await operations.lstat(target, { bigint: true });
   } catch (error) {
     if (isMissing(error)) return false;
     servicePathUnsafe();
@@ -132,8 +158,8 @@ async function inspectReplaceableTarget(
   if (
     metadata.isSymbolicLink() ||
     !metadata.isFile() ||
-    !isCurrentUser(metadata.uid, target) ||
-    !isPrivateFileMode(metadata.mode)
+    !isCurrentUserOwner(metadata, target, isCurrentUser) ||
+    !privateFileMode(metadata)
   ) {
     servicePathUnsafe();
   }
@@ -160,11 +186,11 @@ async function removeCreatedTemporary(
 ): Promise<void> {
   if (identity === undefined) return;
   try {
-    const metadata = await operations.lstat(temporary);
+    const metadata = await operations.lstat(temporary, { bigint: true });
     if (
       metadata.isFile() &&
       !metadata.isSymbolicLink() &&
-      isCurrentUser(metadata.uid, temporary) &&
+      isCurrentUserOwner(metadata, temporary, isCurrentUser) &&
       metadata.dev === identity.device &&
       metadata.ino === identity.inode
     ) {
@@ -211,12 +237,12 @@ async function publishPrivateAtomic(
       0o600,
     );
     try {
-      const metadata = await handle.stat();
-      if (!metadata.isFile() || !isCurrentUser(metadata.uid, temporary)) {
+      const metadata = await handle.stat({ bigint: true });
+      if (!metadata.isFile() || !isCurrentUserOwner(metadata, temporary, isCurrentUser)) {
         servicePathUnsafe();
       }
       temporaryIdentity = { device: metadata.dev, inode: metadata.ino };
-      if (!isPrivateFileMode(metadata.mode)) servicePathUnsafe();
+      if (!privateFileMode(metadata)) servicePathUnsafe();
       await handle.writeFile(bytes);
       await handle.sync();
     } finally {
@@ -287,11 +313,11 @@ async function openPrivateRegularFile(filePath: string): Promise<FileHandle | un
   }
 
   try {
-    const metadata = await handle.stat();
+    const metadata = await handle.stat({ bigint: true });
     if (
       !metadata.isFile() ||
-      !defaultCurrentUserCheck(metadata.uid) ||
-      !isPrivateFileMode(metadata.mode)
+      !isCurrentUserOwner(metadata, filePath, defaultCurrentUserCheck) ||
+      !privateFileMode(metadata)
     ) {
       servicePathUnsafe();
     }
@@ -327,8 +353,8 @@ export async function readPrivateRegularFile(
     const handle = await openPrivateRegularFile(filePath);
     if (handle === undefined) return undefined;
     try {
-      const metadata = await handle.stat();
-      if (metadata.size > MAX_PRIVATE_REGULAR_FILE_BYTES) servicePathUnsafe();
+      const metadata = await handle.stat({ bigint: true });
+      if (metadata.size > BigInt(MAX_PRIVATE_REGULAR_FILE_BYTES)) servicePathUnsafe();
       await options.beforeRead?.();
       return await readBounded(handle);
     } finally {
@@ -340,38 +366,88 @@ export async function readPrivateRegularFile(
   }
 }
 
-export async function removeOwnedDefinition(filePath: string): Promise<void> {
+export interface RemoveOwnedDefinitionOptions {
+  readonly expectedBytes?: Uint8Array;
+  readonly randomSuffix?: () => string;
+}
+
+async function restoreClaimedDefinition(
+  claimPath: string,
+  filePath: string,
+  parent: string,
+): Promise<void> {
+  try {
+    await link(claimPath, filePath);
+    await unlink(claimPath);
+    await syncDirectory(parent, DEFAULT_OPERATIONS);
+  } catch {
+    servicePathUnsafe();
+  }
+}
+
+export async function removeOwnedDefinition(
+  filePath: string,
+  options: RemoveOwnedDefinitionOptions = {},
+): Promise<void> {
   assertAbsoluteTarget(filePath);
   const parent = path.dirname(filePath);
+  let claimPath: string | undefined;
+  let claimed = false;
   try {
-    const handle = await openPrivateRegularFile(filePath);
-    if (handle === undefined) return;
-    let opened;
+    const parentExists = await inspectDirectoryPath(
+      parent,
+      "owned-not-writable",
+      false,
+      DEFAULT_OPERATIONS,
+      defaultCurrentUserCheck,
+    );
+    if (!parentExists) return;
+    const suffix = (options.randomSuffix ?? randomUUID)();
+    if (!SAFE_SUFFIX.test(suffix)) servicePathUnsafe();
+    claimPath = path.join(parent, `.${path.basename(filePath)}.${suffix}.delete-claim`);
     try {
-      opened = await handle.stat();
-    } finally {
-      await handle.close();
+      await DEFAULT_OPERATIONS.lstat(claimPath, { bigint: true });
+      servicePathUnsafe();
+    } catch (error) {
+      if (!isMissing(error)) {
+        if (error instanceof RuntimeServiceError) throw error;
+        servicePathUnsafe();
+      }
     }
-    const current = await lstat(filePath);
-    if (
-      !current.isFile() ||
-      current.isSymbolicLink() ||
-      current.dev !== opened.dev ||
-      current.ino !== opened.ino
-    ) {
+    try {
+      await rename(filePath, claimPath);
+      claimed = true;
+      await syncDirectory(parent, DEFAULT_OPERATIONS);
+    } catch (error) {
+      if (isMissing(error)) return;
       servicePathUnsafe();
     }
-    await unlink(filePath);
-    const directory = await open(
-      parent,
-      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-    );
+
+    let claimedBytes: Uint8Array | undefined;
     try {
-      await directory.sync();
-    } finally {
-      await directory.close();
+      claimedBytes = await readPrivateRegularFile(claimPath);
+    } catch (error) {
+      await restoreClaimedDefinition(claimPath, filePath, parent);
+      claimed = false;
+      if (error instanceof RuntimeServiceError) throw error;
+      servicePathUnsafe();
     }
+    if (
+      claimedBytes === undefined ||
+      (options.expectedBytes !== undefined &&
+        !Buffer.from(claimedBytes).equals(Buffer.from(options.expectedBytes)))
+    ) {
+      await restoreClaimedDefinition(claimPath, filePath, parent);
+      claimed = false;
+      servicePathUnsafe();
+    }
+    await unlink(claimPath);
+    claimed = false;
+    await syncDirectory(parent, DEFAULT_OPERATIONS);
   } catch (error) {
+    if (claimed && claimPath !== undefined) {
+      await restoreClaimedDefinition(claimPath, filePath, parent);
+    }
     if (error instanceof RuntimeServiceError) throw error;
     servicePathUnsafe();
   }
