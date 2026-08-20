@@ -228,12 +228,22 @@ The task profile is control-plane input. The runtime never derives risk,
 complexity, authority, or override from prompt text, provider output,
 repository content, or agent messages.
 
+The accepted routing-capability vocabulary is closed to `text`, `tools`,
+`json-schema`, `vision`, `reasoning`, `streaming`, `long-context`, and
+`independent-review`. `text` is the base provider capability; the five native
+feature names map to the corresponding catalog/live capability intersection;
+`long-context` and `independent-review` additionally require their exact
+logical class. Numeric context and output ceilings are enforced independently
+for every route. An unknown capability name is policy-invalid, not a marketing
+model selector.
+
 An optional override contains an authoritative artifact reference, target
 catalog entry ID, exact catalog and policy hashes, canonical issuance time, and
 one closed reason code. Its canonical content hash must equal the artifact
 reference hash. It may select only an otherwise eligible entry. It cannot add
 capabilities, increase any budget or tool boundary, weaken review, reopen a
 circuit, exceed latency policy, or target a stale catalog/policy revision.
+An override issued after the explicit decision time is invalid.
 
 ## Selection algorithm
 
@@ -255,14 +265,18 @@ circuit, exceed latency policy, or target a stale catalog/policy revision.
    exact entry. Reject an ineligible or stale override; never ignore it.
 9. Select one worker alias and at most the policy fallback limit. Every
    fallback must independently satisfy the complete worker requirement.
-10. If review is required, select an independent reviewer and reserve worker
-    plus reviewer ceilings together. No partial plan is returned.
+10. If review is required, select an independent reviewer. Atomically reserve
+    the primary worker, every planned fallback, and reviewer ceilings together.
+    No partial plan is returned.
 11. Return a canonical `model-selection-plan.v1` and exact next routing state,
     or a canonical blocked plan with no state mutation.
 
-Catalog array order, live-route order, object insertion order, and locale do
-not affect the result. Comparisons use fixed ASCII/code-unit ordering, not the
-host locale.
+The router sorts semantic sets and candidate arrays with fixed ASCII ordering
+before evaluation. Reordering and rehashing an authoritative catalog or live
+capability document cannot change the selected entries, attempts, or
+elimination reasons, but the plan hash still changes as required to bind the
+new exact input hash. Object insertion order and host locale never affect the
+result. Comparisons use fixed ASCII/code-unit ordering, not the host locale.
 
 ## Selection plan
 
@@ -321,19 +335,30 @@ cost = ceil(uncached_input * input_rate / 1_000_000)
 
 Negative subsets, noninteger usage, or overflow fail closed. A reservation
 uses the call's maximum input tokens, the maximum of ordinary/reasoning output
-rates for maximum output tokens, maximum duration, and one turn. An alias with
-multiple accepted routes reserves the greatest cost among them. Worker and
-required reviewer reservations are checked atomically against every remaining
-run limit.
+rates for maximum output tokens, maximum duration, and one turn for each
+planned attempt. An alias with multiple accepted routes reserves the greatest
+cost among them. Primary worker, every planned fallback, and required reviewer
+allocations are summed and checked atomically against every remaining run
+limit. The reservation retains one immutable allocation per attempt so
+settlement can price the exact route actually used.
+
+The reservation also stores a `decision_hash` over the complete planned
+decision payload, including bindings, attempts, price snapshots, requirements,
+allocations, and eliminations, with `decision_hash`, next-state identity, and
+the final document hash omitted. The next state therefore binds the plan
+semantics without a plan/state hash cycle. The final plan then binds the exact
+next-state hash.
 
 `settleRoutingDecision()` requires the exact reservation, plan hash, attested
-route, and usage. It releases the reservation and adds actual input/output,
-cost, duration, and turn values. If actual settled usage crosses a run limit,
-the settlement outcome is `FAILED` and the new state prevents every later
-reservation. A decision that may have incurred provider usage but lacks a
-trusted complete usage record sets budget status to `unknown`; later routing
-is blocked with `RUNTIME_ROUTING_USAGE_UNKNOWN` until Issue #12 supplies an
-authoritative reconciliation transition.
+routes, and usage for every attempted allocation. Unused allocations are
+released; attempted allocations are priced from their exact accepted route and
+added to actual input/output, cost, duration, and turn values. If actual
+settled usage crosses a run limit, the settlement outcome is `FAILED` and the
+new state prevents every later reservation. A decision that may have incurred
+provider usage but lacks a trusted complete route or usage record sets budget
+status to `unknown`; later routing is blocked with
+`RUNTIME_ROUTING_USAGE_UNKNOWN` until Issue #12 supplies an authoritative
+reconciliation transition.
 
 Budget exhaustion before a provider effect is `BLOCKED`. Budget exhaustion or
 unknown cost after a provider effect is `FAILED`. Issue #10 records that run
@@ -432,8 +457,9 @@ their separate availability states.
 
 ### Deterministic selection tests
 
-- every permutation of equivalent catalog and live-route arrays yields the
-  same plan bytes and hash;
+- permutations of semantically equivalent catalog and live-route arrays yield
+  the same selected entries, attempts, and elimination reasons while plan
+  hashes remain bound to the exact rehashed authoritative inputs;
 - phase, complexity, risk, logical-class, capability, latency, and policy-rule
   matrices select the expected entry;
 - marketing names never affect eligibility except as exact attested identity;
@@ -446,7 +472,7 @@ their separate availability states.
 
 - exact microusd rounding, cached/reasoning subsets, overflow, and maximum
   safe-integer cases;
-- worker-only and atomic worker-plus-reviewer reservations;
+- worker-only and atomic primary-plus-fallback-plus-reviewer reservations;
 - reviewer provider/model independence across every accepted route pair;
 - pre-effect BLOCKED, post-effect FAILED, unknown-usage blocking, exact
   settlement, duplicate/stale reservation rejection, and remaining-limit
