@@ -38,8 +38,9 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:package": "node scripts/package-test.mjs",
+    "test:package:contents": "node scripts/package-test.mjs --contents-only",
     "verify": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run build && npm run test:package",
-    "prepack": "npm run verify"
+    "prepack": "npm run format:check && npm run lint && npm run typecheck && npm run build && npm run test:package:contents"
   },
   "publishConfig": {
     "access": "public",

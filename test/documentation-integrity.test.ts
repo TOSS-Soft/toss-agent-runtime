@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 
 import {
+  createBaselineCapabilities,
   parseExecutionEvent,
   parseExecutionRequest,
   parseExecutionResult,
@@ -24,6 +25,16 @@ async function readExample(name: string): Promise<Uint8Array> {
 }
 
 describe("published protocol artifacts", () => {
+  it("keeps the packaged capability example aligned with baseline schemas", async () => {
+    const result = parseRuntimeCapabilities(await readExample("runtime-capabilities"));
+    const baseline = createBaselineCapabilities({ os: "linux", arch: "x64", node: "22.23.1" });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.supported_schemas).toEqual(baseline.supported_schemas);
+    }
+  });
+
   it("loads the complete example chain through the public package API", async () => {
     const request = parseExecutionRequest(await readExample("execution-request"));
     const event = parseExecutionEvent(await readExample("execution-event"));
@@ -55,10 +66,65 @@ describe("published protocol artifacts", () => {
       "runtime-capabilities.v1",
       "runtime-common.v1",
       "runtime-config.v1",
+      "service-lock.v1",
+      "service-control-request.v1",
+      "service-control-response.v1",
     ]);
     for (const entry of manifest.schemas) {
       const schema = JSON.parse(await readFile(entry.path, "utf8")) as { readonly $id?: string };
       expect(schema.$id).toBe(entry.id);
     }
+  });
+
+  it("documents explicit service installation and the package side-effect boundary", async () => {
+    const readme = await readFile("README.md", "utf8");
+    const contract = await readFile("docs/contracts/local-service-control-v1.md", "utf8");
+    const packageManifest = JSON.parse(await readFile("package.json", "utf8")) as {
+      readonly scripts: Readonly<Record<string, string>>;
+    };
+    const grammar = `toss-runtime service install [--config <absolute-path>] [--json]
+toss-runtime service start [--json]
+toss-runtime service stop [--json]
+toss-runtime service restart [--json]
+toss-runtime service status [--json]
+toss-runtime service uninstall [--json]`;
+
+    expect(contract).toContain(grammar);
+    expect(contract).toContain("Only `service install` accepts `--config`");
+    expect(contract).toContain(
+      "/usr/bin/systemctl --user show toss-agent-runtime.service --property=LoadState,UnitFileState,ActiveState,SubState,Result,NRestarts,ExecMainStatus --no-pager",
+    );
+    for (const action of ["start", "stop", "restart", "status", "uninstall"]) {
+      expect(grammar).toContain(`toss-runtime service ${action} [--json]`);
+      expect(grammar).not.toContain(`service ${action} [--config`);
+    }
+    expect(readme).toContain("It does not start the service in the current session");
+    expect(contract).toMatch(/It does not start the service in\s+the current session/u);
+
+    expect(packageManifest.scripts["test:package:contents"]).toBe(
+      "node scripts/package-test.mjs --contents-only",
+    );
+    expect(packageManifest.scripts.prepack).toBe(
+      "npm run format:check && npm run lint && npm run typecheck && npm run build && npm run test:package:contents",
+    );
+    expect(packageManifest.scripts.prepack).not.toMatch(/\bverify\b|npm test|\bserve\b/u);
+    expect(contract).toMatch(
+      /`prepack` runs only non-service format, lint, typecheck, build, and\s+package-content acceptance/u,
+    );
+    expect(contract).toMatch(/must not reach the\s+installed-supervisor smoke or start `serve`/u);
+
+    expect(contract).toMatch(
+      /The forced outcome resolves at the configured deadline even if socket close or\s+lock release never settles/u,
+    );
+    expect(contract).toMatch(
+      /close the socket, then release the exact lock, then\s+restore the prior umask/u,
+    );
+    expect(contract).toMatch(
+      /Automatic login-session\s+activation and native crash-loop observation remain platform-integration\s+pending/u,
+    );
+    expect(contract).toMatch(
+      /Production-durable `INTERRUPTED`\s+persistence remains pending issue #1/u,
+    );
+    expect(contract).toContain("issue #28 remains open");
   });
 });

@@ -1,5 +1,5 @@
-import { constants } from "node:fs";
-import { lstat, open } from "node:fs/promises";
+import { constants, type Stats } from "node:fs";
+import { lstat, open, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 
 import Ajv2020Module from "ajv/dist/2020.js";
@@ -8,11 +8,18 @@ import { parseDocument } from "yaml";
 import configSchema from "../../contracts/runtime/runtime-config.v1.schema.json" with { type: "json" };
 import {
   assertPlainJson,
+  DEFAULT_JSON_LIMITS,
   deepFreezeJson,
   parseJsonBytes,
   type JsonValue,
 } from "../protocol/json.js";
-import type { LoadedConfig, RuntimeConfigV1 } from "./types.js";
+import type {
+  LoadedConfig,
+  RuntimeConfigV1,
+  RuntimeEnvironment,
+  RuntimePlatform,
+} from "./types.js";
+import { serviceSocketLayoutFits } from "../service/paths.js";
 
 const Ajv2020 = Ajv2020Module.default;
 const ajv = new Ajv2020({
@@ -23,6 +30,7 @@ const ajv = new Ajv2020({
   useDefaults: false,
 });
 const validateConfig = ajv.compile(configSchema);
+const MAX_RUNTIME_CONFIG_BYTES = DEFAULT_JSON_LIMITS.maxBytes;
 
 export class RuntimeConfigError extends Error {
   constructor(
@@ -35,17 +43,14 @@ export class RuntimeConfigError extends Error {
   }
 }
 
-type PlatformName = "darwin" | "linux";
-type Environment = Readonly<Record<string, string | undefined>>;
-
-function xdgPath(env: Environment, key: string, fallback: string): string {
+function xdgPath(env: RuntimeEnvironment, key: string, fallback: string): string {
   const value = env[key];
   return value === undefined || value.length === 0 || !path.isAbsolute(value)
     ? fallback
     : path.normalize(value);
 }
 
-function absoluteEnvironmentPath(env: Environment, key: string): string | undefined {
+function absoluteEnvironmentPath(env: RuntimeEnvironment, key: string): string | undefined {
   const value = env[key];
   return value !== undefined && value.length > 0 && path.isAbsolute(value)
     ? path.normalize(value)
@@ -53,9 +58,9 @@ function absoluteEnvironmentPath(env: Environment, key: string): string | undefi
 }
 
 export function defaultConfig(
-  platform: PlatformName,
+  platform: RuntimePlatform,
   home: string,
-  env: Environment = {},
+  env: RuntimeEnvironment = {},
 ): RuntimeConfigV1 {
   const state =
     platform === "darwin"
@@ -93,7 +98,11 @@ export function defaultConfig(
   return deepFreezeJson(config as unknown as JsonValue) as unknown as RuntimeConfigV1;
 }
 
-function defaultConfigPath(platform: PlatformName, home: string, env: Environment): string {
+export function resolveDefaultConfigPath(
+  platform: RuntimePlatform,
+  home: string,
+  env: RuntimeEnvironment,
+): string {
   if (platform === "darwin") {
     return path.join(home, "Library", "Application Support", "TOSS", "runtime", "config.yaml");
   }
@@ -129,7 +138,34 @@ function parseConfigBytes(filePath: string, input: Uint8Array): JsonValue {
   return value;
 }
 
-function assertConfig(value: JsonValue): RuntimeConfigV1 {
+function assertServiceSocketLayout(options: {
+  readonly socketPath: string;
+  readonly platform: RuntimePlatform;
+  readonly socketPathByteLimit?: number | undefined;
+}): void {
+  if (
+    !serviceSocketLayoutFits({
+      socketPath: options.socketPath,
+      platform: options.platform,
+      ...(options.socketPathByteLimit === undefined
+        ? {}
+        : { pathByteLimit: options.socketPathByteLimit }),
+    })
+  ) {
+    throw new RuntimeConfigError(
+      "RUNTIME_CONFIG_INVALID",
+      "Configuration service socket path exceeds platform support",
+    );
+  }
+}
+
+function assertConfig(
+  value: JsonValue,
+  options: {
+    readonly platform: RuntimePlatform;
+    readonly socketPathByteLimit?: number | undefined;
+  },
+): RuntimeConfigV1 {
   if (!validateConfig(value)) {
     const issues = (validateConfig.errors ?? [])
       .map((error) => `${error.instancePath || "/"}: ${error.keyword}`)
@@ -149,6 +185,11 @@ function assertConfig(value: JsonValue): RuntimeConfigV1 {
       );
     }
   }
+  assertServiceSocketLayout({
+    socketPath: config.paths.socket,
+    platform: options.platform,
+    socketPathByteLimit: options.socketPathByteLimit,
+  });
   return config;
 }
 
@@ -160,6 +201,25 @@ function errorCode(error: unknown): string | undefined {
   return typeof error === "object" && error !== null && "code" in error
     ? String(error.code)
     : undefined;
+}
+
+function configSizeInvalid(): never {
+  throw new RuntimeConfigError(
+    "RUNTIME_CONFIG_INVALID",
+    "Configuration exceeds maximum supported size",
+  );
+}
+
+async function readBoundedConfig(handle: FileHandle): Promise<Buffer> {
+  const bytes = Buffer.allocUnsafe(MAX_RUNTIME_CONFIG_BYTES + 1);
+  let offset = 0;
+  while (offset < bytes.length) {
+    const result = await handle.read(bytes, offset, bytes.length - offset, offset);
+    if (result.bytesRead === 0) break;
+    offset += result.bytesRead;
+  }
+  if (offset > MAX_RUNTIME_CONFIG_BYTES) configSizeInvalid();
+  return bytes.subarray(0, offset);
 }
 
 function isWithin(root: string, candidate: string): boolean {
@@ -178,9 +238,9 @@ interface ProductionRoots {
 }
 
 function productionRoots(options: {
-  readonly env: Environment;
+  readonly env: RuntimeEnvironment;
   readonly home: string;
-  readonly platform: PlatformName;
+  readonly platform: RuntimePlatform;
 }): ProductionRoots {
   if (options.platform === "darwin") {
     const runtime = path.join(options.home, "Library", "Application Support", "TOSS", "runtime");
@@ -232,15 +292,23 @@ async function assertPrivateDirectoryPath(
   roots: readonly string[],
 ): Promise<void> {
   const root = selectApprovedRoot(candidate, roots);
-  const relative = path.relative(root, candidate);
+  const parsed = path.parse(candidate);
+  const relative = candidate.slice(parsed.root.length);
   const segments = relative === "" ? [] : relative.split(path.sep);
-  const pathsToCheck: string[] = [root];
-  let current = root;
+  const pathsToCheck: string[] = [parsed.root];
+  let current = parsed.root;
   for (const segment of segments) {
+    if (segment.length === 0 || segment === "." || segment === "..") {
+      throw new RuntimeConfigError(
+        "RUNTIME_CONFIG_UNSAFE",
+        "Production runtime directory could not be inspected safely",
+      );
+    }
     current = path.join(current, segment);
     pathsToCheck.push(current);
   }
 
+  let reachedCurrentUserDirectory = false;
   for (const directoryPath of pathsToCheck) {
     let metadata;
     try {
@@ -252,12 +320,33 @@ async function assertPrivateDirectoryPath(
         "Production runtime directory could not be inspected safely",
       );
     }
-    if (
-      metadata.isSymbolicLink() ||
-      !metadata.isDirectory() ||
-      !currentUserOwns(metadata.uid) ||
-      (metadata.mode & 0o077) !== 0
-    ) {
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      throw new RuntimeConfigError(
+        "RUNTIME_CONFIG_UNSAFE",
+        "Production runtime directories must be private and owned by the current user",
+      );
+    }
+    const ownedByCurrentUser = currentUserOwns(metadata.uid);
+    const trustedSystemAncestor = metadata.uid === 0 && !reachedCurrentUserDirectory;
+    if (trustedSystemAncestor) {
+      const writable = (metadata.mode & 0o022) !== 0;
+      const sticky = (metadata.mode & 0o1000) !== 0;
+      if (writable && !sticky) {
+        throw new RuntimeConfigError(
+          "RUNTIME_CONFIG_UNSAFE",
+          "Production runtime directories must be private and owned by the current user",
+        );
+      }
+    } else {
+      if (!ownedByCurrentUser || (metadata.mode & 0o022) !== 0) {
+        throw new RuntimeConfigError(
+          "RUNTIME_CONFIG_UNSAFE",
+          "Production runtime directories must be private and owned by the current user",
+        );
+      }
+      reachedCurrentUserDirectory = true;
+    }
+    if (isWithin(root, directoryPath) && (!ownedByCurrentUser || (metadata.mode & 0o077) !== 0)) {
       throw new RuntimeConfigError(
         "RUNTIME_CONFIG_UNSAFE",
         "Production runtime directories must be private and owned by the current user",
@@ -269,7 +358,11 @@ async function assertPrivateDirectoryPath(
 async function assertProductionIsolation(
   config: RuntimeConfigV1,
   selectedPath: string,
-  options: { readonly env: Environment; readonly home: string; readonly platform: PlatformName },
+  options: {
+    readonly env: RuntimeEnvironment;
+    readonly home: string;
+    readonly platform: RuntimePlatform;
+  },
 ): Promise<void> {
   const roots = productionRoots(options);
   await assertPrivateDirectoryPath(path.dirname(selectedPath), [roots.config]);
@@ -280,15 +373,19 @@ async function assertProductionIsolation(
 
 export async function loadConfig(options: {
   readonly explicitPath?: string;
-  readonly env: Environment;
-  readonly platform: PlatformName;
+  readonly env: RuntimeEnvironment;
+  readonly platform: RuntimePlatform;
   readonly home: string;
+  /** @internal Deterministic Unix-socket ABI-budget seam for portable tests. */
+  readonly socketPathByteLimit?: number;
+  /** @internal Deterministic race hook used only by real-filesystem tests. */
+  readonly beforeRead?: () => Promise<void>;
 }): Promise<LoadedConfig> {
   const environmentPath = options.env.TOSS_RUNTIME_CONFIG;
   const selectedPath =
     options.explicitPath ??
     (environmentPath === undefined || environmentPath.length === 0
-      ? defaultConfigPath(options.platform, options.home, options.env)
+      ? resolveDefaultConfigPath(options.platform, options.home, options.env)
       : environmentPath);
   const required =
     options.explicitPath !== undefined ||
@@ -299,8 +396,14 @@ export async function loadConfig(options: {
     handle = await open(selectedPath, constants.O_RDONLY | constants.O_NOFOLLOW);
   } catch (error) {
     if (!required && isMissingFile(error)) {
+      const config = defaultConfig(options.platform, options.home, options.env);
+      assertServiceSocketLayout({
+        socketPath: config.paths.socket,
+        platform: options.platform,
+        socketPathByteLimit: options.socketPathByteLimit,
+      });
       return {
-        config: defaultConfig(options.platform, options.home, options.env),
+        config,
         source: "defaults",
       };
     }
@@ -313,24 +416,41 @@ export async function loadConfig(options: {
     throw new RuntimeConfigError("RUNTIME_CONFIG_UNAVAILABLE", "Configuration file is unavailable");
   }
 
-  let metadata;
+  let metadata: Stats;
   let input: Buffer;
   try {
-    metadata = await handle.stat();
-    if (!metadata.isFile()) {
-      throw new RuntimeConfigError(
-        "RUNTIME_CONFIG_UNSAFE",
-        "Configuration must be a regular non-symlink file",
-      );
+    try {
+      metadata = await handle.stat();
+      if (!metadata.isFile()) {
+        throw new RuntimeConfigError(
+          "RUNTIME_CONFIG_UNSAFE",
+          "Configuration must be a regular non-symlink file",
+        );
+      }
+      if (metadata.size > MAX_RUNTIME_CONFIG_BYTES) configSizeInvalid();
+      try {
+        await options.beforeRead?.();
+      } catch {
+        throw new RuntimeConfigError(
+          "RUNTIME_CONFIG_INVALID",
+          "Configuration could not be read safely",
+        );
+      }
+      input = await readBoundedConfig(handle);
+    } finally {
+      await handle.close();
     }
-    input = await handle.readFile();
-  } finally {
-    await handle.close();
+  } catch (error) {
+    if (error instanceof RuntimeConfigError) throw error;
+    throw new RuntimeConfigError(
+      "RUNTIME_CONFIG_INVALID",
+      "Configuration could not be read safely",
+    );
   }
 
   let config: RuntimeConfigV1;
   try {
-    config = assertConfig(parseConfigBytes(selectedPath, input));
+    config = assertConfig(parseConfigBytes(selectedPath, input), options);
   } catch (error) {
     if (error instanceof RuntimeConfigError) {
       throw error;

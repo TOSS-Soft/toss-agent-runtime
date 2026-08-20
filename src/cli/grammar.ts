@@ -1,9 +1,17 @@
+export type ServiceAction = "install" | "start" | "stop" | "restart" | "status" | "uninstall";
+
 export type BaselineCommand =
   | Readonly<{ name: "help" }>
   | Readonly<{ name: "version" }>
   | Readonly<{ name: "capabilities"; json: boolean }>
   | Readonly<{ name: "doctor"; json: boolean; configPath?: string }>
-  | Readonly<{ name: "serve"; json: boolean; configPath?: string }>;
+  | Readonly<{ name: "serve"; json: boolean; configPath?: string }>
+  | Readonly<{
+      name: "service";
+      action: ServiceAction;
+      json: boolean;
+      configPath?: string;
+    }>;
 
 export class CliUsageError extends Error {
   readonly code = "RUNTIME_CLI_USAGE";
@@ -15,8 +23,9 @@ export class CliUsageError extends Error {
 }
 
 function parseOptions(
-  name: "capabilities" | "doctor" | "serve",
+  name: string,
   args: readonly string[],
+  allowConfig: boolean,
 ): { readonly json: boolean; readonly configPath?: string } {
   let json = false;
   let configPath: string | undefined;
@@ -29,8 +38,8 @@ function parseOptions(
       continue;
     }
     if (option === "--config") {
-      if (name === "capabilities") {
-        throw new CliUsageError("Unknown option for capabilities: --config");
+      if (!allowConfig) {
+        throw new CliUsageError(`Unknown option for ${name}: --config`);
       }
       const value = args[index + 1];
       if (value === undefined || value.startsWith("--")) {
@@ -48,6 +57,20 @@ function parseOptions(
   return configPath === undefined ? { json } : { json, configPath };
 }
 
+const SERVICE_ACTIONS = new Set<ServiceAction>([
+  "install",
+  "start",
+  "stop",
+  "restart",
+  "status",
+  "uninstall",
+]);
+
+function serviceAction(value: string): ServiceAction {
+  if (SERVICE_ACTIONS.has(value as ServiceAction)) return value as ServiceAction;
+  throw new CliUsageError("Unknown service action");
+}
+
 export function parseCli(argv: readonly string[]): BaselineCommand {
   if (argv.length === 0 || (argv.length === 1 && ["--help", "-h", "help"].includes(argv[0]!))) {
     return { name: "help" };
@@ -58,7 +81,19 @@ export function parseCli(argv: readonly string[]): BaselineCommand {
 
   const [name, ...args] = argv;
   if (name === "capabilities" || name === "doctor" || name === "serve") {
-    return { name, ...parseOptions(name, args) };
+    return { name, ...parseOptions(name, args, name !== "capabilities") };
+  }
+  if (name === "service") {
+    const [rawAction, ...serviceArgs] = args;
+    if (rawAction === undefined || rawAction.startsWith("--")) {
+      throw new CliUsageError("Missing service action");
+    }
+    const action = serviceAction(rawAction);
+    return {
+      name,
+      action,
+      ...parseOptions(`service ${action}`, serviceArgs, action === "install"),
+    };
   }
   throw new CliUsageError("Unknown command");
 }

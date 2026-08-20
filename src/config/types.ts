@@ -1,3 +1,6 @@
+export type RuntimePlatform = "darwin" | "linux";
+export type RuntimeEnvironment = Readonly<Record<string, string | undefined>>;
+
 export type RuntimeMode = "development" | "production";
 export type LogLevel = "debug" | "info" | "warn" | "error";
 

@@ -1,0 +1,1869 @@
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  truncate,
+  writeFile,
+} from "node:fs/promises";
+import path from "node:path";
+
+import { afterEach, describe, expect, it } from "vitest";
+
+import type { CommandResult, CommandRunner } from "../src/platform/commands.js";
+import { renderServiceDefinition } from "../src/service/definition.js";
+import { ensureServiceConfig } from "../src/service/definition-store.js";
+import { createServiceManager, type ServiceManager } from "../src/service/manager.js";
+
+const temporaryDirectories: string[] = [];
+
+class RecordingRunner implements CommandRunner {
+  readonly calls: { file: string; args: readonly string[] }[] = [];
+
+  constructor(
+    private readonly results: readonly (CommandResult | Error)[] = [
+      { exitCode: 0, stdout: "", stderr: "" },
+    ],
+  ) {}
+
+  run(file: string, args: readonly string[]): Promise<CommandResult> {
+    this.calls.push({ file, args: [...args] });
+    const result = this.results[this.calls.length - 1] ?? { exitCode: 0, stdout: "", stderr: "" };
+    return result instanceof Error ? Promise.reject(result) : Promise.resolve(result);
+  }
+}
+
+interface ManagerFixture {
+  readonly manager: ServiceManager;
+  readonly platform: "darwin" | "linux";
+  readonly home: string;
+  readonly definition: string;
+  readonly config: string;
+  readonly canonicalRunArtifact: string;
+  readonly journal: string;
+  readonly registry: string;
+  readonly pendingIntake: string;
+  readonly operationalLog: string;
+}
+
+interface FixtureOptions {
+  readonly beforeDefinitionPublish?: (input: {
+    readonly definition: string;
+    readonly config: string;
+  }) => Promise<void>;
+  readonly isDefinitionCurrentUser?: (userId: number, candidate?: string) => boolean;
+  readonly definitionRemovalHooks?: {
+    readonly beforeClaim?: () => Promise<void>;
+    readonly afterStateStageWrite?: () => Promise<void>;
+    readonly afterStateLink?: () => Promise<void>;
+    readonly afterStateSync?: () => Promise<void>;
+    readonly beforeStateStageUnlink?: () => Promise<void>;
+    readonly afterStateStageUnlink?: () => Promise<void>;
+    readonly beforeRename?: () => Promise<void>;
+    readonly afterRename?: () => Promise<void>;
+    readonly afterSync?: () => Promise<void>;
+    readonly beforeUnlink?: () => Promise<void>;
+    readonly afterUnlink?: () => Promise<void>;
+    readonly afterFinalValidationBeforeMove?: () => Promise<void>;
+    readonly afterMove?: () => Promise<void>;
+    readonly afterMoveSync?: () => Promise<void>;
+    readonly afterMovedUnlink?: () => Promise<void>;
+    readonly afterCanonicalReappearance?: () => Promise<void>;
+  };
+  readonly deleteClaimOwnerState?: () => "dead" | "live" | "unknown";
+}
+
+async function temporaryDirectory(): Promise<string> {
+  // This suite exercises manager semantics; socket ABI boundaries live in config/control tests.
+  const directory = await realpath(
+    await mkdtemp(path.join(await realpath("/tmp"), "toss-runtime-manager-")),
+  );
+  temporaryDirectories.push(directory);
+  return directory;
+}
+
+async function fixture(
+  platform: "darwin" | "linux",
+  runner: CommandRunner,
+  options: FixtureOptions = {},
+): Promise<ManagerFixture> {
+  const home = await temporaryDirectory();
+  const config = await ensureServiceConfig({
+    platform,
+    home,
+    env: {},
+    randomSuffix: () => "config",
+  });
+  const state = path.join(home, "state");
+  const logs = path.join(home, "logs");
+  await mkdir(state, { recursive: true, mode: 0o700 });
+  await mkdir(logs, { recursive: true, mode: 0o700 });
+  const canonicalRunArtifact = path.join(state, "canonical-run.json");
+  const journal = path.join(state, "journal.ndjson");
+  const registry = path.join(state, "registry.json");
+  const pendingIntake = path.join(state, "pending.ndjson");
+  const operationalLog = path.join(logs, "runtime.log");
+  await Promise.all(
+    [canonicalRunArtifact, journal, registry, pendingIntake, operationalLog].map(
+      async (filePath) => {
+        await writeFile(filePath, "preserve", { mode: 0o600 });
+        await chmod(filePath, 0o600);
+      },
+    ),
+  );
+
+  const definition =
+    platform === "linux"
+      ? path.join(home, ".config", "systemd", "user", "toss-agent-runtime.service")
+      : path.join(home, "Library", "LaunchAgents", "software.toss.agent-runtime.plist");
+  const beforeDefinitionPublish = options.beforeDefinitionPublish;
+  const manager = createServiceManager({
+    platform,
+    home,
+    env: {},
+    uid: 501,
+    currentUid: () => 501,
+    nodePath: "/opt/toss/node/bin/node",
+    cliPath: "/opt/toss/bin/toss-runtime.js",
+    configPath: config,
+    randomSuffix: () => "00000000-0000-4000-8000-000000000001",
+    runner,
+    ...(beforeDefinitionPublish === undefined
+      ? {}
+      : { beforeDefinitionPublish: () => beforeDefinitionPublish({ definition, config }) }),
+    ...(options.isDefinitionCurrentUser === undefined
+      ? {}
+      : { isDefinitionCurrentUser: options.isDefinitionCurrentUser }),
+    ...(options.definitionRemovalHooks === undefined
+      ? {}
+      : { definitionRemovalHooks: options.definitionRemovalHooks }),
+    ...(options.deleteClaimOwnerState === undefined
+      ? {}
+      : { deleteClaimOwnerState: options.deleteClaimOwnerState }),
+  });
+  return {
+    manager,
+    platform,
+    home,
+    definition,
+    config,
+    canonicalRunArtifact,
+    journal,
+    registry,
+    pendingIntake,
+    operationalLog,
+  };
+}
+
+function managerFor(
+  fixture: ManagerFixture,
+  runner: CommandRunner,
+  configPath: string,
+  overrides: Readonly<{
+    uid?: number;
+    currentUid?: () => number;
+    cliPath?: string;
+    env?: Readonly<Record<string, string | undefined>>;
+  }> = {},
+): ServiceManager {
+  return createServiceManager({
+    platform: fixture.platform,
+    home: fixture.home,
+    env: overrides.env ?? {},
+    uid: overrides.uid ?? 501,
+    currentUid: overrides.currentUid ?? (() => 501),
+    nodePath: "/opt/toss/node/bin/node",
+    cliPath: overrides.cliPath ?? "/opt/toss/bin/toss-runtime.js",
+    configPath,
+    randomSuffix: () => "alternate-definition",
+    runner,
+  });
+}
+
+function linuxFixture(runner: CommandRunner, options?: FixtureOptions): Promise<ManagerFixture> {
+  return fixture("linux", runner, options);
+}
+
+function darwinFixture(runner: CommandRunner, options?: FixtureOptions): Promise<ManagerFixture> {
+  return fixture("darwin", runner, options);
+}
+
+afterEach(async () => {
+  await Promise.all(
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { recursive: true, force: true })),
+  );
+});
+
+describe("native per-user service manager", () => {
+  it.each([
+    ["linux", "regular"],
+    ["linux", "directory"],
+    ["linux", "symlink"],
+    ["linux", "cross-owner"],
+    ["darwin", "regular"],
+    ["darwin", "directory"],
+    ["darwin", "symlink"],
+    ["darwin", "cross-owner"],
+  ] as const)(
+    "preserves an unexpected %s %s moved after final validation and fails later operations closed",
+    async (platform, kind) => {
+      let definition = "";
+      let crossOwner = false;
+      let replacementIdentity: { readonly dev: bigint; readonly ino: bigint } | undefined;
+      const runner = new RecordingRunner();
+      const artifacts = await (platform === "linux" ? linuxFixture : darwinFixture)(runner, {
+        isDefinitionCurrentUser: (_uid, candidate) => !crossOwner || candidate !== definition,
+        deleteClaimOwnerState: () => "dead",
+        definitionRemovalHooks: {
+          afterFinalValidationBeforeMove: async () => {
+            if (kind === "directory") {
+              await rm(definition);
+              await mkdir(definition, { mode: 0o700 });
+              await chmod(definition, 0o700);
+            } else if (kind === "symlink") {
+              const target = path.join(path.dirname(path.dirname(definition)), "moved-target");
+              await writeFile(target, "preserve", { mode: 0o600 });
+              await chmod(target, 0o600);
+              await rm(definition);
+              await symlink(target, definition);
+            } else {
+              await rm(definition);
+              await writeFile(definition, kind === "regular" ? "replacement" : "cross-owner", {
+                mode: 0o600,
+              });
+              await chmod(definition, 0o600);
+              crossOwner = kind === "cross-owner";
+            }
+            const metadata = await lstat(definition, { bigint: true });
+            replacementIdentity = { dev: metadata.dev, ino: metadata.ino };
+          },
+        },
+      });
+      definition = artifacts.definition;
+      await artifacts.manager.install();
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      const claimName = (await readdir(path.dirname(definition))).find((name) =>
+        name.includes("delete-claim"),
+      );
+      expect(claimName).toBeDefined();
+      const moved = path.join(path.dirname(definition), claimName!, "moved");
+      const after = await lstat(moved, { bigint: true });
+      expect(after.dev).toBe(replacementIdentity?.dev);
+      expect(after.ino).toBe(replacementIdentity?.ino);
+      expect(after.isDirectory()).toBe(kind === "directory");
+      expect(after.isSymbolicLink()).toBe(kind === "symlink");
+      expect(after.isFile()).toBe(kind === "regular" || kind === "cross-owner");
+      await expect(lstat(definition, { bigint: true })).rejects.toMatchObject({ code: "ENOENT" });
+      runner.calls.splice(0);
+      await expect(artifacts.manager.status()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      const retained = await lstat(moved, { bigint: true });
+      expect(retained.dev).toBe(replacementIdentity?.dev);
+      expect(retained.ino).toBe(replacementIdentity?.ino);
+      expect(runner.calls).toEqual([]);
+    },
+  );
+
+  it.each([
+    ["linux", "different CLI entry", { cliPath: "/opt/other/toss-runtime.js" }],
+    ["darwin", "different CLI entry", { cliPath: "/opt/other/toss-runtime.js" }],
+    ["linux", "different allowlisted environment", { env: { LANG: "C" } }],
+    ["darwin", "different allowlisted environment", { env: { LANG: "C" } }],
+  ] as const)(
+    "rejects %s custom-config recovery with a %s before native mutation",
+    async (platform, _name, overrides) => {
+      const runner = new RecordingRunner();
+      const artifacts = await fixture(platform, runner);
+      const customConfig = path.join(artifacts.home, "custom-config.yaml");
+      await managerFor(artifacts, runner, customConfig).install();
+      const definitionBefore = await readFile(artifacts.definition);
+      runner.calls.splice(0);
+
+      const incompatible = managerFor(artifacts, runner, artifacts.config, overrides);
+      await expect(incompatible.status()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      expect(runner.calls).toEqual([]);
+      expect(await readFile(artifacts.definition)).toEqual(definitionBefore);
+    },
+  );
+
+  it.each([
+    ["afterStateStageWrite", "state.stage", "directory"],
+    ["afterStateStageWrite", "state.stage", "symlink"],
+    ["afterStateLink", "state", "directory"],
+    ["afterStateLink", "state", "symlink"],
+  ] as const)(
+    "preserves a %s replacement of %s at the %s failure boundary",
+    async (boundary, entry, replacementKind) => {
+      const runner = new RecordingRunner();
+      let replacementIdentity: { readonly dev: bigint; readonly ino: bigint } | undefined;
+      let replacementPath = "";
+      const artifacts = await linuxFixture(runner, {
+        definitionRemovalHooks: {
+          [boundary]: async () => {
+            const claimName = (await readdir(path.dirname(artifacts.definition))).find((name) =>
+              name.includes("delete-claim"),
+            );
+            expect(claimName).toBeDefined();
+            replacementPath = path.join(path.dirname(artifacts.definition), claimName!, entry);
+            await rm(replacementPath);
+            if (replacementKind === "directory") {
+              await mkdir(replacementPath, { mode: 0o700 });
+              await chmod(replacementPath, 0o700);
+            } else {
+              const target = path.join(
+                path.dirname(path.dirname(artifacts.definition)),
+                "stage-target",
+              );
+              await writeFile(target, "preserve", { mode: 0o600 });
+              await chmod(target, 0o600);
+              await symlink(target, replacementPath);
+            }
+            const metadata = await lstat(replacementPath, { bigint: true });
+            replacementIdentity = { dev: metadata.dev, ino: metadata.ino };
+          },
+        },
+      });
+      await artifacts.manager.install();
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      const after = await lstat(replacementPath, { bigint: true });
+      expect(after.dev).toBe(replacementIdentity?.dev);
+      expect(after.ino).toBe(replacementIdentity?.ino);
+      expect(after.isDirectory()).toBe(replacementKind === "directory");
+      expect(after.isSymbolicLink()).toBe(replacementKind === "symlink");
+      expect(
+        (await readdir(path.dirname(artifacts.definition))).filter((name) =>
+          name.includes("delete-claim"),
+        ),
+      ).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    ["afterStateStageWrite", "state.stage"],
+    ["afterStateLink", "state"],
+  ] as const)(
+    "preserves a replacement regular %s inode at the %s failure boundary",
+    async (boundary, entry) => {
+      const runner = new RecordingRunner();
+      let replacementIdentity: { readonly dev: bigint; readonly ino: bigint } | undefined;
+      let replacementPath = "";
+      const artifacts = await linuxFixture(runner, {
+        definitionRemovalHooks: {
+          [boundary]: async () => {
+            const claimName = (await readdir(path.dirname(artifacts.definition))).find((name) =>
+              name.includes("delete-claim"),
+            );
+            expect(claimName).toBeDefined();
+            replacementPath = path.join(path.dirname(artifacts.definition), claimName!, entry);
+            await rm(replacementPath);
+            await writeFile(replacementPath, "replacement", { mode: 0o600 });
+            await chmod(replacementPath, 0o600);
+            const metadata = await lstat(replacementPath, { bigint: true });
+            replacementIdentity = { dev: metadata.dev, ino: metadata.ino };
+          },
+        },
+      });
+      await artifacts.manager.install();
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      const after = await lstat(replacementPath, { bigint: true });
+      expect(after.isFile()).toBe(true);
+      expect(after.dev).toBe(replacementIdentity?.dev);
+      expect(after.ino).toBe(replacementIdentity?.ino);
+      expect(
+        (await readdir(path.dirname(artifacts.definition))).filter((name) =>
+          name.includes("delete-claim"),
+        ),
+      ).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    ["linux", "directory"],
+    ["linux", "symlink"],
+    ["linux", "cross-owner"],
+    ["darwin", "directory"],
+    ["darwin", "symlink"],
+    ["darwin", "cross-owner"],
+  ] as const)(
+    "cleans only its prepared %s claim when a %s replaces the definition before linking",
+    async (platform, kind) => {
+      let definition = "";
+      let crossOwner = false;
+      let identity: { readonly dev: bigint; readonly ino: bigint } | undefined;
+      const replace = async (): Promise<void> => {
+        if (kind === "directory") {
+          await rm(definition);
+          await mkdir(definition, { mode: 0o700 });
+          await chmod(definition, 0o700);
+        } else if (kind === "symlink") {
+          const target = path.join(path.dirname(path.dirname(definition)), "prepared-target");
+          await writeFile(target, "preserve", { mode: 0o600 });
+          await chmod(target, 0o600);
+          await rm(definition);
+          await symlink(target, definition);
+        } else {
+          await rm(definition);
+          await writeFile(definition, "cross-owner", { mode: 0o600 });
+          await chmod(definition, 0o600);
+          crossOwner = true;
+        }
+        const metadata = await lstat(definition, { bigint: true });
+        identity = { dev: metadata.dev, ino: metadata.ino };
+      };
+      const runner = new RecordingRunner();
+      const artifacts = await (platform === "linux" ? linuxFixture : darwinFixture)(runner, {
+        isDefinitionCurrentUser: (_uid, candidate) => !crossOwner || candidate !== definition,
+        definitionRemovalHooks: { afterStateStageUnlink: replace },
+      });
+      definition = artifacts.definition;
+      await artifacts.manager.install();
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      const after = await lstat(definition, { bigint: true });
+      expect(after.dev).toBe(identity?.dev);
+      expect(after.ino).toBe(identity?.ino);
+      expect(after.isDirectory()).toBe(kind === "directory");
+      expect(after.isSymbolicLink()).toBe(kind === "symlink");
+      expect(after.isFile()).toBe(kind === "cross-owner");
+      expect(
+        (await readdir(path.dirname(definition))).filter((entry) => entry.includes("delete-claim")),
+      ).toEqual([]);
+    },
+  );
+
+  it("repairs a restrictive umask to a private claim directory before publishing state", async () => {
+    const runner = new RecordingRunner();
+    const artifacts = await linuxFixture(runner, {
+      deleteClaimOwnerState: () => "dead",
+      definitionRemovalHooks: {
+        afterStateStageUnlink: () => Promise.reject(new Error("inspect claim mode")),
+      },
+    });
+    await artifacts.manager.install();
+    const previousUmask = process.umask(0o777);
+    try {
+      await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+    } finally {
+      process.umask(previousUmask);
+    }
+    const claimName = (await readdir(path.dirname(artifacts.definition))).find((entry) =>
+      entry.includes("delete-claim"),
+    );
+    expect(claimName).toBeDefined();
+    const metadata = await lstat(path.join(path.dirname(artifacts.definition), claimName!), {
+      bigint: true,
+    });
+    expect(Number(metadata.mode & 0o777n)).toBe(0o700);
+  });
+
+  it.each(["linux", "darwin"] as const)(
+    "preserves a byte-identical %s definition replacement with a different inode",
+    async (platform) => {
+      let definition = "";
+      let accepted = new Uint8Array();
+      let replacementIdentity: { readonly dev: bigint; readonly ino: bigint } | undefined;
+      const runner: CommandRunner & { calls: { file: string; args: readonly string[] }[] } = {
+        calls: [],
+        async run(file, args) {
+          this.calls.push({ file, args: [...args] });
+          const isBoundary =
+            (platform === "linux" && args[1] === "stop") ||
+            (platform === "darwin" && args[0] === "bootout");
+          if (replacementIdentity === undefined && isBoundary) {
+            await rm(definition);
+            await writeFile(definition, accepted, { mode: 0o600 });
+            await chmod(definition, 0o600);
+            const metadata = await lstat(definition, { bigint: true });
+            replacementIdentity = { dev: metadata.dev, ino: metadata.ino };
+          }
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      };
+      const artifacts = await (platform === "linux" ? linuxFixture : darwinFixture)(runner);
+      definition = artifacts.definition;
+      await artifacts.manager.install();
+      accepted = await readFile(definition);
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      const after = await lstat(definition, { bigint: true });
+      expect(after.dev).toBe(replacementIdentity?.dev);
+      expect(after.ino).toBe(replacementIdentity?.ino);
+      expect(await readFile(definition)).toEqual(accepted);
+    },
+  );
+
+  it.each(["dead", "live", "unknown"] as const)(
+    "recovers a %s claimant's partial initial state stage only when the claimant is dead",
+    async (ownerState) => {
+      const runner = new RecordingRunner();
+      const artifacts = await linuxFixture(runner, {
+        deleteClaimOwnerState: () => ownerState,
+      });
+      await artifacts.manager.install();
+      runner.calls.splice(0);
+
+      const claimName = `.${path.basename(artifacts.definition)}.${process.pid}.00000000-0000-4000-8000-000000000001.delete-claim`;
+      const claim = path.join(path.dirname(artifacts.definition), claimName);
+      await mkdir(claim, { mode: 0o700 });
+      await chmod(claim, 0o700);
+      await writeFile(path.join(claim, "state.stage"), "{", { mode: 0o600 });
+      await chmod(path.join(claim, "state.stage"), 0o600);
+      runner.calls.splice(0);
+
+      if (ownerState === "dead") {
+        await expect(artifacts.manager.status()).resolves.toBeDefined();
+        expect(
+          (await readdir(path.dirname(artifacts.definition))).filter((entry) =>
+            entry.includes("delete-claim"),
+          ),
+        ).toEqual([]);
+      } else {
+        await expect(artifacts.manager.status()).rejects.toMatchObject({
+          code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+        });
+        expect(
+          (await readdir(path.dirname(artifacts.definition))).filter((entry) =>
+            entry.includes("delete-claim"),
+          ),
+        ).toEqual([claimName]);
+        expect(runner.calls).toEqual([]);
+      }
+    },
+  );
+
+  it("recovers a dead claimant's empty attributed claim without reading the canonical definition", async () => {
+    const runner = new RecordingRunner();
+    const artifacts = await linuxFixture(runner, { deleteClaimOwnerState: () => "dead" });
+    await artifacts.manager.install();
+    runner.calls.splice(0);
+    const claimName = `.${path.basename(artifacts.definition)}.${process.pid}.00000000-0000-4000-8000-000000000001.delete-claim`;
+    await mkdir(path.join(path.dirname(artifacts.definition), claimName), { mode: 0o700 });
+    await chmod(path.join(path.dirname(artifacts.definition), claimName), 0o700);
+    await rm(artifacts.definition);
+    await mkdir(artifacts.definition, { mode: 0o700 });
+    await chmod(artifacts.definition, 0o700);
+
+    await expect(artifacts.manager.status()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+    });
+    expect(
+      (await readdir(path.dirname(artifacts.definition))).filter((entry) =>
+        entry.includes("delete-claim"),
+      ),
+    ).toEqual([]);
+    expect(runner.calls).toEqual([]);
+  });
+
+  it.each([
+    "afterStateStageWrite",
+    "afterStateLink",
+    "afterStateSync",
+    "beforeStateStageUnlink",
+    "afterStateStageUnlink",
+  ] as const)(
+    "recovers a dead claimant interrupted at the %s state-persistence boundary",
+    async (boundary) => {
+      const runner = new RecordingRunner();
+      const artifacts = await linuxFixture(runner, {
+        deleteClaimOwnerState: () => "dead",
+        definitionRemovalHooks: {
+          [boundary]: () => Promise.reject(new Error(`interrupt-${boundary}`)),
+        },
+      });
+      await artifacts.manager.install();
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      expect(
+        (await readdir(path.dirname(artifacts.definition))).filter((entry) =>
+          entry.includes("delete-claim"),
+        ),
+      ).toHaveLength(1);
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.install()).resolves.toMatchObject({ installed: true });
+      expect(
+        (await readdir(path.dirname(artifacts.definition))).filter((entry) =>
+          entry.includes("delete-claim"),
+        ),
+      ).toEqual([]);
+    },
+  );
+
+  it.each([
+    ["linux", "beforeUnlink", "directory"],
+    ["linux", "afterUnlink", "directory"],
+    ["linux", "beforeUnlink", "symlink"],
+    ["linux", "afterUnlink", "symlink"],
+    ["linux", "beforeUnlink", "cross-owner"],
+    ["linux", "afterUnlink", "cross-owner"],
+    ["darwin", "beforeUnlink", "directory"],
+    ["darwin", "afterUnlink", "directory"],
+    ["darwin", "beforeUnlink", "symlink"],
+    ["darwin", "afterUnlink", "symlink"],
+    ["darwin", "beforeUnlink", "cross-owner"],
+    ["darwin", "afterUnlink", "cross-owner"],
+  ] as const)(
+    "preserves a %s %s replacement at the internal %s boundary without a claim leak",
+    async (platform, boundary, kind) => {
+      let definition = "";
+      let crossOwner = false;
+      let identity: { readonly dev: bigint; readonly ino: bigint } | undefined;
+      const createReplacement = async (): Promise<void> => {
+        if (kind === "directory") {
+          await rm(definition, { force: true });
+          await mkdir(definition, { mode: 0o700 });
+          await chmod(definition, 0o700);
+        } else if (kind === "symlink") {
+          const target = path.join(path.dirname(path.dirname(definition)), "replacement-target");
+          await writeFile(target, "preserve", { mode: 0o600 });
+          await chmod(target, 0o600);
+          await rm(definition, { force: true });
+          await symlink(target, definition);
+        } else {
+          await rm(definition, { force: true });
+          await writeFile(definition, "cross-owner", { mode: 0o600 });
+          await chmod(definition, 0o600);
+          crossOwner = true;
+        }
+        const after = await lstat(definition, { bigint: true });
+        identity = { dev: after.dev, ino: after.ino };
+      };
+      const runner = new RecordingRunner();
+      const artifacts = await (platform === "linux" ? linuxFixture : darwinFixture)(runner, {
+        isDefinitionCurrentUser: (_uid, candidate) => !crossOwner || candidate !== definition,
+        definitionRemovalHooks: { [boundary]: createReplacement },
+      });
+      definition = artifacts.definition;
+      await artifacts.manager.install();
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      const after = await lstat(definition, { bigint: true });
+      expect(after.dev).toBe(identity?.dev);
+      expect(after.ino).toBe(identity?.ino);
+      expect(after.isDirectory()).toBe(kind === "directory");
+      expect(after.isSymbolicLink()).toBe(kind === "symlink");
+      expect(after.isFile()).toBe(kind === "cross-owner");
+      expect(
+        (await readdir(path.dirname(definition))).filter((entry) => entry.includes("delete-claim")),
+      ).toEqual([]);
+    },
+  );
+
+  it.each(["linux", "darwin"] as const)(
+    "restores a %s directory replacement that races the final preclaim validation",
+    async (platform) => {
+      let definition = "";
+      let replacementIdentity: { readonly dev: bigint; readonly ino: bigint } | undefined;
+      const runner = new RecordingRunner();
+      const artifacts = await (platform === "linux" ? linuxFixture : darwinFixture)(runner, {
+        definitionRemovalHooks: {
+          beforeRename: async () => {
+            await rm(definition);
+            await mkdir(definition, { mode: 0o700 });
+            await chmod(definition, 0o700);
+            const metadata = await lstat(definition, { bigint: true });
+            replacementIdentity = { dev: metadata.dev, ino: metadata.ino };
+          },
+        },
+      });
+      definition = artifacts.definition;
+      await artifacts.manager.install();
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      const after = await lstat(definition, { bigint: true });
+      expect(after.isDirectory()).toBe(true);
+      expect(after.dev).toBe(replacementIdentity?.dev);
+      expect(after.ino).toBe(replacementIdentity?.ino);
+      expect(
+        (await readdir(path.dirname(definition))).filter((entry) => entry.includes("delete-claim")),
+      ).toEqual([]);
+    },
+  );
+
+  it.each(["linux", "darwin"] as const)(
+    "preserves a %s symlink replacement before the claim link without a claim leak",
+    async (platform) => {
+      let definition = "";
+      let replacementIdentity: { readonly dev: bigint; readonly ino: bigint } | undefined;
+      const runner = new RecordingRunner();
+      const artifacts = await (platform === "linux" ? linuxFixture : darwinFixture)(runner, {
+        definitionRemovalHooks: {
+          beforeRename: async () => {
+            const target = path.join(path.dirname(path.dirname(definition)), "preclaim-target");
+            await writeFile(target, "preserve", { mode: 0o600 });
+            await chmod(target, 0o600);
+            await rm(definition);
+            await symlink(target, definition);
+            const metadata = await lstat(definition, { bigint: true });
+            replacementIdentity = { dev: metadata.dev, ino: metadata.ino };
+          },
+        },
+      });
+      definition = artifacts.definition;
+      await artifacts.manager.install();
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      const after = await lstat(definition, { bigint: true });
+      expect(after.isSymbolicLink()).toBe(true);
+      expect(after.dev).toBe(replacementIdentity?.dev);
+      expect(after.ino).toBe(replacementIdentity?.ino);
+      expect(
+        (await readdir(path.dirname(definition))).filter((entry) => entry.includes("delete-claim")),
+      ).toEqual([]);
+    },
+  );
+
+  it.each([
+    "beforeClaim",
+    "afterRename",
+    "afterSync",
+    "beforeUnlink",
+    "afterUnlink",
+    "afterMove",
+    "afterMoveSync",
+    "afterMovedUnlink",
+  ] as const)(
+    "recovers an interrupted delete claim at the %s boundary before a later manager install",
+    async (boundary) => {
+      const interruption = new Error(`interrupt-${boundary}`);
+      const runner = new RecordingRunner();
+      const artifacts = await linuxFixture(runner, {
+        deleteClaimOwnerState: () => "dead",
+        definitionRemovalHooks: {
+          [boundary]: () => Promise.reject(interruption),
+        },
+      });
+      await artifacts.manager.install();
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.install()).resolves.toMatchObject({
+        installed: true,
+        enabled: true,
+      });
+      expect(await readFile(artifacts.definition, "utf8")).toContain("toss-runtime");
+      expect(
+        (await readdir(path.dirname(artifacts.definition))).filter((entry) =>
+          entry.includes("delete-claim"),
+        ),
+      ).toEqual([]);
+      expect(runner.calls).toEqual([
+        { file: "/usr/bin/systemctl", args: ["--user", "daemon-reload"] },
+        { file: "/usr/bin/systemctl", args: ["--user", "enable", "toss-agent-runtime.service"] },
+      ]);
+    },
+  );
+
+  it("preserves a canonical reappearance across an interruption at the post-move boundary", async () => {
+    const interruption = new Error("interrupt-after-canonical-reappearance");
+    const runner = new RecordingRunner();
+    const artifacts = await linuxFixture(runner, {
+      deleteClaimOwnerState: () => "dead",
+      definitionRemovalHooks: {
+        afterMovedUnlink: async () => {
+          await writeFile(artifacts.definition, "canonical-reappearance", { mode: 0o600 });
+          await chmod(artifacts.definition, 0o600);
+        },
+        afterCanonicalReappearance: () => Promise.reject(interruption),
+      },
+    });
+    await artifacts.manager.install();
+    runner.calls.splice(0);
+
+    await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+    });
+    const identity = await lstat(artifacts.definition, { bigint: true });
+    runner.calls.splice(0);
+
+    await expect(artifacts.manager.status()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+    });
+    const after = await lstat(artifacts.definition, { bigint: true });
+    expect(after.dev).toBe(identity.dev);
+    expect(after.ino).toBe(identity.ino);
+    expect(await readFile(artifacts.definition, "utf8")).toBe("canonical-reappearance");
+    expect(
+      (await readdir(path.dirname(artifacts.definition))).filter((entry) =>
+        entry.includes("delete-claim"),
+      ),
+    ).toEqual([]);
+    expect(runner.calls).toEqual([]);
+  });
+
+  it.each(["live", "unknown"] as const)(
+    "fails closed for a %s delete-claim owner before another native manager action",
+    async (ownerState) => {
+      const runner = new RecordingRunner();
+      const artifacts = await linuxFixture(runner, {
+        deleteClaimOwnerState: () => ownerState,
+        definitionRemovalHooks: {
+          afterRename: () => Promise.reject(new Error("simulated interruption")),
+        },
+      });
+      await artifacts.manager.install();
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.status()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      expect(runner.calls).toEqual([]);
+    },
+  );
+
+  it("fails closed on a conflicting delete claim without deleting the replacement", async () => {
+    const runner = new RecordingRunner();
+    const artifacts = await linuxFixture(runner, {
+      deleteClaimOwnerState: () => "dead",
+      definitionRemovalHooks: {
+        afterRename: () => Promise.reject(new Error("simulated interruption")),
+      },
+    });
+    await artifacts.manager.install();
+    const accepted = await readFile(artifacts.definition);
+    runner.calls.splice(0);
+
+    await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+    });
+    await rm(artifacts.definition);
+    await writeFile(artifacts.definition, accepted, { mode: 0o600 });
+    await chmod(artifacts.definition, 0o600);
+    runner.calls.splice(0);
+
+    await expect(artifacts.manager.status()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+    });
+    expect(await readFile(artifacts.definition)).toEqual(accepted);
+    expect(
+      (await readdir(path.dirname(artifacts.definition))).filter((entry) =>
+        entry.includes("delete-claim"),
+      ),
+    ).toEqual([]);
+    expect(runner.calls).toEqual([]);
+  });
+
+  it("fails closed on a malformed delete claim without touching the canonical definition", async () => {
+    const runner = new RecordingRunner();
+    const artifacts = await linuxFixture(runner, {
+      deleteClaimOwnerState: () => "dead",
+      definitionRemovalHooks: {
+        afterRename: () => Promise.reject(new Error("simulated interruption")),
+      },
+    });
+    await artifacts.manager.install();
+    runner.calls.splice(0);
+
+    await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+    });
+    const claimName = (await readdir(path.dirname(artifacts.definition))).find((entry) =>
+      entry.includes("delete-claim"),
+    );
+    expect(claimName).toBeDefined();
+    await writeFile(
+      path.join(path.dirname(artifacts.definition), claimName!, "state.json"),
+      "malformed",
+      { mode: 0o600 },
+    );
+    await chmod(path.join(path.dirname(artifacts.definition), claimName!, "state.json"), 0o600);
+    await writeFile(artifacts.definition, "replacement", { mode: 0o600 });
+    await chmod(artifacts.definition, 0o600);
+    runner.calls.splice(0);
+
+    await expect(artifacts.manager.status()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+    });
+    expect(await readFile(artifacts.definition, "utf8")).toBe("replacement");
+    expect(runner.calls).toEqual([]);
+  });
+
+  it.each([
+    ["mismatched", (): number => 502],
+    ["negative", (): number => -1],
+    [
+      "unavailable",
+      (): number => {
+        throw new Error("uid unavailable");
+      },
+    ],
+  ] as const)(
+    "rejects a %s current UID before definition or native mutation",
+    async (_name, currentUid) => {
+      const runner = new RecordingRunner();
+      const artifacts = await linuxFixture(runner);
+      const customConfig = path.join(artifacts.home, "custom-config.yaml");
+      await managerFor(artifacts, runner, customConfig).install();
+      const definitionBefore = await readFile(artifacts.definition);
+      runner.calls.splice(0);
+
+      expect(() => managerFor(artifacts, runner, artifacts.config, { currentUid })).toThrowError(
+        expect.objectContaining({ code: "RUNTIME_SERVICE_DEFINITION_UNSAFE" }),
+      );
+      expect(runner.calls).toEqual([]);
+      expect(await readFile(artifacts.definition)).toEqual(definitionBefore);
+    },
+  );
+
+  it.each(["linux", "darwin"] as const)(
+    "rejects malformed, control-bearing, and noncanonical %s definition bytes before native mutation",
+    async (platform) => {
+      const cases: Uint8Array[] = [];
+      const runner = new RecordingRunner();
+      const artifacts = await fixture(platform, runner);
+      const customConfig = path.join(
+        artifacts.home,
+        platform === "linux" ? "custom%config.yaml" : "custom&config.yaml",
+      );
+      await managerFor(artifacts, runner, customConfig).install();
+      runner.calls.splice(0);
+      const canonical = await readFile(artifacts.definition);
+      const encodedConfig =
+        platform === "linux"
+          ? customConfig.replaceAll("%", "%%")
+          : customConfig.replaceAll("&", "&amp;");
+      const configBytes = Buffer.from(encodedConfig, "utf8");
+      const configOffset = canonical.indexOf(configBytes);
+      expect(configOffset).toBeGreaterThanOrEqual(0);
+      cases.push(
+        Buffer.concat([
+          canonical.subarray(0, configOffset),
+          Buffer.from([0xff]),
+          canonical.subarray(configOffset + 1),
+        ]),
+      );
+      cases.push(
+        Buffer.from(canonical.toString("utf8").replace(encodedConfig, "/tmp/control\u0001.yaml")),
+      );
+      cases.push(
+        Buffer.from(
+          platform === "linux"
+            ? canonical.toString("utf8").replace("custom%%config.yaml", "custom%config.yaml")
+            : canonical
+                .toString("utf8")
+                .replace("custom&amp;config.yaml", "custom&#38;config.yaml"),
+        ),
+      );
+
+      for (const tampered of cases) {
+        await writeFile(artifacts.definition, tampered, { mode: 0o600 });
+        await chmod(artifacts.definition, 0o600);
+        await expect(artifacts.manager.status()).rejects.toMatchObject({
+          code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+        });
+        expect(runner.calls).toEqual([]);
+      }
+    },
+  );
+
+  it.each(["linux", "darwin"] as const)(
+    "recognizes a canonical %s definition installed with a custom config for every later action",
+    async (platform) => {
+      const runner = new RecordingRunner();
+      const artifacts = await fixture(platform, runner);
+      const customConfig = path.join(artifacts.home, 'custom % $ \\ " & < >.yaml');
+      await managerFor(artifacts, runner, customConfig).install();
+
+      await expect(artifacts.manager.installedConfigPath()).resolves.toBe(customConfig);
+      await expect(artifacts.manager.start()).resolves.toMatchObject({ installed: true });
+      await expect(artifacts.manager.stop()).resolves.toMatchObject({ installed: true });
+      await expect(artifacts.manager.restart()).resolves.toMatchObject({ installed: true });
+      await expect(artifacts.manager.status()).resolves.toMatchObject({ backoff: false });
+      await expect(artifacts.manager.uninstall()).resolves.toMatchObject({ installed: false });
+      await expect(lstat(artifacts.definition)).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
+
+  it.each(["linux", "darwin"] as const)(
+    "rejects a %s definition whose recovered config path is not absolute before native mutation",
+    async (platform) => {
+      const runner = new RecordingRunner();
+      const artifacts = await fixture(platform, runner);
+      const customConfig = path.join(artifacts.home, "custom-config.yaml");
+      const installer = managerFor(artifacts, runner, customConfig);
+      await installer.install();
+      runner.calls.splice(0);
+      const canonical = await readFile(artifacts.definition, "utf8");
+      await writeFile(artifacts.definition, canonical.replace(customConfig, "relative.yaml"), {
+        mode: 0o600,
+      });
+      await chmod(artifacts.definition, 0o600);
+
+      await expect(artifacts.manager.status()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      expect(runner.calls).toEqual([]);
+    },
+  );
+
+  it.each(["linux", "darwin"] as const)(
+    "rejects a canonical %s definition generated for another executable before native mutation",
+    async (platform) => {
+      const runner = new RecordingRunner();
+      const artifacts = await fixture(platform, runner);
+      const customConfig = path.join(artifacts.home, "custom-config.yaml");
+      await managerFor(artifacts, runner, customConfig).install();
+      runner.calls.splice(0);
+      await writeFile(
+        artifacts.definition,
+        renderServiceDefinition({
+          platform,
+          uid: 501,
+          nodePath: "/opt/untrusted/node",
+          cliPath: "/opt/toss/bin/toss-runtime.js",
+          configPath: customConfig,
+          environment: {},
+        }),
+        { mode: 0o600 },
+      );
+      await chmod(artifacts.definition, 0o600);
+
+      await expect(artifacts.manager.status()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      expect(runner.calls).toEqual([]);
+    },
+  );
+
+  it("enables Linux login startup without starting during install", async () => {
+    const runner = new RecordingRunner();
+    const { manager } = await linuxFixture(runner);
+
+    await expect(manager.install()).resolves.toEqual({
+      installed: true,
+      enabled: true,
+      active: false,
+      backoff: false,
+      restartCount: 0,
+      lastExitCode: null,
+    });
+    expect(runner.calls).toEqual([
+      { file: "/usr/bin/systemctl", args: ["--user", "daemon-reload"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "enable", "toss-agent-runtime.service"] },
+    ]);
+    expect(runner.calls.flatMap((entry) => entry.args)).not.toContain("start");
+  });
+
+  it("writes a Darwin login definition without starting during install", async () => {
+    const runner = new RecordingRunner();
+    const { manager, definition } = await darwinFixture(runner);
+
+    await manager.install();
+
+    expect(runner.calls).toEqual([]);
+    expect(await readFile(definition, "utf8")).toContain("<key>RunAtLoad</key>");
+  });
+
+  it.each([
+    ["start", ["--user", "start", "toss-agent-runtime.service"]],
+    ["stop", ["--user", "stop", "toss-agent-runtime.service"]],
+    ["restart", ["--user", "restart", "toss-agent-runtime.service"]],
+  ] as const)("uses the exact Linux %s boundary", async (method, args) => {
+    const runner = new RecordingRunner();
+    const { manager } = await linuxFixture(runner);
+    await manager.install();
+    runner.calls.splice(0);
+
+    await manager[method]();
+
+    expect(runner.calls).toEqual([{ file: "/usr/bin/systemctl", args }]);
+  });
+
+  it.each([
+    ["start", ["bootstrap", "gui/501", "DEFINITION"]],
+    ["stop", ["bootout", "gui/501/software.toss.agent-runtime"]],
+    ["restart", ["kickstart", "-k", "gui/501/software.toss.agent-runtime"]],
+  ] as const)("uses the exact Darwin %s boundary", async (method, expectedArgs) => {
+    const runner = new RecordingRunner();
+    const { manager, definition } = await darwinFixture(runner);
+    await manager.install();
+
+    await manager[method]();
+
+    const args = expectedArgs.map((value) => (value === "DEFINITION" ? definition : value));
+    expect(runner.calls).toEqual([{ file: "/bin/launchctl", args }]);
+  });
+
+  it("parses every Linux manager status field from the native status output", async () => {
+    const runner = new RecordingRunner([
+      {
+        exitCode: 0,
+        stdout:
+          "LoadState=loaded\nUnitFileState=enabled\nActiveState=activating\nSubState=auto-restart\nResult=success\nNRestarts=7\nExecMainStatus=23\n",
+        stderr: "",
+      },
+    ]);
+    const { manager } = await linuxFixture(runner);
+    await manager.install();
+    runner.calls.splice(0);
+
+    await expect(manager.status()).resolves.toEqual({
+      installed: true,
+      enabled: true,
+      active: false,
+      backoff: true,
+      restartCount: 7,
+      lastExitCode: 23,
+    });
+    expect(runner.calls).toEqual([
+      {
+        file: "/usr/bin/systemctl",
+        args: [
+          "--user",
+          "show",
+          "toss-agent-runtime.service",
+          "--property=LoadState,UnitFileState,ActiveState,SubState,Result,NRestarts,ExecMainStatus",
+          "--no-pager",
+        ],
+      },
+    ]);
+  });
+
+  it("parses terminal systemd start-limit failures as actionable restart backoff", async () => {
+    const runner = new RecordingRunner([
+      {
+        exitCode: 0,
+        stdout:
+          "LoadState=loaded\nUnitFileState=enabled\nActiveState=failed\nSubState=failed\nResult=start-limit-hit\nNRestarts=5\nExecMainStatus=70\n",
+        stderr: "",
+      },
+    ]);
+    const { manager } = await linuxFixture(runner);
+    await manager.install();
+    runner.calls.splice(0);
+
+    await expect(manager.status()).resolves.toEqual({
+      installed: true,
+      enabled: true,
+      active: false,
+      backoff: true,
+      restartCount: 5,
+      lastExitCode: 70,
+    });
+    expect(runner.calls).toEqual([
+      {
+        file: "/usr/bin/systemctl",
+        args: [
+          "--user",
+          "show",
+          "toss-agent-runtime.service",
+          "--property=LoadState,UnitFileState,ActiveState,SubState,Result,NRestarts,ExecMainStatus",
+          "--no-pager",
+        ],
+      },
+    ]);
+  });
+
+  it.each([
+    [
+      "linux",
+      (value: string) =>
+        `LoadState=loaded\nUnitFileState=enabled\nActiveState=inactive\nSubState=dead\nResult=success\nNRestarts=${value}\nExecMainStatus=${value}\n`,
+    ],
+    ["darwin", (value: string) => `state = exited\nruns = ${value}\nlast exit code = ${value}\n`],
+  ] as const)(
+    "normalizes unsafe native %s status integers to deterministic fallback values",
+    async (platform, output) => {
+      const runner = new RecordingRunner([
+        { exitCode: 0, stdout: output("9".repeat(400)), stderr: "" },
+      ]);
+      const { manager } = await (platform === "linux" ? linuxFixture : darwinFixture)(runner);
+      await manager.install();
+      runner.calls.splice(0);
+
+      await expect(manager.status()).resolves.toEqual({
+        installed: true,
+        enabled: true,
+        active: false,
+        backoff: false,
+        restartCount: 0,
+        lastExitCode: null,
+      });
+    },
+  );
+
+  it.each([
+    [
+      "linux",
+      "LoadState=loaded\nUnitFileState=enabled\nActiveState=inactive\nSubState=dead\nResult=success\nNRestarts=-1\nExecMainStatus=-1\n",
+    ],
+    ["darwin", "state = exited\nruns = -1\nlast exit code = -1\n"],
+  ] as const)("rejects negative native %s status integers", async (platform, output) => {
+    const runner = new RecordingRunner([{ exitCode: 0, stdout: output, stderr: "" }]);
+    const { manager } = await (platform === "linux" ? linuxFixture : darwinFixture)(runner);
+    await manager.install();
+    runner.calls.splice(0);
+
+    await expect(manager.status()).resolves.toMatchObject({
+      restartCount: 0,
+      lastExitCode: null,
+    });
+  });
+
+  it("returns an absent status without invoking a manager for a missing definition", async () => {
+    const runner = new RecordingRunner();
+    const { manager } = await linuxFixture(runner);
+
+    await expect(manager.status()).resolves.toEqual({
+      installed: false,
+      enabled: false,
+      active: false,
+      backoff: false,
+      restartCount: 0,
+      lastExitCode: null,
+    });
+    expect(runner.calls).toEqual([]);
+  });
+
+  it("returns an absent status when Linux reports an installed unit as not found", async () => {
+    const runner = new RecordingRunner([
+      { exitCode: 0, stdout: "", stderr: "" },
+      { exitCode: 0, stdout: "", stderr: "" },
+      { exitCode: 1, stdout: "LoadState=not-found\n", stderr: "" },
+    ]);
+    const { manager } = await linuxFixture(runner);
+    await manager.install();
+
+    await expect(manager.status()).resolves.toEqual({
+      installed: false,
+      enabled: false,
+      active: false,
+      backoff: false,
+      restartCount: 0,
+      lastExitCode: null,
+    });
+  });
+
+  it("parses a Darwin running status and uses the exact print boundary", async () => {
+    const runner = new RecordingRunner([
+      { exitCode: 0, stdout: "state = running\nruns = 4\nlast exit code = 0\n", stderr: "" },
+    ]);
+    const { manager } = await darwinFixture(runner);
+    await manager.install();
+
+    await expect(manager.status()).resolves.toEqual({
+      installed: true,
+      enabled: true,
+      active: true,
+      backoff: false,
+      restartCount: 4,
+      lastExitCode: 0,
+    });
+    expect(runner.calls).toEqual([
+      { file: "/bin/launchctl", args: ["print", "gui/501/software.toss.agent-runtime"] },
+    ]);
+  });
+
+  it("returns an absent status when Darwin reports no registered service", async () => {
+    const runner = new RecordingRunner([
+      {
+        exitCode: 1,
+        stdout: "",
+        stderr: "Could not find service gui/501/software.toss.agent-runtime",
+      },
+    ]);
+    const { manager } = await darwinFixture(runner);
+    await manager.install();
+
+    await expect(manager.status()).resolves.toEqual({
+      installed: false,
+      enabled: false,
+      active: false,
+      backoff: false,
+      restartCount: 0,
+      lastExitCode: null,
+    });
+  });
+
+  it("treats a repeated Darwin bootstrap as an idempotent start", async () => {
+    const runner = new RecordingRunner([
+      { exitCode: 0, stdout: "", stderr: "" },
+      { exitCode: 1, stdout: "", stderr: "service software.toss.agent-runtime already loaded" },
+    ]);
+    const { manager } = await darwinFixture(runner);
+    await manager.install();
+
+    await manager.start();
+    await expect(manager.start()).resolves.toMatchObject({ installed: true, active: true });
+  });
+
+  it("remains idempotent when Linux stop and disable report an absent unit", async () => {
+    const runner = new RecordingRunner([
+      { exitCode: 0, stdout: "", stderr: "" },
+      { exitCode: 0, stdout: "", stderr: "" },
+      { exitCode: 1, stdout: "", stderr: "Unit toss-agent-runtime.service not loaded" },
+      { exitCode: 1, stdout: "", stderr: "Unit file toss-agent-runtime.service does not exist" },
+      { exitCode: 0, stdout: "", stderr: "" },
+    ]);
+    const { manager, definition } = await linuxFixture(runner);
+    await manager.install();
+
+    await expect(manager.uninstall()).resolves.toMatchObject({ installed: false, enabled: false });
+    await expect(lstat(definition)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(runner.calls).toEqual([
+      { file: "/usr/bin/systemctl", args: ["--user", "daemon-reload"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "enable", "toss-agent-runtime.service"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "stop", "toss-agent-runtime.service"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "disable", "toss-agent-runtime.service"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "daemon-reload"] },
+    ]);
+  });
+
+  it("keeps repeated Linux install, start, stop, and uninstall operations within manager scope", async () => {
+    const runner = new RecordingRunner();
+    const { manager } = await linuxFixture(runner);
+
+    await manager.install();
+    await manager.install();
+    await manager.start();
+    await manager.start();
+    await manager.stop();
+    await manager.stop();
+    await manager.uninstall();
+    await manager.uninstall();
+
+    expect(runner.calls).toEqual([
+      { file: "/usr/bin/systemctl", args: ["--user", "daemon-reload"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "enable", "toss-agent-runtime.service"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "daemon-reload"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "enable", "toss-agent-runtime.service"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "start", "toss-agent-runtime.service"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "start", "toss-agent-runtime.service"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "stop", "toss-agent-runtime.service"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "stop", "toss-agent-runtime.service"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "stop", "toss-agent-runtime.service"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "disable", "toss-agent-runtime.service"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "daemon-reload"] },
+    ]);
+  });
+
+  it("uninstalls only native manager artifacts and preserves state, intake, and logs", async () => {
+    const runner = new RecordingRunner();
+    const artifacts = await linuxFixture(runner);
+    await artifacts.manager.install();
+    runner.calls.splice(0);
+
+    await artifacts.manager.uninstall();
+
+    await expect(lstat(artifacts.definition)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(artifacts.config, "utf8")).resolves.toContain("schema_version");
+    await expect(readFile(artifacts.canonicalRunArtifact, "utf8")).resolves.toBe("preserve");
+    await expect(readFile(artifacts.journal, "utf8")).resolves.toBe("preserve");
+    await expect(readFile(artifacts.registry, "utf8")).resolves.toBe("preserve");
+    await expect(readFile(artifacts.pendingIntake, "utf8")).resolves.toBe("preserve");
+    await expect(readFile(artifacts.operationalLog, "utf8")).resolves.toBe("preserve");
+  });
+
+  it.each([
+    ["linux", "stop", ["--user", "stop", "toss-agent-runtime.service"]],
+    ["linux", "disable", ["--user", "disable", "toss-agent-runtime.service"]],
+    ["darwin", "bootout", ["bootout", "gui/501/software.toss.agent-runtime"]],
+  ] as const)(
+    "preserves a definition replaced after %s %s and cleans its uninstall claim before recovery",
+    async (platform, replacementBoundary, boundaryArguments) => {
+      let definition = "";
+      let replaced = false;
+      const runner: CommandRunner & { calls: { file: string; args: readonly string[] }[] } = {
+        calls: [],
+        async run(file, args) {
+          this.calls.push({ file, args: [...args] });
+          if (
+            !replaced &&
+            ((platform === "linux" && args[1] === replacementBoundary) ||
+              (platform === "darwin" && args[0] === replacementBoundary))
+          ) {
+            replaced = true;
+            await writeFile(definition, "replacement-after-native-mutation", { mode: 0o600 });
+            await chmod(definition, 0o600);
+          }
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      };
+      const makeFixture = platform === "linux" ? linuxFixture : darwinFixture;
+      const artifacts = await makeFixture(runner);
+      definition = artifacts.definition;
+      await artifacts.manager.install();
+      const acceptedDefinition = await readFile(definition);
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      expect(runner.calls).toEqual(
+        platform === "linux"
+          ? [
+              {
+                file: "/usr/bin/systemctl",
+                args: ["--user", "stop", "toss-agent-runtime.service"],
+              },
+              {
+                file: "/usr/bin/systemctl",
+                args: ["--user", "disable", "toss-agent-runtime.service"],
+              },
+            ]
+          : [{ file: "/bin/launchctl", args: boundaryArguments }],
+      );
+      expect(await readFile(definition, "utf8")).toBe("replacement-after-native-mutation");
+      expect(await readdir(path.dirname(definition))).toEqual([path.basename(definition)]);
+
+      await writeFile(definition, acceptedDefinition, { mode: 0o600 });
+      await chmod(definition, 0o600);
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.uninstall()).resolves.toEqual({
+        installed: false,
+        enabled: false,
+        active: false,
+        backoff: false,
+        restartCount: 0,
+        lastExitCode: null,
+      });
+      await expect(lstat(definition)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(runner.calls).toEqual(
+        platform === "linux"
+          ? [
+              {
+                file: "/usr/bin/systemctl",
+                args: ["--user", "stop", "toss-agent-runtime.service"],
+              },
+              {
+                file: "/usr/bin/systemctl",
+                args: ["--user", "disable", "toss-agent-runtime.service"],
+              },
+              { file: "/usr/bin/systemctl", args: ["--user", "daemon-reload"] },
+            ]
+          : [
+              {
+                file: "/bin/launchctl",
+                args: ["bootout", "gui/501/software.toss.agent-runtime"],
+              },
+            ],
+      );
+    },
+  );
+
+  it.each([
+    ["linux", "stop", "directory"],
+    ["linux", "disable", "directory"],
+    ["darwin", "bootout", "directory"],
+    ["linux", "stop", "symlink"],
+    ["linux", "disable", "symlink"],
+    ["darwin", "bootout", "symlink"],
+    ["linux", "stop", "cross-owner"],
+    ["linux", "disable", "cross-owner"],
+    ["darwin", "bootout", "cross-owner"],
+  ] as const)(
+    "preserves an exact %s replacement after %s without leaking a delete claim",
+    async (platform, replacementBoundary, replacementKind) => {
+      let definition = "";
+      let treatDefinitionAsCrossOwner = false;
+      let replacementIdentity: { readonly dev: bigint; readonly ino: bigint } | undefined;
+      const runner: CommandRunner & { calls: { file: string; args: readonly string[] }[] } = {
+        calls: [],
+        async run(file, args) {
+          this.calls.push({ file, args: [...args] });
+          const isBoundary =
+            (platform === "linux" && args[1] === replacementBoundary) ||
+            (platform === "darwin" && args[0] === replacementBoundary);
+          if (replacementIdentity === undefined && isBoundary) {
+            if (replacementKind === "directory") {
+              await rm(definition);
+              await mkdir(definition, { mode: 0o700 });
+              await chmod(definition, 0o700);
+            } else if (replacementKind === "symlink") {
+              const target = path.join(
+                path.dirname(path.dirname(definition)),
+                "replacement-target",
+              );
+              await writeFile(target, "preserve", { mode: 0o600 });
+              await chmod(target, 0o600);
+              await rm(definition);
+              await symlink(target, definition);
+            } else {
+              await writeFile(definition, "cross-owner-replacement", { mode: 0o600 });
+              await chmod(definition, 0o600);
+              treatDefinitionAsCrossOwner = true;
+            }
+            const metadata = await lstat(definition, { bigint: true });
+            replacementIdentity = { dev: metadata.dev, ino: metadata.ino };
+          }
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      };
+      const makeFixture = platform === "linux" ? linuxFixture : darwinFixture;
+      const artifacts = await makeFixture(runner, {
+        isDefinitionCurrentUser: (_userId, candidate) =>
+          !treatDefinitionAsCrossOwner || candidate !== definition,
+      });
+      definition = artifacts.definition;
+      await artifacts.manager.install();
+      runner.calls.splice(0);
+
+      await expect(artifacts.manager.uninstall()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      const after = await lstat(definition, { bigint: true });
+      expect(after.dev).toBe(replacementIdentity?.dev);
+      expect(after.ino).toBe(replacementIdentity?.ino);
+      expect(after.isDirectory()).toBe(replacementKind === "directory");
+      expect(after.isSymbolicLink()).toBe(replacementKind === "symlink");
+      expect(after.isFile()).toBe(replacementKind === "cross-owner");
+      expect(await readdir(path.dirname(definition))).toEqual([path.basename(definition)]);
+      expect(runner.calls).toEqual(
+        platform === "linux"
+          ? [
+              {
+                file: "/usr/bin/systemctl",
+                args: ["--user", "stop", "toss-agent-runtime.service"],
+              },
+              {
+                file: "/usr/bin/systemctl",
+                args: ["--user", "disable", "toss-agent-runtime.service"],
+              },
+            ]
+          : [
+              {
+                file: "/bin/launchctl",
+                args: ["bootout", "gui/501/software.toss.agent-runtime"],
+              },
+            ],
+      );
+    },
+  );
+
+  it("rejects an incompatible installed definition without replacing it", async () => {
+    const runner = new RecordingRunner();
+    const { manager, definition } = await linuxFixture(runner);
+    await manager.install();
+    await writeFile(definition, "[Service]\nExecStart=/untrusted\n", { mode: 0o600 });
+    await chmod(definition, 0o600);
+
+    await expect(manager.install()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+    });
+    expect(await readFile(definition, "utf8")).toBe("[Service]\nExecStart=/untrusted\n");
+  });
+
+  it("rejects a symlinked installed definition without touching its target", async () => {
+    const runner = new RecordingRunner();
+    const { manager, definition } = await linuxFixture(runner);
+    await manager.install();
+    const target = path.join(path.dirname(definition), "target.service");
+    await writeFile(target, "preserve", { mode: 0o600 });
+    await chmod(target, 0o600);
+    await rm(definition);
+    await symlink(target, definition);
+
+    await expect(manager.install()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+    });
+    expect(await readFile(target, "utf8")).toBe("preserve");
+  });
+
+  it("normalizes an oversized definition before any native mutation without reflecting its path", async () => {
+    const runner = new RecordingRunner();
+    const { manager, definition } = await linuxFixture(runner);
+    await mkdir(path.dirname(definition), { recursive: true, mode: 0o700 });
+    await writeFile(definition, "", { mode: 0o600 });
+    await chmod(definition, 0o600);
+    await truncate(definition, 65_537);
+
+    let error: unknown;
+    try {
+      await manager.install();
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toMatchObject({ code: "RUNTIME_SERVICE_DEFINITION_UNSAFE" });
+    expect(String(error)).not.toContain(definition);
+    expect(runner.calls).toEqual([]);
+  });
+
+  it("maps a missing native manager executable to the fixed unavailable error", async () => {
+    const missing = Object.assign(new Error("ENOENT /untrusted/path"), { code: "ENOENT" });
+    const runner = new RecordingRunner([missing]);
+    const { manager } = await linuxFixture(runner);
+
+    await expect(manager.install()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_MANAGER_UNAVAILABLE",
+    });
+  });
+
+  it("maps nonzero manager results to a fixed error without reflecting command output", async () => {
+    const runner = new RecordingRunner([
+      { exitCode: 71, stdout: "secret=/private/runtime", stderr: "token=must-not-leak" },
+    ]);
+    const { manager } = await linuxFixture(runner);
+
+    let error: unknown;
+    try {
+      await manager.install();
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toMatchObject({ code: "RUNTIME_SERVICE_MANAGER_FAILED" });
+    expect(String(error)).not.toContain("private/runtime");
+    expect(String(error)).not.toContain("must-not-leak");
+  });
+
+  it.each([
+    ["linux", "stop", "incompatible"],
+    ["linux", "uninstall", "incompatible"],
+    ["darwin", "stop", "incompatible"],
+    ["darwin", "uninstall", "incompatible"],
+    ["linux", "stop", "symlink"],
+    ["linux", "uninstall", "symlink"],
+    ["darwin", "stop", "symlink"],
+    ["darwin", "uninstall", "symlink"],
+  ] as const)(
+    "refuses %s %s before native mutation when its definition is %s",
+    async (platform, action, unsafeKind) => {
+      const runner = new RecordingRunner();
+      const fixtureForPlatform = platform === "linux" ? linuxFixture : darwinFixture;
+      const { manager, definition } = await fixtureForPlatform(runner);
+      await manager.install();
+      runner.calls.splice(0);
+
+      const target = path.join(path.dirname(definition), "preserved-definition");
+      if (unsafeKind === "incompatible") {
+        await writeFile(definition, "untrusted-definition", { mode: 0o600 });
+        await chmod(definition, 0o600);
+      } else {
+        await writeFile(target, "preserve", { mode: 0o600 });
+        await chmod(target, 0o600);
+        await rm(definition);
+        await symlink(target, definition);
+      }
+
+      await expect(manager[action]()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+      });
+      expect(runner.calls).toEqual([]);
+      if (unsafeKind === "incompatible") {
+        expect(await readFile(definition, "utf8")).toBe("untrusted-definition");
+      } else {
+        expect(await readFile(target, "utf8")).toBe("preserve");
+      }
+    },
+  );
+
+  it("uses the Darwin bootout boundary while preserving config, state, intake, and logs", async () => {
+    const runner = new RecordingRunner();
+    const artifacts = await darwinFixture(runner);
+    await artifacts.manager.install();
+
+    await artifacts.manager.uninstall();
+
+    expect(runner.calls).toEqual([
+      { file: "/bin/launchctl", args: ["bootout", "gui/501/software.toss.agent-runtime"] },
+    ]);
+    await expect(lstat(artifacts.definition)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(artifacts.config, "utf8")).resolves.toContain("schema_version");
+    await expect(readFile(artifacts.canonicalRunArtifact, "utf8")).resolves.toBe("preserve");
+    await expect(readFile(artifacts.journal, "utf8")).resolves.toBe("preserve");
+    await expect(readFile(artifacts.registry, "utf8")).resolves.toBe("preserve");
+    await expect(readFile(artifacts.pendingIntake, "utf8")).resolves.toBe("preserve");
+    await expect(readFile(artifacts.operationalLog, "utf8")).resolves.toBe("preserve");
+  });
+
+  it("keeps repeated Darwin stop and uninstall operations idempotent", async () => {
+    const runner = new RecordingRunner([
+      { exitCode: 0, stdout: "", stderr: "" },
+      {
+        exitCode: 1,
+        stdout: "",
+        stderr: "Could not find service gui/501/software.toss.agent-runtime",
+      },
+      { exitCode: 0, stdout: "", stderr: "" },
+    ]);
+    const { manager } = await darwinFixture(runner);
+    await manager.install();
+
+    await manager.stop();
+    await manager.stop();
+    await manager.uninstall();
+    await manager.uninstall();
+
+    expect(runner.calls).toEqual([
+      { file: "/bin/launchctl", args: ["bootout", "gui/501/software.toss.agent-runtime"] },
+      { file: "/bin/launchctl", args: ["bootout", "gui/501/software.toss.agent-runtime"] },
+      { file: "/bin/launchctl", args: ["bootout", "gui/501/software.toss.agent-runtime"] },
+    ]);
+  });
+
+  it("preserves and rejects an incompatible definition that wins the install publication race", async () => {
+    const runner = new RecordingRunner();
+    const { manager, definition } = await linuxFixture(runner, {
+      beforeDefinitionPublish: async () => {
+        await writeFile(definition, "raced-untrusted-definition", { mode: 0o600 });
+        await chmod(definition, 0o600);
+      },
+    });
+
+    await expect(manager.install()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_DEFINITION_UNSAFE",
+    });
+    expect(runner.calls).toEqual([]);
+    expect(await readFile(definition, "utf8")).toBe("raced-untrusted-definition");
+  });
+
+  it("accepts a byte-compatible definition that wins the install publication race", async () => {
+    const runner = new RecordingRunner();
+    const { manager, definition, config } = await linuxFixture(runner, {
+      beforeDefinitionPublish: async () => {
+        const definitionBytes = renderServiceDefinition({
+          platform: "linux",
+          uid: 501,
+          nodePath: "/opt/toss/node/bin/node",
+          cliPath: "/opt/toss/bin/toss-runtime.js",
+          configPath: config,
+          environment: {},
+        });
+        await writeFile(definition, definitionBytes, { mode: 0o600 });
+        await chmod(definition, 0o600);
+      },
+    });
+
+    await expect(manager.install()).resolves.toMatchObject({ installed: true, enabled: true });
+    expect(runner.calls).toEqual([
+      { file: "/usr/bin/systemctl", args: ["--user", "daemon-reload"] },
+      { file: "/usr/bin/systemctl", args: ["--user", "enable", "toss-agent-runtime.service"] },
+    ]);
+    expect(await readFile(definition, "utf8")).toBe(
+      renderServiceDefinition({
+        platform: "linux",
+        uid: 501,
+        nodePath: "/opt/toss/node/bin/node",
+        cliPath: "/opt/toss/bin/toss-runtime.js",
+        configPath: config,
+        environment: {},
+      }),
+    );
+  });
+
+  it("does not accept unrelated idempotent-looking Linux or Darwin manager failures", async () => {
+    const linuxRunner = new RecordingRunner([
+      { exitCode: 0, stdout: "", stderr: "" },
+      { exitCode: 0, stdout: "", stderr: "" },
+      { exitCode: 1, stdout: "", stderr: "Unit unrelated.service not loaded" },
+    ]);
+    const { manager: linuxManager } = await linuxFixture(linuxRunner);
+    await linuxManager.install();
+    await expect(linuxManager.stop()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_MANAGER_FAILED",
+    });
+
+    const darwinRunner = new RecordingRunner([
+      { exitCode: 1, stdout: "", stderr: "Could not find service gui/501/unrelated" },
+    ]);
+    const { manager: darwinManager } = await darwinFixture(darwinRunner);
+    await darwinManager.install();
+    await expect(darwinManager.stop()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_MANAGER_FAILED",
+    });
+  });
+
+  it.each([
+    ["bootstrap", "start", "service software.toss.agent-runtime.helper already loaded"],
+    ["bootout", "stop", "Could not find service gui/501/software.toss.agent-runtime-helper"],
+    ["print", "status", "Could not find service gui/501/software.toss.agent-runtime.helper"],
+  ] as const)(
+    "does not accept a Darwin %s failure for a target-prefix service identity",
+    async (_operation, action, stderr) => {
+      const runner = new RecordingRunner([{ exitCode: 1, stdout: "", stderr }]);
+      const { manager } = await darwinFixture(runner);
+      await manager.install();
+
+      await expect(manager[action]()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_MANAGER_FAILED",
+      });
+    },
+  );
+
+  it.each([
+    ["bootstrap service-first", "start", "service evilsoftware.toss.agent-runtime already loaded"],
+    ["bootstrap loaded-first", "start", "already loaded evilsoftware.toss.agent-runtime"],
+    ["bootout", "stop", "Could not find service evilgui/501/software.toss.agent-runtime"],
+    ["print", "status", "Could not find service evilgui/501/software.toss.agent-runtime"],
+  ] as const)(
+    "does not accept a Darwin %s failure for a leading-prefix service identity",
+    async (_operation, action, stderr) => {
+      const runner = new RecordingRunner([{ exitCode: 1, stdout: "", stderr }]);
+      const { manager } = await darwinFixture(runner);
+      await manager.install();
+
+      await expect(manager[action]()).rejects.toMatchObject({
+        code: "RUNTIME_SERVICE_MANAGER_FAILED",
+      });
+    },
+  );
+
+  it.each(["linux", "darwin"] as const)(
+    "returns absent without native mutation for missing %s definitions",
+    async (platform) => {
+      const runner = new RecordingRunner();
+      const fixtureForPlatform = platform === "linux" ? linuxFixture : darwinFixture;
+      const { manager } = await fixtureForPlatform(runner);
+
+      await expect(manager.start()).resolves.toMatchObject({ installed: false, enabled: false });
+      await expect(manager.stop()).resolves.toMatchObject({ installed: false, enabled: false });
+      await expect(manager.restart()).resolves.toMatchObject({ installed: false, enabled: false });
+      await expect(manager.uninstall()).resolves.toMatchObject({
+        installed: false,
+        enabled: false,
+      });
+      expect(runner.calls).toEqual([]);
+    },
+  );
+});
