@@ -59,6 +59,7 @@ export function createBaselineCapabilities(platform: {
     platform: Object.freeze({ ...platform }),
     supported_protocols: Object.freeze([PROTOCOL_VERSION]),
     supported_schemas: Object.freeze([
+      "agentgateway-capabilities.v1",
       "candidate-job-intent.v1",
       "execution-request.v1",
       "execution-event.v1",
@@ -73,7 +74,7 @@ export function createBaselineCapabilities(platform: {
       "service-control-request.v1",
       "service-control-response.v1",
     ]),
-    provider_transports: Object.freeze(["openai", "anthropic", "gemini"]),
+    provider_transports: Object.freeze(["agentgateway", "openai", "anthropic", "gemini"]),
     model_classes: Object.freeze([]),
     skill_host_versions: Object.freeze([]),
     superpowers_capabilities: Object.freeze([]),

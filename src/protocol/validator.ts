@@ -1,6 +1,7 @@
 import Ajv2020Module, { type ErrorObject, type ValidateFunction } from "ajv/dist/2020.js";
 import addFormatsModule from "ajv-formats";
 
+import agentgatewayCapabilitiesSchema from "../../contracts/runtime/agentgateway-capabilities.v1.schema.json" with { type: "json" };
 import commonSchema from "../../contracts/runtime/runtime-common.v1.schema.json" with { type: "json" };
 import executionEventSchema from "../../contracts/runtime/execution-event.v1.schema.json" with { type: "json" };
 import executionRequestSchema from "../../contracts/runtime/execution-request.v1.schema.json" with { type: "json" };
@@ -23,6 +24,8 @@ const Ajv2020 = Ajv2020Module.default;
 const addFormats = addFormatsModule.default;
 
 const REGISTERED_SCHEMAS: Readonly<Record<string, string>> = {
+  "agentgateway-capabilities.v1":
+    "https://toss.software/schemas/runtime/v1/agentgateway-capabilities.v1.schema.json",
   "execution-request.v1":
     "https://toss.software/schemas/runtime/v1/execution-request.v1.schema.json",
   "execution-event.v1": "https://toss.software/schemas/runtime/v1/execution-event.v1.schema.json",
@@ -94,6 +97,7 @@ export function createProtocolValidator(): ProtocolValidator {
   });
   addFormats(ajv);
   ajv.addSchema(commonSchema);
+  ajv.addSchema(agentgatewayCapabilitiesSchema);
   ajv.addSchema(executionEventSchema);
   ajv.addSchema(executionRequestSchema);
   ajv.addSchema(executionResultSchema);

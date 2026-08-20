@@ -74,6 +74,7 @@ describe("published protocol artifacts", () => {
     ) as ContractManifest;
     expect(manifest.schema_version).toBe("runtime-contract-manifest.v1");
     expect(manifest.schemas.map((entry) => entry.schema_version)).toEqual([
+      "agentgateway-capabilities.v1",
       "candidate-job-intent.v1",
       "command-result.v1",
       "execution-event.v1",

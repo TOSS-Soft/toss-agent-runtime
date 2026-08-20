@@ -1,3 +1,5 @@
+import type { AgentgatewayProfileV1 } from "../gateway/types.js";
+
 export type RuntimePlatform = "darwin" | "linux";
 export type RuntimeEnvironment = Readonly<Record<string, string | undefined>>;
 
@@ -21,6 +23,7 @@ export interface RuntimeConfigV1 {
     max_bytes: 104857600;
   }>;
   readonly gateway_profile: string | null;
+  readonly gateway_profiles: Readonly<Record<string, AgentgatewayProfileV1>>;
   readonly provider_profiles: readonly string[];
   readonly mcp_profiles: readonly string[];
   readonly secret_references: Readonly<Record<string, SecretReference>>;

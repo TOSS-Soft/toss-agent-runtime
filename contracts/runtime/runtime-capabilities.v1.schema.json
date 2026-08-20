@@ -66,6 +66,7 @@
       "items": {
         "type": "string",
         "enum": [
+          "agentgateway-capabilities.v1",
           "candidate-job-intent.v1",
           "execution-request.v1",
           "execution-event.v1",
