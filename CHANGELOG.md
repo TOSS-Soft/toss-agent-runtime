@@ -12,6 +12,7 @@ All notable changes to this project are documented here. The format follows Keep
 - `toss-runtime` CLI, diagnostics, and graceful SIGINT/SIGTERM lifecycle shell.
 - Explicit macOS launchd and Linux `systemd --user` service lifecycle commands, deterministic login-enablement command arrays, restart/backoff status, and actionable doctor checks (#28 foundation).
 - Closed, bounded local status contracts, a private Unix socket, conservative single-instance locking, and ordered bounded supervisor shutdown.
+- Immutable, hash-linked run journals with exact-head transitions, idempotent command replay, side-effect intent reconciliation, partial-tail quarantine, corrupt-chain blocking, and production-durable `INTERRUPTED` shutdown records (#1).
 - Native launchd/systemd definition validation and installed-package supervision smoke tests for duplicate instances, permissions, status, signals, cleanup, and process reaping.
 - Deterministic package-content tests and credential-free Node.js 22/24 CI baseline.
 - Commit-bound acceptance evidence for the Runtime Contract Protocol/package baseline (#2 and #4).
@@ -33,8 +34,7 @@ All notable changes to this project are documented here. The format follows Keep
 
 ### Known limitations
 
-- Production-durable `INTERRUPTED` journal persistence remains pending issue #1, so issue #28 is not closed by this service foundation.
 - Automatic login-session activation and actual native crash-loop observation remain platform-integration pending; deterministic definitions, syntax lint, exact manager arrays, parsers, doctor checks, and direct supervisor smoke do not replace those gates.
-- Issues #1 (run journals), #29 (project registration/watching), and #30 (structured operational logging) remain incomplete; the current local socket exposes only closed service status.
+- Issues #29 (project registration/watching) and #30 (structured operational logging) remain incomplete; the current local socket exposes only closed service status.
 - Providers, routing, skills, MCP, agent execution, review, and execution evidence capture remain unavailable until later v1 waves.
 - The package is not publishable as `1.0.0` until protected live-provider and agentgateway release gates are implemented and pass.

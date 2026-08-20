@@ -42,6 +42,32 @@ Canonical JSON recursively sorts object keys, preserves array order, normalizes 
 
 Changing a request, event, or order invalidates the chain. Hash integrity proves linkage, not truth, authorization, or acceptance.
 
+### Durable run-journal entries
+
+`run-journal-entry.v1` is the private durable execution-state record. Each
+canonical entry carries contiguous `sequence` and `journal_revision` values,
+the exact `previous_entry_hash`, a monotonic run attempt, previous and next
+state, command/input identities, safe metadata, and an optional side-effect
+intent or completion. The entry hash excludes only `entry_hash`; the first
+previous hash is `sha256:` plus 64 zeroes.
+
+Transitions require the exact expected revision and head hash. A stale head
+fails as `RUNTIME_STATE_STALE`; a state outside the closed transition matrix
+fails as `RUNTIME_STATE_TRANSITION_INVALID`; reusing a command or side-effect
+identity with different canonical input fails as `RUNTIME_OPERATION_CONFLICT`.
+An exact repeated command returns the already published entry and appends no
+bytes. Provider/tool intent is synchronized before the effect, and an
+unresolved intent is returned for reconciliation rather than automatically
+repeated.
+
+Private journals are current-user `0600` JSONL beneath current-user `0700`
+state directories. Startup validates every complete line and the full chain. A
+nonempty unterminated tail is unpublished: it is copied byte-for-byte to a
+private synchronized quarantine artifact before the exact valid prefix is
+restored. Invalid complete content or an interior chain break blocks that run
+without being skipped or truncated and does not invalidate unrelated verified
+runs.
+
 ## 5. Capability handshake and compatibility
 
 Before execution, the consumer obtains `runtime-capabilities.v1` and negotiates the request. It MUST confirm the protocol, request schema, logical model class, every required model capability, every required Superpowers capability, an MCP transport, the exact MCP profile identity, and the required execution topology. Every execution-critical feature state MUST be `available`; `blocked` and `unavailable` fail negotiation.

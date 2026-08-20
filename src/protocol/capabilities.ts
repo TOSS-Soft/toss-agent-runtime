@@ -63,6 +63,7 @@ export function createBaselineCapabilities(platform: {
       "execution-event.v1",
       "execution-result.v1",
       "runtime-capabilities.v1",
+      "run-journal-entry.v1",
       "service-lock.v1",
       "service-control-request.v1",
       "service-control-response.v1",

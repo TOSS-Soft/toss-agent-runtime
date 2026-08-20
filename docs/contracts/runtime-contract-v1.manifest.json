@@ -38,6 +38,11 @@
       "id": "https://toss.software/schemas/runtime/v1/runtime-config.v1.schema.json"
     },
     {
+      "schema_version": "run-journal-entry.v1",
+      "path": "contracts/runtime/run-journal-entry.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/run-journal-entry.v1.schema.json"
+    },
+    {
       "schema_version": "service-lock.v1",
       "path": "contracts/runtime/service-lock.v1.schema.json",
       "id": "https://toss.software/schemas/runtime/v1/service-lock.v1.schema.json"

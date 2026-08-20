@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   createBaselineCapabilities,
+  createRunJournalStore,
   parseExecutionEvent,
   parseExecutionRequest,
   parseExecutionResult,
@@ -66,6 +67,7 @@ describe("published protocol artifacts", () => {
       "runtime-capabilities.v1",
       "runtime-common.v1",
       "runtime-config.v1",
+      "run-journal-entry.v1",
       "service-lock.v1",
       "service-control-request.v1",
       "service-control-response.v1",
@@ -123,8 +125,35 @@ toss-runtime service uninstall [--json]`;
       /Automatic login-session\s+activation and native crash-loop observation remain platform-integration\s+pending/u,
     );
     expect(contract).toMatch(
-      /Production-durable `INTERRUPTED`\s+persistence remains pending issue #1/u,
+      /Production-durable `INTERRUPTED`\s+journal persistence is implemented/u,
     );
-    expect(contract).toContain("issue #28 remains open");
+    expect(contract).toMatch(/Issue #28 remains open/u);
+  });
+
+  it("publishes the durable journal API and removes the issue #1 no-op boundary", async () => {
+    const readme = await readFile("README.md", "utf8");
+    const serviceContract = await readFile("docs/contracts/local-service-control-v1.md", "utf8");
+    const protocolContract = await readFile(
+      "docs/contracts/runtime-contract-protocol-v1.md",
+      "utf8",
+    );
+    const changelog = await readFile("CHANGELOG.md", "utf8");
+
+    expect(createRunJournalStore).toBeTypeOf("function");
+    expect(readme).toContain("append-only run journals");
+    expect(readme).toContain("Active runs are durably recorded as `INTERRUPTED`");
+    expect(readme).not.toContain("Issues #1, #29, and #30");
+    expect(readme).not.toContain("durable run journals are not implemented");
+    expect(serviceContract).toMatch(
+      /Production uses the same private run-journal store as both recovery participant\s+and interruption recorder/u,
+    );
+    expect(serviceContract).not.toContain("Production currently supplies a no-op recorder");
+    expect(serviceContract).not.toContain("persistence remains pending issue #1");
+    expect(protocolContract).toContain("`run-journal-entry.v1`");
+    expect(protocolContract).toContain("RUNTIME_OPERATION_CONFLICT");
+    expect(changelog).toContain("Immutable, hash-linked run journals");
+    expect(changelog).not.toContain(
+      "Production-durable `INTERRUPTED` journal persistence remains pending issue #1",
+    );
   });
 });

@@ -14,6 +14,7 @@ import type {
   RunState,
 } from "../src/journal/types.js";
 import { canonicalJson } from "../src/protocol/json.js";
+import { createBaselineCapabilities } from "../src/protocol/capabilities.js";
 
 const STATES = [
   "CREATED",
@@ -63,6 +64,13 @@ function entry(overrides: Partial<HashableRunJournalEntryV1> = {}): RunJournalEn
 }
 
 describe("run journal entry contract", () => {
+  it("advertises the journal schema in baseline capabilities", () => {
+    expect(
+      createBaselineCapabilities({ os: "darwin", arch: "arm64", node: "22.23.1" })
+        .supported_schemas,
+    ).toContain("run-journal-entry.v1");
+  });
+
   it("accepts an independently hashed closed entry and deep-freezes it", () => {
     const candidate = entry();
 

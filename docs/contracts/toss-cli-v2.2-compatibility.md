@@ -39,6 +39,13 @@ The integration is fail-closed. An unknown protocol major, unknown schema versio
 
 CLI MUST resolve policy precedence before constructing the request. The runtime MUST NOT accept a request field as authority to alter the referenced artifacts or expand filesystem, tool, egress, secret, approval, or acceptance scope.
 
+The runtime persists state in `run-journal-entry.v1` before exposing a new
+revision. CLI resume, retry, approval, cancellation, and reconciliation calls
+must present the exact observed journal revision and entry hash plus a stable
+command identity. Exact duplicate input replays the published entry; changed
+input under the same identity fails closed. CLI must reconcile an unresolved
+side-effect intent and must not request blind provider/tool repetition.
+
 ## Journal consumption mapping
 
 | Runtime event field                 | TOSS CLI v2.2.0 handling                                                                           |

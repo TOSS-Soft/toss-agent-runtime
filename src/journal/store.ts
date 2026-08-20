@@ -1,12 +1,7 @@
 import { canonicalJson } from "../protocol/json.js";
 import { parseRunJournalEntry, ZERO_JOURNAL_HASH } from "./entry.js";
 import { RuntimeJournalError } from "./errors.js";
-import {
-  createJournalFilesystem,
-  type CreateJournalFilesystemOptions,
-  type JournalFileSnapshot,
-  type JournalOperationHooks,
-} from "./filesystem.js";
+import { createJournalFilesystem, type JournalFileSnapshot } from "./filesystem.js";
 import {
   decideRunTransition,
   findUnresolvedSideEffects,
@@ -33,8 +28,6 @@ export interface CreateRunJournalStoreOptions {
   readonly statePath: string;
   readonly now: () => Date;
   readonly randomId: () => string;
-  readonly isCurrentUser?: CreateJournalFilesystemOptions["isCurrentUser"];
-  readonly operationHooks?: JournalOperationHooks;
 }
 
 export interface RunJournalStore {
@@ -180,8 +173,6 @@ export function createRunJournalStore(options: CreateRunJournalStoreOptions): Ru
     statePath: options.statePath,
     now: options.now,
     randomId: options.randomId,
-    ...(options.isCurrentUser === undefined ? {} : { isCurrentUser: options.isCurrentUser }),
-    ...(options.operationHooks === undefined ? {} : { operationHooks: options.operationHooks }),
   });
   const queues = new Map<string, Promise<unknown>>();
   const pending = new Set<Promise<unknown>>();

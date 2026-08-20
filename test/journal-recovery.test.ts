@@ -13,6 +13,7 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
+import { createJournalFilesystem } from "../src/journal/filesystem.js";
 import { createRunJournalStore, type RunJournalStore } from "../src/journal/store.js";
 import type { TransitionCommand } from "../src/journal/state-machine.js";
 import type { JournalHead, RunState } from "../src/journal/types.js";
@@ -132,7 +133,7 @@ describe("run journal recovery", () => {
 
   it("does not report success when journal synchronization fails", async () => {
     const { statePath } = await fixture();
-    const failing = createRunJournalStore({
+    const failing = createJournalFilesystem({
       statePath,
       now: () => new Date("2026-08-20T12:00:00.000Z"),
       randomId: () => "00000000-0000-4000-8000-000000000001",
@@ -141,7 +142,7 @@ describe("run journal recovery", () => {
       },
     });
 
-    await expect(failing.transition(command("run-sync", "CREATED", null))).rejects.toMatchObject({
+    await expect(failing.create("run-sync", Buffer.from("{}\n", "utf8"))).rejects.toMatchObject({
       code: "RUNTIME_JOURNAL_UNAVAILABLE",
     });
   });
