@@ -80,9 +80,15 @@ The supervised process is the only operational-log writer. It appends closed `op
 
 Metadata is built from event-specific allowlists. Secret-tagged values, nested payloads, environment/argument maps, provider or MCP payloads, prompts, and tool output are omitted; sensitive-key scanning provides a second rejection boundary. A synchronization, rotation, retention, `ENOSPC`, or `EDQUOT` failure makes logging sticky-degraded. Required project mutations do not report success unless their operational event is durable, and service status/doctor expose degraded logging health.
 
+## Provider adapters
+
+The public library exposes one closed normalized request/event/completion boundary plus OpenAI, Anthropic, and Gemini adapters. Adapters receive an injected wire transport; they do not resolve credentials or open network connections themselves. Capability preflight rejects unsupported tools, JSON schema, vision, reasoning, streaming, and output limits before any transport call. Streaming and non-streaming provider-native fixtures close through the same canonical completion collector.
+
+Provider wire values are untrusted edge input. Only allowlisted scalar/content fields are projected into `provider-event.v1`; raw SDK objects, headers, endpoints, native error messages, credentials, and response bodies have no public runtime representation. Stable provider failures distinguish authentication, rate limit, timeout, cancellation, refusal, transient unavailability, invalid input, and internal failure. The adapter never retries automatically; authenticated transport, secret resolution, tracing, routing, and fallback remain later governed layers.
+
 `doctor` checks package, platform, Node, configuration, native manager state, restart backoff, and private socket health. A healthy active service with a matching socket identity passes the service check. Missing or stopped service state warns in development and fails in production; backoff, unsafe state, unavailable/degraded control, or identity mismatch fails. See the [Local Service Control v1 contract](docs/contracts/local-service-control-v1.md) for exact native commands, permissions, protocol bounds, stable failures, and shutdown ordering.
 
-`capabilities` remains deliberately fail-closed: an empty or unavailable capability is not an implementation promise. The supervised `serve` process owns the single-instance lock, private local status socket, and private append-only run-journal store. Active runs are durably recorded as `INTERRUPTED` before graceful shutdown removes the socket or lock. Agent execution remains unavailable until its later v1 waves.
+`capabilities` advertises the delivered OpenAI, Anthropic, and Gemini normalized adapter transports while keeping routing, skills, MCP, the agent loop, review, and evidence unavailable. An empty or unavailable capability is not an implementation promise. The supervised `serve` process owns the single-instance lock, private local status socket, and private append-only run-journal store. Active runs are durably recorded as `INTERRUPTED` before graceful shutdown removes the socket or lock. Agent execution remains unavailable until its later v1 waves.
 
 Stable exit codes are `0` success, `2` usage, `3` invalid input, `4` blocked/policy, `5` validation, `6` conflict/stale revision, `69` unavailable capability, and `70` internal failure.
 
@@ -111,7 +117,7 @@ const journal = createRunJournalStore({
 
 The public parser returns either a validated, deeply frozen domain value or a normalized failure. Input is bounded JSON; duplicate keys, unknown properties, unsupported schema versions, and unsafe JavaScript values are rejected.
 
-The same top-level API exports the closed project manifest, registry-entry, and candidate-intent parsers plus safe registry/intake interface types. Filesystem constructors and operation hooks remain internal to the supervised process.
+The same top-level API exports the closed project manifest, registry-entry, candidate-intent, and provider-event parsers; safe registry/intake interface types; provider-neutral request/event/completion types; and the three adapter factories. Filesystem constructors, native SDK handles, wire clients, and operation hooks remain outside canonical runtime values.
 
 ## Contracts and examples
 

@@ -182,7 +182,7 @@ describe("baseline CLI", () => {
       id: "execution-capabilities",
       status: "WARN",
       message:
-        "Execution providers, skills, MCP, and orchestration are not installed in the baseline wave",
+        "Execution routing, skills, MCP, and orchestration are not installed in the baseline wave",
     });
   });
 
@@ -604,7 +604,7 @@ describe("baseline CLI", () => {
         id: "execution-capabilities",
         status: "FAIL",
         message:
-          "Execution providers, skills, MCP, and orchestration are not installed in the baseline wave",
+          "Execution routing, skills, MCP, and orchestration are not installed in the baseline wave",
       });
     } finally {
       vi.unstubAllEnvs();

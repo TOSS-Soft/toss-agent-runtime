@@ -1,0 +1,28 @@
+[
+  {
+    "modelVersion": "gemini-2.5-pro",
+    "candidates": [{ "content": { "role": "model", "parts": [{ "text": "Hello" }] } }]
+  },
+  {
+    "modelVersion": "gemini-2.5-pro",
+    "candidates": [
+      {
+        "finishReason": "STOP",
+        "safetyRatings": [{ "category": "HARM_CATEGORY_HARASSMENT", "probability": "NEGLIGIBLE" }],
+        "content": {
+          "role": "model",
+          "parts": [
+            { "text": "think", "thought": true },
+            { "functionCall": { "name": "lookup", "args": { "q": "docs" } } }
+          ]
+        }
+      }
+    ],
+    "usageMetadata": {
+      "promptTokenCount": 10,
+      "candidatesTokenCount": 5,
+      "cachedContentTokenCount": 2,
+      "thoughtsTokenCount": 1
+    }
+  }
+]

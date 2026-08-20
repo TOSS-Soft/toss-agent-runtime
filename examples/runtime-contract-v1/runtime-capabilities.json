@@ -23,6 +23,7 @@
     "execution-event.v1",
     "execution-result.v1",
     "operational-event.v1",
+    "provider-event.v1",
     "project-registry-entry.v1",
     "project-watch-manifest.v1",
     "runtime-capabilities.v1",
@@ -31,7 +32,7 @@
     "service-control-request.v1",
     "service-control-response.v1"
   ],
-  "provider_transports": [],
+  "provider_transports": ["openai", "anthropic", "gemini"],
   "model_classes": [],
   "skill_host_versions": [],
   "superpowers_capabilities": [],
@@ -39,7 +40,7 @@
   "mcp_profiles": [],
   "execution_topologies": [],
   "features": {
-    "providers": "unavailable",
+    "providers": "available",
     "routing": "unavailable",
     "skills": "unavailable",
     "mcp": "unavailable",
