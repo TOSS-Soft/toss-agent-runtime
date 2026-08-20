@@ -59,3 +59,17 @@ export interface ProjectRegistration {
   readonly manifest_hash: `sha256:${string}`;
   readonly state: ProjectRegistryState;
 }
+
+export interface ProjectPendingWindowV1 {
+  readonly protocol_version: "runtime-contract.v1";
+  readonly schema_version: "project-pending-window.v1";
+  readonly document_type: "project-pending-window";
+  readonly project_id: string;
+  readonly registry_revision: number;
+  readonly canonical_root: string;
+  readonly manifest_hash: `sha256:${string}`;
+  readonly opened_at: string;
+  readonly updated_at: string;
+  readonly deadline_at: string;
+  readonly changes: readonly ProjectChange[];
+}
