@@ -219,7 +219,35 @@ Operational events use the closed `operational-event.v1` envelope with a canonic
 
 OpenAI, Anthropic, and Gemini adapters accept the same bounded provider-neutral request and expose the same event stream and canonical completion. Capability preflight occurs before the injected wire transport and covers tools, JSON schema, vision, reasoning, streaming, and output limits. The completion collector rejects identity/sequence changes, missing or duplicate terminals, post-terminal events, malformed tool arguments, and inconsistent stable errors. Streaming and non-streaming paths MUST close to the same completion semantics.
 
-The adapter boundary performs no automatic retry and owns no credential lookup. Authentication, rate limit, timeout, cancellation, refusal, transient unavailability, invalid input, and internal failure are distinct stable codes with fixed retryability. Native SDK objects, headers, endpoints, error messages, credentials, stacks, and unrestricted response objects MUST NOT enter provider events, journals, results, operational logs, or evidence. Authenticated agentgateway transport/tracing and routing/fallback remain separate governed layers.
+The adapter boundary performs no automatic retry and owns no credential lookup. Authentication, rate limit, timeout, cancellation, refusal, transient unavailability, invalid input, and internal failure are distinct stable codes with fixed retryability. Native SDK objects, headers, endpoints, error messages, credentials, stacks, and unrestricted response objects MUST NOT enter provider events, journals, results, operational logs, or evidence. Authenticated agentgateway transport is the separate governed transport layer; routing policy and fallback remain later boundaries.
+
+### Authenticated agentgateway transport
+
+Production configuration MUST select exactly one named HTTPS profile whose protocol is `toss-agentgateway.v1`, MUST resolve that profile through one named command-backed secret reference, and MUST NOT configure direct provider profiles. Development MAY use exact loopback HTTP. The endpoint is a base URL for only `/healthz`, `/v1/toss/capabilities`, and `/v1/responses`. Redirect following is disabled; a redirect, origin change, unsafe endpoint, or unexpected response URL fails closed.
+
+Credential resolution returns a short-lived virtual Bearer lease. A lease is reused only while at least 30 seconds remain. Token values, raw provider credentials, resolver diagnostics, headers, bodies, and credential-cache state MUST NOT enter configuration output, public API values, provider events, journals, logs, errors, observations, or evidence.
+
+Each provider operation obtains a fresh, bounded `agentgateway-capabilities.v1` document, verifies its canonical hash and lifetime, and requires at least one alias route to satisfy tools, JSON Schema, vision, reasoning, streaming, and output-token requirements. The Responses request sends only `Authorization`, `Content-Type`, `Accept`, `traceparent`, optional `tracestate`, `x-toss-run-id`, `x-toss-request-id`, `x-toss-capability-revision`, `x-toss-capability-document-sha256`, and `x-toss-requirement-sha256`. Callers cannot add headers.
+
+Every successful response MUST attest one known route through the allowlisted `x-toss-route-id`, `x-toss-resolved-provider`, `x-toss-resolved-model`, capability revision/hash, requirement hash, and optional gateway request ID fields. The attested route MUST satisfy the original requirement and MUST match the fresh capability document. Unknown, missing, duplicated, mutated, or weaker attestations fail with `RUNTIME_PROVIDER_CAPABILITY_DOWNGRADE` or `RUNTIME_PROVIDER_GATEWAY_INVALID`; they never reach provider normalization.
+
+JSON and SSE responses are bounded to 8 MiB total. SSE additionally permits at most 1 MiB per event and 10,000 events, requires fatal UTF-8 decoding and one terminal event, and rejects trailing data. Cancellation, timeout, consumer termination, malformed content, and overflow close the native response body. The transport never retries automatically.
+
+Body observability is `off` by default. `redacted-metadata` permits only a frozen structural observation containing run/request IDs, route ID, streaming flag, encoded byte totals, message/content/tool counts, status class, and monotonic duration. It MUST NOT contain request/response content, tokens, headers, endpoints, provider diagnostics, or raw status text. Observation callback failure does not alter the provider result.
+
+| Stable code                             | Meaning                                      | Retryable |
+| --------------------------------------- | -------------------------------------------- | --------- |
+| `RUNTIME_PROVIDER_AUTHENTICATION`       | Credential or gateway authentication failed  | no        |
+| `RUNTIME_PROVIDER_ROUTE_NOT_FOUND`      | The requested alias has no route             | no        |
+| `RUNTIME_PROVIDER_RATE_LIMIT`           | The gateway returned rate limiting           | yes       |
+| `RUNTIME_PROVIDER_TIMEOUT`              | The provider operation timed out             | yes       |
+| `RUNTIME_PROVIDER_CANCELLED`            | The operation was cancelled                  | no        |
+| `RUNTIME_PROVIDER_GATEWAY_UNAVAILABLE`  | The gateway or transport is unavailable      | yes       |
+| `RUNTIME_PROVIDER_TRANSIENT`            | The upstream provider is transiently down    | yes       |
+| `RUNTIME_PROVIDER_CAPABILITY_DOWNGRADE` | The selected route is weaker than required   | no        |
+| `RUNTIME_PROVIDER_GATEWAY_INVALID`      | The gateway response failed integrity checks | no        |
+
+Catalog caching and routing/fallback policy belong to issue #6, tool propagation to issue #9, final release evidence to issue #12, and protected live-provider/agentgateway smoke to issue #15. Ordinary credential-free CI MUST NOT claim the protected live gate.
 
 ## 11. Stable failures
 

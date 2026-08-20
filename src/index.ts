@@ -69,14 +69,27 @@ export {
   type FragmentName,
   type ProtocolValidator,
 } from "./protocol/validator.js";
-export { createAgentgatewayTransport, hashProviderRouteRequirement } from "./gateway/index.js";
+export {
+  createAgentgatewayTransport,
+  hashAgentgatewayCapabilities,
+  hashProviderRouteRequirement,
+  parseAgentgatewayCapabilities,
+  parseAgentgatewayHealth,
+} from "./gateway/index.js";
 export type {
+  AgentgatewayBodyObservability,
   AgentgatewayCapabilitiesV1,
+  AgentgatewayCapabilitiesValidationResult,
   AgentgatewayClientHealth,
+  AgentgatewayHealth,
+  AgentgatewayHealthValidationResult,
   AgentgatewayProfileV1,
   AgentgatewayRouteV1,
   GatewayCredentialLease,
   GatewayCredentialProvider,
+  GatewayObservation,
+  GatewayObservationStatusClass,
+  ParseAgentgatewayCapabilitiesOptions,
 } from "./gateway/index.js";
 export {
   createRunJournalStore,

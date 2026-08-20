@@ -10,8 +10,16 @@ logs:
   level: info
   retention_days: 7
   max_bytes: 104857600
-gateway_profile: null
-gateway_profiles: {}
+gateway_profile: gateway-development
+gateway_profiles:
+  gateway-development:
+    protocol: toss-agentgateway.v1
+    endpoint: http://127.0.0.1:8080
+    credential_reference: gateway-development-token
+    body_observability: off
 provider_profiles: []
 mcp_profiles: []
-secret_references: {}
+secret_references:
+  gateway-development-token:
+    source: env
+    key: TOSS_AGENTGATEWAY_TOKEN

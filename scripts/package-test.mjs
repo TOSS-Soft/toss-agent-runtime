@@ -124,6 +124,13 @@ const ALLOWED_PATHS = Object.freeze([
   /^examples\/runtime-contract-v1\/[a-z0-9._-]+\.json$/,
 ]);
 
+const SAFE_SECRET_SHAPED_CODE_PATHS = new Set([
+  "dist/src/gateway/credentials.d.ts",
+  "dist/src/gateway/credentials.d.ts.map",
+  "dist/src/gateway/credentials.js",
+  "dist/src/gateway/credentials.js.map",
+]);
+
 function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
@@ -203,9 +210,10 @@ function assertPackageFiles(files) {
       `Credential-shaped file leaked: ${publishedPath}`,
     );
     assert(
-      !/(?:^|\/)[^/]*(?:credential|password|private[-_.]?key|token)[^/]*(?:\/|$)/i.test(
-        publishedPath,
-      ),
+      SAFE_SECRET_SHAPED_CODE_PATHS.has(publishedPath) ||
+        !/(?:^|\/)[^/]*(?:credential|password|private[-_.]?key|token)[^/]*(?:\/|$)/i.test(
+          publishedPath,
+        ),
       `Secret-shaped file name leaked: ${publishedPath}`,
     );
     assert(
@@ -816,7 +824,7 @@ try {
     [
       "--input-type=module",
       "--eval",
-      'import * as api from "@toss-software/agent-runtime"; const required = ["parseExecutionRequest", "validateExecutionChain", "parseCandidateJobIntent", "parseProjectRegistryEntry", "parseProjectWatchManifest", "RuntimeProjectError"]; const forbidden = ["createProjectRegistry", "createProjectIntake", "createProjectWatcher"]; if (required.some((name) => typeof api[name] !== "function") || forbidden.some((name) => name in api)) process.exit(1);',
+      'import * as api from "@toss-software/agent-runtime"; const required = ["parseExecutionRequest", "validateExecutionChain", "parseCandidateJobIntent", "parseProjectRegistryEntry", "parseProjectWatchManifest", "RuntimeProjectError", "createAgentgatewayTransport", "parseAgentgatewayCapabilities", "hashAgentgatewayCapabilities"]; const forbidden = ["createProjectRegistry", "createProjectIntake", "createProjectWatcher", "createAgentgatewayClient", "createGatewayCredentialCoordinator", "parseAgentgatewayAttestation", "parseBoundedSse", "readBoundedAgentgatewayResponse", "startFakeAgentgateway"]; if (required.some((name) => typeof api[name] !== "function") || forbidden.some((name) => name in api)) process.exit(1);',
     ],
     { cwd: temporaryDirectory, encoding: "utf8" },
   );
@@ -927,6 +935,7 @@ try {
         shutdown_timeout_ms: 5_000,
         logs: { level: "info", retention_days: 7, max_bytes: 104_857_600 },
         gateway_profile: null,
+        gateway_profiles: {},
         provider_profiles: [],
         mcp_profiles: [],
         secret_references: {},

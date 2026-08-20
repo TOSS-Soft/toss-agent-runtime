@@ -7,9 +7,20 @@ import { requireModelRouter } from "../src/routing/index.js";
 import { requireSecurityRuntime } from "../src/security/index.js";
 import { requireSkillsHost } from "../src/skills/index.js";
 import { requireToolBroker } from "../src/tools/index.js";
+import {
+  createAgentgatewayTransport,
+  hashAgentgatewayCapabilities,
+  parseAgentgatewayCapabilities,
+} from "../src/index.js";
 import { UnavailableCapabilityError } from "../src/version.js";
 
 describe("future subsystem boundaries", () => {
+  it("treats the authenticated agentgateway transport as delivered", () => {
+    expect(createAgentgatewayTransport).toBeTypeOf("function");
+    expect(parseAgentgatewayCapabilities).toBeTypeOf("function");
+    expect(hashAgentgatewayCapabilities).toBeTypeOf("function");
+  });
+
   it.each([
     ["routing", requireModelRouter],
     ["agents", requireAgentRegistry],

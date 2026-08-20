@@ -202,4 +202,43 @@ toss-runtime service uninstall [--json]`;
     expect(protocolContract).toMatch(/does not authorize\s+execution/u);
     expect(changelog).toContain("Explicit project registry");
   });
+
+  it("publishes the authenticated agentgateway contract and package boundary", async () => {
+    const readme = await readFile("README.md", "utf8");
+    const protocolContract = await readFile(
+      "docs/contracts/runtime-contract-protocol-v1.md",
+      "utf8",
+    );
+    const changelog = await readFile("CHANGELOG.md", "utf8");
+    const developmentConfig = await readFile("examples/config/runtime.development.yaml", "utf8");
+    const providerEvent = parseProviderEvent(await readExample("provider-event"));
+    const expectedPackagedFiles = JSON.parse(
+      await readFile("scripts/package-files.json", "utf8"),
+    ) as readonly string[];
+
+    expect(readme).toContain("## Authenticated agentgateway transport");
+    expect(readme).toContain("production mode is gateway-only");
+    expect(readme).toContain("`/healthz`");
+    expect(readme).toContain("`/v1/toss/capabilities`");
+    expect(readme).toContain("`/v1/responses`");
+    expect(readme).toContain("never retries automatically");
+    expect(readme).toContain("Protected live-provider and agentgateway smoke remains issue #15");
+    expect(protocolContract).toContain("### Authenticated agentgateway transport");
+    expect(protocolContract).toContain("x-toss-capability-document-sha256");
+    expect(protocolContract).toContain("RUNTIME_PROVIDER_CAPABILITY_DOWNGRADE");
+    expect(protocolContract).toContain("redacted-metadata");
+    expect(changelog).toContain("Authenticated agentgateway transport");
+    expect(changelog).not.toContain("live authenticated provider transport");
+    expect(developmentConfig).toContain("protocol: toss-agentgateway.v1");
+    expect(developmentConfig).toContain("source: env");
+    expect(providerEvent.ok).toBe(true);
+    if (providerEvent.ok) {
+      expect(providerEvent.value.data).toHaveProperty("route_identity");
+    }
+    expect(expectedPackagedFiles).toContain(
+      "contracts/runtime/agentgateway-capabilities.v1.schema.json",
+    );
+    expect(expectedPackagedFiles).toContain("dist/src/gateway/transport.js");
+    expect(expectedPackagedFiles).not.toContain("test/helpers/fake-agentgateway.js");
+  });
 });
