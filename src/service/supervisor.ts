@@ -3,6 +3,7 @@ import { lstat, mkdir } from "node:fs/promises";
 import path from "node:path";
 
 import type { LoadedConfig } from "../config/types.js";
+import type { OperationalEventInput } from "../logging/types.js";
 import type { SignalSource } from "../platform/signals.js";
 import { PACKAGE_VERSION } from "../version.js";
 import type { ServiceStatusV1 } from "./contracts.js";
@@ -31,6 +32,11 @@ export interface InterruptionRecorder {
   interruptActive(signal: AbortSignal): Promise<void>;
 }
 
+export interface SupervisorOperationalLogger extends RecoveryParticipant {
+  write(input: OperationalEventInput): Promise<unknown>;
+  isDegraded(): boolean;
+}
+
 export interface SupervisorOutcome extends ServiceOutcome {
   readonly serviceInstanceId: string;
 }
@@ -51,6 +57,7 @@ export interface RunSupervisorOptions {
   readonly socketProbe: SocketIdentityProbe;
   readonly recoveryParticipants: readonly RecoveryParticipant[];
   readonly interruptionRecorder: InterruptionRecorder;
+  readonly operationalLogger?: SupervisorOperationalLogger;
   readonly onReady: () => void;
   readonly acquireLock?: (options: AcquireInstanceLockOptions) => Promise<InstanceLock>;
   readonly createControlServer?: (
@@ -253,6 +260,21 @@ export async function runSupervisor(options: RunSupervisorOptions): Promise<Supe
     finalizerError = firstError(finalizerError, safeError(error));
   };
 
+  const logLifecycle = async (
+    event: "service.recovery-complete" | "service.ready" | "service.stopping",
+    level: "info" | "warn" = "info",
+  ): Promise<void> => {
+    if (options.operationalLogger === undefined || lock === undefined) return;
+    await options.operationalLogger.write({
+      level,
+      component: "supervisor",
+      event,
+      correlationId: lock.owner.service_instance_id,
+      metadata: { status: event.slice("service.".length) },
+      allowedMetadataKeys: ["status"],
+    });
+  };
+
   const finalizeOwnedResources = (): Promise<void> => {
     finalizationPromise ??= (async () => {
       try {
@@ -298,17 +320,26 @@ export async function runSupervisor(options: RunSupervisorOptions): Promise<Supe
           socketProbe: options.socketProbe,
         });
 
+        if (options.operationalLogger !== undefined) {
+          await options.operationalLogger.recover();
+          recoveredParticipants.push(options.operationalLogger);
+        }
+
         for (const participant of options.recoveryParticipants) {
           await participant.recover();
           recoveredParticipants.push(participant);
         }
+        await logLifecycle("service.recovery-complete");
 
         const status = (): ServiceStatusV1 => ({
           package_version: PACKAGE_VERSION,
           service_instance_id: lock!.owner.service_instance_id,
           pid: options.pid,
           started_at: lock!.owner.created_at,
-          health,
+          health:
+            health === "stopping" || options.operationalLogger?.isDegraded() !== true
+              ? health
+              : "degraded",
           accepting,
         });
         server = (options.createControlServer ?? createServiceControlServer)({
@@ -320,6 +351,7 @@ export async function runSupervisor(options: RunSupervisorOptions): Promise<Supe
           cacheSize: 256,
         });
         await server.listen();
+        await logLifecycle("service.ready");
         accepting = true;
 
         outcome = await runService({
@@ -365,6 +397,22 @@ export async function runSupervisor(options: RunSupervisorOptions): Promise<Supe
                   options.interruptionRecorder.interruptActive(signal),
                 );
                 if (interruption.error !== undefined) capture(interruption.error);
+              }
+
+              if (!signal.aborted && options.operationalLogger !== undefined) {
+                const logging = await runParticipantStage(signal, () =>
+                  logLifecycle("service.stopping"),
+                );
+                if (logging.error !== undefined) capture(logging.error);
+                try {
+                  options.operationalLogger.stopIntake();
+                } catch (error) {
+                  capture(error);
+                }
+                const flushed = await runParticipantStage(signal, () =>
+                  options.operationalLogger!.flush(signal),
+                );
+                if (flushed.error !== undefined) capture(flushed.error);
               }
             } finally {
               await finalizeOwnedResources();

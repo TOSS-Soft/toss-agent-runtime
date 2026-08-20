@@ -1,8 +1,8 @@
 # TOSS Agent Runtime
 
-`@toss-software/agent-runtime` is the governed, provider-neutral execution runtime for TOSS. This development baseline publishes Runtime Contract Protocol v1, strict configuration loading, a truthful capability handshake, immutable append-only run journals, and the explicit per-user `toss-runtime` service-supervision foundation.
+`@toss-software/agent-runtime` is the governed, provider-neutral execution runtime for TOSS. This development baseline publishes Runtime Contract Protocol v1, strict configuration loading, a truthful capability handshake, immutable append-only run journals, private structured operational logs, and the explicit per-user `toss-runtime` service-supervision foundation.
 
-> Status: the package remains `0.0.0-development` until all v1 release waves and protected live-provider gates pass. Immutable run-journal persistence and explicit project intake are implemented; issue #28 still requires its separate real macOS login/native crash-loop acceptance. Issue #30 and npm `1.0.0` remain incomplete. This baseline does not execute agents, call providers, run tools, or expose remote control.
+> Status: the package remains `0.0.0-development` until all v1 release waves and protected live-provider gates pass. Immutable run-journal persistence, explicit project intake, and structured operational logging are implemented; issue #28 still requires its separate real macOS login/native crash-loop acceptance. npm `1.0.0` remains incomplete. This baseline does not execute agents, call providers, run tools, or expose remote control.
 
 ## Requirements
 
@@ -44,6 +44,8 @@ toss-runtime service uninstall [--json]
 toss-runtime project register <absolute-root> [--json]
 toss-runtime project unregister <project-id> [--json]
 toss-runtime project list [--json]
+toss-runtime logs [--level <debug|info|warn|error>] [--project <id>] [--run <id>] [--json]
+toss-runtime logs --follow [--level <debug|info|warn|error>] [--project <id>] [--run <id>]
 ```
 
 Only `service install` accepts `--config`. It validates or materializes a private configuration, writes the current user's native service definition, and enables automatic startup at login. It does not start the service in the current session; run `toss-runtime service start` for that explicit activation. `service status` is read-only and returns success with `installed: false` when no compatible definition exists. `service stop` and `service uninstall` are idempotent when absent, while absent `start` or `restart` returns unavailable.
@@ -69,6 +71,14 @@ ignore_paths:
 Native changes are normalized and coalesced after 200 ms, with a hard 2 second maximum for a continuous burst. The pending window is synchronized before its timer is armed; after restart it is either completed exactly once or rejected safely. Duplicate normalized change sets append no second record. A missing, moved, or replaced root becomes `BLOCKED_PROJECT_UNAVAILABLE`; the runtime never guesses a replacement root.
 
 The watcher emits only a durable `candidate-job-intent.v1` candidate job intent. A candidate does not authorize execution, approve policy, select a provider, invoke a tool, mutate authoritative project artifacts, or satisfy acceptance. Those governance gates remain owned by the TOSS control plane.
+
+## Operational logs
+
+The supervised process is the only operational-log writer. It appends closed `operational-event.v1` JSON lines under the configured private log root, assigns one service-local sequence, synchronizes each accepted line, rotates before the 100 MiB or UTC-day boundary, and retains only recognized closed operational logs for seven days and a 100 MiB aggregate budget. Run journals and release evidence are separate immutable artifacts and are never retention targets.
+
+`logs --json` returns one deterministic command result. Human and JSON views contain the same event IDs; `--level` is a minimum severity and `--project`/`--run` are exact canonical UUID filters. `--follow` is human-only and follows an active-file rotation without duplicating the hard-linked event. A partial final line is ignored and reported until startup recovery truncates it; invalid interior content fails closed.
+
+Metadata is built from event-specific allowlists. Secret-tagged values, nested payloads, environment/argument maps, provider or MCP payloads, prompts, and tool output are omitted; sensitive-key scanning provides a second rejection boundary. A synchronization, rotation, retention, `ENOSPC`, or `EDQUOT` failure makes logging sticky-degraded. Required project mutations do not report success unless their operational event is durable, and service status/doctor expose degraded logging health.
 
 `doctor` checks package, platform, Node, configuration, native manager state, restart backoff, and private socket health. A healthy active service with a matching socket identity passes the service check. Missing or stopped service state warns in development and fails in production; backoff, unsafe state, unavailable/degraded control, or identity mismatch fails. See the [Local Service Control v1 contract](docs/contracts/local-service-control-v1.md) for exact native commands, permissions, protocol bounds, stable failures, and shutdown ordering.
 

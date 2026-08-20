@@ -11,6 +11,15 @@ import {
 } from "../config/load.js";
 import type { LoadedConfig, RuntimeEnvironment } from "../config/types.js";
 import { createRunJournalStore } from "../journal/store.js";
+import { RuntimeLoggingError } from "../logging/errors.js";
+import {
+  createOperationalLogReader,
+  renderOperationalEventHuman,
+  type OperationalLogFilter,
+  type OperationalLogReadResult,
+} from "../logging/reader.js";
+import type { OperationalEventV1 } from "../logging/types.js";
+import { createOperationalLogStore } from "../logging/store.js";
 import type { SignalSource } from "../platform/signals.js";
 import { createBaselineCapabilities } from "../protocol/capabilities.js";
 import { canonicalJson, type JsonValue } from "../protocol/json.js";
@@ -64,6 +73,8 @@ Commands:
   toss-runtime project register <absolute-root> [--json]
   toss-runtime project unregister <project-id> [--json]
   toss-runtime project list [--json]
+  toss-runtime logs [--level <debug|info|warn|error>] [--project <id>] [--run <id>] [--json]
+  toss-runtime logs --follow [--level <debug|info|warn|error>] [--project <id>] [--run <id>]
   toss-runtime --version
 `;
 
@@ -91,12 +102,19 @@ export interface CliServices {
   readonly requestProjectOperation?: (
     operation: ProjectControlOperation,
   ) => Promise<ServiceProjectDataV1>;
+  readonly readOperationalLogs?: (
+    filter: OperationalLogFilter,
+  ) => Promise<OperationalLogReadResult>;
+  readonly followOperationalLogs?: (
+    filter: OperationalLogFilter,
+  ) => Promise<AsyncIterable<OperationalEventV1>>;
 }
 
 export interface CliOutput {
   readonly exitCode: ExitCode;
   readonly stdout: string;
   readonly stderr: string;
+  readonly stdoutStream?: AsyncIterable<string>;
 }
 
 export interface ExecutableHashOptions {
@@ -229,6 +247,21 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
     return loaded.config.paths.socket;
   };
 
+  const operationalLogReader = async () => {
+    const configPath = await installedServiceConfigPath();
+    const loaded = await loadConfigured(configPath);
+    const status = await (options.requestServiceStatus ?? requestRuntimeServiceStatus)({
+      socketPath: loaded.config.paths.socket,
+    });
+    const identity = await (options.probeServiceIdentity ?? probeRuntimeServiceIdentity)({
+      socketPath: loaded.config.paths.socket,
+    });
+    if (!status.accepting || identity !== status.service_instance_id) {
+      throw new RuntimeServiceError("RUNTIME_SERVICE_UNAVAILABLE");
+    }
+    return createOperationalLogReader({ logsPath: loaded.config.paths.logs });
+  };
+
   return {
     platform: options.platform,
     loadConfig: ({ explicitPath }) => loadConfigured(explicitPath),
@@ -262,12 +295,37 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
         socketPath: await serviceSocketPath(),
         operation,
       }),
+    readOperationalLogs: async (filter) => (await operationalLogReader()).read(filter),
+    followOperationalLogs: async (filter) => {
+      const reader = await operationalLogReader();
+      return (async function* () {
+        const controller = new AbortController();
+        const unsubscribe: (() => void)[] = [];
+        try {
+          unsubscribe.push(options.signals.subscribe("SIGINT", () => controller.abort()));
+          unsubscribe.push(options.signals.subscribe("SIGTERM", () => controller.abort()));
+          yield* reader.follow(filter, controller.signal);
+        } finally {
+          for (const remove of unsubscribe) remove();
+        }
+      })();
+    },
     serve: async ({ configPath }) => {
       if (!isSupportedPlatform(options.platform)) {
         throw new RuntimeServiceError("RUNTIME_SERVICE_UNAVAILABLE");
       }
       const loaded = await loadConfigured(configPath);
       const executableHash = await options.resolveExecutableHash();
+      const serviceInstanceId = options.createServiceInstanceId();
+      const logStore = createOperationalLogStore({
+        logsPath: loaded.config.paths.logs,
+        serviceInstanceId,
+        now: options.now,
+        randomId: randomUUID,
+        maxBytes: loaded.config.logs.max_bytes,
+        retentionMaxBytes: loaded.config.logs.max_bytes,
+        retentionDays: loaded.config.logs.retention_days,
+      });
       const journal = createRunJournalStore({
         statePath: loaded.config.paths.state,
         now: options.now,
@@ -293,7 +351,7 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
         signals: options.signals,
         pid: options.pid,
         now: options.now,
-        createServiceInstanceId: options.createServiceInstanceId,
+        createServiceInstanceId: () => serviceInstanceId,
         executableHash,
         processProbe: { liveness: processLiveness },
         socketProbe: {
@@ -301,21 +359,51 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
         },
         recoveryParticipants: [journal, projects],
         interruptionRecorder: journal,
+        operationalLogger: logStore,
         acquireLock: acquireInstanceLock,
         createControlServer: (serverOptions) =>
           createServiceControlServer({
             ...serverOptions,
             handleProjectRequest: async (request) => {
               if (request.command === "project-register") {
+                const registration = await projects.register(request.root, request.operation_id);
+                await logStore.write({
+                  level: "info",
+                  component: "project-registry",
+                  event: "project.registered",
+                  correlationId: request.request_id,
+                  projectId: registration.project_id,
+                  metadata: {
+                    registry_revision: registration.registry_revision,
+                    status: registration.state,
+                  },
+                  allowedMetadataKeys: ["registry_revision", "status"],
+                });
                 return {
                   kind: "project-registration",
-                  registration: await projects.register(request.root, request.operation_id),
+                  registration,
                 };
               }
               if (request.command === "project-unregister") {
+                const registration = await projects.unregister(
+                  request.project_id,
+                  request.operation_id,
+                );
+                await logStore.write({
+                  level: "info",
+                  component: "project-registry",
+                  event: "project.unregistered",
+                  correlationId: request.request_id,
+                  projectId: registration.project_id,
+                  metadata: {
+                    registry_revision: registration.registry_revision,
+                    status: registration.state,
+                  },
+                  allowedMetadataKeys: ["registry_revision", "status"],
+                });
                 return {
                   kind: "project-registration",
-                  registration: await projects.unregister(request.project_id, request.operation_id),
+                  registration,
                 };
               }
               return { kind: "project-list", registrations: await projects.list() };
@@ -517,6 +605,86 @@ function projectFailure(commandName: string, json: boolean, error: unknown): Cli
     json,
     "",
   );
+}
+
+function loggingFailure(json: boolean, error: unknown): CliOutput {
+  if (error instanceof RuntimeConfigError || error instanceof RuntimeServiceError) {
+    return serviceFailure("logs", json, error);
+  }
+  if (error instanceof RuntimeLoggingError) {
+    const exitCode =
+      error.code === "RUNTIME_LOGGING_INVALID"
+        ? 3
+        : error.code === "RUNTIME_LOGGING_DEGRADED"
+          ? 69
+          : 5;
+    return outputForResult(
+      commandResult({
+        command: "logs",
+        exitCode,
+        error: {
+          code: error.code,
+          category: error.category,
+          retryable: error.retryable,
+          safe_message: error.safe_message,
+        },
+      }),
+      json,
+      "",
+    );
+  }
+  return outputForResult(
+    commandResult({
+      command: "logs",
+      exitCode: 70,
+      error: runtimeError("RUNTIME_LOGGING_FAILED", "internal", "Operational log command failed"),
+    }),
+    json,
+    "",
+  );
+}
+
+async function logs(
+  command: Extract<BaselineCommand, { name: "logs" }>,
+  services: CliServices,
+): Promise<CliOutput> {
+  const filter: OperationalLogFilter = {
+    ...(command.level === undefined ? {} : { level: command.level }),
+    ...(command.projectId === undefined ? {} : { projectId: command.projectId }),
+    ...(command.runId === undefined ? {} : { runId: command.runId }),
+  };
+  try {
+    if (command.follow) {
+      if (services.followOperationalLogs === undefined) {
+        throw new RuntimeLoggingError("RUNTIME_LOGGING_DEGRADED");
+      }
+      const source = await services.followOperationalLogs(filter);
+      return {
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        stdoutStream: (async function* () {
+          for await (const event of source) yield `${renderOperationalEventHuman(event)}\n`;
+        })(),
+      };
+    }
+    if (services.readOperationalLogs === undefined) {
+      throw new RuntimeLoggingError("RUNTIME_LOGGING_DEGRADED");
+    }
+    const result = await services.readOperationalLogs(filter);
+    const document = commandResult({
+      command: "logs",
+      exitCode: 0,
+      data: jsonValue({ events: result.events, partial_tail_bytes: result.partialTailBytes }),
+    });
+    const lines = result.events.map(renderOperationalEventHuman);
+    if (result.partialTailBytes > 0) {
+      lines.push(`WARN logger logging.partial-tail pending_bytes=${result.partialTailBytes}`);
+    }
+    return outputForResult(document, command.json, lines.join("\n"));
+  } catch (error) {
+    return loggingFailure(command.json, error);
+  }
 }
 
 async function project(
@@ -881,6 +1049,7 @@ export async function runCli(argv: readonly string[], services: CliServices): Pr
   if (command.name === "doctor") return doctor(command, services);
   if (command.name === "service") return service(command, services);
   if (command.name === "project") return project(command, services);
+  if (command.name === "logs") return logs(command, services);
   return serve(command, services);
 }
 
@@ -923,7 +1092,16 @@ export async function main(argv: readonly string[]): Promise<number> {
       "",
     );
   }
+  let exitCode = output.exitCode;
   if (output.stdout.length > 0) process.stdout.write(output.stdout);
   if (output.stderr.length > 0) process.stderr.write(output.stderr);
-  return output.exitCode;
+  if (output.stdoutStream !== undefined) {
+    try {
+      for await (const line of output.stdoutStream) process.stdout.write(line);
+    } catch {
+      process.stderr.write("Operational logging is degraded\n");
+      exitCode = 69;
+    }
+  }
+  return exitCode;
 }

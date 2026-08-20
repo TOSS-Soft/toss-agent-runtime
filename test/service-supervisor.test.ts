@@ -14,6 +14,7 @@ import {
   type InterruptionRecorder,
   type RecoveryParticipant,
   type RunSupervisorOptions,
+  type SupervisorOperationalLogger,
 } from "../src/service/supervisor.js";
 import { FakeSignals } from "./support/fake-signals.js";
 
@@ -188,6 +189,103 @@ afterEach(async () => {
 });
 
 describe("runtime service supervisor", () => {
+  it("durably logs recovery, readiness, and shutdown before acknowledging each boundary", async () => {
+    const events: string[] = [];
+    let degraded = false;
+    let status: (() => ServiceStatusV1) | undefined;
+    const logger: SupervisorOperationalLogger = {
+      recover: () => {
+        events.push("logger-recover");
+        return Promise.resolve();
+      },
+      write: (input) => {
+        events.push(`log-${input.event}`);
+        return Promise.resolve();
+      },
+      stopIntake: () => events.push("logger-stop"),
+      flush: () => {
+        events.push("logger-flush");
+        return Promise.resolve();
+      },
+      isDegraded: () => degraded,
+    };
+    const running = runSupervisor(
+      options({
+        operationalLogger: logger,
+        recoveryParticipants: [
+          {
+            recover: () => {
+              events.push("project-recover");
+              return Promise.resolve();
+            },
+            stopIntake: () => events.push("project-stop"),
+            flush: () => {
+              events.push("project-flush");
+              return Promise.resolve();
+            },
+          },
+        ],
+        createControlServer: (serverOptions) => {
+          status = serverOptions.status;
+          return fakeServer({
+            listen: () => {
+              events.push("listen");
+              return Promise.resolve();
+            },
+            stopAccepting: () => events.push("stop-accepting"),
+            drain: () => {
+              events.push("control-drain");
+              return Promise.resolve();
+            },
+          });
+        },
+        onReady: () => {
+          events.push("ready");
+          resolveReady?.();
+        },
+      }),
+    );
+
+    await readyObserved;
+    expect(events).toEqual([
+      "logger-recover",
+      "project-recover",
+      "log-service.recovery-complete",
+      "listen",
+      "log-service.ready",
+      "ready",
+    ]);
+    degraded = true;
+    expect(status?.().health).toBe("degraded");
+    signals.emit("SIGTERM");
+    await running;
+    expect(events.slice(6)).toEqual([
+      "stop-accepting",
+      "project-stop",
+      "project-flush",
+      "control-drain",
+      "log-service.stopping",
+      "logger-stop",
+      "logger-flush",
+    ]);
+  });
+
+  it("does not announce readiness when its required ready event is not durable", async () => {
+    const logger: SupervisorOperationalLogger = {
+      ...noOpRecovery(),
+      write: (input) =>
+        input.event === "service.ready"
+          ? Promise.reject(new Error("simulated logging disk failure"))
+          : Promise.resolve(),
+      isDegraded: () => true,
+    };
+
+    await expect(runSupervisor(options({ operationalLogger: logger }))).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_UNAVAILABLE",
+    });
+    expect(readyCalls).toBe(0);
+  });
+
   it("announces readiness only after lock, recovery, listeners, and private socket", async () => {
     const events: string[] = [];
     const recordingSignals = {
