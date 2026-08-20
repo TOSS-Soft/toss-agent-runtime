@@ -31,7 +31,7 @@ const MODEL_CATALOG_JSON_LIMITS: JsonLimits = Object.freeze({
 });
 
 const ROUTING_POLICY_JSON_LIMITS: JsonLimits = Object.freeze({
-  maxBytes: 2 * 1024 * 1024,
+  maxBytes: 512 * 1024,
   maxDepth: 32,
   maxMembers: 100_000,
 });

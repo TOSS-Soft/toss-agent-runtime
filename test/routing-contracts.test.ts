@@ -251,6 +251,15 @@ describe("routing policy contract", () => {
     expect(parsedPolicy(policy)).toMatchObject({ ok: true });
   });
 
+  it("rejects a valid policy padded beyond the 512 KiB input ceiling", () => {
+    const paddedPolicy = `${policyBytes(validRoutingPolicy())}${" ".repeat(512 * 1024 + 1)}`;
+
+    expect(parseRoutingPolicy(paddedPolicy)).toMatchObject({
+      ok: false,
+      code: "RUNTIME_DOCUMENT_INVALID",
+    });
+  });
+
   it.each([
     [
       "duplicate rule IDs",
