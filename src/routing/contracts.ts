@@ -95,7 +95,8 @@ export function hashModelCatalog(value: ModelCatalogV1): `sha256:${string}` {
     MODEL_CATALOG_JSON_LIMITS,
   );
   if (!isRecord(normalized)) throw new TypeError("model catalog is invalid");
-  const { document_hash: _documentHash, ...hashable } = normalized;
+  const hashable = { ...normalized };
+  delete hashable.document_hash;
   return sha256(hashable, MODEL_CATALOG_JSON_LIMITS);
 }
 
@@ -211,7 +212,8 @@ export function hashRoutingPolicy(value: RoutingPolicyV1): `sha256:${string}` {
     ROUTING_POLICY_JSON_LIMITS,
   );
   if (!isRecord(normalized)) throw new TypeError("routing policy is invalid");
-  const { document_hash: _documentHash, ...hashable } = normalized;
+  const hashable = { ...normalized };
+  delete hashable.document_hash;
   return sha256(hashable, ROUTING_POLICY_JSON_LIMITS);
 }
 

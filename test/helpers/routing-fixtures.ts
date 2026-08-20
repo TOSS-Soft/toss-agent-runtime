@@ -29,7 +29,8 @@ export function pricing(
 }
 
 export function catalogDocumentHash(value: Record<string, unknown>): `sha256:${string}` {
-  const { document_hash: _documentHash, ...hashable } = value;
+  const hashable = { ...value };
+  delete hashable.document_hash;
   return sha256(hashable);
 }
 
@@ -38,7 +39,8 @@ export function catalogBytes(value: Record<string, unknown>): string {
 }
 
 export function policyDocumentHash(value: Record<string, unknown>): `sha256:${string}` {
-  const { document_hash: _documentHash, ...hashable } = value;
+  const hashable = { ...value };
+  delete hashable.document_hash;
   return sha256(hashable);
 }
 

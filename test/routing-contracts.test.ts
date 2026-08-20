@@ -144,10 +144,8 @@ describe("model catalog contract", () => {
     const missing = validCatalog();
     const entry = (missing.entries as Record<string, unknown>[])[0] as Record<string, unknown>;
     const route = (entry.routes as Record<string, unknown>[])[0] as Record<string, unknown>;
-    const { output_microusd_per_million: _output, ...pricing } = route.pricing as Record<
-      string,
-      unknown
-    >;
+    const pricing = { ...(route.pricing as Record<string, unknown>) };
+    delete pricing.output_microusd_per_million;
     missing.entries = [{ ...entry, routes: [{ ...route, pricing }] }];
     expectInvalid(missing);
 
@@ -430,15 +428,15 @@ describe("routing override contract", () => {
         ...overrideInput(),
         artifact: {
           ...overrideInput().artifact,
-          hash: `sha256:${"f".repeat(64)}` as `sha256:${string}`,
+          hash: overrideValueHash({ stale: true }),
         },
       }),
     ],
     [
       "a missing target entry",
       () => {
-        const value = validRoutingOverride();
-        const { target_entry_id: _targetEntryId, ...withoutTarget } = value;
+        const withoutTarget = { ...validRoutingOverride() };
+        delete withoutTarget.target_entry_id;
         return overrideInput(withoutTarget);
       },
     ],
