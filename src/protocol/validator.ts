@@ -2,6 +2,7 @@ import Ajv2020Module, { type ErrorObject, type ValidateFunction } from "ajv/dist
 import addFormatsModule from "ajv-formats";
 
 import agentgatewayCapabilitiesSchema from "../../contracts/runtime/agentgateway-capabilities.v1.schema.json" with { type: "json" };
+import modelCatalogSchema from "../../contracts/runtime/model-catalog.v1.schema.json" with { type: "json" };
 import commonSchema from "../../contracts/runtime/runtime-common.v1.schema.json" with { type: "json" };
 import executionEventSchema from "../../contracts/runtime/execution-event.v1.schema.json" with { type: "json" };
 import executionRequestSchema from "../../contracts/runtime/execution-request.v1.schema.json" with { type: "json" };
@@ -10,7 +11,13 @@ import operationalEventSchema from "../../contracts/runtime/operational-event.v1
 import providerEventSchema from "../../contracts/runtime/provider-event.v1.schema.json" with { type: "json" };
 import runJournalEntrySchema from "../../contracts/runtime/run-journal-entry.v1.schema.json" with { type: "json" };
 import runtimeCapabilitiesSchema from "../../contracts/runtime/runtime-capabilities.v1.schema.json" with { type: "json" };
-import { canonicalJson, deepFreezeJson, parseJsonBytes, type JsonValue } from "./json.js";
+import {
+  canonicalJson,
+  deepFreezeJson,
+  parseJsonBytes,
+  type JsonLimits,
+  type JsonValue,
+} from "./json.js";
 import { sensitiveMetadataIssues } from "./metadata.js";
 import type {
   RuntimeDocument,
@@ -26,6 +33,7 @@ const addFormats = addFormatsModule.default;
 const REGISTERED_SCHEMAS: Readonly<Record<string, string>> = {
   "agentgateway-capabilities.v1":
     "https://toss.software/schemas/runtime/v1/agentgateway-capabilities.v1.schema.json",
+  "model-catalog.v1": "https://toss.software/schemas/runtime/v1/model-catalog.v1.schema.json",
   "execution-request.v1":
     "https://toss.software/schemas/runtime/v1/execution-request.v1.schema.json",
   "execution-event.v1": "https://toss.software/schemas/runtime/v1/execution-event.v1.schema.json",
@@ -83,6 +91,7 @@ export interface ProtocolValidator {
   parse<T extends RuntimeDocument>(
     input: string | Uint8Array,
     expectedType: T["document_type"],
+    limits?: JsonLimits,
   ): ValidationResult<T>;
 }
 
@@ -98,6 +107,7 @@ export function createProtocolValidator(): ProtocolValidator {
   addFormats(ajv);
   ajv.addSchema(commonSchema);
   ajv.addSchema(agentgatewayCapabilitiesSchema);
+  ajv.addSchema(modelCatalogSchema);
   ajv.addSchema(executionEventSchema);
   ajv.addSchema(executionRequestSchema);
   ajv.addSchema(executionResultSchema);
@@ -145,10 +155,11 @@ export function createProtocolValidator(): ProtocolValidator {
     parse<T extends RuntimeDocument>(
       input: string | Uint8Array,
       expectedType: T["document_type"],
+      limits?: JsonLimits,
     ): ValidationResult<T> {
       let candidate: JsonValue;
       try {
-        candidate = deepFreezeJson(parseJsonBytes(input));
+        candidate = deepFreezeJson(parseJsonBytes(input, limits), limits);
       } catch (error) {
         return jsonFailure(error);
       }
