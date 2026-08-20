@@ -2,6 +2,7 @@ import path from "node:path";
 
 export type ServiceAction = "install" | "start" | "stop" | "restart" | "status" | "uninstall";
 export type ProjectAction = "register" | "unregister" | "list";
+export type LogLevel = "debug" | "info" | "warn" | "error";
 
 export type BaselineCommand =
   | Readonly<{ name: "help" }>
@@ -31,6 +32,14 @@ export type BaselineCommand =
       name: "project";
       action: "list";
       json: boolean;
+    }>
+  | Readonly<{
+      name: "logs";
+      json: boolean;
+      follow: boolean;
+      level?: LogLevel;
+      projectId?: string;
+      runId?: string;
     }>;
 
 export class CliUsageError extends Error {
@@ -126,6 +135,63 @@ function projectCommand(args: readonly string[]): Extract<BaselineCommand, { nam
   return { name: "project", action, projectId: argument.toLowerCase(), ...parsed };
 }
 
+function logCommand(args: readonly string[]): Extract<BaselineCommand, { name: "logs" }> {
+  let json = false;
+  let follow = false;
+  let level: LogLevel | undefined;
+  let projectId: string | undefined;
+  let runId: string | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const option = args[index];
+    if (option === "--json") {
+      if (json) throw new CliUsageError("Duplicate option: --json");
+      json = true;
+      continue;
+    }
+    if (option === "--follow") {
+      if (follow) throw new CliUsageError("Duplicate option: --follow");
+      follow = true;
+      continue;
+    }
+    if (option !== "--level" && option !== "--project" && option !== "--run") {
+      const safeOption = option?.startsWith("--") ? option.split("=", 1)[0]! : "<argument>";
+      throw new CliUsageError(`Unknown option for logs: ${safeOption}`);
+    }
+    const value = args[index + 1];
+    if (value === undefined || value.startsWith("--")) {
+      throw new CliUsageError(`Missing value for ${option}`);
+    }
+    if (option === "--level") {
+      if (level !== undefined) throw new CliUsageError("Duplicate option: --level");
+      if (value !== "debug" && value !== "info" && value !== "warn" && value !== "error") {
+        throw new CliUsageError("Invalid log level");
+      }
+      level = value;
+    } else {
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(value)) {
+        throw new CliUsageError(`${option === "--project" ? "Project" : "Run"} ID must be a UUID`);
+      }
+      if (option === "--project") {
+        if (projectId !== undefined) throw new CliUsageError("Duplicate option: --project");
+        projectId = value.toLowerCase();
+      } else {
+        if (runId !== undefined) throw new CliUsageError("Duplicate option: --run");
+        runId = value.toLowerCase();
+      }
+    }
+    index += 1;
+  }
+  if (json && follow) throw new CliUsageError("--json cannot be combined with --follow");
+  return {
+    name: "logs",
+    json,
+    follow,
+    ...(level === undefined ? {} : { level }),
+    ...(projectId === undefined ? {} : { projectId }),
+    ...(runId === undefined ? {} : { runId }),
+  };
+}
+
 export function parseCli(argv: readonly string[]): BaselineCommand {
   if (argv.length === 0 || (argv.length === 1 && ["--help", "-h", "help"].includes(argv[0]!))) {
     return { name: "help" };
@@ -151,5 +217,6 @@ export function parseCli(argv: readonly string[]): BaselineCommand {
     };
   }
   if (name === "project") return projectCommand(args);
+  if (name === "logs") return logCommand(args);
   throw new CliUsageError("Unknown command");
 }

@@ -112,3 +112,28 @@ export type {
   ProjectRegistryState,
   ProjectWatchManifestV1,
 } from "./service/project/types.js";
+export {
+  createOperationalEvent,
+  parseOperationalEvent,
+  sanitizeOperationalMetadata,
+  sensitiveOperationalValue,
+} from "./logging/contracts.js";
+export { RuntimeLoggingError, type RuntimeLoggingErrorCode } from "./logging/errors.js";
+export {
+  createOperationalLogReader,
+  renderOperationalEventHuman,
+  renderOperationalEventsJson,
+  type CreateOperationalLogReaderOptions,
+  type OperationalLogFilter,
+  type OperationalLogReader,
+  type OperationalLogReadResult,
+} from "./logging/reader.js";
+export type {
+  OperationalEventInput,
+  OperationalEventV1,
+  OperationalLogLevel,
+  OperationalMetadata,
+  OperationalMetadataInput,
+  OperationalMetadataValue,
+  SensitiveOperationalValue,
+} from "./logging/types.js";

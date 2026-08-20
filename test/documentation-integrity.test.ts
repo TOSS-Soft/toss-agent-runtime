@@ -77,6 +77,7 @@ describe("published protocol artifacts", () => {
       "execution-event.v1",
       "execution-request.v1",
       "execution-result.v1",
+      "operational-event.v1",
       "project-registry-entry.v1",
       "project-watch-manifest.v1",
       "run-journal-entry.v1",

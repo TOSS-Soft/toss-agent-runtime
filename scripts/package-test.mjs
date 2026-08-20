@@ -464,7 +464,48 @@ async function assertPrivateRuntime(paths, run, canonicalJson) {
     typeof owner.service_instance_id === "string",
     "Installed serve lock owner lacked a service identity",
   );
+  const operationalEvents = await readInstalledOperationalEvents(paths.logs, canonicalJson);
+  const serviceEvents = operationalEvents.filter(
+    (event) => event.service_instance_id === owner.service_instance_id,
+  );
+  assert(
+    serviceEvents.some((event) => event.event === "service.recovery-complete") &&
+      serviceEvents.some((event) => event.event === "service.ready"),
+    "Installed serve did not durably log recovery and readiness",
+  );
   return { owner, publicationGuardName: stagingGuards[0] };
+}
+
+async function readInstalledOperationalEvents(logsPath, canonicalJson) {
+  const names = (await readdir(logsPath))
+    .filter((name) => /^operational-(?:current|\d{4}-\d{2}-\d{2}-\d{6})\.jsonl$/u.test(name))
+    .sort((left, right) => {
+      if (left === "operational-current.jsonl") return 1;
+      if (right === "operational-current.jsonl") return -1;
+      return left.localeCompare(right);
+    });
+  const events = [];
+  for (const name of names) {
+    const filePath = path.join(logsPath, name);
+    const metadata = await lstat(filePath);
+    assert(
+      metadata.isFile() && (metadata.mode & 0o777) === 0o600,
+      "Installed operational log file was not private",
+    );
+    const text = await readFile(filePath, "utf8");
+    for (const line of text.trimEnd().split("\n")) {
+      if (line.length === 0) continue;
+      const event = JSON.parse(line);
+      assert(line === canonicalJson(event), "Installed operational event was not canonical JSON");
+      assert(
+        event.schema_version === "operational-event.v1" &&
+          event.document_type === "operational-event",
+        "Installed operational event used the wrong closed envelope",
+      );
+      events.push(event);
+    }
+  }
+  return events;
 }
 
 async function assertMissing(candidate, label) {
@@ -624,6 +665,11 @@ async function stopInstalledServeGracefully(paths, run, signal, canonicalJson) {
   assert(
     (await readdir(paths.runtime)).length === 0,
     `${signal} left unexpected runtime entries behind`,
+  );
+  const operationalEvents = await readInstalledOperationalEvents(paths.logs, canonicalJson);
+  assert(
+    operationalEvents.at(-1)?.event === "service.stopping",
+    `${signal} shutdown did not durably flush its stopping event`,
   );
   assertReaped(run.child.pid, signal);
 }
@@ -788,6 +834,15 @@ try {
     "agent-runtime",
   );
   const api = await import(pathToFileURL(path.join(installedRoot, "dist", "src", "index.js")).href);
+  assert(
+    typeof api.createOperationalLogReader === "function" &&
+      api.createOperationalLogStore === undefined,
+    "Installed public API exposed the wrong operational logging boundary",
+  );
+  await assertMissing(
+    path.join(installedRoot, "dist", "src", "logging", "store.d.ts"),
+    "Private operational store declaration",
+  );
   const projectInterfaces = await readFile(
     path.join(installedRoot, "dist", "src", "service", "project", "interfaces.d.ts"),
     "utf8",

@@ -3,17 +3,18 @@
 ## Status and scope
 
 This document is the normative operator and trust-boundary contract for the
-implemented per-user service foundation and issue #29 project-control extension.
+implemented per-user service foundation, project-control extension, and
+structured operational logging.
 It covers macOS launchd, the retained Linux `systemd --user` definition contract,
 explicit service lifecycle commands, the single-instance lock, private local
 control, project registration/intake, readiness, and bounded shutdown. The
-v1.0.0 package supports macOS only. Windows, remote control, provider/tool
-execution, and operational log management are outside this contract.
+v1.0.0 package supports macOS only. Windows, remote control, and provider/tool
+execution are outside this contract.
 
 This foundation does not complete Wave 2. Production-durable `INTERRUPTED`
 journal persistence is implemented through the private run-journal store.
 Issue #28 remains open for its separate real macOS login/native crash-loop
-acceptance. Issue #30 and npm `1.0.0` remain incomplete.
+acceptance. npm `1.0.0` remains incomplete.
 
 ## Operator grammar and activation boundary
 
@@ -26,6 +27,8 @@ toss-runtime service stop [--json]
 toss-runtime service restart [--json]
 toss-runtime service status [--json]
 toss-runtime service uninstall [--json]
+toss-runtime logs [--level <debug|info|warn|error>] [--project <id>] [--run <id>] [--json]
+toss-runtime logs --follow [--level <debug|info|warn|error>] [--project <id>] [--run <id>]
 ```
 
 Only `service install` accepts `--config`. All six commands accept `--json`.
@@ -234,6 +237,22 @@ Project operations additionally use these fixed failures:
 | `RUNTIME_PROJECT_REGISTRY_CORRUPT` |    5 | Registry history cannot be trusted            |
 | `RUNTIME_PROJECT_INTAKE_CORRUPT`   |    5 | Pending/candidate intake cannot be trusted    |
 | `RUNTIME_PROJECT_UNAVAILABLE`      |   69 | Registered project is unavailable             |
+
+Operational log commands additionally use these fixed failures:
+
+| Logging error                 | Exit | Meaning                                         |
+| ----------------------------- | ---: | ----------------------------------------------- |
+| `RUNTIME_LOGGING_INVALID`     |    3 | Filter, event, or logging option is invalid     |
+| `RUNTIME_LOGGING_CORRUPT`     |    5 | A complete operational record cannot be trusted |
+| `RUNTIME_LOGGING_PATH_UNSAFE` |    5 | Log root or owned-file identity is unsafe       |
+| `RUNTIME_LOGGING_DEGRADED`    |   69 | Durable logging is unavailable until recovery   |
+
+The supervised process owns one private append queue under the configured log
+root. Each accepted state-changing project operation writes its required event
+before returning success. A logging failure changes the service health to
+`degraded`; `doctor` therefore fails the active-service check. Rotation and
+seven-day/100 MiB retention target only exact operational filenames and never
+run journals, candidate intents, evidence, or unrelated files.
 
 Usage failures use exit `2`; successful actions use `0`. Unexpected internal
 service failures use `70`. Configuration selection/validation failures and an
