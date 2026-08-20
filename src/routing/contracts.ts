@@ -471,6 +471,25 @@ export function parseRoutingState(input: string | Uint8Array): ValidationResult<
         ),
       );
     }
+    if (circuit.status === "probe-reserved") {
+      const matchingReservations = parsed.value.reservations.filter(
+        (reservation) => reservation.decision_id === circuit.probe_decision_id,
+      );
+      if (
+        matchingReservations.length !== 1 ||
+        !matchingReservations[0]?.allocations.some(
+          (allocation) => allocation.entry_id === circuit.entry_id,
+        )
+      ) {
+        issues.push(
+          issue(
+            `/circuits/${circuitIndex}/probe_decision_id`,
+            "probeReservation",
+            "probe must match one active reservation allocation for its entry",
+          ),
+        );
+      }
+    }
   }
 
   let expectedHash: `sha256:${string}` | undefined;
@@ -526,6 +545,7 @@ function validatePlanAttempt(
   path: string,
   plan: PlannedModelSelectionPlanV1,
   issues: ValidationIssue[],
+  routeIds: Set<string>,
 ): void {
   if (attempt.gateway_profile !== plan.gateway_profile) {
     issues.push(issue(`${path}/gateway_profile`, "liveBinding", "gateway profile must match plan"));
@@ -558,6 +578,7 @@ function validatePlanAttempt(
     `${path}/accepted_routes`,
     "uniqueRoute",
     issues,
+    routeIds,
   );
 }
 
@@ -600,6 +621,7 @@ export function parseModelSelectionPlan(
     const plan = parsed.value;
     const attemptIds = new Set<string>();
     const entryIds = new Set<string>();
+    const routeIds = new Set<string>();
     for (const [attemptIndex, attempt] of plan.worker_attempts.entries()) {
       const path = `/worker_attempts/${attemptIndex}`;
       if (attempt.fallback_index !== attemptIndex) {
@@ -619,7 +641,7 @@ export function parseModelSelectionPlan(
         issues.push(issue(`${path}/entry_id`, "uniqueEntry", "selected entry_id must be unique"));
       }
       entryIds.add(attempt.entry_id);
-      validatePlanAttempt(attempt, path, plan, issues);
+      validatePlanAttempt(attempt, path, plan, issues, routeIds);
     }
     if (plan.reviewer_attempt !== null) {
       const reviewer = plan.reviewer_attempt;
@@ -635,7 +657,7 @@ export function parseModelSelectionPlan(
         );
       }
       entryIds.add(reviewer.entry_id);
-      validatePlanAttempt(reviewer, "/reviewer_attempt", plan, issues);
+      validatePlanAttempt(reviewer, "/reviewer_attempt", plan, issues, routeIds);
     }
     for (const [eliminationIndex, elimination] of plan.eliminations.entries()) {
       if (entryIds.has(elimination.entry_id)) {

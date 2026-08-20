@@ -487,7 +487,18 @@ describe("routing state contract", () => {
     const state = validRoutingState();
     state.revision = 2;
     state.previous_state_hash = `sha256:${"9".repeat(64)}`;
-    state.reservations = [validRoutingReservation()];
+    const reservation = validRoutingReservation();
+    const workerAllocation = (reservation.allocations as Record<string, unknown>[])[0];
+    reservation.allocations = [
+      {
+        ...workerAllocation,
+        attempt_id: "attempt-reviewer",
+        entry_id: "review-primary",
+        role: "reviewer",
+      },
+      workerAllocation,
+    ];
+    state.reservations = [reservation];
     state.circuits = [
       {
         entry_id: "balanced-primary",
@@ -528,6 +539,30 @@ describe("routing state contract", () => {
 
     state.revision = 2;
     expect(parsedState(state)).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
+  });
+
+  it.each([
+    ["a dangling decision", "balanced-primary", "decision-missing"],
+    ["a reservation for another entry", "review-primary", "decision-1"],
+  ])("rejects a probe claim backed by %s", (_name, entryId, probeDecisionId) => {
+    const state = validRoutingState();
+    state.revision = 2;
+    state.previous_state_hash = `sha256:${"9".repeat(64)}`;
+    state.reservations = [validRoutingReservation()];
+    state.circuits = [
+      {
+        entry_id: entryId,
+        status: "probe-reserved",
+        consecutive_failures: 3,
+        retry_at: "2026-08-21T12:01:00.000Z",
+        probe_decision_id: probeDecisionId,
+      },
+    ];
+
+    expect(parsedState(state)).toMatchObject({
+      ok: false,
+      code: "RUNTIME_DOCUMENT_INVALID",
+    });
   });
 
   it.each([
@@ -771,6 +806,40 @@ describe("selection plan contract", () => {
     const plan = validPlannedSelectionPlan();
     mutate(plan);
     expect(parsedPlan(plan)).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
+  });
+
+  it("rejects an accepted route ID reused by a different attempt", () => {
+    const plan = validPlannedSelectionPlan();
+    const primary = (plan.worker_attempts as Record<string, unknown>[])[0] as Record<
+      string,
+      unknown
+    >;
+    const duplicateRoute = (primary.accepted_routes as Record<string, unknown>[])[0];
+    const fallback = {
+      ...primary,
+      attempt_id: "attempt-worker-1",
+      fallback_index: 1,
+      entry_id: "balanced-secondary",
+      accepted_routes: [duplicateRoute],
+    };
+    plan.worker_attempts = [primary, fallback];
+
+    const reservation = plan.reservation as Record<string, unknown>;
+    const primaryAllocation = (reservation.allocations as Record<string, unknown>[])[0];
+    reservation.allocations = [
+      primaryAllocation,
+      {
+        ...primaryAllocation,
+        attempt_id: "attempt-worker-1",
+        entry_id: "balanced-secondary",
+      },
+    ];
+    reservation.decision_hash = selectionDecisionHash(plan);
+
+    expect(parsedPlan(plan)).toMatchObject({
+      ok: false,
+      code: "RUNTIME_DOCUMENT_INVALID",
+    });
   });
 
   it("rejects blocked plans carrying attempts and planned plans lacking next state", () => {
