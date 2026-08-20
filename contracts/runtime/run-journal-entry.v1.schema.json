@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toss.software/schemas/runtime/v1/run-journal-entry.v1.schema.json",
+  "title": "TOSS Runtime run journal entry v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "schema_version",
+    "document_type",
+    "run_id",
+    "journal_revision",
+    "run_attempt",
+    "sequence",
+    "previous_entry_hash",
+    "entry_hash",
+    "command_id",
+    "command_input_hash",
+    "operation_id",
+    "side_effect",
+    "previous_state",
+    "state",
+    "reason_code",
+    "timestamp",
+    "trace",
+    "metadata"
+  ],
+  "properties": {
+    "protocol_version": { "const": "runtime-contract.v1" },
+    "schema_version": { "const": "run-journal-entry.v1" },
+    "document_type": { "const": "run-journal-entry" },
+    "run_id": {
+      "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/identifier"
+    },
+    "journal_revision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "run_attempt": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "sequence": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "previous_entry_hash": {
+      "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/sha256"
+    },
+    "entry_hash": {
+      "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/sha256"
+    },
+    "command_id": {
+      "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/identifier"
+    },
+    "command_input_hash": {
+      "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/sha256"
+    },
+    "operation_id": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/identifier"
+        }
+      ]
+    },
+    "side_effect": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["identity", "phase", "input_hash", "output_hash"],
+          "properties": {
+            "identity": {
+              "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/identifier"
+            },
+            "phase": { "const": "INTENT" },
+            "input_hash": {
+              "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/sha256"
+            },
+            "output_hash": { "type": "null" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["identity", "phase", "input_hash", "output_hash"],
+          "properties": {
+            "identity": {
+              "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/identifier"
+            },
+            "phase": { "const": "COMPLETED" },
+            "input_hash": {
+              "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/sha256"
+            },
+            "output_hash": {
+              "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/sha256"
+            }
+          }
+        }
+      ]
+    },
+    "previous_state": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "string",
+          "enum": [
+            "CREATED",
+            "ROUTED",
+            "RUNNING",
+            "TOOL_PENDING",
+            "APPROVAL_PENDING",
+            "REVIEW_PENDING",
+            "COMPLETED",
+            "FAILED",
+            "BLOCKED",
+            "CANCELLED",
+            "INTERRUPTED"
+          ]
+        }
+      ]
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "CREATED",
+        "ROUTED",
+        "RUNNING",
+        "TOOL_PENDING",
+        "APPROVAL_PENDING",
+        "REVIEW_PENDING",
+        "COMPLETED",
+        "FAILED",
+        "BLOCKED",
+        "CANCELLED",
+        "INTERRUPTED"
+      ]
+    },
+    "reason_code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{2,127}$" },
+    "timestamp": {
+      "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/utc_timestamp"
+    },
+    "trace": {
+      "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/trace_context"
+    },
+    "metadata": {
+      "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/safe_json"
+    }
+  }
+}

@@ -5,6 +5,7 @@ import commonSchema from "../../contracts/runtime/runtime-common.v1.schema.json"
 import executionEventSchema from "../../contracts/runtime/execution-event.v1.schema.json" with { type: "json" };
 import executionRequestSchema from "../../contracts/runtime/execution-request.v1.schema.json" with { type: "json" };
 import executionResultSchema from "../../contracts/runtime/execution-result.v1.schema.json" with { type: "json" };
+import runJournalEntrySchema from "../../contracts/runtime/run-journal-entry.v1.schema.json" with { type: "json" };
 import runtimeCapabilitiesSchema from "../../contracts/runtime/runtime-capabilities.v1.schema.json" with { type: "json" };
 import { canonicalJson, deepFreezeJson, parseJsonBytes, type JsonValue } from "./json.js";
 import { sensitiveMetadataIssues } from "./metadata.js";
@@ -24,6 +25,8 @@ const REGISTERED_SCHEMAS: Readonly<Record<string, string>> = {
     "https://toss.software/schemas/runtime/v1/execution-request.v1.schema.json",
   "execution-event.v1": "https://toss.software/schemas/runtime/v1/execution-event.v1.schema.json",
   "execution-result.v1": "https://toss.software/schemas/runtime/v1/execution-result.v1.schema.json",
+  "run-journal-entry.v1":
+    "https://toss.software/schemas/runtime/v1/run-journal-entry.v1.schema.json",
   "runtime-capabilities.v1":
     "https://toss.software/schemas/runtime/v1/runtime-capabilities.v1.schema.json",
 };
@@ -89,6 +92,7 @@ export function createProtocolValidator(): ProtocolValidator {
   ajv.addSchema(executionEventSchema);
   ajv.addSchema(executionRequestSchema);
   ajv.addSchema(executionResultSchema);
+  ajv.addSchema(runJournalEntrySchema);
   ajv.addSchema(runtimeCapabilitiesSchema);
 
   const fragmentValidators = Object.fromEntries(
