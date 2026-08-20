@@ -194,6 +194,13 @@ function isIdempotentResult(
       "i",
     ).test(output);
   }
+  if (
+    idempotentState === "darwin-bootout" &&
+    result.exitCode === 3 &&
+    output.trim() === "Boot-out failed: 3: No such process"
+  ) {
+    return true;
+  }
   if (idempotentState === "darwin-bootout" || idempotentState === "darwin-print") {
     const legacyAbsent = new RegExp(`could not find service\\s+["']?${identity}`, "i").test(output);
     const nativeAbsent = new RegExp(

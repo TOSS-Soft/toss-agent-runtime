@@ -766,6 +766,75 @@ describe("baseline CLI", () => {
     });
   });
 
+  it("completes Darwin uninstall after an already successful stop", async () => {
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-runtime-cli-uninstall-")));
+    const cliPath = path.join(root, "cli.js");
+    const configPath = path.join(
+      root,
+      "Library",
+      "Application Support",
+      "TOSS",
+      "runtime",
+      "config.yaml",
+    );
+    await writeFile(cliPath, "", { mode: 0o600 });
+    const runner = {
+      calls: [] as { file: string; args: readonly string[] }[],
+      results: [
+        { exitCode: 0, stdout: "", stderr: "" },
+        { exitCode: 3, stdout: "", stderr: "Boot-out failed: 3: No such process\n" },
+      ],
+      run(file: string, args: readonly string[]) {
+        this.calls.push({ file, args: [...args] });
+        return Promise.resolve(
+          this.results[this.calls.length - 1] ?? { exitCode: 0, stdout: "", stderr: "" },
+        );
+      },
+    };
+    try {
+      const manager = createServiceManager({
+        platform: "darwin",
+        home: root,
+        env: {},
+        uid: 501,
+        currentUid: () => 501,
+        nodePath: process.execPath,
+        cliPath,
+        configPath,
+        randomSuffix: () => "00000000-0000-4000-8000-000000000001",
+        runner,
+      });
+      await manager.install();
+      const cliServices: CliServices = {
+        ...services,
+        platform: { os: "darwin", arch: "arm64", node: "22.23.1" },
+        manageService: (action) => manager[action](),
+      };
+
+      const stop = await runCli(["service", "stop", "--json"], cliServices);
+      const uninstall = await runCli(["service", "uninstall", "--json"], cliServices);
+
+      expect(stop).toMatchObject({ exitCode: 0, stderr: "" });
+      expect(JSON.parse(stop.stdout)).toMatchObject({
+        command: "service stop",
+        ok: true,
+        data: { installed: true, active: false },
+      });
+      expect(uninstall).toMatchObject({ exitCode: 0, stderr: "" });
+      expect(JSON.parse(uninstall.stdout)).toMatchObject({
+        command: "service uninstall",
+        ok: true,
+        data: { installed: false, active: false },
+      });
+      expect(runner.calls).toEqual([
+        { file: "/bin/launchctl", args: ["bootout", "gui/501/software.toss.agent-runtime"] },
+        { file: "/bin/launchctl", args: ["bootout", "gui/501/software.toss.agent-runtime"] },
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("reports installed-stopped and crash-backoff as status data, not command failures", async () => {
     for (const manager of [
       { ...activeManagerStatus, active: false },
