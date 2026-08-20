@@ -939,6 +939,146 @@ describe("runtime service supervisor", () => {
     },
   );
 
+  it.each([
+    [
+      "recovery",
+      [
+        "recover-first",
+        "recover-second",
+        "stop-first",
+        "flush-first",
+        "abort-flush",
+        "release-lock",
+        "restore-umask",
+      ],
+    ],
+    [
+      "socket listen",
+      [
+        "recover-first",
+        "listen",
+        "stop-first",
+        "flush-first",
+        "abort-flush",
+        "close-socket",
+        "release-lock",
+        "restore-umask",
+      ],
+    ],
+    [
+      "readiness callback",
+      [
+        "recover-first",
+        "listen",
+        "ready",
+        "stop-first",
+        "flush-first",
+        "abort-flush",
+        "close-socket",
+        "release-lock",
+        "restore-umask",
+      ],
+    ],
+  ] as const)(
+    "bounds a permanently pending participant flush after %s failure",
+    async (stage, expected) => {
+      vi.useFakeTimers();
+      const events: string[] = [];
+      let resolveFlushStarted: (() => void) | undefined;
+      const flushStarted = new Promise<void>((resolve) => {
+        resolveFlushStarted = resolve;
+      });
+      const privatePrimary = new RuntimeServiceError("RUNTIME_SERVICE_PATH_UNSAFE");
+      privatePrimary.message = "private startup /Users/operator/runtime stack";
+      const recoveryParticipants: RecoveryParticipant[] = [
+        {
+          recover: () => {
+            events.push("recover-first");
+            return Promise.resolve();
+          },
+          stopIntake: () => events.push("stop-first"),
+          flush: (signal) => {
+            events.push("flush-first");
+            signal.addEventListener("abort", () => events.push("abort-flush"), { once: true });
+            resolveFlushStarted?.();
+            return new Promise<void>(() => undefined);
+          },
+        },
+      ];
+      if (stage === "recovery") {
+        recoveryParticipants.push({
+          ...noOpRecovery(),
+          recover: () => {
+            events.push("recover-second");
+            return Promise.reject(privatePrimary);
+          },
+        });
+      }
+      const stageOptions = options({
+        loaded: {
+          ...fixture.loaded,
+          config: { ...fixture.loaded.config, shutdown_timeout_ms: 25 },
+        },
+        recoveryParticipants,
+        acquireLock: () =>
+          Promise.resolve(
+            fakeLock(() => {
+              events.push("release-lock");
+              return Promise.resolve();
+            }),
+          ),
+        createControlServer: () =>
+          fakeServer({
+            listen: () => {
+              events.push("listen");
+              return stage === "socket listen" ? Promise.reject(privatePrimary) : Promise.resolve();
+            },
+            close: () => {
+              events.push("close-socket");
+              return Promise.resolve();
+            },
+          }),
+        onReady: () => {
+          events.push("ready");
+          if (stage === "readiness callback") throw privatePrimary;
+          readyCalls += 1;
+        },
+        umask: {
+          set(mask) {
+            if (mask === 0o022) events.push("restore-umask");
+            const previous = activeMask;
+            activeMask = mask;
+            return previous;
+          },
+        },
+      });
+      let settled = false;
+      const completion = runSupervisor(stageOptions)
+        .then(
+          (outcome) => ({ outcome, error: undefined }),
+          (error: unknown) => ({ outcome: undefined, error }),
+        )
+        .finally(() => {
+          settled = true;
+        });
+      await flushStarted;
+
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(24);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(settled).toBe(true);
+      const { outcome, error } = await completion;
+      expect(outcome).toBeUndefined();
+      expect(error).toMatchObject({ code: "RUNTIME_SERVICE_PATH_UNSAFE" });
+      expect(String(error)).not.toMatch(/private|\/Users|runtime|stack/u);
+      expect(events).toEqual(expected);
+      expect(signals.count()).toBe(0);
+      expect(activeMask).toBe(0o022);
+    },
+  );
+
   it("unwinds only successfully recovered participants when a later recovery fails", async () => {
     const events: string[] = [];
     const running = runSupervisor(

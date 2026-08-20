@@ -377,20 +377,28 @@ export async function runSupervisor(options: RunSupervisorOptions): Promise<Supe
     }
   } finally {
     if (!shutdownSequenceStarted) {
-      for (const participant of recoveredParticipants.toReversed()) {
-        try {
-          participant.stopIntake();
-        } catch (error) {
-          capture(error);
+      const cleanupController = new AbortController();
+      const cleanupTimer = setTimeout(
+        () => cleanupController.abort(),
+        options.loaded.config.shutdown_timeout_ms,
+      );
+      try {
+        for (const participant of recoveredParticipants.toReversed()) {
+          try {
+            participant.stopIntake();
+          } catch (error) {
+            capture(error);
+          }
         }
-      }
-      const cleanupSignal = new AbortController().signal;
-      for (const participant of recoveredParticipants.toReversed()) {
-        try {
-          await participant.flush(cleanupSignal);
-        } catch (error) {
-          capture(error);
+        for (const participant of recoveredParticipants.toReversed()) {
+          if (cleanupController.signal.aborted) break;
+          const flushed = await runParticipantStage(cleanupController.signal, () =>
+            participant.flush(cleanupController.signal),
+          );
+          if (flushed.error !== undefined) capture(flushed.error);
         }
+      } finally {
+        clearTimeout(cleanupTimer);
       }
     }
     const finalizing = finalizeOwnedResources();
