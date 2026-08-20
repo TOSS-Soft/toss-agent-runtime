@@ -1,0 +1,33 @@
+{
+  "protocol_version": "runtime-contract.v1",
+  "schema_version": "execution-event.v1",
+  "document_type": "execution-event",
+  "run_id": "RUN-001",
+  "request_hash": "sha256:70d377068f5fe9a7031876978a1092aee6b8548b2dc35a300eb79475e7734f37",
+  "sequence": 1,
+  "run_revision": 1,
+  "previous_event_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "event_hash": "sha256:a1b5799365ea584a6970f016b93e21fea5a7002fbee0ac783979673b95d041d8",
+  "event_type": "COMPLETED",
+  "timestamp": "2026-08-19T00:01:00.000Z",
+  "producer": {
+    "kind": "runtime",
+    "name": "toss-agent-runtime",
+    "version": "0.0.0-development"
+  },
+  "trace": {
+    "trace_id": "0123456789abcdef0123456789abcdef",
+    "span_id": "0123456789abcdef",
+    "trace_flags": 1
+  },
+  "input_reference": {
+    "document_type": "task-contract",
+    "artifact_id": "TASK-001",
+    "revision": 3,
+    "hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "location": "project-management/tasks/TASK-001.json"
+  },
+  "payload": {
+    "state": "COMPLETED"
+  }
+}

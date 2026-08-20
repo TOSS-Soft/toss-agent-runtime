@@ -1,0 +1,41 @@
+{
+  "schema_version": "runtime-contract-manifest.v1",
+  "protocol_version": "runtime-contract.v1",
+  "schemas": [
+    {
+      "schema_version": "command-result.v1",
+      "path": "contracts/runtime/command-result.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/command-result.v1.schema.json"
+    },
+    {
+      "schema_version": "execution-event.v1",
+      "path": "contracts/runtime/execution-event.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/execution-event.v1.schema.json"
+    },
+    {
+      "schema_version": "execution-request.v1",
+      "path": "contracts/runtime/execution-request.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/execution-request.v1.schema.json"
+    },
+    {
+      "schema_version": "execution-result.v1",
+      "path": "contracts/runtime/execution-result.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/execution-result.v1.schema.json"
+    },
+    {
+      "schema_version": "runtime-capabilities.v1",
+      "path": "contracts/runtime/runtime-capabilities.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/runtime-capabilities.v1.schema.json"
+    },
+    {
+      "schema_version": "runtime-common.v1",
+      "path": "contracts/runtime/runtime-common.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json"
+    },
+    {
+      "schema_version": "runtime-config.v1",
+      "path": "contracts/runtime/runtime-config.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/runtime-config.v1.schema.json"
+    }
+  ]
+}

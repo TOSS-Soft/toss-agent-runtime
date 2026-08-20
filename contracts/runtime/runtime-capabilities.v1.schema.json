@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toss.software/schemas/runtime/v1/runtime-capabilities.v1.schema.json",
+  "title": "TOSS Runtime capabilities v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "schema_version",
+    "document_type",
+    "runtime",
+    "package",
+    "platform",
+    "supported_protocols",
+    "supported_schemas",
+    "provider_transports",
+    "model_classes",
+    "skill_host_versions",
+    "superpowers_capabilities",
+    "mcp_transports",
+    "mcp_profiles",
+    "execution_topologies",
+    "features"
+  ],
+  "properties": {
+    "protocol_version": { "const": "runtime-contract.v1" },
+    "schema_version": { "const": "runtime-capabilities.v1" },
+    "document_type": { "const": "runtime-capabilities" },
+    "runtime": {
+      "allOf": [
+        {
+          "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/producer_identity"
+        },
+        { "type": "object", "properties": { "kind": { "const": "runtime" } } }
+      ]
+    },
+    "package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "const": "@toss-software/agent-runtime" },
+        "version": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    },
+    "platform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "arch", "node"],
+      "properties": {
+        "os": { "type": "string", "enum": ["darwin", "linux"] },
+        "arch": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,32}$" },
+        "node": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" }
+      }
+    },
+    "supported_protocols": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "const": "runtime-contract.v1" }
+    },
+    "supported_schemas": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "execution-request.v1",
+          "execution-event.v1",
+          "execution-result.v1",
+          "runtime-capabilities.v1"
+        ]
+      }
+    },
+    "provider_transports": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": ["openai", "anthropic", "gemini", "openai-compatible", "agentgateway"]
+      }
+    },
+    "model_classes": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["logical_class", "capabilities"],
+        "properties": {
+          "logical_class": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+          "capabilities": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" }
+          }
+        }
+      }
+    },
+    "skill_host_versions": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+    },
+    "superpowers_capabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,127}$" }
+    },
+    "mcp_transports": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "enum": ["stdio", "streamable-http", "agentgateway"] }
+    },
+    "mcp_profiles": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/artifact_reference"
+      }
+    },
+    "execution_topologies": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "const": "sequential-worker-reviewer" }
+    },
+    "features": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["providers", "routing", "skills", "mcp", "agent_loop", "review", "evidence"],
+      "properties": {
+        "providers": { "$ref": "#/$defs/availability" },
+        "routing": { "$ref": "#/$defs/availability" },
+        "skills": { "$ref": "#/$defs/availability" },
+        "mcp": { "$ref": "#/$defs/availability" },
+        "agent_loop": { "$ref": "#/$defs/availability" },
+        "review": { "$ref": "#/$defs/availability" },
+        "evidence": { "$ref": "#/$defs/availability" }
+      }
+    }
+  },
+  "$defs": {
+    "availability": {
+      "type": "string",
+      "enum": ["available", "unavailable", "blocked"]
+    }
+  }
+}

@@ -1,0 +1,17 @@
+.env
+.env.*
+.git
+.github
+.gitignore
+.npmrc
+.prettierrc.json
+.worktrees
+coverage
+docs/superpowers
+eslint.config.js
+node_modules
+scripts
+test
+tsconfig.json
+tsconfig.build.json
+*.tgz

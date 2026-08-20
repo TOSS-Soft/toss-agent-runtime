@@ -1,0 +1,75 @@
+{
+  "protocol_version": "runtime-contract.v1",
+  "schema_version": "execution-request.v1",
+  "document_type": "execution-request",
+  "request_id": "REQ-001",
+  "run_id": "RUN-001",
+  "created_at": "2026-08-19T00:00:00.000Z",
+  "deadline": "2026-08-19T00:10:00.000Z",
+  "task_contract": {
+    "document_type": "task-contract",
+    "artifact_id": "TASK-001",
+    "revision": 3,
+    "hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "location": "project-management/tasks/TASK-001.json"
+  },
+  "input_artifacts": [
+    {
+      "document_type": "pm-analysis",
+      "artifact_id": "PM-001",
+      "revision": 2,
+      "hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "location": "project-management/artifacts/PM-001.json"
+    }
+  ],
+  "agent": {
+    "definition": {
+      "document_type": "agent-definition",
+      "artifact_id": "AGENT-WORKER",
+      "revision": 1,
+      "hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    "role": "worker"
+  },
+  "model": {
+    "logical_class": "balanced-code",
+    "required_capabilities": ["structured-output", "tools"]
+  },
+  "superpowers": {
+    "required": ["brainstorming", "test-driven-development", "verification-before-completion"]
+  },
+  "mcp": {
+    "profile": {
+      "document_type": "mcp-profile",
+      "artifact_id": "MCP-READONLY",
+      "revision": 1,
+      "hash": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    }
+  },
+  "budget": {
+    "max_input_tokens": 20000,
+    "max_output_tokens": 4000,
+    "max_cost_microusd": 5000000,
+    "max_duration_ms": 600000,
+    "max_turns": 12
+  },
+  "review_policy": {
+    "document_type": "review-policy",
+    "artifact_id": "REVIEW-MEDIUM",
+    "revision": 1,
+    "hash": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  },
+  "output": {
+    "schema": {
+      "document_type": "output-schema",
+      "artifact_id": "OUTPUT-IMPLEMENTATION",
+      "revision": 1,
+      "hash": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    }
+  },
+  "trace": {
+    "trace_id": "0123456789abcdef0123456789abcdef",
+    "span_id": "0123456789abcdef",
+    "trace_flags": 1
+  }
+}

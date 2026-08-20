@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toss.software/schemas/runtime/v1/command-result.v1.schema.json",
+  "title": "TOSS Runtime command result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "document_type", "command", "ok", "exit_code", "data", "error"],
+  "properties": {
+    "schema_version": { "const": "command-result.v1" },
+    "document_type": { "const": "command-result" },
+    "command": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "ok": { "type": "boolean" },
+    "exit_code": { "type": "integer", "enum": [0, 2, 3, 4, 5, 6, 69, 70] },
+    "data": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/safe_json"
+        }
+      ]
+    },
+    "error": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/runtime_error"
+        }
+      ]
+    }
+  }
+}

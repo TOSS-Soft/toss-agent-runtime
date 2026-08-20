@@ -1,0 +1,42 @@
+{
+  "protocol_version": "runtime-contract.v1",
+  "schema_version": "runtime-capabilities.v1",
+  "document_type": "runtime-capabilities",
+  "runtime": {
+    "kind": "runtime",
+    "name": "toss-agent-runtime",
+    "version": "0.0.0-development"
+  },
+  "package": {
+    "name": "@toss-software/agent-runtime",
+    "version": "0.0.0-development"
+  },
+  "platform": {
+    "os": "linux",
+    "arch": "x64",
+    "node": "22.23.1"
+  },
+  "supported_protocols": ["runtime-contract.v1"],
+  "supported_schemas": [
+    "execution-request.v1",
+    "execution-event.v1",
+    "execution-result.v1",
+    "runtime-capabilities.v1"
+  ],
+  "provider_transports": [],
+  "model_classes": [],
+  "skill_host_versions": [],
+  "superpowers_capabilities": [],
+  "mcp_transports": [],
+  "mcp_profiles": [],
+  "execution_topologies": [],
+  "features": {
+    "providers": "unavailable",
+    "routing": "unavailable",
+    "skills": "unavailable",
+    "mcp": "unavailable",
+    "agent_loop": "unavailable",
+    "review": "unavailable",
+    "evidence": "unavailable"
+  }
+}

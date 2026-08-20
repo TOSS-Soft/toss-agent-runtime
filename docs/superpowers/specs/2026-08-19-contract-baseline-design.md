@@ -81,8 +81,11 @@ The first wave publishes:
 
 Artifact references require document type, stable ID, positive revision,
 SHA-256 hash, and optional repository-relative location. They never contain
-artifact bodies. Secret values, raw provider tokens, credential material, and
-arbitrary environment maps have no schema representation.
+artifact bodies. Dedicated credential fields use secret references rather than
+values. Because generic JSON strings cannot prove that content is non-secret,
+producers must use event-specific allowlists, sensitivity tags, and structural
+redaction before serialization; parsers reject normalized secret- and
+authority-shaped metadata keys as defense in depth.
 
 ## Validation and trust boundary
 
@@ -116,7 +119,12 @@ enumeration is never serialized.
 The baseline config schema contains mode, state/log/config paths, shutdown
 deadline, log policy, provider/gateway profile names, MCP profile names, and
 secret references. A secret reference identifies a source and key; it never
-contains a secret. CLI arguments reject token/key/password options.
+contains a secret. CLI arguments reject token/key/password options. Production
+configuration is read through one no-follow file descriptor, must be private
+and user-owned, and may reference only private approved per-user roots. The
+roots are field-specific: configuration stays in the platform config root,
+state in the state root, logs in the log root, and the socket in the runtime
+root (falling back to state on Linux when no absolute `XDG_RUNTIME_DIR` exists).
 
 ## CLI and process behavior
 
@@ -130,7 +138,10 @@ failure.
 The daemon lifecycle owns an abort signal, registers `SIGINT`/`SIGTERM` once,
 stops accepting work, waits up to the configured deadline, and returns a
 deterministic exit. It never backgrounds itself or installs a service as a
-package side effect.
+package side effect. Startup failures and synchronous shutdown callback errors
+remove every installed signal listener and keep-alive timer. Installed-process
+signal tests wait for an explicit diagnostic readiness message before sending a
+signal.
 
 ## Testing and CI
 
