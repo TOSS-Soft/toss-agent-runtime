@@ -1339,24 +1339,65 @@ describe("native per-user service manager", () => {
     await expect(manager.status()).resolves.toMatchObject({ backoff: false });
   });
 
-  it("returns an absent status when Darwin reports no registered service", async () => {
+  it.each([
+    [
+      "native launchctl wording",
+      113,
+      'Bad request.\nCould not find service "software.toss.agent-runtime" in domain for user gui: 501\n',
+    ],
+    ["compatible legacy wording", 1, "Could not find service gui/501/software.toss.agent-runtime"],
+  ])(
+    "reports a verified Darwin definition as installed but stopped for %s",
+    async (_name, exitCode, stderr) => {
+      const runner = new RecordingRunner([{ exitCode, stdout: "", stderr }]);
+      const { manager } = await darwinFixture(runner);
+      await manager.install();
+
+      await expect(manager.status()).resolves.toEqual({
+        installed: true,
+        enabled: true,
+        active: false,
+        backoff: false,
+        restartCount: 0,
+        lastExitCode: null,
+      });
+    },
+  );
+
+  it.each([
+    [
+      "wrong uid",
+      'Could not find service "software.toss.agent-runtime" in domain for user gui: 502',
+    ],
+    [
+      "wrong label",
+      'Could not find service "software.toss.agent-runtime-helper" in domain for user gui: 501',
+    ],
+    [
+      "leading label prefix",
+      'Could not find service "evilsoftware.toss.agent-runtime" in domain for user gui: 501',
+    ],
+    [
+      "wrong domain",
+      'Could not find service "software.toss.agent-runtime" in domain for user system: 501',
+    ],
+    [
+      "missing domain uid",
+      'Could not find service "software.toss.agent-runtime" in domain for user gui',
+    ],
+  ])("rejects native Darwin unloaded-service wording with %s", async (_name, stderr) => {
     const runner = new RecordingRunner([
       {
-        exitCode: 1,
+        exitCode: 113,
         stdout: "",
-        stderr: "Could not find service gui/501/software.toss.agent-runtime",
+        stderr,
       },
     ]);
     const { manager } = await darwinFixture(runner);
     await manager.install();
 
-    await expect(manager.status()).resolves.toEqual({
-      installed: false,
-      enabled: false,
-      active: false,
-      backoff: false,
-      restartCount: 0,
-      lastExitCode: null,
+    await expect(manager.status()).rejects.toMatchObject({
+      code: "RUNTIME_SERVICE_MANAGER_FAILED",
     });
   });
 

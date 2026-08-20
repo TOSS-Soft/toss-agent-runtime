@@ -195,7 +195,12 @@ function isIdempotentResult(
     ).test(output);
   }
   if (idempotentState === "darwin-bootout" || idempotentState === "darwin-print") {
-    return new RegExp(`could not find service\\s+["']?${identity}`, "i").test(output);
+    const legacyAbsent = new RegExp(`could not find service\\s+["']?${identity}`, "i").test(output);
+    const nativeAbsent = new RegExp(
+      `(?:^|\\n)could not find service\\s+["']${serviceLabel}["']\\s+in domain for user gui:\\s*${uid}\\s*(?:\\n|$)`,
+      "i",
+    ).test(output);
+    return legacyAbsent || nativeAbsent;
   }
   return false;
 }
@@ -483,7 +488,7 @@ class NativeServiceManager implements ServiceManager {
       ["print", nativeIdentity(this.options.uid)],
       "darwin-print",
     );
-    return result === undefined ? EMPTY_STATUS : darwinStatus(result);
+    return result === undefined ? fixedStatus(true, true, false) : darwinStatus(result);
   }
 
   async uninstall(): Promise<ServiceManagerStatus> {
