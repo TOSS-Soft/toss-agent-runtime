@@ -988,6 +988,80 @@ describe("baseline CLI", () => {
     }
   });
 
+  it("turns native Darwin spawn-scheduled crash retry into a blocking doctor check", async () => {
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-runtime-cli-launchd-")));
+    const cliPath = path.join(root, "cli.js");
+    const configPath = path.join(
+      root,
+      "Library",
+      "Application Support",
+      "TOSS",
+      "runtime",
+      "config.yaml",
+    );
+    await writeFile(cliPath, "", { mode: 0o600 });
+    const runner = {
+      calls: [] as { file: string; args: readonly string[] }[],
+      run(file: string, args: readonly string[]) {
+        this.calls.push({ file, args: [...args] });
+        return Promise.resolve({
+          exitCode: 0,
+          stdout: "state = spawn scheduled\nruns = 5\nlast exit code = 5\n",
+          stderr: "",
+        });
+      },
+    };
+    try {
+      const installer = createServiceManager({
+        platform: "darwin",
+        home: root,
+        env: {},
+        uid: 501,
+        currentUid: () => 501,
+        nodePath: process.execPath,
+        cliPath,
+        configPath,
+        randomSuffix: () => "definition",
+        runner,
+      });
+      await installer.install();
+      runner.calls.splice(0);
+      const mainServices = createMainServices({
+        platform: { os: "darwin", arch: "arm64", node: "22.23.1" },
+        env: {},
+        home: root,
+        signals: { subscribe: () => () => undefined },
+        pid: 4217,
+        now: () => new Date("2026-08-20T10:00:00.000Z"),
+        createServiceInstanceId: () => healthySocketStatus.service_instance_id,
+        resolveExecutableHash: () => Promise.resolve("a".repeat(64)),
+        sendReady: () => undefined,
+        nodePath: process.execPath,
+        cliPath,
+        uid: 501,
+        loadConfig: () =>
+          Promise.resolve({ config: defaultConfig("darwin", root), source: "launchd-format-test" }),
+        createServiceManager: (options) =>
+          createServiceManager({ ...options, currentUid: () => 501, runner }),
+      });
+
+      const output = await runCli(["doctor", "--json"], mainServices);
+
+      expect(output.exitCode).toBe(5);
+      expect(doctorChecks(output)).toContainEqual({
+        id: "service",
+        status: "FAIL",
+        message: "Runtime service restart backoff is active; inspect service status",
+      });
+      expect(output.stdout).not.toContain("spawn scheduled");
+      expect(runner.calls).toEqual([
+        { file: "/bin/launchctl", args: ["print", "gui/501/software.toss.agent-runtime"] },
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("renders oversized native status integers as safe JSON fallback values", async () => {
     const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-runtime-cli-status-")));
     const cliPath = path.join(root, "cli.js");

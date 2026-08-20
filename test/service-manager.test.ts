@@ -1305,6 +1305,40 @@ describe("native per-user service manager", () => {
     ]);
   });
 
+  it("parses the observed Darwin spawn-scheduled crash retry as backoff", async () => {
+    const runner = new RecordingRunner([
+      {
+        exitCode: 0,
+        stdout: "state = spawn scheduled\nruns = 5\nlast exit code = 5\n",
+        stderr: "",
+      },
+    ]);
+    const { manager } = await darwinFixture(runner);
+    await manager.install();
+
+    await expect(manager.status()).resolves.toEqual({
+      installed: true,
+      enabled: true,
+      active: false,
+      backoff: true,
+      restartCount: 5,
+      lastExitCode: 5,
+    });
+  });
+
+  it.each([
+    ["first scheduled launch", "state = spawn scheduled\nruns = 1\nlast exit code = 5\n"],
+    ["clean scheduled launch", "state = spawn scheduled\nruns = 5\nlast exit code = 0\n"],
+    ["missing exit", "state = spawn scheduled\nruns = 5\n"],
+    ["ordinary exit", "state = exited\nruns = 5\nlast exit code = 5\n"],
+  ])("does not misclassify Darwin %s as crash backoff", async (_name, output) => {
+    const runner = new RecordingRunner([{ exitCode: 0, stdout: output, stderr: "" }]);
+    const { manager } = await darwinFixture(runner);
+    await manager.install();
+
+    await expect(manager.status()).resolves.toMatchObject({ backoff: false });
+  });
+
   it("returns an absent status when Darwin reports no registered service", async () => {
     const runner = new RecordingRunner([
       {
