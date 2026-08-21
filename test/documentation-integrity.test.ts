@@ -84,7 +84,9 @@ describe("published protocol artifacts", () => {
       await readFile("docs/contracts/runtime-contract-v1.manifest.json", "utf8"),
     ) as ContractManifest;
     expect(manifest.schema_version).toBe("runtime-contract-manifest.v1");
-    expect(manifest.schemas.map((entry) => entry.schema_version)).toEqual([
+    const versions = manifest.schemas.map((entry) => entry.schema_version);
+    expect(versions).toEqual([...versions].sort());
+    expect(versions).toEqual([
       "agentgateway-capabilities.v1",
       "candidate-job-intent.v1",
       "command-result.v1",
@@ -94,22 +96,26 @@ describe("published protocol artifacts", () => {
       "model-catalog.v1",
       "model-selection-plan.v1",
       "operational-event.v1",
-      "provider-event.v1",
       "project-registry-entry.v1",
       "project-watch-manifest.v1",
+      "provider-event.v1",
       "routing-policy.v1",
       "routing-state.v1",
       "run-journal-entry.v1",
       "runtime-capabilities.v1",
       "runtime-common.v1",
       "runtime-config.v1",
-      "service-lock.v1",
       "service-control-request.v1",
       "service-control-response.v1",
+      "service-lock.v1",
     ]);
     for (const entry of manifest.schemas) {
+      const expectedPath = `contracts/runtime/${entry.schema_version}.schema.json`;
+      const expectedId = `https://toss.software/schemas/runtime/v1/${entry.schema_version}.schema.json`;
+      expect(entry.path).toBe(expectedPath);
+      expect(entry.id).toBe(expectedId);
       const schema = JSON.parse(await readFile(entry.path, "utf8")) as { readonly $id?: string };
-      expect(schema.$id).toBe(entry.id);
+      expect(schema.$id).toBe(expectedId);
     }
   });
 

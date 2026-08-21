@@ -16,6 +16,7 @@ import {
   parseRoutingState,
   planModelSelection,
   recordRoutingOutcome,
+  RuntimeRoutingError,
   settleRoutingDecision,
   verifyResolvedRoute,
   type AgentgatewayCapabilitiesV1,
@@ -246,10 +247,59 @@ describe("governed routing integration", () => {
       }),
     ).toEqual(fallbackResult.route_identity);
 
-    const settlement = settleRoutingDecision({
+    const secondRecorded = recordRoutingOutcome({
       state: recorded.state,
+      plan: fixture.plan,
+      policy: fixture.policy,
+      attempt_id: fallback.attempt_id,
+      outcome: "RUNTIME_PROVIDER_TIMEOUT",
+      occurred_at: "2026-08-21T12:00:45.000Z",
+    });
+    expect(secondRecorded.transition).toMatchObject({
+      previous_state_hash: recorded.state.document_hash,
+      next_state_hash: secondRecorded.state.document_hash,
+      decision_id: fixture.plan.decision_id,
+      attempt_id: fallback.attempt_id,
+      outcome: "RUNTIME_PROVIDER_TIMEOUT",
+      occurred_at: "2026-08-21T12:00:45.000Z",
+      policy_hash: fixture.policy.document_hash,
+    });
+    expect(secondRecorded.transition.transition_hash).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(secondRecorded.state.previous_state_hash).toBe(recorded.state.document_hash);
+    expect(secondRecorded.state.revision).toBe(recorded.state.revision + 1);
+    expect(secondRecorded.state.circuits.map((circuit) => circuit.entry_id)).toEqual(
+      [primary.entry_id, fallback.entry_id].sort(),
+    );
+
+    for (const incompleteChain of [[secondRecorded.state], [recorded.state]]) {
+      expect(() =>
+        settleRoutingDecision({
+          state: secondRecorded.state,
+          reserved_state: fixture.state,
+          circuit_state_chain: incompleteChain,
+          plan: fixture.plan,
+          attempts: [primaryResult, fallbackResult],
+          settled_at: "2026-08-21T12:01:00.000Z",
+        }),
+      ).toThrowError(RuntimeRoutingError);
+      try {
+        settleRoutingDecision({
+          state: secondRecorded.state,
+          reserved_state: fixture.state,
+          circuit_state_chain: incompleteChain,
+          plan: fixture.plan,
+          attempts: [primaryResult, fallbackResult],
+          settled_at: "2026-08-21T12:01:00.000Z",
+        });
+      } catch (error) {
+        expect((error as RuntimeRoutingError).code).toBe("RUNTIME_ROUTING_STALE_STATE");
+      }
+    }
+
+    const settlement = settleRoutingDecision({
+      state: secondRecorded.state,
       reserved_state: fixture.state,
-      circuit_state_chain: [recorded.state],
+      circuit_state_chain: [recorded.state, secondRecorded.state],
       plan: fixture.plan,
       attempts: [primaryResult, fallbackResult],
       settled_at: "2026-08-21T12:01:00.000Z",
@@ -262,6 +312,9 @@ describe("governed routing integration", () => {
       duration_ms: 2_000,
       turns: 2,
     });
+    expect(settlement.state.previous_state_hash).toBe(secondRecorded.state.document_hash);
+    expect(settlement.state.revision).toBe(secondRecorded.state.revision + 1);
+    expect(settlement.state.circuits).toEqual(secondRecorded.state.circuits);
   });
 
   it("plans a 1,024-entry catalog against exactly 256 live routes within five seconds", () => {

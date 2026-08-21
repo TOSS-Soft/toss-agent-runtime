@@ -48,11 +48,6 @@
       "id": "https://toss.software/schemas/runtime/v1/operational-event.v1.schema.json"
     },
     {
-      "schema_version": "provider-event.v1",
-      "path": "contracts/runtime/provider-event.v1.schema.json",
-      "id": "https://toss.software/schemas/runtime/v1/provider-event.v1.schema.json"
-    },
-    {
       "schema_version": "project-registry-entry.v1",
       "path": "contracts/runtime/project-registry-entry.v1.schema.json",
       "id": "https://toss.software/schemas/runtime/v1/project-registry-entry.v1.schema.json"
@@ -61,6 +56,11 @@
       "schema_version": "project-watch-manifest.v1",
       "path": "contracts/runtime/project-watch-manifest.v1.schema.json",
       "id": "https://toss.software/schemas/runtime/v1/project-watch-manifest.v1.schema.json"
+    },
+    {
+      "schema_version": "provider-event.v1",
+      "path": "contracts/runtime/provider-event.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/provider-event.v1.schema.json"
     },
     {
       "schema_version": "routing-policy.v1",
@@ -93,11 +93,6 @@
       "id": "https://toss.software/schemas/runtime/v1/runtime-config.v1.schema.json"
     },
     {
-      "schema_version": "service-lock.v1",
-      "path": "contracts/runtime/service-lock.v1.schema.json",
-      "id": "https://toss.software/schemas/runtime/v1/service-lock.v1.schema.json"
-    },
-    {
       "schema_version": "service-control-request.v1",
       "path": "contracts/runtime/service-control-request.v1.schema.json",
       "id": "https://toss.software/schemas/runtime/v1/service-control-request.v1.schema.json"
@@ -106,6 +101,11 @@
       "schema_version": "service-control-response.v1",
       "path": "contracts/runtime/service-control-response.v1.schema.json",
       "id": "https://toss.software/schemas/runtime/v1/service-control-response.v1.schema.json"
+    },
+    {
+      "schema_version": "service-lock.v1",
+      "path": "contracts/runtime/service-lock.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/service-lock.v1.schema.json"
     }
   ]
 }
