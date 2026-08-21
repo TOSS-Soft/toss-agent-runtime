@@ -41,6 +41,7 @@ export interface PrivateMutationClaim {
 }
 
 export interface PrivateAgentStoreOperationHooks {
+  readonly beforeSnapshotAllocation?: () => void;
   readonly beforeFileSync?: (stagePath: string) => Promise<void>;
   readonly afterFileSync?: (stagePath: string) => Promise<void>;
   readonly beforeLinkPublication?: (stagePath: string, objectPath: string) => Promise<void>;
@@ -674,6 +675,8 @@ export function createPrivateAgentStore(
     hash: `sha256:${string}`,
     bytes: Uint8Array,
   ): Promise<PrivateObjectSnapshot> => {
+    if (bytes.byteLength > MAX_PRIVATE_OBJECT_BYTES) registryCorrupt();
+    options.operationHooks?.beforeSnapshotAllocation?.();
     const canonicalBytes = Buffer.from(bytes);
     const name = validateObject(hash, canonicalBytes);
     await ensureRoots();

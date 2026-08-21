@@ -206,6 +206,28 @@ describe.sequential("private agent object store", () => {
     expect((await store.readObject(hash))?.bytes).toEqual(entryBytes);
   });
 
+  it("rejects oversized caller bytes before entering private snapshot allocation", async () => {
+    const { statePath } = await fixture();
+    let snapshotAllocations = 0;
+    const operationHooks = {
+      beforeSnapshotAllocation: () => {
+        snapshotAllocations += 1;
+      },
+    } as unknown as PrivateAgentStoreOperationHooks;
+    const store = createPrivateAgentStore(options(statePath, { operationHooks }));
+    const oversized = Buffer.alloc(MAX_PRIVATE_OBJECT_BYTES + 1);
+
+    await expectAgentError(
+      store.publishObject(contentHash(oversized), oversized),
+      "RUNTIME_AGENT_REGISTRY_CORRUPT",
+    );
+    expect(snapshotAllocations).toBe(0);
+
+    const bounded = Buffer.from("bounded-snapshot", "utf8");
+    await store.publishObject(contentHash(bounded), bounded);
+    expect(snapshotAllocations).toBe(1);
+  });
+
   it("rejects malformed hashes, hash mismatches, oversized publication, and non-absolute state paths", async () => {
     const { statePath } = await fixture();
     const store = createPrivateAgentStore(options(statePath));
