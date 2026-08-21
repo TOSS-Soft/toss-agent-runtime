@@ -23,10 +23,14 @@
     "execution-request.v1",
     "execution-event.v1",
     "execution-result.v1",
+    "model-catalog.v1",
+    "model-selection-plan.v1",
     "operational-event.v1",
     "provider-event.v1",
     "project-registry-entry.v1",
     "project-watch-manifest.v1",
+    "routing-policy.v1",
+    "routing-state.v1",
     "runtime-capabilities.v1",
     "run-journal-entry.v1",
     "service-lock.v1",
@@ -34,7 +38,20 @@
     "service-control-response.v1"
   ],
   "provider_transports": ["agentgateway", "openai", "anthropic", "gemini"],
-  "model_classes": [],
+  "model_classes": [
+    { "logical_class": "economy", "capabilities": ["text"] },
+    {
+      "logical_class": "balanced-code",
+      "capabilities": ["json-schema", "text", "tools"]
+    },
+    { "logical_class": "deep-reasoning", "capabilities": ["reasoning", "text"] },
+    { "logical_class": "long-context", "capabilities": ["long-context", "text"] },
+    { "logical_class": "vision", "capabilities": ["text", "vision"] },
+    {
+      "logical_class": "independent-review",
+      "capabilities": ["independent-review", "reasoning", "text"]
+    }
+  ],
   "skill_host_versions": [],
   "superpowers_capabilities": [],
   "mcp_transports": [],
@@ -42,7 +59,7 @@
   "execution_topologies": [],
   "features": {
     "providers": "available",
-    "routing": "unavailable",
+    "routing": "available",
     "skills": "unavailable",
     "mcp": "unavailable",
     "agent_loop": "unavailable",

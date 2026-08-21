@@ -109,4 +109,34 @@ describe("package metadata", () => {
       expect(packageApi).not.toHaveProperty(internalName);
     }
   });
+
+  it("exports governed routing without stateful or test-only routing internals", () => {
+    for (const name of [
+      "calculateRoutingCost",
+      "estimateRoutingAllocation",
+      "nextModelFallback",
+      "parseModelCatalog",
+      "parseRoutingPolicy",
+      "parseRoutingState",
+      "parseModelSelectionPlan",
+      "planModelSelection",
+      "recordRoutingOutcome",
+      "reserveRoutingBudget",
+      "settleRoutingDecision",
+      "verifyResolvedRoute",
+    ]) {
+      expect(packageApi).toHaveProperty(name, expect.any(Function));
+    }
+
+    for (const internalName of [
+      "createRoutingStore",
+      "modelCatalogValidator",
+      "requireModelRouter",
+      "routingCache",
+      "scoreRoutingCandidates",
+      "validCatalog",
+    ]) {
+      expect(packageApi).not.toHaveProperty(internalName);
+    }
+  });
 });

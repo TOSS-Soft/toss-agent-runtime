@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { requireAgentRegistry } from "../src/agents/index.js";
 import { requireEvidenceEmitter } from "../src/evidence/index.js";
 import { requireAgentLoop } from "../src/orchestration/index.js";
-import { requireModelRouter } from "../src/routing/index.js";
+import * as routingApi from "../src/routing/index.js";
 import { requireSecurityRuntime } from "../src/security/index.js";
 import { requireSkillsHost } from "../src/skills/index.js";
 import { requireToolBroker } from "../src/tools/index.js";
@@ -21,8 +21,13 @@ describe("future subsystem boundaries", () => {
     expect(hashAgentgatewayCapabilities).toBeTypeOf("function");
   });
 
+  it("treats governed model routing as delivered", () => {
+    expect(routingApi).not.toHaveProperty("requireModelRouter");
+    expect(routingApi).toHaveProperty("planModelSelection", expect.any(Function));
+    expect(routingApi).toHaveProperty("verifyResolvedRoute", expect.any(Function));
+  });
+
   it.each([
-    ["routing", requireModelRouter],
     ["agents", requireAgentRegistry],
     ["skills", requireSkillsHost],
     ["tools", requireToolBroker],

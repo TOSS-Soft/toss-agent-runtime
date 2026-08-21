@@ -46,6 +46,9 @@ describe("published protocol artifacts", () => {
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.value.supported_schemas).toEqual(baseline.supported_schemas);
+      expect(result.value.model_classes).toEqual(baseline.model_classes);
+      expect(result.value.features).toEqual(baseline.features);
+      expect(result.value.execution_topologies).toEqual([]);
     }
   });
 
