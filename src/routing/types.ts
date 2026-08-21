@@ -4,6 +4,8 @@ import type {
   RuntimeDocument,
   UsageSummary,
 } from "../protocol/types.js";
+import type { ExecutionRequestV1 } from "../protocol/request.js";
+import type { AgentgatewayCapabilitiesV1 } from "../gateway/types.js";
 import type {
   ProviderAdapterCapabilities,
   ProviderKind,
@@ -282,3 +284,28 @@ export interface RoutingAttemptResult {
   readonly duration_ms: number;
   readonly effect_may_have_occurred: boolean;
 }
+
+export interface PlanModelSelectionInput {
+  readonly request: ExecutionRequestV1;
+  readonly task: RoutingTaskProfile;
+  readonly ceilings: RoutingCallCeilings;
+  readonly catalog: ModelCatalogV1;
+  readonly policy: RoutingPolicyV1;
+  readonly state: RoutingStateV1;
+  readonly live: AgentgatewayCapabilitiesV1;
+  readonly gateway_profile: string;
+  readonly decision_at: string;
+  readonly override?: GovernedRoutingOverride;
+}
+
+export type RoutingDecision =
+  | Readonly<{
+      status: "planned";
+      plan: PlannedModelSelectionPlanV1;
+      next_state: RoutingStateV1;
+    }>
+  | Readonly<{
+      status: "blocked";
+      plan: BlockedModelSelectionPlanV1;
+      next_state: null;
+    }>;
