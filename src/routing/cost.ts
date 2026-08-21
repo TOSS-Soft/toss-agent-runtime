@@ -342,39 +342,56 @@ function changedCircuitEntryIds(
   return entryIds.filter((entryId) => !canonicalEqual(reserved.get(entryId), current.get(entryId)));
 }
 
-function assertCurrentStateDescendsFromReservation(
+function assertCircuitStateChain(
   currentState: RoutingStateV1,
   reservedState: RoutingStateV1,
   plan: PlannedModelSelectionPlanV1,
+  chainInput: readonly RoutingStateV1[],
 ): void {
-  if (
-    currentState.document_hash === reservedState.document_hash &&
-    canonicalEqual(currentState, reservedState)
-  ) {
+  if (!Array.isArray(chainInput)) invalid();
+  const chain = chainInput as readonly RoutingStateV1[];
+  const plannedAttemptCount =
+    plan.worker_attempts.length + (plan.reviewer_attempt === null ? 0 : 1);
+  if (chain.length === 0) {
+    if (!canonicalEqual(currentState, reservedState)) {
+      throw new RuntimeRoutingError("RUNTIME_ROUTING_STALE_STATE");
+    }
     return;
   }
-  if (
-    currentState.revision !== reservedState.revision + 1 ||
-    currentState.previous_state_hash !== reservedState.document_hash ||
-    !canonicalEqual(
-      stateWithoutTransitionFields(currentState),
-      stateWithoutTransitionFields(reservedState),
-    )
-  ) {
+  if (chain.length > plannedAttemptCount) {
     throw new RuntimeRoutingError("RUNTIME_ROUTING_STALE_STATE");
   }
 
-  const changedEntryIds = changedCircuitEntryIds(reservedState, currentState);
   const plannedEntryIds = new Set([
     ...plan.worker_attempts.map((attempt) => attempt.entry_id),
     ...(plan.reviewer_attempt === null ? [] : [plan.reviewer_attempt.entry_id]),
   ]);
-  const changedEntryId = changedEntryIds[0];
-  if (
-    changedEntryIds.length !== 1 ||
-    changedEntryId === undefined ||
-    !plannedEntryIds.has(changedEntryId)
-  ) {
+  let previous = reservedState;
+  for (const chainValue of chain) {
+    const current = stateOrThrow(chainValue);
+    if (
+      current.revision !== previous.revision + 1 ||
+      current.previous_state_hash !== previous.document_hash ||
+      !canonicalEqual(
+        stateWithoutTransitionFields(current),
+        stateWithoutTransitionFields(reservedState),
+      )
+    ) {
+      throw new RuntimeRoutingError("RUNTIME_ROUTING_STALE_STATE");
+    }
+    exactReservation(current, plan);
+    const changedEntryIds = changedCircuitEntryIds(previous, current);
+    const changedEntryId = changedEntryIds[0];
+    if (
+      changedEntryIds.length !== 1 ||
+      changedEntryId === undefined ||
+      !plannedEntryIds.has(changedEntryId)
+    ) {
+      throw new RuntimeRoutingError("RUNTIME_ROUTING_STALE_STATE");
+    }
+    previous = current;
+  }
+  if (!canonicalEqual(previous, currentState)) {
     throw new RuntimeRoutingError("RUNTIME_ROUTING_STALE_STATE");
   }
 }
@@ -448,6 +465,7 @@ function addKnownUsage(
 export function settleRoutingDecision(input: {
   readonly state: RoutingStateV1;
   readonly reserved_state: RoutingStateV1;
+  readonly circuit_state_chain: readonly RoutingStateV1[];
   readonly plan: PlannedModelSelectionPlanV1;
   readonly attempts: readonly RoutingAttemptResult[];
   readonly settled_at: string;
@@ -458,7 +476,7 @@ export function settleRoutingDecision(input: {
   const plan = planOrThrow(input.plan);
   if (state.revision >= Number.MAX_SAFE_INTEGER) invalid();
   assertReservedPlanBindings(reservedState, plan);
-  assertCurrentStateDescendsFromReservation(state, reservedState, plan);
+  assertCircuitStateChain(state, reservedState, plan, input.circuit_state_chain);
   exactReservation(reservedState, plan);
   const reservation = exactReservation(state, plan);
   if (

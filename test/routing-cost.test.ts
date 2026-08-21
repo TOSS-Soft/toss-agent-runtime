@@ -560,6 +560,23 @@ describe("routing budget reservation", () => {
 });
 
 describe("routing budget settlement", () => {
+  it("rejects a non-array circuit state chain with a safe routing error", () => {
+    const fixture = reservedPlanFixture();
+
+    expectRoutingError(
+      () =>
+        settleRoutingDecision({
+          state: fixture.state,
+          reserved_state: fixture.state,
+          circuit_state_chain: null as unknown as readonly RoutingStateV1[],
+          plan: fixture.plan,
+          attempts: [successfulAttempt(fixture.plan)],
+          settled_at: "2026-08-21T12:00:01.000Z",
+        }),
+      "RUNTIME_ROUTING_INVALID",
+    );
+  });
+
   it("prices the exact accepted route, releases the reservation, and records actual usage", () => {
     const fixture = reservedPlanFixture();
     const attempt = fixture.plan.worker_attempts[0];
@@ -575,6 +592,7 @@ describe("routing budget settlement", () => {
     const settled = settleRoutingDecision({
       state: fixture.state,
       reserved_state: fixture.state,
+      circuit_state_chain: [],
       plan: fixture.plan,
       attempts: [result],
       settled_at: "2026-08-21T12:00:01.000Z",
@@ -622,6 +640,7 @@ describe("routing budget settlement", () => {
     const settled = settleRoutingDecision({
       state: fixture.state,
       reserved_state: fixture.state,
+      circuit_state_chain: [],
       plan: fixture.plan,
       attempts: [
         {
@@ -655,6 +674,7 @@ describe("routing budget settlement", () => {
       const settled = settleRoutingDecision({
         state: fixture.state,
         reserved_state: fixture.state,
+        circuit_state_chain: [],
         plan: fixture.plan,
         attempts: [
           {
@@ -702,6 +722,7 @@ describe("routing budget settlement", () => {
       settleRoutingDecision({
         state,
         reserved_state: fixture.state,
+        circuit_state_chain: state === fixture.state ? [] : [state],
         plan,
         attempts,
         settled_at: "2026-08-21T12:00:01.000Z",
@@ -769,6 +790,7 @@ describe("routing budget settlement", () => {
     const settled = settleRoutingDecision({
       state: later,
       reserved_state: fixture.state,
+      circuit_state_chain: [later],
       plan: fixture.plan,
       attempts: [
         {
@@ -855,6 +877,7 @@ describe("routing budget settlement", () => {
           settleRoutingDecision({
             state,
             reserved_state: fixture.state,
+            circuit_state_chain: [state],
             plan: fixture.plan,
             attempts: [successfulAttempt(fixture.plan)],
             settled_at: "2026-08-21T12:00:01.000Z",
@@ -876,6 +899,7 @@ describe("routing budget settlement", () => {
         settleRoutingDecision({
           state: fixture.state,
           reserved_state: driftedReservedState,
+          circuit_state_chain: [],
           plan: fixture.plan,
           attempts: [successfulAttempt(fixture.plan)],
           settled_at: "2026-08-21T12:00:01.000Z",
@@ -894,6 +918,7 @@ describe("routing budget settlement", () => {
           settleRoutingDecision({
             state: fixture.state,
             reserved_state: fixture.state,
+            circuit_state_chain: [],
             plan: fixture.plan,
             attempts: [
               usageStatus === "known" ? attempt : { ...attempt, route_identity: null, usage: null },
@@ -923,6 +948,7 @@ describe("routing budget settlement", () => {
       const settled = settleRoutingDecision({
         state: current,
         reserved_state: fixture.state,
+        circuit_state_chain: [current],
         plan: fixture.plan,
         attempts: [
           usageStatus === "known" ? attempt : { ...attempt, route_identity: null, usage: null },
@@ -979,6 +1005,7 @@ describe("routing budget settlement", () => {
         settleRoutingDecision({
           state: fixture.state,
           reserved_state: fixture.state,
+          circuit_state_chain: [],
           plan: fixture.plan,
           attempts: [{ ...attempt, route_identity: null, usage: null }],
           settled_at: "2026-08-21T12:00:01.000Z",

@@ -314,6 +314,22 @@ export type RoutingDecision =
 
 export type RoutingProviderOutcome = RuntimeProviderErrorCode | "RUNTIME_PROVIDER_SUCCESS";
 
+export interface RoutingOutcomeTransition {
+  readonly transition_hash: `sha256:${string}`;
+  readonly previous_state_hash: `sha256:${string}`;
+  readonly next_state_hash: `sha256:${string}`;
+  readonly decision_id: string;
+  readonly attempt_id: string;
+  readonly outcome: RoutingProviderOutcome;
+  readonly occurred_at: string;
+  readonly policy_hash: `sha256:${string}`;
+}
+
+export interface RecordedRoutingOutcome {
+  readonly state: RoutingStateV1;
+  readonly transition: RoutingOutcomeTransition;
+}
+
 export type ModelFallbackDecision =
   | Readonly<{ status: "ready"; attempt: RoutingAttemptV1 }>
   | Readonly<{

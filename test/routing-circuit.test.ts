@@ -1,18 +1,20 @@
 import { describe, expect, it } from "vitest";
 
-import { canonicalJson } from "../src/protocol/json.js";
+import { sha256 } from "../src/protocol/json.js";
 import type { ProviderRouteIdentity, ProviderUsage } from "../src/providers/types.js";
 import type { RuntimeProviderErrorCode } from "../src/providers/errors.js";
 import { nextModelFallback, recordRoutingOutcome } from "../src/routing/circuit.js";
-import { hashRoutingState, parseRoutingState } from "../src/routing/contracts.js";
+import { hashRoutingState } from "../src/routing/contracts.js";
 import { settleRoutingDecision } from "../src/routing/cost.js";
 import { RuntimeRoutingError } from "../src/routing/errors.js";
 import { planModelSelection } from "../src/routing/selection.js";
 import type {
   PlannedModelSelectionPlanV1,
+  RecordedRoutingOutcome,
   RoutingAttemptResult,
   RoutingAttemptV1,
   RoutingCircuitV1,
+  RoutingOutcomeTransition,
   RoutingStateV1,
 } from "../src/routing/types.js";
 import { plannedRoutingFixture, type PlannedRoutingFixture } from "./helpers/routing-fixtures.js";
@@ -39,6 +41,9 @@ const ALL_PROVIDER_OUTCOMES = [
   "RUNTIME_PROVIDER_UNAVAILABLE",
   "RUNTIME_PROVIDER_INTERNAL",
 ] as const satisfies readonly RuntimeProviderErrorCode[];
+const TERMINAL_NON_FALLBACK_OUTCOMES = ALL_PROVIDER_OUTCOMES.filter(
+  (outcome) => !ALLOWED_OUTCOMES.includes(outcome as (typeof ALLOWED_OUTCOMES)[number]),
+);
 
 function primary(fixture: PlannedRoutingFixture): RoutingAttemptV1 {
   const attempt = fixture.plan.worker_attempts[0];
@@ -93,13 +98,23 @@ function record(
   state: RoutingStateV1 = fixture.state,
   attempt: RoutingAttemptV1 = primary(fixture),
 ): RoutingStateV1 {
+  return recorded(fixture, outcome, state, attempt).state;
+}
+
+function recorded(
+  fixture: PlannedRoutingFixture,
+  outcome: RuntimeProviderErrorCode | "RUNTIME_PROVIDER_SUCCESS",
+  state: RoutingStateV1 = fixture.state,
+  attempt: RoutingAttemptV1 = primary(fixture),
+  occurredAt: string = OCCURRED_AT,
+): RecordedRoutingOutcome {
   return recordRoutingOutcome({
     state,
     plan: fixture.plan,
     policy: fixture.policy,
     attempt_id: attempt.attempt_id,
     outcome,
-    occurred_at: OCCURRED_AT,
+    occurred_at: occurredAt,
   });
 }
 
@@ -109,34 +124,32 @@ function fallback(
     state: RoutingStateV1;
     attempt?: RoutingAttemptV1;
     outcome?: RuntimeProviderErrorCode;
+    previous_state?: RoutingStateV1;
+    policy?: PlannedRoutingFixture["policy"];
+    transition?: RoutingOutcomeTransition;
+    occurred_at?: string;
     results?: readonly RoutingAttemptResult[];
     remaining_duration_ms?: number;
   }>,
 ) {
   const attempt = input.attempt ?? primary(fixture);
+  const outcome = input.outcome ?? "RUNTIME_PROVIDER_TIMEOUT";
+  const previousState = input.previous_state ?? fixture.state;
+  const occurredAt = input.occurred_at ?? OCCURRED_AT;
+  const transition =
+    input.transition ?? recorded(fixture, outcome, previousState, attempt, occurredAt).transition;
   return nextModelFallback({
     state: input.state,
+    previous_state: previousState,
     plan: fixture.plan,
+    policy: input.policy ?? fixture.policy,
+    transition,
     current_attempt_id: attempt.attempt_id,
-    outcome: input.outcome ?? "RUNTIME_PROVIDER_TIMEOUT",
+    outcome,
+    occurred_at: occurredAt,
     attempt_results: input.results ?? [attemptResult(attempt)],
     remaining_duration_ms: input.remaining_duration_ms ?? 300_000,
   });
-}
-
-function rehashState(state: RoutingStateV1, overrides: Partial<RoutingStateV1>): RoutingStateV1 {
-  const candidate = {
-    ...state,
-    ...overrides,
-    document_hash: `sha256:${"0".repeat(64)}`,
-  } as RoutingStateV1;
-  const withHash = {
-    ...candidate,
-    document_hash: hashRoutingState(candidate),
-  } as RoutingStateV1;
-  const parsed = parseRoutingState(canonicalJson(withHash));
-  if (!parsed.ok) throw new Error(`invalid changed state: ${JSON.stringify(parsed.issues)}`);
-  return parsed.value;
 }
 
 function circuit(state: RoutingStateV1, entryId: string): RoutingCircuitV1 | undefined {
@@ -144,6 +157,49 @@ function circuit(state: RoutingStateV1, entryId: string): RoutingCircuitV1 | und
 }
 
 describe("recordRoutingOutcome", () => {
+  it("returns a closed hash-bound witness for the exact outcome event", () => {
+    const fixture = plannedRoutingFixture();
+    const result = recordRoutingOutcome({
+      state: fixture.state,
+      plan: fixture.plan,
+      policy: fixture.policy,
+      attempt_id: primary(fixture).attempt_id,
+      outcome: "RUNTIME_PROVIDER_TIMEOUT",
+      occurred_at: OCCURRED_AT,
+    }) as unknown as {
+      readonly state: RoutingStateV1;
+      readonly transition: Readonly<Record<string, unknown>> &
+        Readonly<{ transition_hash: `sha256:${string}` }>;
+    };
+
+    const { transition_hash: transitionHash, ...projection } = result.transition;
+    expect(Object.keys(result)).toEqual(["state", "transition"]);
+    expect(Object.keys(result.transition).sort()).toEqual(
+      [
+        "attempt_id",
+        "decision_id",
+        "next_state_hash",
+        "occurred_at",
+        "outcome",
+        "policy_hash",
+        "previous_state_hash",
+        "transition_hash",
+      ].sort(),
+    );
+    expect(result.transition).toMatchObject({
+      previous_state_hash: fixture.state.document_hash,
+      next_state_hash: result.state.document_hash,
+      decision_id: fixture.plan.decision_id,
+      attempt_id: primary(fixture).attempt_id,
+      outcome: "RUNTIME_PROVIDER_TIMEOUT",
+      occurred_at: OCCURRED_AT,
+      policy_hash: fixture.policy.document_hash,
+    });
+    expect(transitionHash).toBe(sha256(projection));
+    expect(Object.isFrozen(result)).toBe(true);
+    expect(Object.isFrozen(result.transition)).toBe(true);
+  });
+
   it("opens a threshold-one circuit at the exact canonical cooldown timestamp", () => {
     const fixture = plannedRoutingFixture({
       consecutive_failure_threshold: 1,
@@ -181,6 +237,7 @@ describe("recordRoutingOutcome", () => {
     const settled = settleRoutingDecision({
       state: firstOutcome,
       reserved_state: first.state,
+      circuit_state_chain: [firstOutcome],
       plan: first.plan,
       attempts: [
         attemptResult(primary(first), {
@@ -214,7 +271,7 @@ describe("recordRoutingOutcome", () => {
       attempt_id: primary(second).attempt_id,
       outcome: "RUNTIME_PROVIDER_TRANSIENT",
       occurred_at: "2026-08-21T12:01:30.000Z",
-    });
+    }).state;
     expect(circuit(opened, "worker-primary")).toEqual({
       entry_id: "worker-primary",
       status: "open",
@@ -280,6 +337,36 @@ describe("recordRoutingOutcome", () => {
       probe_decision_id: null,
     });
   });
+
+  it.each(TERMINAL_NON_FALLBACK_OUTCOMES)(
+    "releases a probe without changing counters for terminal %s",
+    (outcome) => {
+      const fixture = plannedRoutingFixture({
+        circuits: [
+          {
+            entry_id: "worker-primary",
+            status: "open",
+            consecutive_failures: 2,
+            retry_at: "2026-08-21T12:00:00.000Z",
+            probe_decision_id: null,
+          },
+        ],
+      });
+
+      const next = record(fixture, outcome);
+
+      expect(next).not.toBe(fixture.state);
+      expect(next.revision).toBe(fixture.state.revision + 1);
+      expect(next.previous_state_hash).toBe(fixture.state.document_hash);
+      expect(circuit(next, "worker-primary")).toEqual({
+        entry_id: "worker-primary",
+        status: "open",
+        consecutive_failures: 2,
+        retry_at: "2026-08-21T12:00:00.000Z",
+        probe_decision_id: null,
+      });
+    },
+  );
 
   it("rejects a concurrent probe head reserved by a different decision", () => {
     const openCircuit = {
@@ -448,6 +535,175 @@ describe("recordRoutingOutcome", () => {
 });
 
 describe("nextModelFallback", () => {
+  it("binds a below-threshold fallback to the exact outcome occurrence witness", () => {
+    const fixture = plannedRoutingFixture();
+    const first = recorded(
+      fixture,
+      "RUNTIME_PROVIDER_TIMEOUT",
+      fixture.state,
+      primary(fixture),
+      "2026-08-21T12:00:30.000Z",
+    );
+    const differentTime = recorded(
+      fixture,
+      "RUNTIME_PROVIDER_TIMEOUT",
+      fixture.state,
+      primary(fixture),
+      "2026-08-21T12:00:31.000Z",
+    );
+    expect(differentTime.state).toEqual(first.state);
+    expect(differentTime.transition.transition_hash).not.toBe(first.transition.transition_hash);
+
+    expect(
+      nextModelFallback({
+        state: first.state,
+        previous_state: fixture.state,
+        plan: fixture.plan,
+        policy: fixture.policy,
+        transition: differentTime.transition,
+        current_attempt_id: primary(fixture).attempt_id,
+        outcome: "RUNTIME_PROVIDER_TIMEOUT",
+        occurred_at: "2026-08-21T12:00:30.000Z",
+        attempt_results: [attemptResult(primary(fixture))],
+        remaining_duration_ms: 300_000,
+      }),
+    ).toEqual({
+      status: "blocked",
+      code: "RUNTIME_ROUTING_STALE_STATE",
+      retryable: false,
+    });
+  });
+
+  it("rejects an outcome witness recorded for a different planned attempt", () => {
+    const fixture = plannedRoutingFixture();
+    const otherAttempt = fixture.plan.worker_attempts[1];
+    if (otherAttempt === undefined) throw new Error("missing second fixture attempt");
+    const other = recorded(fixture, "RUNTIME_PROVIDER_TIMEOUT", fixture.state, otherAttempt);
+
+    expect(
+      nextModelFallback({
+        state: other.state,
+        previous_state: fixture.state,
+        plan: fixture.plan,
+        policy: fixture.policy,
+        transition: other.transition,
+        current_attempt_id: primary(fixture).attempt_id,
+        outcome: "RUNTIME_PROVIDER_TIMEOUT",
+        occurred_at: OCCURRED_AT,
+        attempt_results: [attemptResult(primary(fixture))],
+        remaining_duration_ms: 300_000,
+      }),
+    ).toEqual({
+      status: "blocked",
+      code: "RUNTIME_ROUTING_STALE_STATE",
+      retryable: false,
+    });
+  });
+
+  it("rejects an unplanned attempt before it can consume an outcome witness", () => {
+    const fixture = plannedRoutingFixture();
+    const outcome = recorded(fixture, "RUNTIME_PROVIDER_TIMEOUT");
+
+    expect(() =>
+      nextModelFallback({
+        state: outcome.state,
+        previous_state: fixture.state,
+        plan: fixture.plan,
+        policy: fixture.policy,
+        transition: outcome.transition,
+        current_attempt_id: "attempt-not-planned",
+        outcome: "RUNTIME_PROVIDER_TIMEOUT",
+        occurred_at: OCCURRED_AT,
+        attempt_results: [attemptResult(primary(fixture))],
+        remaining_duration_ms: 300_000,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "RUNTIME_ROUTING_INVALID" }));
+  });
+
+  it("rejects a witness bound to the wrong below-threshold outcome", () => {
+    const fixture = plannedRoutingFixture();
+    const timeout = recorded(fixture, "RUNTIME_PROVIDER_TIMEOUT");
+    const transient = recorded(fixture, "RUNTIME_PROVIDER_TRANSIENT");
+    expect(transient.state).toEqual(timeout.state);
+
+    expect(
+      fallback(fixture, {
+        state: timeout.state,
+        transition: transient.transition,
+      }),
+    ).toEqual({
+      status: "blocked",
+      code: "RUNTIME_ROUTING_STALE_STATE",
+      retryable: false,
+    });
+  });
+
+  it("rejects a witness bound to a different previous state", () => {
+    const fixture = plannedRoutingFixture();
+    const outcome = recorded(fixture, "RUNTIME_PROVIDER_TIMEOUT");
+
+    expect(
+      fallback(fixture, {
+        state: outcome.state,
+        previous_state: outcome.state,
+        transition: outcome.transition,
+      }),
+    ).toEqual({
+      status: "blocked",
+      code: "RUNTIME_ROUTING_STALE_STATE",
+      retryable: false,
+    });
+  });
+
+  it("rejects a witness under a different exact policy", () => {
+    const fixture = plannedRoutingFixture();
+    const other = plannedRoutingFixture({ consecutive_failure_threshold: 4 });
+    const outcome = recorded(fixture, "RUNTIME_PROVIDER_TIMEOUT");
+
+    expect(
+      fallback(fixture, {
+        state: outcome.state,
+        policy: other.policy,
+        transition: outcome.transition,
+      }),
+    ).toEqual({
+      status: "blocked",
+      code: "RUNTIME_ROUTING_STALE_STATE",
+      retryable: false,
+    });
+  });
+
+  it.each([
+    [
+      "tampered hash",
+      (transition: RoutingOutcomeTransition) => ({
+        ...transition,
+        transition_hash: `sha256:${"f".repeat(64)}`,
+      }),
+    ],
+    [
+      "unknown field",
+      (transition: RoutingOutcomeTransition) => ({
+        ...transition,
+        unexpected: true,
+      }),
+    ],
+  ] as const)("rejects a %s on the closed transition type", (_name, mutate) => {
+    const fixture = plannedRoutingFixture();
+    const outcome = recorded(fixture, "RUNTIME_PROVIDER_TIMEOUT");
+
+    expect(
+      fallback(fixture, {
+        state: outcome.state,
+        transition: mutate(outcome.transition) as RoutingOutcomeTransition,
+      }),
+    ).toEqual({
+      status: "blocked",
+      code: "RUNTIME_ROUTING_STALE_STATE",
+      retryable: false,
+    });
+  });
+
   it("returns only the next already planned worker attempt", () => {
     const fixture = plannedRoutingFixture();
     const nextState = record(fixture, "RUNTIME_PROVIDER_TIMEOUT");
@@ -471,6 +727,7 @@ describe("nextModelFallback", () => {
 
     const result = fallback(fixture, {
       state: afterSecond,
+      previous_state: afterFirst,
       attempt: second,
       outcome: "RUNTIME_PROVIDER_TRANSIENT",
       results: [attemptResult(first), attemptResult(second)],
@@ -541,6 +798,52 @@ describe("nextModelFallback", () => {
     ).toEqual({
       status: "blocked",
       code: "RUNTIME_ROUTING_USAGE_UNKNOWN",
+      retryable: false,
+    });
+  });
+
+  it("reports unknown possible effect before denying a non-fallback outcome", () => {
+    const fixture = plannedRoutingFixture();
+    const nextState = record(fixture, "RUNTIME_PROVIDER_AUTHENTICATION");
+
+    expect(
+      fallback(fixture, {
+        state: nextState,
+        outcome: "RUNTIME_PROVIDER_AUTHENTICATION",
+        results: [
+          attemptResult(primary(fixture), {
+            route_identity: null,
+            usage: null,
+            effect_may_have_occurred: true,
+          }),
+        ],
+      }),
+    ).toEqual({
+      status: "blocked",
+      code: "RUNTIME_ROUTING_USAGE_UNKNOWN",
+      retryable: false,
+    });
+  });
+
+  it("denies a non-fallback outcome after proving no provider effect", () => {
+    const fixture = plannedRoutingFixture();
+    const nextState = record(fixture, "RUNTIME_PROVIDER_AUTHENTICATION");
+
+    expect(
+      fallback(fixture, {
+        state: nextState,
+        outcome: "RUNTIME_PROVIDER_AUTHENTICATION",
+        results: [
+          attemptResult(primary(fixture), {
+            route_identity: null,
+            usage: null,
+            effect_may_have_occurred: false,
+          }),
+        ],
+      }),
+    ).toEqual({
+      status: "blocked",
+      code: "RUNTIME_ROUTING_POLICY_DENIED",
       retryable: false,
     });
   });
@@ -670,26 +973,24 @@ describe("nextModelFallback", () => {
   );
 
   it("blocks when the next preplanned attempt circuit is newly open", () => {
-    const fixture = plannedRoutingFixture();
-    const outcomeState = record(fixture, "RUNTIME_PROVIDER_TIMEOUT");
+    const fixture = plannedRoutingFixture({ consecutive_failure_threshold: 1 });
     const nextAttempt = fixture.plan.worker_attempts[1];
     if (nextAttempt === undefined) throw new Error("missing next fixture attempt");
-    const changed = rehashState(outcomeState, {
-      circuits: [
-        ...outcomeState.circuits,
-        {
-          entry_id: nextAttempt.entry_id,
-          status: "open",
-          consecutive_failures: 1,
-          retry_at: "2026-08-21T12:02:00.000Z",
-          probe_decision_id: null,
-        } as const,
-      ].sort((left, right) =>
-        left.entry_id < right.entry_id ? -1 : left.entry_id > right.entry_id ? 1 : 0,
-      ),
-    });
+    const priorTransition = recorded(
+      fixture,
+      "RUNTIME_PROVIDER_TIMEOUT",
+      fixture.state,
+      nextAttempt,
+    );
+    const currentTransition = recorded(fixture, "RUNTIME_PROVIDER_TIMEOUT", priorTransition.state);
 
-    expect(fallback(fixture, { state: changed })).toEqual({
+    expect(
+      fallback(fixture, {
+        state: currentTransition.state,
+        previous_state: priorTransition.state,
+        transition: currentTransition.transition,
+      }),
+    ).toEqual({
       status: "blocked",
       code: "RUNTIME_ROUTING_CIRCUIT_OPEN",
       retryable: true,
@@ -720,13 +1021,16 @@ describe("nextModelFallback", () => {
     const fixture = plannedRoutingFixture();
     const attempts = fixture.plan.worker_attempts;
     let state = fixture.state;
+    let previousState = state;
     for (const attempt of attempts) {
+      previousState = state;
       state = record(fixture, "RUNTIME_PROVIDER_TIMEOUT", state, attempt);
     }
     const results = attempts.map((attempt) => attemptResult(attempt));
     expect(
       fallback(fixture, {
         state,
+        previous_state: previousState,
         attempt: attempts.at(-1)!,
         results,
       }),
@@ -741,7 +1045,9 @@ describe("nextModelFallback", () => {
     const fixture = plannedRoutingFixture();
     const attempts = fixture.plan.worker_attempts;
     let state = fixture.state;
+    let previousState = state;
     for (const attempt of attempts) {
+      previousState = state;
       state = record(fixture, "RUNTIME_PROVIDER_TIMEOUT", state, attempt);
     }
     const results = attempts.map((attempt, index) =>
@@ -759,6 +1065,7 @@ describe("nextModelFallback", () => {
     expect(
       fallback(fixture, {
         state,
+        previous_state: previousState,
         attempt: attempts.at(-1)!,
         results,
       }),
@@ -771,16 +1078,202 @@ describe("nextModelFallback", () => {
 
   it("fails closed on a state without the exact live decision reservation", () => {
     const fixture = plannedRoutingFixture();
+    const outcome = recorded(fixture, "RUNTIME_PROVIDER_TIMEOUT");
     expect(() =>
       nextModelFallback({
         state: fixture.prior_state,
+        previous_state: fixture.state,
         plan: fixture.plan,
+        policy: fixture.policy,
+        transition: outcome.transition,
         current_attempt_id: primary(fixture).attempt_id,
         outcome: "RUNTIME_PROVIDER_TIMEOUT",
+        occurred_at: OCCURRED_AT,
         attempt_results: [attemptResult(primary(fixture))],
         remaining_duration_ms: 300_000,
       }),
     ).toThrowError(expect.objectContaining({ code: "RUNTIME_ROUTING_STALE_STATE" }));
+  });
+});
+
+describe("multi-transition settlement", () => {
+  it("settles after two exact allowlisted worker circuit transitions", () => {
+    const fixture = plannedRoutingFixture();
+    const first = primary(fixture);
+    const second = fixture.plan.worker_attempts[1];
+    if (second === undefined) throw new Error("missing second fixture attempt");
+    const afterFirst = record(fixture, "RUNTIME_PROVIDER_TIMEOUT");
+    const afterSecond = record(fixture, "RUNTIME_PROVIDER_TRANSIENT", afterFirst, second);
+
+    const settled = settleRoutingDecision({
+      state: afterSecond,
+      reserved_state: fixture.state,
+      circuit_state_chain: [afterFirst, afterSecond],
+      plan: fixture.plan,
+      attempts: [attemptResult(first), attemptResult(second)],
+      settled_at: "2026-08-21T12:01:00.000Z",
+    });
+
+    expect(settled.status).toBe("SETTLED");
+    expect(settled.state.previous_state_hash).toBe(afterSecond.document_hash);
+    expect(settled.state.circuits).toEqual(afterSecond.circuits);
+  });
+
+  it.each(["missing immediate state", "reordered states", "extra state"] as const)(
+    "rejects a %s in the exact circuit transition chain",
+    (chainKind) => {
+      const fixture = plannedRoutingFixture();
+      const [first, second, third] = fixture.plan.worker_attempts;
+      if (first === undefined || second === undefined || third === undefined) {
+        throw new Error("missing fixture attempts");
+      }
+      const afterFirst = record(fixture, "RUNTIME_PROVIDER_TIMEOUT", fixture.state, first);
+      const afterSecond = record(fixture, "RUNTIME_PROVIDER_TRANSIENT", afterFirst, second);
+      const afterExtra = record(
+        fixture,
+        "RUNTIME_PROVIDER_GATEWAY_UNAVAILABLE",
+        afterSecond,
+        third,
+      );
+      const chain =
+        chainKind === "missing immediate state"
+          ? [afterSecond]
+          : chainKind === "reordered states"
+            ? [afterSecond, afterFirst]
+            : [afterFirst, afterSecond, afterExtra];
+
+      expect(() =>
+        settleRoutingDecision({
+          state: afterSecond,
+          reserved_state: fixture.state,
+          circuit_state_chain: chain,
+          plan: fixture.plan,
+          attempts: [attemptResult(first), attemptResult(second)],
+          settled_at: "2026-08-21T12:01:00.000Z",
+        }),
+      ).toThrowError(expect.objectContaining({ code: "RUNTIME_ROUTING_STALE_STATE" }));
+    },
+  );
+
+  it("rejects a circuit chain longer than the number of planned attempts", () => {
+    const fixture = plannedRoutingFixture();
+    const [first, second, third] = fixture.plan.worker_attempts;
+    if (first === undefined || second === undefined || third === undefined) {
+      throw new Error("missing fixture attempts");
+    }
+    const afterFirst = record(fixture, "RUNTIME_PROVIDER_TIMEOUT", fixture.state, first);
+    const afterSecond = record(fixture, "RUNTIME_PROVIDER_TRANSIENT", afterFirst, second);
+    const afterThird = record(fixture, "RUNTIME_PROVIDER_GATEWAY_UNAVAILABLE", afterSecond, third);
+    const afterFourth = record(fixture, "RUNTIME_PROVIDER_TIMEOUT", afterThird, third);
+
+    expect(() =>
+      settleRoutingDecision({
+        state: afterFourth,
+        reserved_state: fixture.state,
+        circuit_state_chain: [afterFirst, afterSecond, afterThird, afterFourth],
+        plan: fixture.plan,
+        attempts: [attemptResult(first), attemptResult(second), attemptResult(third)],
+        settled_at: "2026-08-21T12:01:00.000Z",
+      }),
+    ).toThrowError(expect.objectContaining({ code: "RUNTIME_ROUTING_STALE_STATE" }));
+  });
+
+  it("settles after later worker and independent reviewer circuits reset", () => {
+    const fixture = plannedRoutingFixture({
+      review: true,
+      circuits: [
+        {
+          entry_id: "worker-fallback-a",
+          status: "closed",
+          consecutive_failures: 2,
+          retry_at: null,
+          probe_decision_id: null,
+        },
+        {
+          entry_id: "reviewer-independent",
+          status: "closed",
+          consecutive_failures: 1,
+          retry_at: null,
+          probe_decision_id: null,
+        },
+      ],
+    });
+    const worker = fixture.plan.worker_attempts[1];
+    const reviewer = fixture.plan.reviewer_attempt;
+    if (worker === undefined || reviewer === null)
+      throw new Error("missing review fixture attempts");
+    const afterWorker = recorded(
+      fixture,
+      "RUNTIME_PROVIDER_SUCCESS",
+      fixture.state,
+      worker,
+      "2026-08-21T12:00:30.000Z",
+    ).state;
+    const afterReviewer = recorded(
+      fixture,
+      "RUNTIME_PROVIDER_SUCCESS",
+      afterWorker,
+      reviewer,
+      "2026-08-21T12:00:31.000Z",
+    ).state;
+
+    const settled = settleRoutingDecision({
+      state: afterReviewer,
+      reserved_state: fixture.state,
+      circuit_state_chain: [afterWorker, afterReviewer],
+      plan: fixture.plan,
+      attempts: [attemptResult(worker), attemptResult(reviewer)],
+      settled_at: "2026-08-21T12:01:00.000Z",
+    });
+
+    expect(settled.status).toBe("SETTLED");
+    expect(circuit(settled.state, worker.entry_id)).toMatchObject({
+      status: "closed",
+      consecutive_failures: 0,
+    });
+    expect(circuit(settled.state, reviewer.entry_id)).toMatchObject({
+      status: "closed",
+      consecutive_failures: 0,
+    });
+  });
+
+  it("settles after a terminal probe outcome restores the prior open circuit", () => {
+    const fixture = plannedRoutingFixture({
+      circuits: [
+        {
+          entry_id: "worker-primary",
+          status: "open",
+          consecutive_failures: 2,
+          retry_at: "2026-08-21T12:00:00.000Z",
+          probe_decision_id: null,
+        },
+      ],
+    });
+    const released = record(fixture, "RUNTIME_PROVIDER_AUTHENTICATION");
+
+    const settled = settleRoutingDecision({
+      state: released,
+      reserved_state: fixture.state,
+      circuit_state_chain: [released],
+      plan: fixture.plan,
+      attempts: [
+        attemptResult(primary(fixture), {
+          route_identity: null,
+          usage: null,
+          effect_may_have_occurred: false,
+        }),
+      ],
+      settled_at: "2026-08-21T12:01:00.000Z",
+    });
+
+    expect(settled.status).toBe("SETTLED");
+    expect(circuit(settled.state, "worker-primary")).toEqual({
+      entry_id: "worker-primary",
+      status: "open",
+      consecutive_failures: 2,
+      retry_at: "2026-08-21T12:00:00.000Z",
+      probe_decision_id: null,
+    });
   });
 });
 

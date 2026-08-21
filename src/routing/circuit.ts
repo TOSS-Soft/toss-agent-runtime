@@ -1,4 +1,4 @@
-import { canonicalJson, type JsonLimits } from "../protocol/json.js";
+import { canonicalJson, sha256, type JsonLimits } from "../protocol/json.js";
 import { isRuntimeProviderErrorCode, type RuntimeProviderErrorCode } from "../providers/errors.js";
 import type { ProviderRouteIdentity } from "../providers/types.js";
 import {
@@ -14,11 +14,13 @@ import { RuntimeRoutingError, type RuntimeRoutingErrorCode } from "./errors.js";
 import type {
   ModelFallbackDecision,
   PlannedModelSelectionPlanV1,
+  RecordedRoutingOutcome,
   RoutingAttemptResult,
   RoutingAttemptV1,
   RoutingCircuitV1,
   RoutingPolicyRuleV1,
   RoutingPolicyV1,
+  RoutingOutcomeTransition,
   RoutingProviderOutcome,
   RoutingReservationV1,
   RoutingStateV1,
@@ -218,6 +220,94 @@ function withEntryCircuit(
   return freezeState(state, circuits);
 }
 
+function recordedOutcome(input: {
+  readonly previous_state: RoutingStateV1;
+  readonly state: RoutingStateV1;
+  readonly plan: PlannedModelSelectionPlanV1;
+  readonly policy: RoutingPolicyV1;
+  readonly attempt_id: string;
+  readonly outcome: RoutingProviderOutcome;
+  readonly occurred_at: string;
+}): RecordedRoutingOutcome {
+  const projection = Object.freeze({
+    previous_state_hash: input.previous_state.document_hash,
+    next_state_hash: input.state.document_hash,
+    decision_id: input.plan.decision_id,
+    attempt_id: input.attempt_id,
+    outcome: input.outcome,
+    occurred_at: input.occurred_at,
+    policy_hash: input.policy.document_hash,
+  });
+  const transition: RoutingOutcomeTransition = Object.freeze({
+    ...projection,
+    transition_hash: sha256(projection, ROUTING_RUNTIME_JSON_LIMITS),
+  });
+  return Object.freeze({ state: input.state, transition });
+}
+
+function transitionOrNull(value: RoutingOutcomeTransition): RoutingOutcomeTransition | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  let prototype: object | null;
+  let descriptors: PropertyDescriptorMap;
+  let symbols: readonly symbol[];
+  try {
+    prototype = Object.getPrototypeOf(value) as object | null;
+    descriptors = Object.getOwnPropertyDescriptors(value);
+    symbols = Object.getOwnPropertySymbols(value);
+  } catch {
+    return null;
+  }
+  const keys = [
+    "attempt_id",
+    "decision_id",
+    "next_state_hash",
+    "occurred_at",
+    "outcome",
+    "policy_hash",
+    "previous_state_hash",
+    "transition_hash",
+  ];
+  if (
+    (prototype !== Object.prototype && prototype !== null) ||
+    symbols.length !== 0 ||
+    Object.keys(descriptors).sort().join("\u0000") !== keys.sort().join("\u0000")
+  ) {
+    return null;
+  }
+  for (const key of keys) {
+    const descriptor = descriptors[key];
+    if (
+      descriptor === undefined ||
+      !descriptor.enumerable ||
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined
+    ) {
+      return null;
+    }
+  }
+  if (
+    typeof value.attempt_id !== "string" ||
+    typeof value.decision_id !== "string" ||
+    typeof value.next_state_hash !== "string" ||
+    typeof value.occurred_at !== "string" ||
+    typeof value.outcome !== "string" ||
+    typeof value.policy_hash !== "string" ||
+    typeof value.previous_state_hash !== "string" ||
+    typeof value.transition_hash !== "string" ||
+    timestamp(value.occurred_at) === null ||
+    (value.outcome !== "RUNTIME_PROVIDER_SUCCESS" && !isRuntimeProviderErrorCode(value.outcome))
+  ) {
+    return null;
+  }
+  const { transition_hash: transitionHash, ...projection } = value;
+  try {
+    if (sha256(projection, ROUTING_RUNTIME_JSON_LIMITS) !== transitionHash) return null;
+  } catch {
+    return null;
+  }
+  return value;
+}
+
 export function recordRoutingOutcome(input: {
   readonly state: RoutingStateV1;
   readonly plan: PlannedModelSelectionPlanV1;
@@ -225,7 +315,7 @@ export function recordRoutingOutcome(input: {
   readonly attempt_id: string;
   readonly outcome: RoutingProviderOutcome;
   readonly occurred_at: string;
-}): RoutingStateV1 {
+}): RecordedRoutingOutcome {
   const occurredAtMs = timestamp(input.occurred_at);
   const plan = planOrThrow(input.plan);
   const decisionAtMs = timestamp(plan.decision_at);
@@ -259,18 +349,55 @@ export function recordRoutingOutcome(input: {
       current === undefined ||
       (current.status === "closed" && current.consecutive_failures === 0)
     ) {
-      return input.state;
+      return recordedOutcome({
+        previous_state: state,
+        state: input.state,
+        plan,
+        policy,
+        attempt_id: attempt.attempt_id,
+        outcome: input.outcome,
+        occurred_at: input.occurred_at,
+      });
     }
-    return withEntryCircuit(state, attempt.entry_id, {
+    const nextState = withEntryCircuit(state, attempt.entry_id, {
       entry_id: attempt.entry_id,
       status: "closed",
       consecutive_failures: 0,
       retry_at: null,
       probe_decision_id: null,
     });
+    return recordedOutcome({
+      previous_state: state,
+      state: nextState,
+      plan,
+      policy,
+      attempt_id: attempt.attempt_id,
+      outcome: input.outcome,
+      occurred_at: input.occurred_at,
+    });
   }
 
-  if (!FALLBACK_OUTCOMES.has(input.outcome)) return input.state;
+  if (!FALLBACK_OUTCOMES.has(input.outcome)) {
+    const nextState =
+      current?.status !== "probe-reserved"
+        ? input.state
+        : withEntryCircuit(state, attempt.entry_id, {
+            entry_id: attempt.entry_id,
+            status: "open",
+            consecutive_failures: current.consecutive_failures,
+            retry_at: current.retry_at,
+            probe_decision_id: null,
+          });
+    return recordedOutcome({
+      previous_state: state,
+      state: nextState,
+      plan,
+      policy,
+      attempt_id: attempt.attempt_id,
+      outcome: input.outcome,
+      occurred_at: input.occurred_at,
+    });
+  }
   const consecutiveFailures = (current?.consecutive_failures ?? 0) + 1;
   if (!Number.isSafeInteger(consecutiveFailures)) invalid();
   const opens =
@@ -291,7 +418,16 @@ export function recordRoutingOutcome(input: {
         retry_at: null,
         probe_decision_id: null,
       };
-  return withEntryCircuit(state, attempt.entry_id, next);
+  const nextState = withEntryCircuit(state, attempt.entry_id, next);
+  return recordedOutcome({
+    previous_state: state,
+    state: nextState,
+    plan,
+    policy,
+    attempt_id: attempt.attempt_id,
+    outcome: input.outcome,
+    occurred_at: input.occurred_at,
+  });
 }
 
 function blocked(code: RuntimeRoutingErrorCode): ModelFallbackDecision {
@@ -455,34 +591,55 @@ function cumulativeBudget(
 
 export function nextModelFallback(input: {
   readonly state: RoutingStateV1;
+  readonly previous_state: RoutingStateV1;
   readonly plan: PlannedModelSelectionPlanV1;
+  readonly policy: RoutingPolicyV1;
+  readonly transition: RoutingOutcomeTransition;
   readonly current_attempt_id: string;
   readonly outcome: RuntimeProviderErrorCode;
+  readonly occurred_at: string;
   readonly attempt_results: readonly RoutingAttemptResult[];
   readonly remaining_duration_ms: number;
 }): ModelFallbackDecision {
   const plan = planOrThrow(input.plan);
   const state = stateOrThrow(input.state);
+  const previousState = stateOrThrow(input.previous_state);
   assertLivePlanState(state, plan);
+  assertLivePlanState(previousState, plan);
   if (!isRuntimeProviderErrorCode(input.outcome)) invalid();
   const currentIndex = plan.worker_attempts.findIndex(
     (attempt) => attempt.attempt_id === input.current_attempt_id,
   );
   if (currentIndex < 0) invalid();
-  if (!FALLBACK_OUTCOMES.has(input.outcome)) {
-    return blocked("RUNTIME_ROUTING_POLICY_DENIED");
+  const transition = transitionOrNull(input.transition);
+  if (transition === null) return blocked("RUNTIME_ROUTING_STALE_STATE");
+  let recomputed: RecordedRoutingOutcome;
+  try {
+    recomputed = recordRoutingOutcome({
+      state: previousState,
+      plan,
+      policy: input.policy,
+      attempt_id: input.current_attempt_id,
+      outcome: input.outcome,
+      occurred_at: input.occurred_at,
+    });
+  } catch (error) {
+    if (error instanceof RuntimeRoutingError) return blocked(error.code);
+    throw error;
   }
   if (
-    state.revision !== plan.next_state_revision + currentIndex + 1 ||
-    (currentIndex === 0 && state.previous_state_hash !== plan.next_state_hash) ||
-    state.circuits.some(
-      (circuit) =>
-        circuit.status === "probe-reserved" && circuit.probe_decision_id === plan.decision_id,
-    )
+    !canonicalEqual(recomputed.state, state) ||
+    !canonicalEqual(recomputed.transition, transition) ||
+    transition.previous_state_hash !== previousState.document_hash ||
+    transition.next_state_hash !== state.document_hash ||
+    transition.decision_id !== plan.decision_id ||
+    transition.attempt_id !== input.current_attempt_id ||
+    transition.outcome !== input.outcome ||
+    transition.occurred_at !== input.occurred_at ||
+    transition.policy_hash !== input.policy.document_hash
   ) {
     return blocked("RUNTIME_ROUTING_STALE_STATE");
   }
-
   const prefix = plan.worker_attempts.slice(0, currentIndex + 1);
   if (
     input.attempt_results.length !== prefix.length ||
@@ -497,6 +654,9 @@ export function nextModelFallback(input: {
 
   const budget = cumulativeBudget(state, plan, input.attempt_results, prefix);
   if (typeof budget === "string") return blocked(budget);
+  if (!FALLBACK_OUTCOMES.has(input.outcome)) {
+    return blocked("RUNTIME_ROUTING_POLICY_DENIED");
+  }
   if (exceedsBudget(state, budget)) return blocked("RUNTIME_ROUTING_BUDGET_EXCEEDED");
 
   const nextAttempt = plan.worker_attempts[currentIndex + 1];
