@@ -1,0 +1,373 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toss.software/schemas/runtime/v1/model-selection-plan.v1.schema.json",
+  "title": "TOSS model selection plan v1",
+  "oneOf": [
+    {
+      "type": "object",
+      "allOf": [{ "$ref": "#/$defs/base_plan" }, { "$ref": "#/$defs/planned_fields" }],
+      "unevaluatedProperties": false
+    },
+    {
+      "type": "object",
+      "allOf": [{ "$ref": "#/$defs/base_plan" }, { "$ref": "#/$defs/blocked_fields" }],
+      "unevaluatedProperties": false
+    }
+  ],
+  "$defs": {
+    "identifier": {
+      "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/identifier"
+    },
+    "sha256": {
+      "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/sha256"
+    },
+    "timestamp": {
+      "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/utc_timestamp"
+    },
+    "artifact_reference": {
+      "$ref": "https://toss.software/schemas/runtime/v1/runtime-common.v1.schema.json#/$defs/artifact_reference"
+    },
+    "positive_safe_integer": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "nonnegative_safe_integer": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "task_contract": {
+      "allOf": [
+        { "$ref": "#/$defs/artifact_reference" },
+        { "type": "object", "properties": { "document_type": { "const": "task-contract" } } }
+      ]
+    },
+    "override_binding": {
+      "oneOf": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/artifact_reference" },
+            {
+              "type": "object",
+              "properties": { "document_type": { "const": "routing-override" } }
+            }
+          ]
+        },
+        { "type": "null" }
+      ]
+    },
+    "elimination": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entry_id", "reason"],
+      "properties": {
+        "entry_id": { "$ref": "#/$defs/identifier" },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "capability",
+            "circuit",
+            "latency",
+            "live-route",
+            "override",
+            "policy",
+            "review-independence",
+            "budget"
+          ]
+        }
+      }
+    },
+    "pricing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input_microusd_per_million",
+        "cached_input_microusd_per_million",
+        "output_microusd_per_million",
+        "reasoning_output_microusd_per_million"
+      ],
+      "properties": {
+        "input_microusd_per_million": { "$ref": "#/$defs/nonnegative_safe_integer" },
+        "cached_input_microusd_per_million": { "$ref": "#/$defs/nonnegative_safe_integer" },
+        "output_microusd_per_million": { "$ref": "#/$defs/nonnegative_safe_integer" },
+        "reasoning_output_microusd_per_million": {
+          "$ref": "#/$defs/nonnegative_safe_integer"
+        }
+      }
+    },
+    "accepted_route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["route_id", "provider", "model", "pricing"],
+      "properties": {
+        "route_id": {
+          "$ref": "https://toss.software/schemas/runtime/v1/agentgateway-capabilities.v1.schema.json#/$defs/identifier"
+        },
+        "provider": {
+          "$ref": "https://toss.software/schemas/runtime/v1/agentgateway-capabilities.v1.schema.json#/$defs/provider"
+        },
+        "model": {
+          "$ref": "https://toss.software/schemas/runtime/v1/agentgateway-capabilities.v1.schema.json#/$defs/model"
+        },
+        "pricing": { "$ref": "#/$defs/pricing" }
+      }
+    },
+    "requirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "alias",
+        "tools",
+        "json_schema",
+        "vision",
+        "reasoning",
+        "streaming",
+        "max_output_tokens"
+      ],
+      "properties": {
+        "schema_version": { "const": "gateway-route-requirement.v1" },
+        "alias": {
+          "$ref": "https://toss.software/schemas/runtime/v1/agentgateway-capabilities.v1.schema.json#/$defs/identifier"
+        },
+        "tools": { "type": "boolean" },
+        "json_schema": { "type": "boolean" },
+        "vision": { "type": "boolean" },
+        "reasoning": { "type": "boolean" },
+        "streaming": { "type": "boolean" },
+        "max_output_tokens": { "type": "integer", "minimum": 1, "maximum": 1000000000 }
+      }
+    },
+    "attempt_base": {
+      "type": "object",
+      "required": [
+        "attempt_id",
+        "role",
+        "fallback_index",
+        "entry_id",
+        "alias",
+        "gateway_profile",
+        "gateway_revision",
+        "capability_document_hash",
+        "latency_class",
+        "requirement",
+        "requirement_hash",
+        "accepted_routes",
+        "reserved_cost_microusd"
+      ],
+      "properties": {
+        "attempt_id": { "$ref": "#/$defs/identifier" },
+        "role": { "type": "string", "enum": ["reviewer", "worker"] },
+        "fallback_index": {
+          "oneOf": [{ "type": "integer", "minimum": 0, "maximum": 15 }, { "type": "null" }]
+        },
+        "entry_id": { "$ref": "#/$defs/identifier" },
+        "alias": { "$ref": "#/$defs/identifier" },
+        "gateway_profile": { "$ref": "#/$defs/identifier" },
+        "gateway_revision": { "$ref": "#/$defs/nonnegative_safe_integer" },
+        "capability_document_hash": { "$ref": "#/$defs/sha256" },
+        "latency_class": {
+          "type": "string",
+          "enum": ["interactive", "standard", "extended"]
+        },
+        "requirement": { "$ref": "#/$defs/requirement" },
+        "requirement_hash": { "$ref": "#/$defs/sha256" },
+        "accepted_routes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/accepted_route" }
+        },
+        "reserved_cost_microusd": { "$ref": "#/$defs/nonnegative_safe_integer" }
+      }
+    },
+    "worker_attempt": {
+      "type": "object",
+      "allOf": [
+        { "$ref": "#/$defs/attempt_base" },
+        {
+          "type": "object",
+          "required": ["role", "fallback_index"],
+          "properties": {
+            "role": { "const": "worker" },
+            "fallback_index": { "type": "integer", "minimum": 0, "maximum": 15 }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "reviewer_attempt": {
+      "type": "object",
+      "allOf": [
+        { "$ref": "#/$defs/attempt_base" },
+        {
+          "type": "object",
+          "required": ["role", "fallback_index"],
+          "properties": {
+            "role": { "const": "reviewer" },
+            "fallback_index": { "type": "null" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "allocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attempt_id",
+        "entry_id",
+        "role",
+        "input_tokens",
+        "output_tokens",
+        "cost_microusd",
+        "duration_ms",
+        "turns"
+      ],
+      "properties": {
+        "attempt_id": { "$ref": "#/$defs/identifier" },
+        "entry_id": { "$ref": "#/$defs/identifier" },
+        "role": { "type": "string", "enum": ["reviewer", "worker"] },
+        "input_tokens": { "$ref": "#/$defs/nonnegative_safe_integer" },
+        "output_tokens": { "$ref": "#/$defs/nonnegative_safe_integer" },
+        "cost_microusd": { "$ref": "#/$defs/nonnegative_safe_integer" },
+        "duration_ms": { "$ref": "#/$defs/nonnegative_safe_integer" },
+        "turns": { "const": 1 }
+      }
+    },
+    "reservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decision_id", "decision_hash", "request_id", "allocations", "created_at"],
+      "properties": {
+        "decision_id": { "$ref": "#/$defs/identifier" },
+        "decision_hash": { "$ref": "#/$defs/sha256" },
+        "request_id": { "$ref": "#/$defs/identifier" },
+        "allocations": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 17,
+          "items": { "$ref": "#/$defs/allocation" }
+        },
+        "created_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "base_plan": {
+      "type": "object",
+      "required": [
+        "protocol_version",
+        "schema_version",
+        "document_type",
+        "decision_id",
+        "revision",
+        "run_id",
+        "request_id",
+        "request_hash",
+        "task_contract",
+        "catalog_id",
+        "catalog_revision",
+        "catalog_hash",
+        "policy_id",
+        "policy_revision",
+        "policy_hash",
+        "prior_state_id",
+        "prior_state_revision",
+        "prior_state_hash",
+        "gateway_profile",
+        "gateway_revision",
+        "capability_document_hash",
+        "override",
+        "decision_at",
+        "matched_rule_id",
+        "eliminations",
+        "document_hash"
+      ],
+      "properties": {
+        "protocol_version": { "const": "runtime-contract.v1" },
+        "schema_version": { "const": "model-selection-plan.v1" },
+        "document_type": { "const": "model-selection-plan" },
+        "decision_id": { "$ref": "#/$defs/identifier" },
+        "revision": { "const": 1 },
+        "run_id": { "$ref": "#/$defs/identifier" },
+        "request_id": { "$ref": "#/$defs/identifier" },
+        "request_hash": { "$ref": "#/$defs/sha256" },
+        "task_contract": { "$ref": "#/$defs/task_contract" },
+        "catalog_id": { "$ref": "#/$defs/identifier" },
+        "catalog_revision": { "$ref": "#/$defs/positive_safe_integer" },
+        "catalog_hash": { "$ref": "#/$defs/sha256" },
+        "policy_id": { "$ref": "#/$defs/identifier" },
+        "policy_revision": { "$ref": "#/$defs/positive_safe_integer" },
+        "policy_hash": { "$ref": "#/$defs/sha256" },
+        "prior_state_id": { "$ref": "#/$defs/identifier" },
+        "prior_state_revision": { "$ref": "#/$defs/positive_safe_integer" },
+        "prior_state_hash": { "$ref": "#/$defs/sha256" },
+        "gateway_profile": { "$ref": "#/$defs/identifier" },
+        "gateway_revision": { "$ref": "#/$defs/nonnegative_safe_integer" },
+        "capability_document_hash": { "$ref": "#/$defs/sha256" },
+        "override": { "$ref": "#/$defs/override_binding" },
+        "decision_at": { "$ref": "#/$defs/timestamp" },
+        "matched_rule_id": { "$ref": "#/$defs/identifier" },
+        "eliminations": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": { "$ref": "#/$defs/elimination" }
+        },
+        "document_hash": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "planned_fields": {
+      "type": "object",
+      "required": [
+        "status",
+        "request_deadline",
+        "live_expires_at",
+        "worker_attempts",
+        "reviewer_attempt",
+        "reservation",
+        "next_state_revision",
+        "next_state_hash"
+      ],
+      "properties": {
+        "status": { "const": "planned" },
+        "request_deadline": { "$ref": "#/$defs/timestamp" },
+        "live_expires_at": { "$ref": "#/$defs/timestamp" },
+        "worker_attempts": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/worker_attempt" }
+        },
+        "reviewer_attempt": {
+          "oneOf": [{ "$ref": "#/$defs/reviewer_attempt" }, { "type": "null" }]
+        },
+        "reservation": { "$ref": "#/$defs/reservation" },
+        "next_state_revision": { "$ref": "#/$defs/positive_safe_integer" },
+        "next_state_hash": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "blocked_fields": {
+      "type": "object",
+      "required": ["status", "block_code", "retryable", "next_retry_at"],
+      "properties": {
+        "status": { "const": "blocked" },
+        "block_code": {
+          "type": "string",
+          "enum": [
+            "RUNTIME_ROUTING_BUDGET_EXCEEDED",
+            "RUNTIME_ROUTING_CIRCUIT_OPEN",
+            "RUNTIME_ROUTING_NO_CAPABLE_ROUTE",
+            "RUNTIME_ROUTING_POLICY_DENIED",
+            "RUNTIME_ROUTING_REVIEW_UNAVAILABLE",
+            "RUNTIME_ROUTING_STALE_STATE",
+            "RUNTIME_ROUTING_USAGE_UNKNOWN"
+          ]
+        },
+        "retryable": { "type": "boolean" },
+        "next_retry_at": {
+          "oneOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }]
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "budget": {
+    "max_cost_microusd": 5000000,
+    "max_duration_ms": 900000,
+    "max_input_tokens": 200000,
+    "max_output_tokens": 50000,
+    "max_turns": 16
+  },
+  "budget_status": "known",
+  "catalog_hash": "sha256:894dd8db8ee23d7e4081a9c523ad34beb181636e87a32a4dd19d3507ff9bb107",
+  "circuits": [],
+  "document_hash": "sha256:c5b100e4c82beedb933ae7e096f050dcce9c4a1e68608cc7cc15b00984bffe7d",
+  "document_type": "routing-state",
+  "policy_hash": "sha256:68844bf69d113ba143fdbc486919a7afffc8fa66af8643d12c7769d40ccee321",
+  "previous_state_hash": null,
+  "protocol_version": "runtime-contract.v1",
+  "request_hash": "sha256:29bd3c6190625d77a9415298ae38675e7f21965ccdfb4299f497cd6f14dba521",
+  "reservations": [],
+  "revision": 1,
+  "run_id": "run-circuit-1",
+  "schema_version": "routing-state.v1",
+  "settled": {
+    "cost_microusd": 0,
+    "duration_ms": 0,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "turns": 0
+  },
+  "state_id": "routing-circuit-1"
+}

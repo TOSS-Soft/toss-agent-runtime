@@ -1,0 +1,64 @@
+{
+  "document_hash": "sha256:68844bf69d113ba143fdbc486919a7afffc8fa66af8643d12c7769d40ccee321",
+  "document_type": "routing-policy",
+  "policy_id": "routing-production",
+  "protocol_version": "runtime-contract.v1",
+  "revision": 3,
+  "rules": [
+    {
+      "circuit": {
+        "consecutive_failure_threshold": 3,
+        "cooldown_ms": 60000
+      },
+      "match": {
+        "complexity": "*",
+        "phase": "*",
+        "risks": []
+      },
+      "max_fallbacks": 2,
+      "max_latency_class": "standard",
+      "priority": 10,
+      "required_capabilities": ["json-schema", "text"],
+      "review": "none",
+      "rule_id": "non-risk-default",
+      "worker_class_preference": ["balanced-code", "economy"]
+    },
+    {
+      "circuit": {
+        "consecutive_failure_threshold": 3,
+        "cooldown_ms": 60000
+      },
+      "match": {
+        "complexity": "high",
+        "phase": "implementation",
+        "risks": ["security"]
+      },
+      "max_fallbacks": 1,
+      "max_latency_class": "extended",
+      "priority": 5,
+      "required_capabilities": ["reasoning", "tools"],
+      "review": "independent",
+      "rule_id": "security-review",
+      "worker_class_preference": ["deep-reasoning"]
+    },
+    {
+      "circuit": {
+        "consecutive_failure_threshold": 3,
+        "cooldown_ms": 60000
+      },
+      "match": {
+        "complexity": "*",
+        "phase": "*",
+        "risks": "*"
+      },
+      "max_fallbacks": 3,
+      "max_latency_class": "extended",
+      "priority": 20,
+      "required_capabilities": ["reasoning"],
+      "review": "independent",
+      "rule_id": "risk-default",
+      "worker_class_preference": ["deep-reasoning", "balanced-code"]
+    }
+  ],
+  "schema_version": "routing-policy.v1"
+}

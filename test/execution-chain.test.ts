@@ -38,16 +38,23 @@ describe("Runtime Contract Protocol v1 chain", () => {
     ).toEqual({ ok: true, value: true });
   });
 
-  it("reports only the delivered provider subsystem as available in the baseline", () => {
+  it("reports the delivered provider and routing planning subsystems in the baseline", () => {
     const document = createBaselineCapabilities({ os: "linux", arch: "x64", node: "22.23.1" });
     expect(document.execution_topologies).toEqual([]);
-    expect(document.model_classes).toEqual([]);
+    expect(document.model_classes.map((entry) => entry.logical_class)).toEqual([
+      "economy",
+      "balanced-code",
+      "deep-reasoning",
+      "long-context",
+      "vision",
+      "independent-review",
+    ]);
     expect(document.mcp_profiles).toEqual([]);
     expect(document.provider_transports).toEqual(["agentgateway", "openai", "anthropic", "gemini"]);
     expect(document.supported_schemas).toContain("agentgateway-capabilities.v1");
     expect(document.features).toEqual({
       providers: "available",
-      routing: "unavailable",
+      routing: "available",
       skills: "unavailable",
       mcp: "unavailable",
       agent_loop: "unavailable",
@@ -65,7 +72,7 @@ describe("Runtime Contract Protocol v1 chain", () => {
       code: "RUNTIME_DOCUMENT_UNSUPPORTED",
     });
     if (!result.ok) {
-      expect(result.issues.map((issue) => issue.keyword)).toContain("modelClass");
+      expect(result.issues.map((issue) => issue.keyword)).toContain("modelCapability");
       expect(result.issues.map((issue) => issue.keyword)).toContain("superpowersCapability");
       expect(result.issues.map((issue) => issue.keyword)).toContain("mcpTransport");
       expect(result.issues.map((issue) => issue.keyword)).toContain("executionTopology");
@@ -170,6 +177,16 @@ describe("Runtime Contract Protocol v1 chain", () => {
 
   it("accepts and rejects mixed provider/routing resource states independently", async () => {
     const { capabilities } = await loadValidChain();
+    const unavailableCapabilities: RuntimeCapabilitiesV1 = {
+      ...capabilities,
+      provider_transports: [],
+      model_classes: [],
+      features: {
+        ...capabilities.features,
+        providers: "unavailable",
+        routing: "unavailable",
+      },
+    };
     const modelClass = { logical_class: "implementation", capabilities: ["text"] };
     const cases: readonly Readonly<{
       name: string;
@@ -180,20 +197,20 @@ describe("Runtime Contract Protocol v1 chain", () => {
         name: "provider available before routing",
         expected: true,
         value: {
-          ...capabilities,
+          ...unavailableCapabilities,
           provider_transports: ["openai"],
-          features: { ...capabilities.features, providers: "available" },
+          features: { ...unavailableCapabilities.features, providers: "available" },
         },
       },
       {
         name: "provider and routing available with their resources",
         expected: true,
         value: {
-          ...capabilities,
+          ...unavailableCapabilities,
           provider_transports: ["openai"],
           model_classes: [modelClass],
           features: {
-            ...capabilities.features,
+            ...unavailableCapabilities.features,
             providers: "available",
             routing: "available",
           },
@@ -202,16 +219,16 @@ describe("Runtime Contract Protocol v1 chain", () => {
       {
         name: "unavailable provider advertising a transport",
         expected: false,
-        value: { ...capabilities, provider_transports: ["openai"] },
+        value: { ...unavailableCapabilities, provider_transports: ["openai"] },
       },
       {
         name: "unavailable routing advertising a model class",
         expected: false,
         value: {
-          ...capabilities,
+          ...unavailableCapabilities,
           provider_transports: ["openai"],
           model_classes: [modelClass],
-          features: { ...capabilities.features, providers: "available" },
+          features: { ...unavailableCapabilities.features, providers: "available" },
         },
       },
     ];

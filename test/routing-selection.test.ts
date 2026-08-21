@@ -1,0 +1,1863 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  hashAgentgatewayCapabilities,
+  parseAgentgatewayCapabilities,
+  routeSatisfiesRequirement,
+  type AgentgatewayCapabilitiesV1,
+} from "../src/gateway/index.js";
+import { canonicalJson, sha256 } from "../src/protocol/json.js";
+import {
+  hashExecutionRequest,
+  parseExecutionRequest,
+  type ExecutionRequestV1,
+} from "../src/protocol/request.js";
+import {
+  parseModelCatalog,
+  parseModelSelectionPlan,
+  parseRoutingPolicy,
+  parseRoutingState,
+} from "../src/routing/contracts.js";
+import { reserveRoutingBudget } from "../src/routing/cost.js";
+import { planModelSelection, type PlanModelSelectionInput } from "../src/routing/selection.js";
+import { RuntimeRoutingError } from "../src/routing/errors.js";
+import type {
+  BlockedModelSelectionPlanV1,
+  CatalogRouteV1,
+  GovernedRoutingOverride,
+  ModelCatalogEntryV1,
+  ModelCatalogV1,
+  PlannedModelSelectionPlanV1,
+  RoutingCircuitV1,
+  RoutingPolicyV1,
+  RoutingReservationV1,
+  RoutingStateV1,
+  RoutingTaskProfile,
+  TaskComplexity,
+  TaskPhase,
+  TaskRisk,
+} from "../src/routing/types.js";
+import {
+  catalogBytes,
+  policyBytes,
+  pricing,
+  providerCapabilities,
+  routingStateBytes,
+  validRoutingPolicy,
+  validRoutingState,
+} from "./helpers/routing-fixtures.js";
+
+const DECISION_AT = "2026-08-21T12:00:00.000Z";
+const SAFE_HASH = `sha256:${"a".repeat(64)}` as const;
+
+function route(
+  routeId: string,
+  provider: "openai" | "anthropic" | "gemini",
+  model: string,
+  overrides: Partial<CatalogRouteV1> = {},
+): CatalogRouteV1 {
+  return {
+    route_id: routeId,
+    provider,
+    model,
+    capabilities: providerCapabilities(provider),
+    latency_class: "standard",
+    pricing: pricing(2_000_000, 200_000, 10_000_000, 12_000_000),
+    ...overrides,
+  };
+}
+
+function entry(
+  entryId: string,
+  alias: string,
+  priority: number,
+  routes: readonly CatalogRouteV1[],
+  overrides: Partial<ModelCatalogEntryV1> = {},
+): ModelCatalogEntryV1 {
+  return {
+    entry_id: entryId,
+    logical_classes: ["balanced-code", "economy"],
+    route_alias: alias,
+    priority,
+    routes,
+    ...overrides,
+  };
+}
+
+function defaultEntries(): readonly ModelCatalogEntryV1[] {
+  return [
+    entry("balanced-primary", "balanced-primary", 10, [
+      route("route-primary-z", "openai", "gpt-5"),
+      route("route-primary-a", "anthropic", "claude-sonnet-4-5", {
+        pricing: pricing(3_000_000, 300_000, 15_000_000, 15_000_000),
+      }),
+    ]),
+    entry("balanced-fallback-a", "balanced-fallback-a", 20, [
+      route("route-fallback-a", "gemini", "gemini-2.5-pro"),
+    ]),
+    entry("balanced-fallback-b", "balanced-fallback-b", 30, [
+      route("route-fallback-b", "anthropic", "claude-haiku-4-5"),
+    ]),
+    entry("economy-only", "economy-only", 1, [route("route-economy", "openai", "gpt-5-mini")], {
+      logical_classes: ["economy"],
+    }),
+  ];
+}
+
+function catalog(entries: readonly ModelCatalogEntryV1[] = defaultEntries()): ModelCatalogV1 {
+  const parsed = parseModelCatalog(
+    catalogBytes({
+      protocol_version: "runtime-contract.v1",
+      schema_version: "model-catalog.v1",
+      document_type: "model-catalog",
+      catalog_id: "catalog-production",
+      revision: 7,
+      entries,
+    }),
+  );
+  if (!parsed.ok) throw new Error(`invalid catalog fixture: ${JSON.stringify(parsed.issues)}`);
+  return parsed.value;
+}
+
+function policy(): RoutingPolicyV1 {
+  const parsed = parseRoutingPolicy(policyBytes(validRoutingPolicy()));
+  if (!parsed.ok) throw new Error(`invalid policy fixture: ${JSON.stringify(parsed.issues)}`);
+  return parsed.value;
+}
+
+function request(
+  overrides: Partial<ExecutionRequestV1> = {},
+  model: Partial<ExecutionRequestV1["model"]> = {},
+): ExecutionRequestV1 {
+  const value: ExecutionRequestV1 = {
+    protocol_version: "runtime-contract.v1",
+    schema_version: "execution-request.v1",
+    document_type: "execution-request",
+    request_id: "request-selection-1",
+    run_id: "run-selection-1",
+    created_at: "2026-08-21T11:00:00.000Z",
+    deadline: "2026-08-21T13:00:00.000Z",
+    task_contract: {
+      document_type: "task-contract",
+      artifact_id: "task-selection-1",
+      revision: 1,
+      hash: SAFE_HASH,
+    },
+    input_artifacts: [],
+    agent: {
+      definition: {
+        document_type: "agent-definition",
+        artifact_id: "agent-worker",
+        revision: 1,
+        hash: `sha256:${"b".repeat(64)}`,
+      },
+      role: "worker",
+    },
+    model: {
+      logical_class: "balanced-code",
+      required_capabilities: ["json-schema", "text", "tools"],
+      ...model,
+    },
+    superpowers: { required: ["test-driven-development"] },
+    mcp: {
+      profile: {
+        document_type: "mcp-profile",
+        artifact_id: "mcp-readonly",
+        revision: 1,
+        hash: `sha256:${"c".repeat(64)}`,
+      },
+    },
+    budget: {
+      max_input_tokens: 200_000,
+      max_output_tokens: 32_768,
+      max_cost_microusd: 5_000_000,
+      max_duration_ms: 900_000,
+      max_turns: 16,
+    },
+    review_policy: {
+      document_type: "review-policy",
+      artifact_id: "review-medium",
+      revision: 1,
+      hash: `sha256:${"d".repeat(64)}`,
+    },
+    output: {
+      schema: {
+        document_type: "output-schema",
+        artifact_id: "output-selection",
+        revision: 1,
+        hash: `sha256:${"e".repeat(64)}`,
+      },
+    },
+    trace: {
+      trace_id: "0123456789abcdef0123456789abcdef",
+      span_id: "0123456789abcdef",
+      trace_flags: 1,
+    },
+    ...overrides,
+  };
+  const parsed = parseExecutionRequest(canonicalJson(value));
+  if (!parsed.ok) throw new Error(`invalid request fixture: ${JSON.stringify(parsed.issues)}`);
+  return parsed.value;
+}
+
+function live(
+  entries: readonly ModelCatalogEntryV1[],
+  mutate: (value: AgentgatewayCapabilitiesV1) => AgentgatewayCapabilitiesV1 = (value) => value,
+): AgentgatewayCapabilitiesV1 {
+  const routes = entries.flatMap((catalogEntry) =>
+    catalogEntry.routes.map((catalogRoute) => ({
+      alias: catalogEntry.route_alias,
+      route_id: catalogRoute.route_id,
+      provider: catalogRoute.provider,
+      model: catalogRoute.model,
+      capabilities: { ...catalogRoute.capabilities },
+    })),
+  );
+  const withoutHash = {
+    protocol_version: "runtime-contract.v1",
+    schema_version: "agentgateway-capabilities.v1",
+    document_type: "agentgateway-capabilities",
+    gateway: { name: "agentgateway", version: "0.10.0", revision: 11 },
+    generated_at: "2026-08-21T11:59:00.000Z",
+    expires_at: "2026-08-21T12:04:00.000Z",
+    routes,
+  } as const;
+  const initial = {
+    ...withoutHash,
+    document_hash: hashAgentgatewayCapabilities({
+      ...withoutHash,
+      document_hash: `sha256:${"0".repeat(64)}`,
+    }),
+  } as AgentgatewayCapabilitiesV1;
+  const changed = mutate(structuredClone(initial));
+  const candidate = {
+    ...changed,
+    document_hash: hashAgentgatewayCapabilities(changed),
+  } as AgentgatewayCapabilitiesV1;
+  const parsed = parseAgentgatewayCapabilities(canonicalJson(candidate), {
+    now: () => new Date(DECISION_AT),
+  });
+  if (!parsed.ok) throw new Error(`invalid live fixture: ${JSON.stringify(parsed.issues)}`);
+  return parsed.value;
+}
+
+function state(input: {
+  readonly request: ExecutionRequestV1;
+  readonly catalog: ModelCatalogV1;
+  readonly policy: RoutingPolicyV1;
+  readonly circuits?: readonly RoutingCircuitV1[];
+  readonly budget?: RoutingStateV1["budget"];
+  readonly budget_status?: RoutingStateV1["budget_status"];
+}): RoutingStateV1 {
+  const base = validRoutingState();
+  const budgetStatus = input.budget_status ?? "known";
+  const parsed = parseRoutingState(
+    routingStateBytes({
+      ...base,
+      state_id: "routing-selection-1",
+      run_id: input.request.run_id,
+      request_hash: hashExecutionRequest(input.request),
+      catalog_hash: input.catalog.document_hash,
+      policy_hash: input.policy.document_hash,
+      budget: input.budget ?? input.request.budget,
+      budget_status: budgetStatus,
+      settled: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cost_microusd: budgetStatus === "known" ? 0 : null,
+        duration_ms: 0,
+        turns: 0,
+      },
+      reservations: [],
+      circuits: [...(input.circuits ?? [])].sort((left, right) =>
+        left.entry_id < right.entry_id ? -1 : left.entry_id > right.entry_id ? 1 : 0,
+      ),
+    }),
+  );
+  if (!parsed.ok) throw new Error(`invalid state fixture: ${JSON.stringify(parsed.issues)}`);
+  return parsed.value;
+}
+
+function fixture(
+  options: {
+    readonly entries?: readonly ModelCatalogEntryV1[];
+    readonly request?: ExecutionRequestV1;
+    readonly task?: Partial<RoutingTaskProfile>;
+    readonly ceilings?: PlanModelSelectionInput["ceilings"];
+    readonly circuits?: readonly RoutingCircuitV1[];
+    readonly budget?: RoutingStateV1["budget"];
+    readonly budget_status?: RoutingStateV1["budget_status"];
+    readonly mutateLive?: (value: AgentgatewayCapabilitiesV1) => AgentgatewayCapabilitiesV1;
+    readonly decision_at?: string;
+  } = {},
+): PlanModelSelectionInput {
+  const entries = options.entries ?? defaultEntries();
+  const selectedRequest =
+    options.request ?? request(options.budget === undefined ? {} : { budget: options.budget });
+  const selectedCatalog = catalog(entries);
+  const selectedPolicy = policy();
+  return {
+    request: selectedRequest,
+    task: {
+      task_contract: selectedRequest.task_contract,
+      phase: "implementation",
+      complexity: "medium",
+      risks: [],
+      max_latency_class: "standard",
+      ...options.task,
+    },
+    ceilings: options.ceilings ?? {
+      max_input_tokens: 20_000,
+      max_output_tokens: 4_000,
+      max_duration_ms: 120_000,
+    },
+    catalog: selectedCatalog,
+    policy: selectedPolicy,
+    state: state({
+      request: selectedRequest,
+      catalog: selectedCatalog,
+      policy: selectedPolicy,
+      ...(options.circuits === undefined ? {} : { circuits: options.circuits }),
+      ...(options.budget === undefined ? {} : { budget: options.budget }),
+      ...(options.budget_status === undefined ? {} : { budget_status: options.budget_status }),
+    }),
+    live: live(entries, options.mutateLive),
+    gateway_profile: "gateway-primary",
+    decision_at: options.decision_at ?? DECISION_AT,
+  };
+}
+
+function planned(input: PlanModelSelectionInput): PlannedModelSelectionPlanV1 {
+  const result = planModelSelection(input);
+  expect(result.status).toBe("planned");
+  if (result.status !== "planned")
+    throw new Error(`expected planned, got ${result.plan.block_code}`);
+  return result.plan;
+}
+
+function blocked(input: PlanModelSelectionInput): BlockedModelSelectionPlanV1 {
+  const result = planModelSelection(input);
+  expect(result.status).toBe("blocked");
+  if (result.status !== "blocked") throw new Error("expected blocked plan");
+  expect(result.next_state).toBeNull();
+  return result.plan;
+}
+
+function selectedEntryIds(plan: PlannedModelSelectionPlanV1): readonly string[] {
+  return plan.worker_attempts.map((attempt) => attempt.entry_id);
+}
+
+function deepRequest(budget?: ExecutionRequestV1["budget"]): ExecutionRequestV1 {
+  return request(budget === undefined ? {} : { budget }, {
+    logical_class: "deep-reasoning",
+    required_capabilities: ["reasoning", "text", "tools"],
+  });
+}
+
+function reviewWorker(
+  entryId: string,
+  provider: "openai" | "anthropic" | "gemini",
+  model: string,
+  priority: number,
+  routes: readonly CatalogRouteV1[] = [route(`route-${entryId}`, provider, model)],
+): ModelCatalogEntryV1 {
+  return entry(entryId, entryId, priority, routes, {
+    logical_classes: ["deep-reasoning"],
+  });
+}
+
+function reviewer(
+  entryId: string,
+  provider: "openai" | "anthropic" | "gemini",
+  model: string,
+  priority: number,
+  routes: readonly CatalogRouteV1[] = [route(`route-${entryId}`, provider, model)],
+): ModelCatalogEntryV1 {
+  return entry(entryId, entryId, priority, routes, {
+    logical_classes: ["independent-review"],
+  });
+}
+
+function governedOverride(
+  input: PlanModelSelectionInput,
+  targetEntryId: string,
+  valueOverrides: Readonly<Record<string, unknown>> = {},
+  artifactOverrides: Readonly<Record<string, unknown>> = {},
+): GovernedRoutingOverride {
+  const value = {
+    version: "routing-override.v1",
+    override_id: "override-selection-1",
+    issued_at: "2026-08-21T11:59:30.000Z",
+    catalog_hash: input.catalog.document_hash,
+    policy_hash: input.policy.document_hash,
+    target_entry_id: targetEntryId,
+    reason_code: "incident-mitigation",
+    ...valueOverrides,
+  };
+  return {
+    artifact: {
+      document_type: "routing-override",
+      artifact_id: "override-selection-1",
+      revision: 1,
+      hash: sha256(value),
+      ...artifactOverrides,
+    },
+    value,
+  } as GovernedRoutingOverride;
+}
+
+describe("deterministic worker selection", () => {
+  it("plans the primary and every allowed capability-equivalent fallback atomically", () => {
+    const input = fixture();
+    const result = planModelSelection(input);
+    expect(result.status).toBe("planned");
+    if (result.status !== "planned") return;
+
+    expect(selectedEntryIds(result.plan)).toEqual([
+      "balanced-primary",
+      "balanced-fallback-a",
+      "balanced-fallback-b",
+    ]);
+    expect(result.plan.worker_attempts[0]?.accepted_routes.map((value) => value.route_id)).toEqual([
+      "route-primary-a",
+      "route-primary-z",
+    ]);
+    expect(result.plan.worker_attempts.map((attempt) => attempt.fallback_index)).toEqual([0, 1, 2]);
+    expect(result.plan.reservation.allocations.map((value) => value.attempt_id)).toEqual(
+      [...result.plan.reservation.allocations]
+        .map((value) => value.attempt_id)
+        .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0)),
+    );
+    expect(result.plan.reservation.allocations).toHaveLength(3);
+    expect(result.plan.request_deadline).toBe(input.request.deadline);
+    expect(result.plan.live_expires_at).toBe(input.live.expires_at);
+    expect(result.next_state.reservations).toEqual([result.plan.reservation]);
+    expect(result.next_state.document_hash).toBe(result.plan.next_state_hash);
+    expect(parseModelSelectionPlan(canonicalJson(result.plan))).toEqual({
+      ok: true,
+      value: result.plan,
+    });
+    expect(planModelSelection(input)).toEqual(result);
+    expect(Object.isFrozen(result.plan)).toBe(true);
+  });
+
+  it.each([
+    [
+      "priority",
+      [
+        entry("z-entry", "z-entry", 20, [route("route-z", "openai", "gpt-5")]),
+        entry("a-entry", "a-entry", 10, [route("route-a", "openai", "gpt-5")]),
+      ],
+      "a-entry",
+    ],
+    [
+      "cost",
+      [
+        entry("expensive", "expensive", 10, [
+          route("route-expensive", "openai", "gpt-5", {
+            pricing: pricing(9_000_000, 9_000_000, 9_000_000, 9_000_000),
+          }),
+        ]),
+        entry("cheap", "cheap", 10, [
+          route("route-cheap", "openai", "gpt-5", { pricing: pricing(1, 1, 1, 1) }),
+        ]),
+      ],
+      "cheap",
+    ],
+    [
+      "latency",
+      [
+        entry("standard", "standard", 10, [route("route-standard", "openai", "gpt-5")]),
+        entry("interactive", "interactive", 10, [
+          route("route-interactive", "openai", "gpt-5", { latency_class: "interactive" }),
+        ]),
+      ],
+      "interactive",
+    ],
+    [
+      "ASCII entry ID",
+      [
+        entry("z-entry", "z-entry", 10, [route("route-z", "openai", "gpt-5")]),
+        entry("A-entry", "A-entry", 10, [route("route-a", "openai", "gpt-5")]),
+      ],
+      "A-entry",
+    ],
+  ] as const)("uses stable %s tie-breaking", (_name, entries, expected) => {
+    expect(planned(fixture({ entries })).worker_attempts[0]?.entry_id).toBe(expected);
+  });
+
+  it("uses the first matched worker-class preference as the leading sort key", () => {
+    const visionRequest = request({}, { logical_class: "vision" });
+    const entries = [
+      entry(
+        "balanced-vision",
+        "balanced-vision",
+        50,
+        [route("route-balanced", "openai", "gpt-5")],
+        {
+          logical_classes: ["balanced-code", "vision"],
+        },
+      ),
+      entry("economy-vision", "economy-vision", 1, [route("route-economy", "openai", "gpt-5")], {
+        logical_classes: ["economy", "vision"],
+      }),
+    ];
+    expect(planned(fixture({ entries, request: visionRequest })).worker_attempts[0]?.entry_id).toBe(
+      "balanced-vision",
+    );
+  });
+
+  it.each([
+    ["analysis", "low", []],
+    ["review", "critical", []],
+    ["implementation", "medium", []],
+  ] as readonly [TaskPhase, TaskComplexity, readonly TaskRisk[]][])(
+    "matches phase %s, complexity %s, and the exact risk set",
+    (phase, complexity, risks) => {
+      expect(planned(fixture({ task: { phase, complexity, risks } })).matched_rule_id).toBe(
+        "non-risk-default",
+      );
+    },
+  );
+
+  it("matches the exact high-security rule and fails closed until reviewer pairing exists", () => {
+    const deepRequest = request({}, { logical_class: "deep-reasoning" });
+    const entries = [
+      entry("deep-worker", "deep-worker", 1, [route("route-deep", "openai", "gpt-5")], {
+        logical_classes: ["deep-reasoning"],
+      }),
+    ];
+    const plan = blocked(
+      fixture({
+        entries,
+        request: deepRequest,
+        task: { complexity: "high", risks: ["security"] },
+      }),
+    );
+    expect(plan).toMatchObject({
+      matched_rule_id: "security-review",
+      block_code: "RUNTIME_ROUTING_REVIEW_UNAVAILABLE",
+    });
+  });
+});
+
+describe("independent review routing", () => {
+  it.each([
+    ["security review", ["security"], "high", "security-review"],
+    ["architecture review", ["architecture"], "medium", "risk-default"],
+    ["irreversible review", ["irreversible"], "medium", "risk-default"],
+    ["multi-risk review", ["architecture", "security"], "critical", "risk-default"],
+  ] as const)("plans an independent reviewer for %s", (_name, risks, complexity, matchedRuleId) => {
+    const entries = [
+      reviewWorker("deep-worker", "openai", "gpt-5", 1),
+      reviewer("independent-reviewer", "anthropic", "claude-review", 1),
+    ];
+    const plan = planned(
+      fixture({
+        entries,
+        request: deepRequest(),
+        task: { risks, complexity },
+      }),
+    );
+
+    expect(plan.matched_rule_id).toBe(matchedRuleId);
+    expect(plan.worker_attempts.map((attempt) => attempt.entry_id)).toEqual(["deep-worker"]);
+    expect(plan.reviewer_attempt).toMatchObject({
+      entry_id: "independent-reviewer",
+      role: "reviewer",
+      fallback_index: null,
+    });
+    expect(plan.reservation.allocations.map((allocation) => allocation.role).sort()).toEqual([
+      "reviewer",
+      "worker",
+    ]);
+    expect(plan.eliminations).toEqual([]);
+  });
+
+  it("rejects different aliases whose accepted reviewer and worker routes resolve to the same provider/model", () => {
+    const plan = blocked(
+      fixture({
+        entries: [
+          reviewWorker("deep-worker", "openai", "shared-model", 1),
+          reviewer("independent-reviewer", "openai", "shared-model", 1),
+        ],
+        request: deepRequest(),
+        task: { risks: ["architecture"] },
+      }),
+    );
+
+    expect(plan.block_code).toBe("RUNTIME_ROUTING_REVIEW_UNAVAILABLE");
+  });
+
+  it("rejects a multi-route reviewer alias when any accepted provider/model pair collides", () => {
+    const workerRoutes = [
+      route("route-worker-openai", "openai", "worker-model-a"),
+      route("route-worker-anthropic", "anthropic", "worker-model-b"),
+    ];
+    const reviewerRoutes = [
+      route("route-reviewer-unique", "gemini", "review-model"),
+      route("route-reviewer-collision", "gemini", "worker-model-a"),
+    ];
+    const plan = blocked(
+      fixture({
+        entries: [
+          reviewWorker("deep-worker", "openai", "unused", 1, workerRoutes),
+          reviewer("independent-reviewer", "gemini", "unused", 1, reviewerRoutes),
+        ],
+        request: deepRequest(),
+        task: { risks: ["architecture"] },
+      }),
+    );
+
+    expect(plan.block_code).toBe("RUNTIME_ROUTING_REVIEW_UNAVAILABLE");
+  });
+
+  it("ranks independent reviewers deterministically by the stable candidate order", () => {
+    const entries = [
+      reviewWorker("deep-worker", "openai", "worker-model", 1),
+      reviewer("reviewer-z", "anthropic", "reviewer-z-model", 10),
+      reviewer("reviewer-A", "gemini", "reviewer-a-model", 10),
+    ];
+
+    const plan = planned(
+      fixture({ entries, request: deepRequest(), task: { risks: ["architecture"] } }),
+    );
+
+    expect(plan.reviewer_attempt?.entry_id).toBe("reviewer-A");
+  });
+
+  it("reserves primary, fallback, and reviewer ceilings as one review budget", () => {
+    const entries = [
+      reviewWorker("deep-worker", "openai", "worker-model", 1, [
+        route("route-deep-worker", "openai", "worker-model", {
+          pricing: pricing(1, 1, 1, 1),
+        }),
+      ]),
+      reviewWorker("deep-fallback", "gemini", "fallback-model", 2, [
+        route("route-deep-fallback", "gemini", "fallback-model", {
+          pricing: pricing(1, 1, 1, 1),
+        }),
+      ]),
+      reviewer("independent-reviewer", "anthropic", "review-model", 1, [
+        route("route-independent-reviewer", "anthropic", "review-model", {
+          pricing: pricing(1, 1, 1, 1),
+        }),
+      ]),
+    ];
+    const exactBudget = {
+      max_input_tokens: 3,
+      max_output_tokens: 3,
+      max_cost_microusd: 6,
+      max_duration_ms: 3,
+      max_turns: 3,
+    };
+    const input = fixture({
+      entries,
+      request: deepRequest(exactBudget),
+      task: { complexity: "high", risks: ["security"] },
+      ceilings: { max_input_tokens: 1, max_output_tokens: 1, max_duration_ms: 1 },
+      budget: exactBudget,
+    });
+    const plan = planned(input);
+
+    expect(plan.worker_attempts.map((attempt) => attempt.entry_id)).toEqual([
+      "deep-worker",
+      "deep-fallback",
+    ]);
+    expect(plan.reviewer_attempt?.entry_id).toBe("independent-reviewer");
+    expect(plan.reservation.allocations).toHaveLength(3);
+    const insufficientBudget = { ...exactBudget, max_cost_microusd: 3 };
+    expect(
+      blocked(
+        fixture({
+          entries,
+          request: deepRequest(insufficientBudget),
+          task: { complexity: "high", risks: ["security"] },
+          ceilings: { max_input_tokens: 1, max_output_tokens: 1, max_duration_ms: 1 },
+          budget: insufficientBudget,
+        }),
+      ).block_code,
+    ).toBe("RUNTIME_ROUTING_REVIEW_UNAVAILABLE");
+  });
+
+  it("selects a cheaper lower-ranked reviewer when the leading review pair exceeds budget", () => {
+    const entries = [
+      reviewWorker("deep-worker", "openai", "worker-model", 1, [
+        route("route-deep-worker", "openai", "worker-model", {
+          pricing: pricing(1, 1, 1, 1),
+        }),
+      ]),
+      reviewer("expensive-reviewer", "anthropic", "expensive-review-model", 1, [
+        route("route-expensive-reviewer", "anthropic", "expensive-review-model", {
+          pricing: pricing(2_000_000, 2_000_000, 2_000_000, 2_000_000),
+        }),
+      ]),
+      reviewer("cheap-reviewer", "gemini", "cheap-review-model", 2, [
+        route("route-cheap-reviewer", "gemini", "cheap-review-model", {
+          pricing: pricing(1, 1, 1, 1),
+        }),
+      ]),
+    ];
+    const budget = {
+      max_input_tokens: 2,
+      max_output_tokens: 2,
+      max_cost_microusd: 5,
+      max_duration_ms: 2,
+      max_turns: 2,
+    };
+    const plan = planned(
+      fixture({
+        entries,
+        request: deepRequest(budget),
+        task: { risks: ["architecture"] },
+        ceilings: { max_input_tokens: 1, max_output_tokens: 1, max_duration_ms: 1 },
+        budget,
+      }),
+    );
+
+    expect(plan.reviewer_attempt?.entry_id).toBe("cheap-reviewer");
+    expect(plan.eliminations).toContainEqual({ entry_id: "expensive-reviewer", reason: "budget" });
+  });
+
+  it("audits review independence against every included fallback and skips a colliding fallback", () => {
+    const entries = [
+      reviewWorker("deep-worker", "openai", "worker-model", 1),
+      reviewWorker("colliding-fallback", "anthropic", "other-worker-model", 2),
+      reviewWorker("independent-fallback", "gemini", "fallback-model", 3),
+      reviewer("independent-reviewer", "anthropic", "review-model", 1),
+    ];
+    const plan = planned(
+      fixture({
+        entries,
+        request: deepRequest(),
+        task: { complexity: "high", risks: ["security"] },
+      }),
+    );
+
+    expect(plan.worker_attempts.map((attempt) => attempt.entry_id)).toEqual([
+      "deep-worker",
+      "independent-fallback",
+    ]);
+    expect(plan.reviewer_attempt?.entry_id).toBe("independent-reviewer");
+    expect(plan.eliminations).toContainEqual({
+      entry_id: "colliding-fallback",
+      reason: "review-independence",
+    });
+  });
+
+  it("prefers more budget-feasible review fallbacks before their ordered entry-ID tuple", () => {
+    const budget = {
+      max_input_tokens: 4,
+      max_output_tokens: 4,
+      max_cost_microusd: 8,
+      max_duration_ms: 4,
+      max_turns: 4,
+    };
+    const entries = [
+      reviewWorker("primary", "openai", "primary-model", 1, [
+        route("route-primary", "openai", "primary-model", {
+          pricing: pricing(1, 1, 1, 1),
+        }),
+      ]),
+      reviewWorker("expensive-fallback", "gemini", "expensive-model", 2, [
+        route("route-expensive-fallback", "gemini", "expensive-model", {
+          pricing: pricing(2_000_000, 2_000_000, 2_000_000, 2_000_000),
+        }),
+      ]),
+      reviewWorker("cheap-fallback-b", "gemini", "cheap-model-b", 3, [
+        route("route-cheap-fallback-b", "gemini", "cheap-model-b", {
+          pricing: pricing(1, 1, 1, 1),
+        }),
+      ]),
+      reviewWorker("cheap-fallback-a", "gemini", "cheap-model-a", 4, [
+        route("route-cheap-fallback-a", "gemini", "cheap-model-a", {
+          pricing: pricing(1, 1, 1, 1),
+        }),
+      ]),
+      reviewer("independent-reviewer", "anthropic", "review-model", 1, [
+        route("route-independent-reviewer", "anthropic", "review-model", {
+          pricing: pricing(1, 1, 1, 1),
+        }),
+      ]),
+    ];
+    const plan = planned(
+      fixture({
+        entries,
+        request: deepRequest(budget),
+        task: { risks: ["architecture"] },
+        ceilings: { max_input_tokens: 1, max_output_tokens: 1, max_duration_ms: 1 },
+        budget,
+      }),
+    );
+
+    expect(plan.worker_attempts.map((attempt) => attempt.entry_id)).toEqual([
+      "primary",
+      "cheap-fallback-b",
+      "cheap-fallback-a",
+    ]);
+    expect(plan.eliminations).toContainEqual({
+      entry_id: "expensive-fallback",
+      reason: "budget",
+    });
+  });
+
+  it("returns a fixed review-unavailable result when no independent reviewer exists", () => {
+    const plan = blocked(
+      fixture({
+        entries: [reviewWorker("deep-worker", "openai", "worker-model", 1)],
+        request: deepRequest(),
+        task: { risks: ["irreversible"] },
+      }),
+    );
+    expect(plan).toMatchObject({
+      block_code: "RUNTIME_ROUTING_REVIEW_UNAVAILABLE",
+      retryable: false,
+      next_retry_at: null,
+    });
+  });
+});
+
+describe("governed routing override", () => {
+  it("applies a valid override only as a narrowing filter", () => {
+    const input = fixture();
+    const plan = planned({
+      ...input,
+      override: governedOverride(input, "balanced-fallback-b"),
+    });
+
+    expect(plan.worker_attempts.map((attempt) => attempt.entry_id)).toEqual([
+      "balanced-fallback-b",
+    ]);
+    expect(plan.override).toEqual(governedOverride(input, "balanced-fallback-b").artifact);
+    expect(plan.eliminations).toEqual([
+      { entry_id: "balanced-fallback-a", reason: "override" },
+      { entry_id: "balanced-primary", reason: "override" },
+      { entry_id: "economy-only", reason: "policy" },
+    ]);
+  });
+
+  it.each([
+    ["stale catalog override", { catalog_hash: `sha256:${"1".repeat(64)}` }],
+    ["stale policy override", { policy_hash: `sha256:${"2".repeat(64)}` }],
+    ["future override", { issued_at: "2026-08-21T12:00:00.001Z" }],
+  ] as const)("denies a %s without ignoring it", (_name, valueOverrides) => {
+    const input = fixture();
+    const plan = blocked({
+      ...input,
+      override: governedOverride(input, "balanced-fallback-a", valueOverrides),
+    });
+    expect(plan.block_code).toBe("RUNTIME_ROUTING_POLICY_DENIED");
+  });
+
+  it("denies an override whose exact artifact hash does not bind its value", () => {
+    const input = fixture();
+    const plan = blocked({
+      ...input,
+      override: governedOverride(
+        input,
+        "balanced-fallback-a",
+        {},
+        {
+          hash: `sha256:${"f".repeat(64)}`,
+        },
+      ),
+    });
+    expect(plan.block_code).toBe("RUNTIME_ROUTING_POLICY_DENIED");
+  });
+
+  it.each([
+    ["absent override target", "absent-target", fixture()],
+    [
+      "circuit-open override target",
+      "balanced-primary",
+      fixture({
+        circuits: [
+          {
+            entry_id: "balanced-primary",
+            status: "open",
+            consecutive_failures: 3,
+            retry_at: "2026-08-21T12:01:00.000Z",
+            probe_decision_id: null,
+          },
+        ],
+      }),
+    ],
+    [
+      "too-slow override target",
+      "slow-target",
+      fixture({
+        entries: [
+          entry("slow-target", "slow-target", 1, [
+            route("route-slow-target", "openai", "slow-model", {
+              latency_class: "extended",
+            }),
+          ]),
+          defaultEntries()[1]!,
+        ],
+      }),
+    ],
+    [
+      "under-capable override target",
+      "weak-target",
+      fixture({
+        entries: [
+          entry("weak-target", "weak-target", 1, [
+            route("route-weak-target", "openai", "weak-model", {
+              capabilities: { ...providerCapabilities("openai"), tools: false },
+            }),
+          ]),
+          defaultEntries()[1]!,
+        ],
+      }),
+    ],
+    [
+      "over-budget override target",
+      "expensive-target",
+      fixture({
+        entries: [
+          entry("expensive-target", "expensive-target", 1, [
+            route("route-expensive-target", "openai", "expensive-model", {
+              pricing: pricing(1_000_000_000, 1_000_000_000, 1_000_000_000, 1_000_000_000),
+            }),
+          ]),
+          entry("cheap-target", "cheap-target", 2, [
+            route("route-cheap-target", "anthropic", "cheap-model", {
+              pricing: pricing(1, 1, 1, 1),
+            }),
+          ]),
+        ],
+        ceilings: { max_input_tokens: 1, max_output_tokens: 1, max_duration_ms: 1 },
+        budget: {
+          max_input_tokens: 2,
+          max_output_tokens: 2,
+          max_cost_microusd: 4,
+          max_duration_ms: 2,
+          max_turns: 2,
+        },
+      }),
+    ],
+  ] as const)("denies an %s that is not already eligible", (_name, target, input) => {
+    const plan = blocked({ ...input, override: governedOverride(input, target) });
+    expect(plan.block_code).toBe("RUNTIME_ROUTING_POLICY_DENIED");
+  });
+
+  it.each([
+    ["reduce review", { review: "none" }],
+    ["increase override budget", { max_cost_microusd: Number.MAX_SAFE_INTEGER }],
+    ["increase override tool capability", { required_capabilities: ["tools"] }],
+  ] as const)("denies an override attempt to %s", (_name, escalation) => {
+    const input = fixture();
+    const plan = blocked({
+      ...input,
+      override: governedOverride(input, "balanced-primary", escalation),
+    });
+    expect(plan.block_code).toBe("RUNTIME_ROUTING_POLICY_DENIED");
+  });
+
+  it("keeps independent review mandatory after a valid worker override", () => {
+    const entries = [
+      reviewWorker("deep-worker-a", "openai", "worker-model-a", 1),
+      reviewWorker("deep-worker-b", "gemini", "worker-model-b", 2),
+      reviewer("independent-reviewer", "anthropic", "review-model", 1),
+    ];
+    const input = fixture({
+      entries,
+      request: deepRequest(),
+      task: { risks: ["architecture"] },
+    });
+    const plan = planned({
+      ...input,
+      override: governedOverride(input, "deep-worker-b"),
+    });
+
+    expect(plan.worker_attempts.map((attempt) => attempt.entry_id)).toEqual(["deep-worker-b"]);
+    expect(plan.reviewer_attempt?.entry_id).toBe("independent-reviewer");
+  });
+});
+
+describe("effective catalog/live capability authority", () => {
+  it.each([
+    [
+      "a live-only route",
+      entry("atomic-live-only", "atomic-live-only", 1, [
+        route("route-atomic-safe", "openai", "gpt-5"),
+      ]),
+      (liveValue: AgentgatewayCapabilitiesV1): AgentgatewayCapabilitiesV1 => ({
+        ...liveValue,
+        routes: [
+          ...liveValue.routes,
+          {
+            alias: "atomic-live-only",
+            route_id: "route-live-only",
+            provider: "gemini" as const,
+            model: "gemini-live-only",
+            capabilities: providerCapabilities("gemini"),
+          },
+        ],
+      }),
+      "live-route",
+      "route-live-only",
+    ],
+    [
+      "a catalog-denied capability",
+      entry("atomic-denied", "atomic-denied", 1, [
+        route("route-atomic-safe", "openai", "gpt-5"),
+        route("route-atomic-denied", "anthropic", "claude-denied", {
+          capabilities: { ...providerCapabilities("anthropic"), tools: false },
+        }),
+      ]),
+      (liveValue: AgentgatewayCapabilitiesV1): AgentgatewayCapabilitiesV1 => ({
+        ...liveValue,
+        routes: liveValue.routes.map((liveRoute) =>
+          liveRoute.route_id === "route-atomic-denied"
+            ? {
+                ...liveRoute,
+                capabilities: { ...liveRoute.capabilities, tools: true },
+              }
+            : liveRoute,
+        ),
+      }),
+      "capability",
+      "route-atomic-denied",
+    ],
+    [
+      "a context-small route",
+      entry("atomic-context", "atomic-context", 1, [
+        route("route-atomic-safe", "openai", "gpt-5"),
+        route("route-atomic-context-small", "anthropic", "claude-small-context", {
+          capabilities: {
+            ...providerCapabilities("anthropic"),
+            max_context_tokens: 20_000,
+          },
+        }),
+      ]),
+      (liveValue: AgentgatewayCapabilitiesV1): AgentgatewayCapabilitiesV1 => liveValue,
+      "capability",
+      "route-atomic-context-small",
+    ],
+    [
+      "a policy-slow route",
+      entry("atomic-latency", "atomic-latency", 1, [
+        route("route-atomic-safe", "openai", "gpt-5"),
+        route("route-atomic-slow", "anthropic", "claude-slow", {
+          latency_class: "extended",
+        }),
+      ]),
+      (liveValue: AgentgatewayCapabilitiesV1): AgentgatewayCapabilitiesV1 => liveValue,
+      "latency",
+      "route-atomic-slow",
+    ],
+  ] as const)(
+    "rejects an alias atomically when gateway execution includes %s",
+    (_name, catalogEntry, mutateLive, reason, dangerousRouteId) => {
+      const input = fixture({ entries: [catalogEntry], mutateLive });
+      const requirement = {
+        schema_version: "gateway-route-requirement.v1" as const,
+        alias: catalogEntry.route_alias,
+        tools: true,
+        json_schema: true,
+        vision: false,
+        reasoning: false,
+        streaming: false,
+        max_output_tokens: 4_000,
+      };
+      const dangerous = input.live.routes.find(
+        (liveRoute) => liveRoute.route_id === dangerousRouteId,
+      );
+      expect(dangerous).toBeDefined();
+      expect(routeSatisfiesRequirement(dangerous!, requirement)).toBe(true);
+
+      expect(blocked(input).eliminations).toEqual([{ entry_id: catalogEntry.entry_id, reason }]);
+    },
+  );
+
+  it("accepts every gateway-executable route in an all-safe alias and reserves its maximum price", () => {
+    const catalogEntry = entry("atomic-safe", "atomic-safe", 1, [
+      route("route-atomic-cheap", "openai", "gpt-5"),
+      route("route-atomic-expensive", "anthropic", "claude-expensive", {
+        pricing: pricing(20_000_000, 20_000_000, 20_000_000, 20_000_000),
+      }),
+    ]);
+
+    const plan = planned(fixture({ entries: [catalogEntry] }));
+
+    expect(plan.worker_attempts[0]?.accepted_routes.map((value) => value.route_id)).toEqual([
+      "route-atomic-cheap",
+      "route-atomic-expensive",
+    ]);
+    expect(plan.worker_attempts[0]?.reserved_cost_microusd).toBe(480_002);
+    expect(plan.reservation.allocations[0]?.cost_microusd).toBe(480_002);
+  });
+
+  it("rejects a reviewer alias when an executable same-alias route collides with the worker", () => {
+    const entries = [
+      reviewWorker("atomic-worker", "openai", "shared-model", 1),
+      reviewer("atomic-reviewer", "anthropic", "independent-model", 1, [
+        route("route-atomic-reviewer-safe", "anthropic", "independent-model"),
+        route("route-atomic-reviewer-collision", "openai", "shared-model"),
+      ]),
+    ];
+    const input = fixture({
+      entries,
+      request: deepRequest(),
+      task: { risks: ["security"] },
+    });
+    const collision = input.live.routes.find(
+      (liveRoute) => liveRoute.route_id === "route-atomic-reviewer-collision",
+    );
+    expect(collision).toBeDefined();
+    expect(
+      routeSatisfiesRequirement(collision!, {
+        schema_version: "gateway-route-requirement.v1",
+        alias: "atomic-reviewer",
+        tools: true,
+        json_schema: false,
+        vision: false,
+        reasoning: true,
+        streaming: false,
+        max_output_tokens: 4_000,
+      }),
+    ).toBe(true);
+
+    expect(blocked(input).block_code).toBe("RUNTIME_ROUTING_REVIEW_UNAVAILABLE");
+  });
+
+  it.each([
+    [
+      "route ID",
+      (liveValue: AgentgatewayCapabilitiesV1) => ({
+        ...liveValue,
+        routes: liveValue.routes.map((value, index) =>
+          index === 0 ? { ...value, route_id: "other-route" } : value,
+        ),
+      }),
+    ],
+    [
+      "provider",
+      (liveValue: AgentgatewayCapabilitiesV1) => ({
+        ...liveValue,
+        routes: liveValue.routes.map((value, index) =>
+          index === 0
+            ? {
+                ...value,
+                provider: "openai" as const,
+                capabilities: { ...value.capabilities, provider: "openai" as const },
+              }
+            : value,
+        ),
+      }),
+    ],
+    [
+      "model",
+      (liveValue: AgentgatewayCapabilitiesV1) => ({
+        ...liveValue,
+        routes: liveValue.routes.map((value, index) =>
+          index === 0 ? { ...value, model: "other-model" } : value,
+        ),
+      }),
+    ],
+  ] as const)("requires the exact live %s identity", (_name, mutateLive) => {
+    const entries = [defaultEntries()[1]!];
+    expect(blocked(fixture({ entries, mutateLive })).block_code).toBe(
+      "RUNTIME_ROUTING_NO_CAPABLE_ROUTE",
+    );
+  });
+
+  it.each([
+    [
+      "tools",
+      (capabilities: CatalogRouteV1["capabilities"]) => ({ ...capabilities, tools: false }),
+    ],
+    [
+      "json-schema",
+      (capabilities: CatalogRouteV1["capabilities"]) => ({ ...capabilities, json_schema: false }),
+    ],
+    [
+      "output",
+      (capabilities: CatalogRouteV1["capabilities"]) => ({
+        ...capabilities,
+        max_output_tokens: 3_999,
+      }),
+    ],
+    [
+      "context",
+      (capabilities: CatalogRouteV1["capabilities"]) => ({
+        ...capabilities,
+        max_context_tokens: 23_999,
+      }),
+    ],
+  ] as const)("allows live authority to remove %s capability but never add it", (_name, weaken) => {
+    const entries = [defaultEntries()[1]!];
+    const mutateLive = (liveValue: AgentgatewayCapabilitiesV1): AgentgatewayCapabilitiesV1 => ({
+      ...liveValue,
+      routes: liveValue.routes.map((value) => ({
+        ...value,
+        capabilities: weaken(value.capabilities),
+      })),
+    });
+    expect(blocked(fixture({ entries, mutateLive })).eliminations).toEqual([
+      { entry_id: "balanced-fallback-a", reason: "capability" },
+    ]);
+  });
+
+  it("does not let a stronger live route restore a capability denied by the catalog", () => {
+    const denied = entry("catalog-denied", "catalog-denied", 1, [
+      route("route-denied", "openai", "gpt-5", {
+        capabilities: { ...providerCapabilities("openai"), tools: false },
+      }),
+    ]);
+    const mutateLive = (liveValue: AgentgatewayCapabilitiesV1): AgentgatewayCapabilitiesV1 => ({
+      ...liveValue,
+      routes: liveValue.routes.map((value) => ({
+        ...value,
+        capabilities: { ...value.capabilities, tools: true },
+      })),
+    });
+    expect(blocked(fixture({ entries: [denied], mutateLive })).eliminations).toEqual([
+      { entry_id: "catalog-denied", reason: "capability" },
+    ]);
+  });
+
+  it("enforces the stricter task/policy latency ceiling", () => {
+    const slow = entry("slow-entry", "slow-entry", 1, [
+      route("route-slow", "openai", "gpt-5", { latency_class: "extended" }),
+    ]);
+    expect(
+      blocked(fixture({ entries: [slow], task: { max_latency_class: "extended" } })).eliminations,
+    ).toEqual([{ entry_id: "slow-entry", reason: "latency" }]);
+  });
+
+  it.each([
+    ["unsupported logical class", request({}, { logical_class: "marketing-ultra" })],
+    ["unsupported capability", request({}, { required_capabilities: ["native-secret"] })],
+  ])("denies %s without widening authority", (_name, selectedRequest) => {
+    expect(blocked(fixture({ request: selectedRequest })).block_code).toBe(
+      "RUNTIME_ROUTING_POLICY_DENIED",
+    );
+  });
+
+  it.each(["toString", "constructor", "__proto__"])(
+    "rejects inherited latency key %s instead of widening to the policy ceiling",
+    (maxLatency) => {
+      const input = fixture();
+      const operation = () =>
+        planModelSelection({
+          ...input,
+          task: {
+            ...input.task,
+            max_latency_class: maxLatency,
+          } as RoutingTaskProfile,
+        });
+
+      expect(operation).toThrowError(expect.objectContaining({ code: "RUNTIME_ROUTING_INVALID" }));
+    },
+  );
+});
+
+describe("circuit, budget, and stale-state blocking", () => {
+  it("excludes an open primary and selects the next closed candidate", () => {
+    const plan = planned(
+      fixture({
+        circuits: [
+          {
+            entry_id: "balanced-primary",
+            status: "open",
+            consecutive_failures: 3,
+            retry_at: "2026-08-21T12:01:00.000Z",
+            probe_decision_id: null,
+          },
+        ],
+      }),
+    );
+    expect(plan.worker_attempts[0]?.entry_id).toBe("balanced-fallback-a");
+    expect(plan.eliminations).toContainEqual({ entry_id: "balanced-primary", reason: "circuit" });
+  });
+
+  it("returns the earliest fixed retry time when every capable circuit is open", () => {
+    const entries = defaultEntries().slice(0, 3);
+    const circuits: readonly RoutingCircuitV1[] = entries.map((value, index) => ({
+      entry_id: value.entry_id,
+      status: "open",
+      consecutive_failures: 3,
+      retry_at: `2026-08-21T12:0${index + 1}:00.000Z`,
+      probe_decision_id: null,
+    }));
+    expect(blocked(fixture({ entries, circuits }))).toMatchObject({
+      block_code: "RUNTIME_ROUTING_CIRCUIT_OPEN",
+      retryable: true,
+      next_retry_at: "2026-08-21T12:01:00.000Z",
+    });
+  });
+
+  it("does not advertise circuit retry for an open route that lacks required capability", () => {
+    const entries = [defaultEntries()[1]!];
+    const input = fixture({
+      entries,
+      circuits: [
+        {
+          entry_id: "balanced-fallback-a",
+          status: "open",
+          consecutive_failures: 3,
+          retry_at: "2026-08-21T12:01:00.000Z",
+          probe_decision_id: null,
+        },
+      ],
+      mutateLive: (value) => ({
+        ...value,
+        routes: value.routes.map((routeValue) => ({
+          ...routeValue,
+          capabilities: { ...routeValue.capabilities, tools: false },
+        })),
+      }),
+    });
+
+    expect(blocked(input)).toMatchObject({
+      block_code: "RUNTIME_ROUTING_NO_CAPABLE_ROUTE",
+      next_retry_at: null,
+      eliminations: [{ entry_id: "balanced-fallback-a", reason: "capability" }],
+    });
+  });
+
+  it("atomically reserves one cooldown-expired primary as the only half-open probe", () => {
+    const entries = defaultEntries().slice(0, 3);
+    const input = fixture({
+      entries,
+      circuits: [
+        {
+          entry_id: "balanced-primary",
+          status: "open",
+          consecutive_failures: 3,
+          retry_at: DECISION_AT,
+          probe_decision_id: null,
+        },
+        {
+          entry_id: "balanced-fallback-a",
+          status: "open",
+          consecutive_failures: 2,
+          retry_at: "2026-08-21T11:59:00.000Z",
+          probe_decision_id: null,
+        },
+      ],
+    });
+    const result = planModelSelection(input);
+    expect(result.status).toBe("planned");
+    if (result.status !== "planned") return;
+    expect(selectedEntryIds(result.plan)).toEqual(["balanced-primary", "balanced-fallback-b"]);
+    expect(result.next_state.circuits).toContainEqual({
+      entry_id: "balanced-primary",
+      status: "probe-reserved",
+      consecutive_failures: 3,
+      retry_at: DECISION_AT,
+      probe_decision_id: result.plan.decision_id,
+    });
+    expect(result.next_state.circuits).toContainEqual(
+      input.state.circuits.find((value) => value.entry_id === "balanced-fallback-a"),
+    );
+  });
+
+  it("blocks the same probe on the exact reserved head", () => {
+    const firstInput = fixture({
+      entries: [defaultEntries()[0]!],
+      circuits: [
+        {
+          entry_id: "balanced-primary",
+          status: "open",
+          consecutive_failures: 3,
+          retry_at: DECISION_AT,
+          probe_decision_id: null,
+        },
+      ],
+    });
+    const first = planModelSelection(firstInput);
+    expect(first.status).toBe("planned");
+    if (first.status !== "planned") return;
+    const second = planModelSelection({ ...firstInput, state: first.next_state });
+    expect(second.status).toBe("blocked");
+    if (second.status === "blocked")
+      expect(second.plan.block_code).toBe("RUNTIME_ROUTING_STALE_STATE");
+  });
+
+  it("prunes a fallback instead of blocking a budget-feasible primary tuple", () => {
+    const plan = planned(
+      fixture({
+        entries: defaultEntries().slice(0, 3),
+        budget: {
+          max_input_tokens: 59_999,
+          max_output_tokens: 12_000,
+          max_cost_microusd: 5_000_000,
+          max_duration_ms: 360_000,
+          max_turns: 3,
+        },
+      }),
+    );
+
+    expect(selectedEntryIds(plan)).toEqual(["balanced-primary", "balanced-fallback-a"]);
+    expect(plan.eliminations).toContainEqual({
+      entry_id: "balanced-fallback-b",
+      reason: "budget",
+    });
+  });
+
+  it("eliminates an individually unaffordable higher-priority entry before ordering", () => {
+    const entries = [
+      entry("expensive-primary", "expensive-primary", 1, [
+        route("route-expensive-primary", "openai", "gpt-5", {
+          pricing: pricing(1_000_000_000, 1_000_000_000, 1_000_000_000, 1_000_000_000),
+        }),
+      ]),
+      entry("feasible-secondary", "feasible-secondary", 2, [
+        route("route-feasible-secondary", "openai", "gpt-5", {
+          pricing: pricing(1, 1, 1, 1),
+        }),
+      ]),
+    ];
+    const plan = planned(
+      fixture({
+        entries,
+        ceilings: { max_input_tokens: 1, max_output_tokens: 1, max_duration_ms: 1 },
+        budget: {
+          max_input_tokens: 10,
+          max_output_tokens: 10,
+          max_cost_microusd: 1_000,
+          max_duration_ms: 10,
+          max_turns: 10,
+        },
+      }),
+    );
+
+    expect(plan.worker_attempts).toHaveLength(1);
+    expect(plan.worker_attempts[0]?.entry_id).toBe("feasible-secondary");
+    expect(plan.worker_attempts[0]?.reserved_cost_microusd).toBe(2);
+    expect(plan.eliminations).toContainEqual({
+      entry_id: "expensive-primary",
+      reason: "budget",
+    });
+  });
+
+  it("skips a combined-cost-infeasible fallback and includes a cheaper later fallback", () => {
+    const entries = [
+      entry("primary", "primary", 1, [
+        route("route-primary", "openai", "gpt-5", { pricing: pricing(1, 1, 1, 1) }),
+      ]),
+      entry("expensive-fallback", "expensive-fallback", 2, [
+        route("route-expensive-fallback", "openai", "gpt-5", {
+          pricing: pricing(2_000_000, 2_000_000, 2_000_000, 2_000_000),
+        }),
+      ]),
+      entry("cheap-later-fallback", "cheap-later-fallback", 3, [
+        route("route-cheap-later", "openai", "gpt-5", {
+          pricing: pricing(1, 1, 1, 1),
+        }),
+      ]),
+    ];
+    const plan = planned(
+      fixture({
+        entries,
+        ceilings: { max_input_tokens: 1, max_output_tokens: 1, max_duration_ms: 1 },
+        budget: {
+          max_input_tokens: 10,
+          max_output_tokens: 10,
+          max_cost_microusd: 4,
+          max_duration_ms: 10,
+          max_turns: 10,
+        },
+      }),
+    );
+
+    expect(selectedEntryIds(plan)).toEqual(["primary", "cheap-later-fallback"]);
+    expect(plan.eliminations).toContainEqual({
+      entry_id: "expensive-fallback",
+      reason: "budget",
+    });
+  });
+
+  it.each([
+    [
+      "input",
+      {
+        max_input_tokens: 2,
+        max_output_tokens: 10,
+        max_cost_microusd: 100,
+        max_duration_ms: 10,
+        max_turns: 10,
+      },
+    ],
+    [
+      "output",
+      {
+        max_input_tokens: 10,
+        max_output_tokens: 2,
+        max_cost_microusd: 100,
+        max_duration_ms: 10,
+        max_turns: 10,
+      },
+    ],
+    [
+      "cost",
+      {
+        max_input_tokens: 10,
+        max_output_tokens: 10,
+        max_cost_microusd: 4,
+        max_duration_ms: 10,
+        max_turns: 10,
+      },
+    ],
+    [
+      "duration",
+      {
+        max_input_tokens: 10,
+        max_output_tokens: 10,
+        max_cost_microusd: 100,
+        max_duration_ms: 2,
+        max_turns: 10,
+      },
+    ],
+    [
+      "turn",
+      {
+        max_input_tokens: 10,
+        max_output_tokens: 10,
+        max_cost_microusd: 100,
+        max_duration_ms: 10,
+        max_turns: 2,
+      },
+    ],
+  ] as const)(
+    "prunes a fallback when the combined tuple exceeds the %s budget",
+    (_name, budget) => {
+      const entries = ["primary", "fallback-a", "fallback-b"].map((entryId, index) =>
+        entry(entryId, entryId, index + 1, [
+          route(`route-${entryId}`, "openai", "gpt-5", { pricing: pricing(1, 1, 1, 1) }),
+        ]),
+      );
+      const plan = planned(
+        fixture({
+          entries,
+          ceilings: { max_input_tokens: 1, max_output_tokens: 1, max_duration_ms: 1 },
+          budget,
+        }),
+      );
+
+      expect(selectedEntryIds(plan)).toEqual(["primary", "fallback-a"]);
+      expect(plan.eliminations).toContainEqual({ entry_id: "fallback-b", reason: "budget" });
+    },
+  );
+
+  it("accounts for every active reservation before constructing the tuple", () => {
+    const entries = ["primary", "fallback-a", "fallback-b"].map((entryId, index) =>
+      entry(entryId, entryId, index + 1, [
+        route(`route-${entryId}`, "openai", "gpt-5", { pricing: pricing(1, 1, 1, 1) }),
+      ]),
+    );
+    const input = fixture({
+      entries,
+      ceilings: { max_input_tokens: 1, max_output_tokens: 1, max_duration_ms: 1 },
+      budget: {
+        max_input_tokens: 3,
+        max_output_tokens: 3,
+        max_cost_microusd: 6,
+        max_duration_ms: 3,
+        max_turns: 3,
+      },
+    });
+    const activeReservation: RoutingReservationV1 = {
+      decision_id: "decision-active",
+      decision_hash: `sha256:${"f".repeat(64)}`,
+      request_id: input.request.request_id,
+      allocations: [
+        {
+          attempt_id: "attempt-active",
+          entry_id: "primary",
+          role: "worker",
+          input_tokens: 1,
+          output_tokens: 1,
+          cost_microusd: 2,
+          duration_ms: 1,
+          turns: 1,
+        },
+      ],
+      created_at: "2026-08-21T11:59:30.000Z",
+    };
+    const activeState = reserveRoutingBudget({
+      state: input.state,
+      reservation: activeReservation,
+    });
+    const plan = planned({ ...input, state: activeState });
+
+    expect(selectedEntryIds(plan)).toEqual(["primary", "fallback-a"]);
+    expect(plan.eliminations).toContainEqual({ entry_id: "fallback-b", reason: "budget" });
+  });
+
+  it("returns a budget block when every otherwise capable entry is unaffordable", () => {
+    const entries = [
+      entry("expensive-only", "expensive-only", 1, [
+        route("route-expensive-only", "openai", "gpt-5", {
+          pricing: pricing(1_000_000_000, 1_000_000_000, 1_000_000_000, 1_000_000_000),
+        }),
+      ]),
+    ];
+    expect(
+      blocked(
+        fixture({
+          entries,
+          ceilings: { max_input_tokens: 1, max_output_tokens: 1, max_duration_ms: 1 },
+          circuits: [
+            {
+              entry_id: "expensive-only",
+              status: "open",
+              consecutive_failures: 3,
+              retry_at: "2026-08-21T12:01:00.000Z",
+              probe_decision_id: null,
+            },
+          ],
+          budget: {
+            max_input_tokens: 10,
+            max_output_tokens: 10,
+            max_cost_microusd: 1_000,
+            max_duration_ms: 10,
+            max_turns: 10,
+          },
+        }),
+      ),
+    ).toMatchObject({
+      block_code: "RUNTIME_ROUTING_BUDGET_EXCEEDED",
+      eliminations: [{ entry_id: "expensive-only", reason: "budget" }],
+    });
+  });
+
+  it.each([
+    ["after deadline", "2026-08-21T12:03:00.000Z", 1],
+    ["at deadline", "2026-08-21T12:02:00.000Z", 1],
+    ["duration exceeds remaining window", "2026-08-21T12:01:30.000Z", 30_001],
+  ] as const)("does not advertise retry %s", (_name, retryAt, maxDurationMs) => {
+    const selectedRequest = request({ deadline: "2026-08-21T12:02:00.000Z" });
+    const plan = blocked(
+      fixture({
+        entries: [defaultEntries()[1]!],
+        request: selectedRequest,
+        ceilings: {
+          max_input_tokens: 1,
+          max_output_tokens: 1,
+          max_duration_ms: maxDurationMs,
+        },
+        circuits: [
+          {
+            entry_id: "balanced-fallback-a",
+            status: "open",
+            consecutive_failures: 3,
+            retry_at: retryAt,
+            probe_decision_id: null,
+          },
+        ],
+      }),
+    );
+
+    expect(plan).toMatchObject({
+      block_code: "RUNTIME_ROUTING_NO_CAPABLE_ROUTE",
+      retryable: false,
+      next_retry_at: null,
+    });
+  });
+
+  it("advertises a capable retry whose full duration fits before the deadline", () => {
+    const selectedRequest = request({ deadline: "2026-08-21T12:02:00.000Z" });
+    expect(
+      blocked(
+        fixture({
+          entries: [defaultEntries()[1]!],
+          request: selectedRequest,
+          ceilings: { max_input_tokens: 1, max_output_tokens: 1, max_duration_ms: 60_000 },
+          circuits: [
+            {
+              entry_id: "balanced-fallback-a",
+              status: "open",
+              consecutive_failures: 3,
+              retry_at: "2026-08-21T12:01:00.000Z",
+              probe_decision_id: null,
+            },
+          ],
+        }),
+      ),
+    ).toMatchObject({
+      block_code: "RUNTIME_ROUTING_CIRCUIT_OPEN",
+      retryable: true,
+      next_retry_at: "2026-08-21T12:01:00.000Z",
+    });
+  });
+
+  it("blocks unknown usage without mutating the supplied state", () => {
+    const input = fixture({ budget_status: "unknown" });
+    const before = canonicalJson(input.state);
+    expect(blocked(input).block_code).toBe("RUNTIME_ROUTING_USAGE_UNKNOWN");
+    expect(canonicalJson(input.state)).toBe(before);
+  });
+
+  it.each([
+    [
+      "request",
+      (input: PlanModelSelectionInput) => ({
+        ...input,
+        state: { ...input.state, request_hash: `sha256:${"f".repeat(64)}` as const },
+      }),
+    ],
+    [
+      "catalog",
+      (input: PlanModelSelectionInput) => ({
+        ...input,
+        state: { ...input.state, catalog_hash: `sha256:${"f".repeat(64)}` as const },
+      }),
+    ],
+    [
+      "policy",
+      (input: PlanModelSelectionInput) => ({
+        ...input,
+        state: { ...input.state, policy_hash: `sha256:${"f".repeat(64)}` as const },
+      }),
+    ],
+    [
+      "run",
+      (input: PlanModelSelectionInput) => ({
+        ...input,
+        state: { ...input.state, run_id: "other-run" },
+      }),
+    ],
+  ] as const)("returns a non-mutating stale plan for a stale %s binding", (_name, mutate) => {
+    const input = fixture();
+    const stale = mutate(input) as PlanModelSelectionInput;
+    expect(blocked(stale).block_code).toBe("RUNTIME_ROUTING_STALE_STATE");
+  });
+
+  it("blocks an expired live document at its half-open boundary", () => {
+    expect(blocked(fixture({ decision_at: "2026-08-21T12:04:00.000Z" })).block_code).toBe(
+      "RUNTIME_ROUTING_STALE_STATE",
+    );
+  });
+
+  it("blocks a request at its exact deadline while live capabilities remain fresh", () => {
+    const deadlineRequest = request({ deadline: DECISION_AT });
+    expect(blocked(fixture({ request: deadlineRequest })).block_code).toBe(
+      "RUNTIME_ROUTING_STALE_STATE",
+    );
+  });
+});
+
+describe("canonical explanations and exact authoritative bindings", () => {
+  it("normalizes the semantic task risk set before decision and attempt identity hashing", () => {
+    const entries = [
+      reviewWorker("risk-worker", "openai", "worker-model", 1),
+      reviewer("risk-reviewer", "anthropic", "reviewer-model", 1),
+    ];
+    const first = planned(
+      fixture({
+        entries,
+        request: deepRequest(),
+        task: { risks: ["security", "architecture"] },
+      }),
+    );
+    const second = planned(
+      fixture({
+        entries,
+        request: deepRequest(),
+        task: { risks: ["architecture", "security"] },
+      }),
+    );
+
+    expect(second.decision_id).toBe(first.decision_id);
+    expect(second.worker_attempts.map((attempt) => attempt.attempt_id)).toEqual(
+      first.worker_attempts.map((attempt) => attempt.attempt_id),
+    );
+    expect(second.reviewer_attempt?.attempt_id).toBe(first.reviewer_attempt?.attempt_id);
+    expect(second.document_hash).toBe(first.document_hash);
+  });
+
+  it.each(["task", "ceilings"] as const)("rejects an unknown %s input field", (target) => {
+    const input = fixture();
+    const operation = () =>
+      planModelSelection(
+        target === "task"
+          ? {
+              ...input,
+              task: { ...input.task, prompt: "must-not-be-accepted" } as RoutingTaskProfile,
+            }
+          : {
+              ...input,
+              ceilings: {
+                ...input.ceilings,
+                native_limit: 1,
+              } as PlanModelSelectionInput["ceilings"],
+            },
+      );
+
+    expect(operation).toThrowError(RuntimeRoutingError);
+    try {
+      operation();
+    } catch (error) {
+      expect(error).toMatchObject({ code: "RUNTIME_ROUTING_INVALID" });
+    }
+  });
+
+  it("accounts for every catalog entry exactly once as selected or eliminated", () => {
+    const plan = planned(fixture());
+    const accounted = [
+      ...plan.worker_attempts.map((value) => value.entry_id),
+      ...plan.eliminations.map((value) => value.entry_id),
+    ].sort();
+    expect(accounted).toEqual(
+      defaultEntries()
+        .map((value) => value.entry_id)
+        .sort(),
+    );
+    expect(new Set(accounted).size).toBe(accounted.length);
+    expect(plan.eliminations).toEqual(
+      [...plan.eliminations].sort((left, right) =>
+        left.entry_id < right.entry_id ? -1 : left.entry_id > right.entry_id ? 1 : 0,
+      ),
+    );
+  });
+
+  it("preserves semantic selection across array permutations while rebinding exact hashes", () => {
+    const originalEntries = defaultEntries();
+    const original = fixture({ entries: originalEntries });
+    const originalPlan = planned(original);
+    const permutedEntries = [...originalEntries]
+      .reverse()
+      .map((value) => ({ ...value, routes: [...value.routes].reverse() }));
+    const permuted = fixture({
+      entries: permutedEntries,
+    });
+    const permutedPlan = planned(permuted);
+
+    expect(selectedEntryIds(permutedPlan)).toEqual(selectedEntryIds(originalPlan));
+    expect(permutedPlan.eliminations).toEqual(originalPlan.eliminations);
+    expect(permutedPlan.catalog_hash).not.toBe(originalPlan.catalog_hash);
+    expect(permutedPlan.capability_document_hash).not.toBe(originalPlan.capability_document_hash);
+    expect(permutedPlan.decision_id).not.toBe(originalPlan.decision_id);
+    expect(permutedPlan.document_hash).not.toBe(originalPlan.document_hash);
+    expect(permutedPlan.next_state_hash).not.toBe(originalPlan.next_state_hash);
+  });
+
+  it("keeps blocked output fixed, bounded, and non-reflective", () => {
+    const input = fixture({
+      entries: [defaultEntries()[1]!],
+      mutateLive: (value) => ({
+        ...value,
+        routes: value.routes.map((routeValue) => ({
+          ...routeValue,
+          model: "native-secret-model",
+        })),
+      }),
+    });
+    const plan = blocked(input);
+    const serialized = JSON.stringify(plan);
+    expect(plan).toMatchObject({
+      block_code: "RUNTIME_ROUTING_NO_CAPABLE_ROUTE",
+      retryable: false,
+      next_retry_at: null,
+    });
+    expect(serialized).not.toContain("native-secret-model");
+    expect(serialized).not.toContain("endpoint");
+    expect(serialized).not.toContain("header");
+    expect(serialized).not.toContain("prompt");
+    expect(serialized.length).toBeLessThan(2 * 1024 * 1024);
+  });
+});

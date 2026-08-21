@@ -1,5 +1,56 @@
-import { UnavailableCapabilityError } from "../version.js";
-
-export function requireModelRouter(): never {
-  throw new UnavailableCapabilityError("routing");
-}
+export {
+  hashModelCatalog,
+  hashModelSelectionPlan,
+  hashRoutingPolicy,
+  hashRoutingState,
+  parseGovernedRoutingOverride,
+  parseModelCatalog,
+  parseModelSelectionPlan,
+  parseRoutingPolicy,
+  parseRoutingState,
+} from "./contracts.js";
+export {
+  calculateRoutingCost,
+  estimateRoutingAllocation,
+  reserveRoutingBudget,
+  settleRoutingDecision,
+} from "./cost.js";
+export { planModelSelection } from "./selection.js";
+export { nextModelFallback, recordRoutingOutcome } from "./circuit.js";
+export { verifyResolvedRoute } from "./resolution.js";
+export { RuntimeRoutingError, type RuntimeRoutingErrorCode } from "./errors.js";
+export type {
+  BlockedModelSelectionPlanV1,
+  CatalogPricingV1,
+  CatalogRouteV1,
+  GovernedRoutingOverride,
+  LatencyClass,
+  LogicalModelClass,
+  ModelCatalogEntryV1,
+  ModelCatalogV1,
+  ModelFallbackDecision,
+  ModelSelectionPlanV1,
+  PlanModelSelectionInput,
+  PlannedModelSelectionPlanV1,
+  RecordedRoutingOutcome,
+  RoutingAcceptedRouteV1,
+  RoutingAttemptResult,
+  RoutingAttemptV1,
+  RoutingBlockCode,
+  RoutingCallCeilings,
+  RoutingCapabilityName,
+  RoutingCircuitV1,
+  RoutingDecision,
+  RoutingEliminationV1,
+  RoutingOutcomeTransition,
+  RoutingOverrideFragmentV1,
+  RoutingPolicyRuleV1,
+  RoutingPolicyV1,
+  RoutingProviderOutcome,
+  RoutingReservationV1,
+  RoutingStateV1,
+  RoutingTaskProfile,
+  TaskComplexity,
+  TaskPhase,
+  TaskRisk,
+} from "./types.js";

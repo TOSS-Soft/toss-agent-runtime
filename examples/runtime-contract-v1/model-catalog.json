@@ -1,0 +1,130 @@
+{
+  "catalog_id": "catalog-circuit",
+  "document_hash": "sha256:894dd8db8ee23d7e4081a9c523ad34beb181636e87a32a4dd19d3507ff9bb107",
+  "document_type": "model-catalog",
+  "entries": [
+    {
+      "entry_id": "worker-primary",
+      "logical_classes": ["balanced-code", "deep-reasoning", "economy"],
+      "priority": 10,
+      "route_alias": "worker-primary",
+      "routes": [
+        {
+          "capabilities": {
+            "json_schema": true,
+            "max_context_tokens": 200000,
+            "max_output_tokens": 16384,
+            "provider": "openai",
+            "reasoning": true,
+            "streaming": true,
+            "tools": true,
+            "vision": false
+          },
+          "latency_class": "standard",
+          "model": "gpt-5",
+          "pricing": {
+            "cached_input_microusd_per_million": 200000,
+            "input_microusd_per_million": 2000000,
+            "output_microusd_per_million": 10000000,
+            "reasoning_output_microusd_per_million": 12000000
+          },
+          "provider": "openai",
+          "route_id": "route-worker-primary"
+        }
+      ]
+    },
+    {
+      "entry_id": "worker-fallback-a",
+      "logical_classes": ["balanced-code", "deep-reasoning", "economy"],
+      "priority": 20,
+      "route_alias": "worker-fallback-a",
+      "routes": [
+        {
+          "capabilities": {
+            "json_schema": true,
+            "max_context_tokens": 200000,
+            "max_output_tokens": 16384,
+            "provider": "openai",
+            "reasoning": true,
+            "streaming": true,
+            "tools": true,
+            "vision": false
+          },
+          "latency_class": "standard",
+          "model": "gpt-5-mini",
+          "pricing": {
+            "cached_input_microusd_per_million": 200000,
+            "input_microusd_per_million": 2000000,
+            "output_microusd_per_million": 10000000,
+            "reasoning_output_microusd_per_million": 12000000
+          },
+          "provider": "openai",
+          "route_id": "route-worker-fallback-a"
+        }
+      ]
+    },
+    {
+      "entry_id": "worker-fallback-b",
+      "logical_classes": ["balanced-code", "deep-reasoning", "economy"],
+      "priority": 30,
+      "route_alias": "worker-fallback-b",
+      "routes": [
+        {
+          "capabilities": {
+            "json_schema": true,
+            "max_context_tokens": 200000,
+            "max_output_tokens": 16384,
+            "provider": "openai",
+            "reasoning": true,
+            "streaming": true,
+            "tools": true,
+            "vision": false
+          },
+          "latency_class": "standard",
+          "model": "gpt-5-nano",
+          "pricing": {
+            "cached_input_microusd_per_million": 200000,
+            "input_microusd_per_million": 2000000,
+            "output_microusd_per_million": 10000000,
+            "reasoning_output_microusd_per_million": 12000000
+          },
+          "provider": "openai",
+          "route_id": "route-worker-fallback-b"
+        }
+      ]
+    },
+    {
+      "entry_id": "reviewer-independent",
+      "logical_classes": ["independent-review"],
+      "priority": 10,
+      "route_alias": "reviewer-independent",
+      "routes": [
+        {
+          "capabilities": {
+            "json_schema": true,
+            "max_context_tokens": 200000,
+            "max_output_tokens": 16384,
+            "provider": "anthropic",
+            "reasoning": true,
+            "streaming": true,
+            "tools": true,
+            "vision": false
+          },
+          "latency_class": "standard",
+          "model": "claude-sonnet-4-5",
+          "pricing": {
+            "cached_input_microusd_per_million": 200000,
+            "input_microusd_per_million": 2000000,
+            "output_microusd_per_million": 10000000,
+            "reasoning_output_microusd_per_million": 12000000
+          },
+          "provider": "anthropic",
+          "route_id": "route-reviewer-independent"
+        }
+      ]
+    }
+  ],
+  "protocol_version": "runtime-contract.v1",
+  "revision": 1,
+  "schema_version": "model-catalog.v1"
+}

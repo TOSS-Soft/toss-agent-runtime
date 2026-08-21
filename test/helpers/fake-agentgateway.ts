@@ -1,6 +1,11 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { once } from "node:events";
 
+import { hashProviderRouteRequirement } from "../../src/gateway/attestation.js";
+import type { AgentgatewayCapabilitiesV1 } from "../../src/gateway/types.js";
+import { canonicalJson } from "../../src/protocol/json.js";
+import type { ProviderRouteRequirement } from "../../src/providers/types.js";
+
 export interface CapturedGatewayRequest {
   readonly method: string;
   readonly path: string;
@@ -14,10 +19,29 @@ export interface FakeGatewayResponse {
   readonly body?: string | Uint8Array | readonly (string | Uint8Array)[];
 }
 
+export interface FakeResolvedRouteConfiguration {
+  readonly capability: AgentgatewayCapabilitiesV1;
+  readonly requirement: ProviderRouteRequirement;
+  readonly route_id: string;
+  readonly body: string | Uint8Array | readonly (string | Uint8Array)[];
+  readonly attestation?: Readonly<
+    Partial<{
+      route_id: string;
+      resolved_provider: string;
+      resolved_model: string;
+      gateway_revision: string;
+      capability_document_hash: string;
+      requirement_hash: string;
+      gateway_request_id: string;
+    }>
+  >;
+}
+
 export interface FakeAgentgateway {
   readonly endpoint: string;
   readonly requests: readonly CapturedGatewayRequest[];
   setResponse(path: string, response: FakeGatewayResponse): void;
+  configureResolvedRoute(configuration: FakeResolvedRouteConfiguration): void;
   close(): Promise<void>;
 }
 
@@ -71,6 +95,38 @@ export async function startFakeAgentgateway(): Promise<FakeAgentgateway> {
     requests,
     setResponse(path, response) {
       responses.set(path, response);
+    },
+    configureResolvedRoute(configuration) {
+      const route = configuration.capability.routes.find(
+        (candidate) => candidate.route_id === configuration.route_id,
+      );
+      if (route === undefined || route.alias !== configuration.requirement.alias) {
+        throw new Error("Fake agentgateway route configuration is invalid");
+      }
+      const attestation = configuration.attestation ?? {};
+      responses.set("/runtime/v1/toss/capabilities", {
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body: canonicalJson(configuration.capability),
+      });
+      responses.set("/runtime/v1/responses", {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "x-toss-route-id": attestation.route_id ?? route.route_id,
+          "x-toss-resolved-provider": attestation.resolved_provider ?? route.provider,
+          "x-toss-resolved-model": attestation.resolved_model ?? route.model,
+          "x-toss-capability-revision":
+            attestation.gateway_revision ?? String(configuration.capability.gateway.revision),
+          "x-toss-capability-document-sha256":
+            attestation.capability_document_hash ?? configuration.capability.document_hash,
+          "x-toss-requirement-sha256":
+            attestation.requirement_hash ?? hashProviderRouteRequirement(configuration.requirement),
+          "x-toss-gateway-request-id":
+            attestation.gateway_request_id ?? "gateway-loopback-request-1",
+        },
+        body: configuration.body,
+      });
     },
     async close() {
       server.close();

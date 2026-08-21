@@ -219,7 +219,7 @@ Operational events use the closed `operational-event.v1` envelope with a canonic
 
 OpenAI, Anthropic, and Gemini adapters accept the same bounded provider-neutral request and expose the same event stream and canonical completion. Capability preflight occurs before the injected wire transport and covers tools, JSON schema, vision, reasoning, streaming, and output limits. The completion collector rejects identity/sequence changes, missing or duplicate terminals, post-terminal events, malformed tool arguments, and inconsistent stable errors. Streaming and non-streaming paths MUST close to the same completion semantics.
 
-The adapter boundary performs no automatic retry and owns no credential lookup. Authentication, rate limit, timeout, cancellation, refusal, transient unavailability, invalid input, and internal failure are distinct stable codes with fixed retryability. Native SDK objects, headers, endpoints, error messages, credentials, stacks, and unrestricted response objects MUST NOT enter provider events, journals, results, operational logs, or evidence. Authenticated agentgateway transport is the separate governed transport layer; routing policy and fallback remain later boundaries.
+The adapter boundary performs no automatic retry and owns no credential lookup. Authentication, rate limit, timeout, cancellation, refusal, transient unavailability, invalid input, and internal failure are distinct stable codes with fixed retryability. Native SDK objects, headers, endpoints, error messages, credentials, stacks, and unrestricted response objects MUST NOT enter provider events, journals, results, operational logs, or evidence. Authenticated agentgateway transport is the separate governed transport layer; the pure governed routing boundary plans attempts and state transitions without invoking either transport or provider.
 
 ### Authenticated agentgateway transport
 
@@ -247,14 +247,79 @@ Body observability is `off` by default. `redacted-metadata` permits only a froze
 | `RUNTIME_PROVIDER_CAPABILITY_DOWNGRADE` | The selected route is weaker than required   | no        |
 | `RUNTIME_PROVIDER_GATEWAY_INVALID`      | The gateway response failed integrity checks | no        |
 
-Catalog caching and routing/fallback policy belong to issue #6, tool propagation to issue #9, final release evidence to issue #12, and protected live-provider/agentgateway smoke to issue #15. Ordinary credential-free CI MUST NOT claim the protected live gate.
+Governed catalog, routing, budget, circuit, fallback-planning, and route-verification contracts are defined below. Tool propagation belongs to issue #9, final release evidence to issue #12, and protected live-provider/agentgateway smoke to issue #15. Ordinary credential-free CI MUST NOT claim the protected live gate.
 
-## 11. Stable failures
+## 11. Governed model routing and budgets
+
+### 11.1 Authority and closed documents
+
+The TOSS control plane authority MUST supply the exact `model-catalog.v1`, `routing-policy.v1`, task profile, and optional governed override. `routing-state.v1` is the exact run-scoped budget/circuit head, and `model-selection-plan.v1` is either a fully reserved plan or a non-executable blocked result. Each of those four protocol documents is closed, bounded, and bound by lowercase SHA-256 over canonical JSON with only `document_hash` omitted.
+
+The runtime and agentgateway MUST NOT become governance authorities. A fresh agentgateway document can only remove a catalog route. Effective boolean capabilities are the catalog AND live capability intersection; effective numeric context/output limits are the minimum of the two declarations. Alias, route ID, provider, and model MUST all match. A prompt, response, repository value, provider, gateway, or agent MUST NOT mint a logical class, capability, task risk, budget, review rule, or override.
+
+A planned alias is atomic for its exact emitted gateway requirement. The runtime MUST enumerate every live same-alias route that the gateway could execute for that requirement, require an exact governed catalog match for each one, and apply capability, context/output, latency, policy, and reviewer-independence checks to the complete set. The plan includes that complete executable set in `accepted_routes` and reserves its maximum governed price. One live-only, denied, under-capable, too-small, too-slow, unpriced, or reviewer-colliding executable route rejects the alias before any provider effect.
+
+### 11.2 Deterministic planning and independent review
+
+For identical request, task, catalog, policy, state, live capabilities, override, gateway profile, and canonical decision time, `planModelSelection()` MUST return identical canonical output. Candidate and semantic-set evaluation uses fixed ASCII deterministic ordering, never locale or object insertion order. Reordered and rehashed catalog/live arrays MUST preserve selected entries, attempt order, and elimination reasons, while the decision, plan, and next-state hashes MUST rebind the changed exact input hashes.
+
+Security, architecture, or irreversible risk requires independent review planning. Every accepted reviewer route MUST differ in both provider and model from every accepted primary and fallback route. The primary, every policy-allowed fallback included in the plan, and the reviewer MUST fit one atomic five-dimensional reservation. This contract proves the reviewer plan; Issue #11 remains pending for independent worker/reviewer orchestration and execution proof.
+
+A governed override is narrowing only. Its artifact/content hash, catalog hash, policy hash, canonical issuance time, and target entry MUST validate exactly. The target MUST already pass normal class, capability, latency, live-route, circuit, review, and budget gates. Override narrowing MUST NOT add capability, increase budget, weaken review, change fallback limits, reopen a circuit, or broaden tool authority.
+
+### 11.3 Exact integer budget
+
+Every public monetary value is nonnegative integer microusd. Products and divisions MUST use `bigint`; floating point MUST NOT be used for money, and any result outside the nonnegative safe-integer range MUST fail closed. Actual cost is the sum of four independently upward-rounded components:
+
+```text
+uncached_input = input_tokens - cached_input_tokens
+ordinary_output = output_tokens - reasoning_tokens
+cost_microusd = ceil(uncached_input * input_rate / 1_000_000)
+              + ceil(cached_input_tokens * cached_input_rate / 1_000_000)
+              + ceil(ordinary_output * output_rate / 1_000_000)
+              + ceil(reasoning_tokens * reasoning_output_rate / 1_000_000)
+```
+
+Reservations MUST cover the worst valid split for each accepted alias and MUST reserve the primary, every planned fallback, and required reviewer together against input tokens, output tokens, microusd cost, duration, and turns. Every listed attempt consumes one turn and its validated duration, including a proven pre-effect attempt with null route and usage; tokens and cost accrue only for a complete trusted route/usage pair. Settlement MUST price only an exact accepted attested route, release unused allocations, and retain actual over-limit totals. A possible provider effect with missing, asymmetric, unaccepted, or otherwise unpriceable route/usage evidence clears active reservations and makes the budget unknown; new selection and fallback then fail until authoritative reconciliation. Pre-effect asymmetric or untrusted complete attestations fail as a resolution mismatch. Issue #12 remains pending for authoritative gateway usage reconciliation and final ACP execution evidence.
+
+### 11.4 Circuits, explicit fallback, and settlement proof
+
+Circuit state is explicit, versioned, hash-linked input; the core MUST NOT read a clock or retain process-local counters. Only `RUNTIME_PROVIDER_TIMEOUT`, `RUNTIME_PROVIDER_TRANSIENT`, and `RUNTIME_PROVIDER_GATEWAY_UNAVAILABLE` can increment a circuit or authorize fallback. Success resets the observed circuit. Authentication, rate-limit, cancellation, refusal, invalid response, capability downgrade, route absence, integrity, policy, and internal failures MUST NOT create fallback authority.
+
+`recordRoutingOutcome()` returns the exact next state plus a closed hashed outcome witness binding prior/next state hashes, decision, attempt, outcome, occurrence time, and policy hash. `nextModelFallback()` MUST recompute and consume that witness and can return only the next explicit fallback already present in the plan; it performs no transport call, sleep, or retry. Settlement after one or more circuit transitions MUST receive every immediate hash-linked state in a bounded `circuit_state_chain`, while preserving reservation and all non-circuit governed fields.
+
+A planned selection closes and hash-binds the execution-request deadline and live-capability expiry without introducing a plan/state hash cycle. Fallback uses the witnessed transition occurrence time: the capability statement MUST still be live, the next attempt MUST start before the request deadline, and its full reserved duration MUST fit at or before that deadline. Equality at the reserved-duration boundary is allowed; starting at either expiry boundary is not.
+
+Issue #10 remains pending for worker-turn execution and consumption of the fallback plan. The Issue #6 operation only decides whether an already planned attempt is ready.
+
+### 11.5 Exact route verification and safe failures
+
+Exact route verification MUST run against the initially reserved state before `recordRoutingOutcome()` changes circuit state. `verifyResolvedRoute()` MUST bind one attempt to transport `agentgateway`, gateway profile and revision, requested alias, route ID, provider, model, capability-document hash, and requirement hash. A mismatch MUST be rejected before provider output is accepted; it MUST NOT silently select another route.
+
+Operational routing failures expose only the following fixed safe routing errors, their fixed category/retryability, and a non-reflective safe message:
+
+| Stable code                           | Category               | Retryable |
+| ------------------------------------- | ---------------------- | --------- |
+| `RUNTIME_ROUTING_INVALID`             | invalid-input          | no        |
+| `RUNTIME_ROUTING_BUDGET_EXCEEDED`     | policy-denied          | no        |
+| `RUNTIME_ROUTING_NO_CAPABLE_ROUTE`    | unsupported-capability | no        |
+| `RUNTIME_ROUTING_REVIEW_UNAVAILABLE`  | unsupported-capability | no        |
+| `RUNTIME_ROUTING_POLICY_DENIED`       | policy-denied          | no        |
+| `RUNTIME_ROUTING_CIRCUIT_OPEN`        | unavailable            | yes       |
+| `RUNTIME_ROUTING_STALE_STATE`         | stale-revision         | no        |
+| `RUNTIME_ROUTING_USAGE_UNKNOWN`       | integrity              | no        |
+| `RUNTIME_ROUTING_RESOLUTION_MISMATCH` | integrity              | no        |
+
+Prompts, provider bodies, endpoints, headers, tokens, credentials, diagnostics, stacks, and native values MUST NOT be reflected in a plan, elimination, routing error, journal, log, or evidence value.
+
+Issue #13 remains pending for full secret, egress, prompt-injection, and sandbox hardening. Issue #15 remains pending for protected live-provider routing smoke and release guidance. Ordinary CI validates the pure contract without claiming either gate.
+
+## 12. Stable failures
 
 Library validation returns `RUNTIME_DOCUMENT_INVALID` for malformed content and `RUNTIME_DOCUMENT_UNSUPPORTED` for a recognized envelope requiring an unimplemented version or capability. Issues contain a JSON Pointer-like path, stable keyword, and safe message in deterministic order.
 
 CLI JSON mode returns one `command-result.v1` document. Exit codes are `0` success, `2` usage, `3` invalid input, `4` policy/blocked, `5` validation, `6` conflict/stale revision, `69` unavailable, and `70` internal. Failure output MUST be safe to persist and MUST NOT echo secret-shaped option values.
 
-## 12. Reference artifacts
+## 13. Reference artifacts
 
-The schema manifest maps every exact version to a stable `$id`. The `examples/runtime-contract-v1` directory contains a complete request, event, result, and baseline capabilities set. Package verification loads these examples through the public API and validates the full hash-linked chain.
+The schema manifest maps every exact version to a stable `$id`. The `examples/runtime-contract-v1` directory contains a complete request, event, result, baseline capabilities, model catalog, routing policy, prior routing state, and model-selection plan set. Package verification loads the examples through the public API, validates the full execution chain, and recomputes all governed routing hashes. The planned example binds its exact next-state hash without embedding a cyclic plan hash in the state reservation.

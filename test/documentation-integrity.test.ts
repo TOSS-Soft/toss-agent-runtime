@@ -5,10 +5,18 @@ import { describe, expect, it } from "vitest";
 import {
   createBaselineCapabilities,
   createRunJournalStore,
+  hashModelCatalog,
+  hashModelSelectionPlan,
+  hashRoutingPolicy,
+  hashRoutingState,
   parseExecutionEvent,
   parseExecutionRequest,
   parseExecutionResult,
+  parseModelCatalog,
+  parseModelSelectionPlan,
   parseProviderEvent,
+  parseRoutingPolicy,
+  parseRoutingState,
   parseRuntimeCapabilities,
   validateExecutionChain,
 } from "../src/index.js";
@@ -46,6 +54,9 @@ describe("published protocol artifacts", () => {
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.value.supported_schemas).toEqual(baseline.supported_schemas);
+      expect(result.value.model_classes).toEqual(baseline.model_classes);
+      expect(result.value.features).toEqual(baseline.features);
+      expect(result.value.execution_topologies).toEqual([]);
     }
   });
 
@@ -73,29 +84,92 @@ describe("published protocol artifacts", () => {
       await readFile("docs/contracts/runtime-contract-v1.manifest.json", "utf8"),
     ) as ContractManifest;
     expect(manifest.schema_version).toBe("runtime-contract-manifest.v1");
-    expect(manifest.schemas.map((entry) => entry.schema_version)).toEqual([
+    const versions = manifest.schemas.map((entry) => entry.schema_version);
+    expect(versions).toEqual([...versions].sort());
+    expect(versions).toEqual([
       "agentgateway-capabilities.v1",
       "candidate-job-intent.v1",
       "command-result.v1",
       "execution-event.v1",
       "execution-request.v1",
       "execution-result.v1",
+      "model-catalog.v1",
+      "model-selection-plan.v1",
       "operational-event.v1",
-      "provider-event.v1",
       "project-registry-entry.v1",
       "project-watch-manifest.v1",
+      "provider-event.v1",
+      "routing-policy.v1",
+      "routing-state.v1",
       "run-journal-entry.v1",
       "runtime-capabilities.v1",
       "runtime-common.v1",
       "runtime-config.v1",
-      "service-lock.v1",
       "service-control-request.v1",
       "service-control-response.v1",
+      "service-lock.v1",
     ]);
     for (const entry of manifest.schemas) {
+      const expectedPath = `contracts/runtime/${entry.schema_version}.schema.json`;
+      const expectedId = `https://toss.software/schemas/runtime/v1/${entry.schema_version}.schema.json`;
+      expect(entry.path).toBe(expectedPath);
+      expect(entry.id).toBe(expectedId);
       const schema = JSON.parse(await readFile(entry.path, "utf8")) as { readonly $id?: string };
-      expect(schema.$id).toBe(entry.id);
+      expect(schema.$id).toBe(expectedId);
     }
+  });
+
+  it("loads all four governed routing examples through their public hash-bound parsers", async () => {
+    const catalog = parseModelCatalog(await readExample("model-catalog"));
+    const policy = parseRoutingPolicy(await readExample("routing-policy"));
+    const state = parseRoutingState(await readExample("routing-state"));
+    const plan = parseModelSelectionPlan(await readExample("model-selection-plan"));
+
+    expect(catalog.ok && policy.ok && state.ok && plan.ok).toBe(true);
+    if (catalog.ok && policy.ok && state.ok && plan.ok) {
+      expect(hashModelCatalog(catalog.value)).toBe(catalog.value.document_hash);
+      expect(hashRoutingPolicy(policy.value)).toBe(policy.value.document_hash);
+      expect(hashRoutingState(state.value)).toBe(state.value.document_hash);
+      expect(hashModelSelectionPlan(plan.value)).toBe(plan.value.document_hash);
+      expect(plan.value.catalog_hash).toBe(catalog.value.document_hash);
+      expect(plan.value.policy_hash).toBe(policy.value.document_hash);
+      expect(plan.value.prior_state_hash).toBe(state.value.document_hash);
+      expect(plan.value.status).toBe("planned");
+    }
+  });
+
+  it("documents the complete governed routing boundary without claiming later execution", async () => {
+    const readme = await readFile("README.md", "utf8");
+    const protocolContract = await readFile(
+      "docs/contracts/runtime-contract-protocol-v1.md",
+      "utf8",
+    );
+    const changelog = await readFile("CHANGELOG.md", "utf8");
+    const combined = `${readme}\n${protocolContract}\n${changelog}`;
+
+    expect(readme).toContain("## Governed model routing and budgets");
+    for (const phrase of [
+      "control plane authority",
+      "deterministic ordering",
+      "capability intersection",
+      "independent review planning",
+      "integer microusd",
+      "circuit_state_chain",
+      "outcome witness",
+      "explicit fallback",
+      "override narrowing",
+      "exact route verification",
+      "fixed safe routing errors",
+    ]) {
+      expect(combined.toLowerCase()).toContain(phrase.toLowerCase());
+    }
+    for (const issue of ["#10", "#11", "#12", "#13", "#15"]) {
+      expect(combined).toMatch(new RegExp(`Issue ${issue}[^\\n]*(?:pending|owns|remains)`, "iu"));
+    }
+    expect(changelog).toContain("Governed model routing");
+    expect(changelog).not.toMatch(/Issue #6[^\n]*(?:executes|invokes) (?:a )?provider/iu);
+    expect(readme).not.toContain("routing policy and fallback remain later governed layers");
+    expect(protocolContract).not.toContain("routing policy and fallback remain later boundaries");
   });
 
   it("documents explicit service installation and the package side-effect boundary", async () => {
