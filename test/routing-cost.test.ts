@@ -211,6 +211,8 @@ describe("exact routing cost", () => {
   it.each([
     ["negative input", usage({ input_tokens: -1 })],
     ["fractional output", usage({ output_tokens: 1.5 })],
+    ["negative cached input", usage({ cached_input_tokens: -1 })],
+    ["negative reasoning output", usage({ reasoning_tokens: -1 })],
     ["cached input above total", usage({ input_tokens: 3, cached_input_tokens: 4 })],
     ["reasoning output above total", usage({ output_tokens: 1, reasoning_tokens: 2 })],
     ["unsafe usage", usage({ input_tokens: Number.MAX_SAFE_INTEGER + 1 })],
@@ -246,6 +248,25 @@ describe("exact routing cost", () => {
         ),
       "RUNTIME_ROUTING_INVALID",
     );
+  });
+
+  it("keeps a safe final cost when bigint intermediate multiplication exceeds safe integer", () => {
+    expect(
+      calculateRoutingCost(
+        {
+          input_microusd_per_million: 2,
+          cached_input_microusd_per_million: 0,
+          output_microusd_per_million: 0,
+          reasoning_output_microusd_per_million: 0,
+        },
+        {
+          input_tokens: Number.MAX_SAFE_INTEGER,
+          output_tokens: 0,
+          cached_input_tokens: 0,
+          reasoning_tokens: 0,
+        },
+      ),
+    ).toBe(18_014_398_510);
   });
 
   it("estimates worst-case input and the larger ordinary/reasoning output rate", () => {
@@ -703,6 +724,106 @@ describe("routing budget settlement", () => {
     },
   );
 
+  it("marks budget unknown when a possible effect reports an unaccepted route", () => {
+    const fixture = reservedPlanFixture();
+    const attempt = fixture.plan.worker_attempts[0];
+    if (attempt === undefined) throw new Error("missing attempt fixture");
+
+    const settled = settleRoutingDecision({
+      state: fixture.state,
+      reserved_state: fixture.state,
+      circuit_state_chain: [],
+      plan: fixture.plan,
+      attempts: [
+        {
+          attempt_id: attempt.attempt_id,
+          route_identity: { ...routeIdentity(fixture.plan), route_id: "unaccepted-route" },
+          usage: usage(),
+          duration_ms: 25,
+          effect_may_have_occurred: true,
+        },
+      ],
+      settled_at: "2026-08-21T12:00:01.000Z",
+    });
+
+    expect(settled).toMatchObject({
+      status: "FAILED",
+      state: {
+        budget_status: "unknown",
+        settled: { duration_ms: 25, turns: 1, cost_microusd: null },
+        reservations: [],
+      },
+    });
+  });
+
+  it("accounts one turn and reported duration for a proven pre-effect attempt", () => {
+    const fixture = reservedPlanFixture();
+    const attempt = fixture.plan.worker_attempts[0];
+    if (attempt === undefined) throw new Error("missing attempt fixture");
+
+    const settled = settleRoutingDecision({
+      state: fixture.state,
+      reserved_state: fixture.state,
+      circuit_state_chain: [],
+      plan: fixture.plan,
+      attempts: [
+        {
+          attempt_id: attempt.attempt_id,
+          route_identity: null,
+          usage: null,
+          duration_ms: 12_345,
+          effect_may_have_occurred: false,
+        },
+      ],
+      settled_at: "2026-08-21T12:00:01.000Z",
+    });
+
+    expect(settled).toMatchObject({
+      status: "SETTLED",
+      state: {
+        budget_status: "known",
+        settled: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cost_microusd: 0,
+          duration_ms: 12_345,
+          turns: 1,
+        },
+        reservations: [],
+      },
+    });
+  });
+
+  it.each(["route", "usage"] as const)(
+    "rejects a pre-effect asymmetric %s/usage pair with a fixed resolution error",
+    (present) => {
+      const fixture = reservedPlanFixture();
+      const attempt = fixture.plan.worker_attempts[0];
+      if (attempt === undefined) throw new Error("missing attempt fixture");
+
+      expectRoutingError(
+        () =>
+          settleRoutingDecision({
+            state: fixture.state,
+            reserved_state: fixture.state,
+            circuit_state_chain: [],
+            plan: fixture.plan,
+            attempts: [
+              {
+                attempt_id: attempt.attempt_id,
+                route_identity: present === "route" ? routeIdentity(fixture.plan) : null,
+                usage: present === "usage" ? usage() : null,
+                duration_ms: 1,
+                effect_may_have_occurred: false,
+              },
+            ],
+            settled_at: "2026-08-21T12:00:01.000Z",
+          }),
+        "RUNTIME_ROUTING_RESOLUTION_MISMATCH",
+      );
+    },
+  );
+
   it("rejects duplicate results, unplanned routes, stale heads, and tampered plans", () => {
     const fixture = reservedPlanFixture();
     const attempt = fixture.plan.worker_attempts[0];
@@ -738,6 +859,7 @@ describe("routing budget settlement", () => {
           {
             ...result,
             route_identity: { ...result.route_identity!, route_id: "unplanned-route" },
+            effect_may_have_occurred: false,
           },
         ]),
       "RUNTIME_ROUTING_RESOLUTION_MISMATCH",
@@ -906,6 +1028,86 @@ describe("routing budget settlement", () => {
         }),
       "RUNTIME_ROUTING_STALE_STATE",
     );
+  });
+
+  it.each([
+    ["state identity", (state: RoutingStateV1) => ({ ...state, state_id: "routing-other" })],
+    ["run", (state: RoutingStateV1) => ({ ...state, run_id: "run-other" })],
+    [
+      "request hash",
+      (state: RoutingStateV1) => ({ ...state, request_hash: `sha256:${"a".repeat(64)}` as const }),
+    ],
+    [
+      "catalog hash",
+      (state: RoutingStateV1) => ({ ...state, catalog_hash: `sha256:${"b".repeat(64)}` as const }),
+    ],
+    [
+      "policy hash",
+      (state: RoutingStateV1) => ({ ...state, policy_hash: `sha256:${"c".repeat(64)}` as const }),
+    ],
+    [
+      "reservation decision",
+      (state: RoutingStateV1) => ({
+        ...state,
+        reservations: [{ ...state.reservations[0]!, decision_id: "decision-other" }],
+      }),
+    ],
+    [
+      "reservation request",
+      (state: RoutingStateV1) => ({
+        ...state,
+        reservations: [{ ...state.reservations[0]!, request_id: "request-other" }],
+      }),
+    ],
+  ] as const)("rejects an independent reserved-state %s mismatch", (_name, mutate) => {
+    const fixture = reservedPlanFixture();
+    const drifted = rehashState(mutate(fixture.state));
+
+    expectRoutingError(
+      () =>
+        settleRoutingDecision({
+          state: drifted,
+          reserved_state: drifted,
+          circuit_state_chain: [],
+          plan: fixture.plan,
+          attempts: [successfulAttempt(fixture.plan)],
+          settled_at: "2026-08-21T12:00:01.000Z",
+        }),
+      "RUNTIME_ROUTING_STALE_STATE",
+    );
+  });
+
+  it("keeps settlement resolution errors fixed and non-reflective", () => {
+    const fixture = reservedPlanFixture();
+    const attempt = successfulAttempt(fixture.plan);
+    const secret = "provider-secret-native-route";
+    let caught: unknown;
+
+    try {
+      settleRoutingDecision({
+        state: fixture.state,
+        reserved_state: fixture.state,
+        circuit_state_chain: [],
+        plan: fixture.plan,
+        attempts: [
+          {
+            ...attempt,
+            route_identity: { ...attempt.route_identity!, route_id: secret },
+            effect_may_have_occurred: false,
+          },
+        ],
+        settled_at: "2026-08-21T12:00:01.000Z",
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toMatchObject({
+      code: "RUNTIME_ROUTING_RESOLUTION_MISMATCH",
+      safe_message: "Resolved route does not match the plan",
+    });
+    expect(String(caught)).not.toContain(secret);
+    expect(JSON.stringify(caught)).not.toContain(secret);
   });
 
   it.each(["known", "unknown"] as const)(

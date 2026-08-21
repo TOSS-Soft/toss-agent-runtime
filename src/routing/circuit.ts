@@ -351,7 +351,7 @@ export function recordRoutingOutcome(input: {
     ) {
       return recordedOutcome({
         previous_state: state,
-        state: input.state,
+        state,
         plan,
         policy,
         attempt_id: attempt.attempt_id,
@@ -380,7 +380,7 @@ export function recordRoutingOutcome(input: {
   if (!FALLBACK_OUTCOMES.has(input.outcome)) {
     const nextState =
       current?.status !== "probe-reserved"
-        ? input.state
+        ? state
         : withEntryCircuit(state, attempt.entry_id, {
             entry_id: attempt.entry_id,
             status: "open",
@@ -509,7 +509,7 @@ function actualResultTotals(
   if (result.effect_may_have_occurred && (!hasRoute || !hasUsage)) {
     return "RUNTIME_ROUTING_USAGE_UNKNOWN";
   }
-  if (hasRoute !== hasUsage) return "RUNTIME_ROUTING_USAGE_UNKNOWN";
+  if (hasRoute !== hasUsage) return "RUNTIME_ROUTING_RESOLUTION_MISMATCH";
   if (!hasRoute || !hasUsage) {
     return {
       ...zeroTotals(),
@@ -519,19 +519,29 @@ function actualResultTotals(
   }
   const identity = result.route_identity;
   const usage = result.usage;
-  if (!routeMatchesAttempt(identity, attempt)) return "RUNTIME_ROUTING_RESOLUTION_MISMATCH";
+  if (!routeMatchesAttempt(identity, attempt)) {
+    return result.effect_may_have_occurred
+      ? "RUNTIME_ROUTING_USAGE_UNKNOWN"
+      : "RUNTIME_ROUTING_RESOLUTION_MISMATCH";
+  }
   const route = attempt.accepted_routes.find(
     (candidate) =>
       candidate.route_id === identity.route_id &&
       candidate.provider === identity.resolved_provider &&
       candidate.model === identity.resolved_model,
   );
-  if (route === undefined) return "RUNTIME_ROUTING_RESOLUTION_MISMATCH";
+  if (route === undefined) {
+    return result.effect_may_have_occurred
+      ? "RUNTIME_ROUTING_USAGE_UNKNOWN"
+      : "RUNTIME_ROUTING_RESOLUTION_MISMATCH";
+  }
   let cost: number;
   try {
     cost = calculateRoutingCost(route.pricing, usage);
   } catch (error) {
-    if (error instanceof RuntimeRoutingError) return error.code;
+    if (error instanceof RuntimeRoutingError) {
+      return result.effect_may_have_occurred ? "RUNTIME_ROUTING_USAGE_UNKNOWN" : error.code;
+    }
     throw error;
   }
   return {
@@ -661,13 +671,31 @@ export function nextModelFallback(input: {
 
   const nextAttempt = plan.worker_attempts[currentIndex + 1];
   if (nextAttempt === undefined) return blocked("RUNTIME_ROUTING_NO_CAPABLE_ROUTE");
+  const nextAllocation = plan.reservation.allocations.find(
+    (allocation) => allocation.attempt_id === nextAttempt.attempt_id,
+  );
+  const occurredAtMs = timestamp(transition.occurred_at);
+  const requestDeadlineMs = timestamp(plan.request_deadline);
+  const liveExpiresAtMs = timestamp(plan.live_expires_at);
+  if (
+    occurredAtMs === null ||
+    requestDeadlineMs === null ||
+    liveExpiresAtMs === null ||
+    nextAllocation === undefined
+  ) {
+    return blocked("RUNTIME_ROUTING_STALE_STATE");
+  }
+  if (occurredAtMs >= liveExpiresAtMs) return blocked("RUNTIME_ROUTING_STALE_STATE");
+  if (
+    occurredAtMs >= requestDeadlineMs ||
+    nextAllocation.duration_ms > requestDeadlineMs - occurredAtMs
+  ) {
+    return blocked("RUNTIME_ROUTING_BUDGET_EXCEEDED");
+  }
   if (
     !Number.isSafeInteger(input.remaining_duration_ms) ||
     input.remaining_duration_ms <= 0 ||
-    input.remaining_duration_ms <
-      (plan.reservation.allocations.find(
-        (allocation) => allocation.attempt_id === nextAttempt.attempt_id,
-      )?.duration_ms ?? Number.MAX_SAFE_INTEGER)
+    input.remaining_duration_ms < nextAllocation.duration_ms
   ) {
     return blocked("RUNTIME_ROUTING_BUDGET_EXCEEDED");
   }

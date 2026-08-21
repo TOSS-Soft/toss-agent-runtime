@@ -254,6 +254,8 @@ interface ModelSelectionPlanBindingV1 extends RuntimeDocument {
 
 export interface PlannedModelSelectionPlanV1 extends ModelSelectionPlanBindingV1 {
   readonly status: "planned";
+  readonly request_deadline: string;
+  readonly live_expires_at: string;
   readonly worker_attempts: readonly RoutingAttemptV1[];
   readonly reviewer_attempt: RoutingAttemptV1 | null;
   readonly reservation: RoutingReservationV1;

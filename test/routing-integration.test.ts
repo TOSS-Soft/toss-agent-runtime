@@ -31,9 +31,10 @@ import {
 } from "../src/index.js";
 import {
   plannedRouteIdentity,
-  plannedRoutingFixture,
   pricing,
   providerCapabilities,
+  routingInputFixture,
+  type PlannedRoutingFixture,
 } from "./helpers/routing-fixtures.js";
 
 const ROUTING_DOCUMENT_LIMITS = Object.freeze({
@@ -113,6 +114,21 @@ function semanticSelection(plan: PlannedModelSelectionPlanV1): unknown {
     reviewer: plan.reviewer_attempt?.entry_id ?? null,
     eliminations: plan.eliminations,
   };
+}
+
+function plannedRoutingFixture(
+  options: Parameters<typeof routingInputFixture>[0] = {},
+): PlannedRoutingFixture {
+  const fixture = routingInputFixture(options);
+  const decision = planModelSelection(fixture.input);
+  if (decision.status !== "planned") {
+    throw new Error(`expected planned integration fixture, got ${decision.plan.block_code}`);
+  }
+  return Object.freeze({
+    ...fixture,
+    plan: decision.plan,
+    state: decision.next_state,
+  });
 }
 
 function resultFor(

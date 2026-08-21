@@ -320,6 +320,8 @@
       "type": "object",
       "required": [
         "status",
+        "request_deadline",
+        "live_expires_at",
         "worker_attempts",
         "reviewer_attempt",
         "reservation",
@@ -328,6 +330,8 @@
       ],
       "properties": {
         "status": { "const": "planned" },
+        "request_deadline": { "$ref": "#/$defs/timestamp" },
+        "live_expires_at": { "$ref": "#/$defs/timestamp" },
         "worker_attempts": {
           "type": "array",
           "minItems": 1,

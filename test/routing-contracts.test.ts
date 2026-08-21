@@ -172,6 +172,28 @@ describe("model catalog contract", () => {
     expectInvalid(unsafe);
   });
 
+  it("rejects an explicit negative catalog price", () => {
+    const catalog = validCatalog();
+    const entry = (catalog.entries as Record<string, unknown>[])[0] as Record<string, unknown>;
+    const route = (entry.routes as Record<string, unknown>[])[0] as Record<string, unknown>;
+    catalog.entries = [
+      {
+        ...entry,
+        routes: [
+          {
+            ...route,
+            pricing: {
+              ...(route.pricing as object),
+              cached_input_microusd_per_million: -1,
+            },
+          },
+        ],
+      },
+    ];
+
+    expectInvalid(catalog);
+  });
+
   it("rejects unknown fields and duplicate JSON keys", () => {
     expectInvalid({ ...validCatalog(), unexpected: true });
     const bytes = catalogBytes(validCatalog()).replace(
@@ -204,20 +226,42 @@ describe("model catalog contract", () => {
     });
   });
 
-  it("returns fixed non-reflective routing errors", () => {
-    expect(routingRuntimeError("RUNTIME_ROUTING_CIRCUIT_OPEN")).toEqual({
-      code: "RUNTIME_ROUTING_CIRCUIT_OPEN",
-      category: "unavailable",
-      retryable: true,
-      safe_message: "Routing circuit is open",
-    });
-    expect(routingRuntimeError("RUNTIME_ROUTING_RESOLUTION_MISMATCH")).toEqual({
-      code: "RUNTIME_ROUTING_RESOLUTION_MISMATCH",
-      category: "integrity",
-      retryable: false,
-      safe_message: "Resolved route does not match the plan",
-    });
-  });
+  it.each([
+    ["RUNTIME_ROUTING_INVALID", "invalid-input", false, "Routing input is invalid"],
+    ["RUNTIME_ROUTING_BUDGET_EXCEEDED", "policy-denied", false, "Routing budget is exceeded"],
+    [
+      "RUNTIME_ROUTING_NO_CAPABLE_ROUTE",
+      "unsupported-capability",
+      false,
+      "No capable route is available",
+    ],
+    [
+      "RUNTIME_ROUTING_REVIEW_UNAVAILABLE",
+      "unsupported-capability",
+      false,
+      "Independent review is unavailable",
+    ],
+    ["RUNTIME_ROUTING_POLICY_DENIED", "policy-denied", false, "Routing policy denied the request"],
+    ["RUNTIME_ROUTING_CIRCUIT_OPEN", "unavailable", true, "Routing circuit is open"],
+    ["RUNTIME_ROUTING_STALE_STATE", "stale-revision", false, "Routing state is stale"],
+    ["RUNTIME_ROUTING_USAGE_UNKNOWN", "integrity", false, "Routing usage is unknown"],
+    [
+      "RUNTIME_ROUTING_RESOLUTION_MISMATCH",
+      "integrity",
+      false,
+      "Resolved route does not match the plan",
+    ],
+  ] as const)(
+    "returns the fixed non-reflective %s mapping",
+    (code, category, retryable, safeMessage) => {
+      expect(routingRuntimeError(code)).toEqual({
+        code,
+        category,
+        retryable,
+        safe_message: safeMessage,
+      });
+    },
+  );
 });
 
 function parsedPolicy(value: Record<string, unknown>) {
@@ -261,6 +305,39 @@ describe("routing policy contract", () => {
     ];
 
     expect(parsedPolicy(policy)).toMatchObject({ ok: true });
+  });
+
+  it("rejects overlapping same-priority rules even when a stronger rule shadows them", () => {
+    const policy = validRoutingPolicy();
+    const nonRisk = policyRule(policy, 0);
+    const exactMatch = {
+      phase: "implementation",
+      complexity: "medium",
+      risks: [],
+    };
+    policy.rules = [
+      {
+        ...nonRisk,
+        rule_id: "stronger-exact",
+        priority: 1,
+        match: exactMatch,
+      },
+      {
+        ...nonRisk,
+        rule_id: "shadowed-overlap-a",
+        priority: 5,
+        match: exactMatch,
+      },
+      {
+        ...nonRisk,
+        rule_id: "shadowed-overlap-b",
+        priority: 5,
+        match: exactMatch,
+      },
+      ...(policy.rules as unknown[]).slice(1),
+    ];
+
+    expectInvalidPolicy(policy);
   });
 
   it("rejects a valid policy padded beyond the 512 KiB input ceiling", () => {
@@ -681,6 +758,10 @@ describe("selection plan contract", () => {
     if (parsedPlanned.ok) {
       expect(Object.isFrozen(parsedPlanned.value)).toBe(true);
       expect(Object.isFrozen(parsedPlanned.value.eliminations)).toBe(true);
+      expect(parsedPlanned.value).toMatchObject({
+        request_deadline: "2026-08-21T13:00:00.000Z",
+        live_expires_at: "2026-08-21T12:04:00.000Z",
+      });
       expect(hashModelSelectionPlan(parsedPlanned.value)).toBe(selectionPlanDocumentHash(planned));
     }
 
@@ -695,6 +776,12 @@ describe("selection plan contract", () => {
     expect(selectionPlanDocumentHash(changedNextState)).not.toBe(selectionPlanDocumentHash(plan));
 
     const semanticSubstitutions = [
+      (candidate: Record<string, unknown>) => {
+        candidate.request_deadline = "2026-08-21T13:00:00.001Z";
+      },
+      (candidate: Record<string, unknown>) => {
+        candidate.live_expires_at = "2026-08-21T12:04:00.001Z";
+      },
       (candidate: Record<string, unknown>) => {
         const attempt = (candidate.worker_attempts as Record<string, unknown>[])[0] as Record<
           string,
@@ -754,6 +841,30 @@ describe("selection plan contract", () => {
       ).toBe(true);
     }
   });
+
+  it.each(["request_deadline", "live_expires_at"] as const)(
+    "requires planned %s authority strictly after decision time",
+    (field) => {
+      for (const value of ["2026-08-21T12:00:00.000Z", "2026-08-21T11:59:59.999Z"]) {
+        const plan = validPlannedSelectionPlan();
+        plan[field] = value;
+        const reservation = plan.reservation as Record<string, unknown>;
+        reservation.decision_hash = selectionDecisionHash(plan);
+
+        const result = parsedPlan(plan);
+        expect(result).toMatchObject({
+          ok: false,
+          code: "RUNTIME_DOCUMENT_INVALID",
+        });
+        if (result.ok) continue;
+        expect(
+          result.issues.some(
+            (issue) => issue.path === `/${field}` && issue.keyword === "timeAuthority",
+          ),
+        ).toBe(true);
+      }
+    },
+  );
 
   it("rejects a mismatched final document hash", () => {
     const plan = validPlannedSelectionPlan();
@@ -848,6 +959,15 @@ describe("selection plan contract", () => {
     const planned = validPlannedSelectionPlan();
     delete planned.next_state_hash;
     expect(parsedPlan(planned)).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
+
+    for (const field of ["request_deadline", "live_expires_at"] as const) {
+      const withoutTimeAuthority = validPlannedSelectionPlan();
+      delete withoutTimeAuthority[field];
+      expect(parsedPlan(withoutTimeAuthority)).toMatchObject({
+        ok: false,
+        code: "RUNTIME_DOCUMENT_INVALID",
+      });
+    }
   });
 
   it("rejects unsafe elimination text or metadata", () => {

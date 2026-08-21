@@ -206,6 +206,18 @@ function taskRiskSets(): readonly (readonly TaskRisk[])[] {
   );
 }
 
+function rulesOverlap(left: RoutingPolicyRuleV1, right: RoutingPolicyRuleV1): boolean {
+  return TASK_PHASES.some((phase) =>
+    TASK_COMPLEXITIES.some((complexity) =>
+      taskRiskSets().some(
+        (risks) =>
+          matchesTaskProfile(left, phase, complexity, risks) &&
+          matchesTaskProfile(right, phase, complexity, risks),
+      ),
+    ),
+  );
+}
+
 export function hashRoutingPolicy(value: RoutingPolicyV1): `sha256:${string}` {
   const normalized = parseJsonBytes(
     canonicalJson(value, ROUTING_POLICY_JSON_LIMITS),
@@ -247,6 +259,16 @@ export function parseRoutingPolicy(input: string | Uint8Array): ValidationResult
   }
   if (catchAllRules.length !== 1) {
     issues.push(issue("/rules", "catchAll", "exactly one catch-all rule is required"));
+  }
+  for (const [leftIndex, left] of parsed.value.rules.entries()) {
+    for (let rightIndex = leftIndex + 1; rightIndex < parsed.value.rules.length; rightIndex += 1) {
+      const right = parsed.value.rules[rightIndex];
+      if (right !== undefined && left.priority === right.priority && rulesOverlap(left, right)) {
+        issues.push(
+          issue(`/rules/${rightIndex}`, "priorityOverlap", "same-priority rules must not overlap"),
+        );
+      }
+    }
   }
 
   for (const phase of TASK_PHASES) {
@@ -621,6 +643,27 @@ export function parseModelSelectionPlan(
 
   if (parsed.value.status === "planned") {
     const plan = parsed.value;
+    const decisionAt = Date.parse(plan.decision_at);
+    const requestDeadline = Date.parse(plan.request_deadline);
+    const liveExpiresAt = Date.parse(plan.live_expires_at);
+    if (!isCanonicalUtcTimestamp(plan.request_deadline) || requestDeadline <= decisionAt) {
+      issues.push(
+        issue(
+          "/request_deadline",
+          "timeAuthority",
+          "request deadline must be canonical and after decision time",
+        ),
+      );
+    }
+    if (!isCanonicalUtcTimestamp(plan.live_expires_at) || liveExpiresAt <= decisionAt) {
+      issues.push(
+        issue(
+          "/live_expires_at",
+          "timeAuthority",
+          "live expiry must be canonical and after decision time",
+        ),
+      );
+    }
     const attemptIds = new Set<string>();
     const entryIds = new Set<string>();
     const routeIds = new Set<string>();

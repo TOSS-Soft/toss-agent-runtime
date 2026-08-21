@@ -12,12 +12,13 @@ import {
 import { hashRoutingState } from "../src/routing/contracts.js";
 import { RuntimeRoutingError } from "../src/routing/errors.js";
 import { verifyResolvedRoute } from "../src/routing/resolution.js";
+import { planModelSelection } from "../src/routing/selection.js";
 import type { RoutingStateV1 } from "../src/routing/types.js";
 import { startFakeAgentgateway, type FakeAgentgateway } from "./helpers/fake-agentgateway.js";
 import {
   plannedRouteIdentity,
-  plannedRoutingFixture,
   providerCapabilities,
+  routingInputFixture,
   type PlannedRoutingFixture,
 } from "./helpers/routing-fixtures.js";
 
@@ -27,6 +28,17 @@ const credentialReference: SecretReference = {
   source: "command",
   key: "TOSS_AGENTGATEWAY_TOKEN",
 };
+
+function plannedRoutingFixture(
+  options: Parameters<typeof routingInputFixture>[0] = {},
+): PlannedRoutingFixture {
+  const fixture = routingInputFixture(options);
+  const decision = planModelSelection(fixture.input);
+  if (decision.status !== "planned") {
+    throw new Error(`expected planned resolution fixture, got ${decision.plan.block_code}`);
+  }
+  return Object.freeze({ ...fixture, plan: decision.plan, state: decision.next_state });
+}
 
 afterEach(async () => {
   await Promise.all(activeGateways.splice(0).map(async (gateway) => gateway.close()));

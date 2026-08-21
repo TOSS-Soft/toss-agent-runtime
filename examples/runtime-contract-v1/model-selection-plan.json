@@ -5,13 +5,14 @@
   "catalog_revision": 1,
   "decision_at": "2026-08-21T12:00:00.000Z",
   "decision_id": "decision-0be5712217867461fdc2bc3a8d47ffb9ec977219fb7f6cc2052d7908e0766de9",
-  "document_hash": "sha256:5a97b639321f83914b6d38263a4f2bbfe320774d6bcb2a68848812f51f46f72b",
+  "document_hash": "sha256:10dd71d96a7b928ff469a98253337933f3e95522384cec668ef7f98963acc3db",
   "document_type": "model-selection-plan",
   "eliminations": [],
   "gateway_profile": "gateway-primary",
   "gateway_revision": 11,
+  "live_expires_at": "2026-08-21T12:04:00.000Z",
   "matched_rule_id": "risk-default",
-  "next_state_hash": "sha256:c61df6d27250eb23d467ece40b225b1069852cd01c2d826287fd21f291843c52",
+  "next_state_hash": "sha256:a78ada7e9e7b1b22a1702d2fcf9ba3ae8c38d92bc15dd321310ec8809e798b10",
   "next_state_revision": 2,
   "override": null,
   "policy_hash": "sha256:68844bf69d113ba143fdbc486919a7afffc8fa66af8643d12c7769d40ccee321",
@@ -21,6 +22,7 @@
   "prior_state_id": "routing-circuit-1",
   "prior_state_revision": 1,
   "protocol_version": "runtime-contract.v1",
+  "request_deadline": "2026-08-21T14:00:00.000Z",
   "request_hash": "sha256:29bd3c6190625d77a9415298ae38675e7f21965ccdfb4299f497cd6f14dba521",
   "request_id": "request-circuit-1",
   "reservation": {
@@ -67,7 +69,7 @@
       }
     ],
     "created_at": "2026-08-21T12:00:00.000Z",
-    "decision_hash": "sha256:bdff56c37a7b681dd1ab1dea91449d0083a9955e3da92df36420f5d60a492598",
+    "decision_hash": "sha256:19bb7d8f30d6061c8154809dfd415c0c0213c71eb593ba5aca163c58ce99fd9b",
     "decision_id": "decision-0be5712217867461fdc2bc3a8d47ffb9ec977219fb7f6cc2052d7908e0766de9",
     "request_id": "request-circuit-1"
   },

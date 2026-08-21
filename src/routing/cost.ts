@@ -442,11 +442,19 @@ function acceptedRoute(
   return route;
 }
 
+function addAttemptActivity(settled: UsageSummary, durationMs: number): UsageSummary {
+  if (settled.cost_microusd === null) invalid();
+  return {
+    ...settled,
+    duration_ms: safeNumber(safeBigInt(settled.duration_ms) + safeBigInt(durationMs)),
+    turns: safeNumber(safeBigInt(settled.turns) + 1n),
+  };
+}
+
 function addKnownUsage(
   settled: UsageSummary,
   usageValue: ProviderUsage,
   costMicrousd: number,
-  durationMs: number,
 ): UsageSummary {
   if (settled.cost_microusd === null) invalid();
   return {
@@ -457,8 +465,8 @@ function addKnownUsage(
       safeBigInt(settled.output_tokens) + safeBigInt(usageValue.output_tokens),
     ),
     cost_microusd: safeNumber(safeBigInt(settled.cost_microusd) + safeBigInt(costMicrousd)),
-    duration_ms: safeNumber(safeBigInt(settled.duration_ms) + safeBigInt(durationMs)),
-    turns: safeNumber(safeBigInt(settled.turns) + 1n),
+    duration_ms: settled.duration_ms,
+    turns: settled.turns,
   };
 }
 
@@ -502,13 +510,29 @@ export function settleRoutingDecision(input: {
     assertSafeNonnegative(result.duration_ms);
     if (seen.has(result.attempt_id) || !allocations.has(result.attempt_id)) invalid();
     seen.add(result.attempt_id);
-    if (result.route_identity === null || result.usage === null) {
+    nextSettled = addAttemptActivity(nextSettled, result.duration_ms);
+    const hasRoute = result.route_identity !== null;
+    const hasUsage = result.usage !== null;
+    if (hasRoute !== hasUsage) {
+      if (result.effect_may_have_occurred) unknown = true;
+      else throw new RuntimeRoutingError("RUNTIME_ROUTING_RESOLUTION_MISMATCH");
+      continue;
+    }
+    if (!hasRoute || !hasUsage) {
       if (result.effect_may_have_occurred) unknown = true;
       continue;
     }
-    const route = acceptedRoute(plan, result.attempt_id, result.route_identity);
-    const costMicrousd = calculateRoutingCost(route.pricing, result.usage);
-    nextSettled = addKnownUsage(nextSettled, result.usage, costMicrousd, result.duration_ms);
+    try {
+      const route = acceptedRoute(plan, result.attempt_id, result.route_identity);
+      const costMicrousd = calculateRoutingCost(route.pricing, result.usage);
+      nextSettled = addKnownUsage(nextSettled, result.usage, costMicrousd);
+    } catch (error) {
+      if (result.effect_may_have_occurred && error instanceof RuntimeRoutingError) {
+        unknown = true;
+        continue;
+      }
+      throw error;
+    }
   }
 
   const reservations = state.reservations.filter(

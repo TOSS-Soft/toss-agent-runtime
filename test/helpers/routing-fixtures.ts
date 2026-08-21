@@ -19,7 +19,6 @@ import {
   parseRoutingPolicy,
   parseRoutingState,
 } from "../../src/routing/contracts.js";
-import { planModelSelection } from "../../src/routing/selection.js";
 import type {
   CatalogRouteV1,
   ModelCatalogEntryV1,
@@ -354,6 +353,8 @@ export function validPlannedSelectionPlan(): Record<string, unknown> {
   const plan = {
     ...planBindings(),
     status: "planned",
+    request_deadline: "2026-08-21T13:00:00.000Z",
+    live_expires_at: "2026-08-21T12:04:00.000Z",
     worker_attempts: [attempt],
     reviewer_attempt: null,
     reservation,
@@ -374,11 +375,14 @@ export function validBlockedSelectionPlan(): Record<string, unknown> {
   };
 }
 
-export interface PlannedRoutingFixture {
+export interface RoutingInputFixture {
   readonly input: PlanModelSelectionInput;
   readonly catalog: ModelCatalogV1;
   readonly policy: RoutingPolicyV1;
   readonly prior_state: RoutingStateV1;
+}
+
+export interface PlannedRoutingFixture extends RoutingInputFixture {
   readonly plan: PlannedModelSelectionPlanV1;
   readonly state: RoutingStateV1;
 }
@@ -410,15 +414,17 @@ export function plannedRouteIdentity(
   });
 }
 
-export function plannedRoutingFixture(
-  options: Readonly<{
-    circuits?: readonly RoutingCircuitV1[];
-    cooldown_ms?: number;
-    consecutive_failure_threshold?: number;
-    decision_at?: string;
-    review?: boolean;
-  }> = {},
-): PlannedRoutingFixture {
+export type RoutingInputFixtureOptions = Readonly<{
+  circuits?: readonly RoutingCircuitV1[];
+  cooldown_ms?: number;
+  consecutive_failure_threshold?: number;
+  decision_at?: string;
+  live_expires_at?: string;
+  request_deadline?: string;
+  review?: boolean;
+}>;
+
+export function routingInputFixture(options: RoutingInputFixtureOptions = {}): RoutingInputFixture {
   const decisionAt = options.decision_at ?? "2026-08-21T12:00:00.000Z";
   const review = options.review ?? false;
   const workerEntries: readonly ModelCatalogEntryV1[] = [
@@ -495,7 +501,7 @@ export function plannedRoutingFixture(
     request_id: "request-circuit-1",
     run_id: "run-circuit-1",
     created_at: "2026-08-21T10:00:00.000Z",
-    deadline: "2026-08-21T14:00:00.000Z",
+    deadline: options.request_deadline ?? "2026-08-21T14:00:00.000Z",
     task_contract: {
       document_type: "task-contract",
       artifact_id: "task-circuit-1",
@@ -566,7 +572,7 @@ export function plannedRoutingFixture(
     document_type: "agentgateway-capabilities",
     gateway: { name: "agentgateway", version: "0.10.0", revision: 11 },
     generated_at: "2026-08-21T11:59:00.000Z",
-    expires_at: "2026-08-21T12:04:00.000Z",
+    expires_at: options.live_expires_at ?? "2026-08-21T12:04:00.000Z",
     routes: entries.flatMap((catalogEntry) =>
       catalogEntry.routes.map((catalogRoute) => ({
         alias: catalogEntry.route_alias,
@@ -630,16 +636,10 @@ export function plannedRoutingFixture(
     gateway_profile: "gateway-primary",
     decision_at: decisionAt,
   };
-  const decision = planModelSelection(input);
-  if (decision.status !== "planned") {
-    throw new Error(`expected planned circuit fixture, got ${decision.plan.block_code}`);
-  }
   return Object.freeze({
     input,
     catalog,
     policy,
     prior_state: priorState,
-    plan: decision.plan,
-    state: decision.next_state,
   });
 }

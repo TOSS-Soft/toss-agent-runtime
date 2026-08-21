@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   hashAgentgatewayCapabilities,
   parseAgentgatewayCapabilities,
+  routeSatisfiesRequirement,
   type AgentgatewayCapabilitiesV1,
 } from "../src/gateway/index.js";
 import { canonicalJson, sha256 } from "../src/protocol/json.js";
@@ -428,6 +429,8 @@ describe("deterministic worker selection", () => {
         .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0)),
     );
     expect(result.plan.reservation.allocations).toHaveLength(3);
+    expect(result.plan.request_deadline).toBe(input.request.deadline);
+    expect(result.plan.live_expires_at).toBe(input.live.expires_at);
     expect(result.next_state.reservations).toEqual([result.plan.reservation]);
     expect(result.next_state.document_hash).toBe(result.plan.next_state_hash);
     expect(parseModelSelectionPlan(canonicalJson(result.plan))).toEqual({
@@ -975,6 +978,152 @@ describe("governed routing override", () => {
 describe("effective catalog/live capability authority", () => {
   it.each([
     [
+      "a live-only route",
+      entry("atomic-live-only", "atomic-live-only", 1, [
+        route("route-atomic-safe", "openai", "gpt-5"),
+      ]),
+      (liveValue: AgentgatewayCapabilitiesV1): AgentgatewayCapabilitiesV1 => ({
+        ...liveValue,
+        routes: [
+          ...liveValue.routes,
+          {
+            alias: "atomic-live-only",
+            route_id: "route-live-only",
+            provider: "gemini" as const,
+            model: "gemini-live-only",
+            capabilities: providerCapabilities("gemini"),
+          },
+        ],
+      }),
+      "live-route",
+      "route-live-only",
+    ],
+    [
+      "a catalog-denied capability",
+      entry("atomic-denied", "atomic-denied", 1, [
+        route("route-atomic-safe", "openai", "gpt-5"),
+        route("route-atomic-denied", "anthropic", "claude-denied", {
+          capabilities: { ...providerCapabilities("anthropic"), tools: false },
+        }),
+      ]),
+      (liveValue: AgentgatewayCapabilitiesV1): AgentgatewayCapabilitiesV1 => ({
+        ...liveValue,
+        routes: liveValue.routes.map((liveRoute) =>
+          liveRoute.route_id === "route-atomic-denied"
+            ? {
+                ...liveRoute,
+                capabilities: { ...liveRoute.capabilities, tools: true },
+              }
+            : liveRoute,
+        ),
+      }),
+      "capability",
+      "route-atomic-denied",
+    ],
+    [
+      "a context-small route",
+      entry("atomic-context", "atomic-context", 1, [
+        route("route-atomic-safe", "openai", "gpt-5"),
+        route("route-atomic-context-small", "anthropic", "claude-small-context", {
+          capabilities: {
+            ...providerCapabilities("anthropic"),
+            max_context_tokens: 20_000,
+          },
+        }),
+      ]),
+      (liveValue: AgentgatewayCapabilitiesV1): AgentgatewayCapabilitiesV1 => liveValue,
+      "capability",
+      "route-atomic-context-small",
+    ],
+    [
+      "a policy-slow route",
+      entry("atomic-latency", "atomic-latency", 1, [
+        route("route-atomic-safe", "openai", "gpt-5"),
+        route("route-atomic-slow", "anthropic", "claude-slow", {
+          latency_class: "extended",
+        }),
+      ]),
+      (liveValue: AgentgatewayCapabilitiesV1): AgentgatewayCapabilitiesV1 => liveValue,
+      "latency",
+      "route-atomic-slow",
+    ],
+  ] as const)(
+    "rejects an alias atomically when gateway execution includes %s",
+    (_name, catalogEntry, mutateLive, reason, dangerousRouteId) => {
+      const input = fixture({ entries: [catalogEntry], mutateLive });
+      const requirement = {
+        schema_version: "gateway-route-requirement.v1" as const,
+        alias: catalogEntry.route_alias,
+        tools: true,
+        json_schema: true,
+        vision: false,
+        reasoning: false,
+        streaming: false,
+        max_output_tokens: 4_000,
+      };
+      const dangerous = input.live.routes.find(
+        (liveRoute) => liveRoute.route_id === dangerousRouteId,
+      );
+      expect(dangerous).toBeDefined();
+      expect(routeSatisfiesRequirement(dangerous!, requirement)).toBe(true);
+
+      expect(blocked(input).eliminations).toEqual([{ entry_id: catalogEntry.entry_id, reason }]);
+    },
+  );
+
+  it("accepts every gateway-executable route in an all-safe alias and reserves its maximum price", () => {
+    const catalogEntry = entry("atomic-safe", "atomic-safe", 1, [
+      route("route-atomic-cheap", "openai", "gpt-5"),
+      route("route-atomic-expensive", "anthropic", "claude-expensive", {
+        pricing: pricing(20_000_000, 20_000_000, 20_000_000, 20_000_000),
+      }),
+    ]);
+
+    const plan = planned(fixture({ entries: [catalogEntry] }));
+
+    expect(plan.worker_attempts[0]?.accepted_routes.map((value) => value.route_id)).toEqual([
+      "route-atomic-cheap",
+      "route-atomic-expensive",
+    ]);
+    expect(plan.worker_attempts[0]?.reserved_cost_microusd).toBe(480_002);
+    expect(plan.reservation.allocations[0]?.cost_microusd).toBe(480_002);
+  });
+
+  it("rejects a reviewer alias when an executable same-alias route collides with the worker", () => {
+    const entries = [
+      reviewWorker("atomic-worker", "openai", "shared-model", 1),
+      reviewer("atomic-reviewer", "anthropic", "independent-model", 1, [
+        route("route-atomic-reviewer-safe", "anthropic", "independent-model"),
+        route("route-atomic-reviewer-collision", "openai", "shared-model"),
+      ]),
+    ];
+    const input = fixture({
+      entries,
+      request: deepRequest(),
+      task: { risks: ["security"] },
+    });
+    const collision = input.live.routes.find(
+      (liveRoute) => liveRoute.route_id === "route-atomic-reviewer-collision",
+    );
+    expect(collision).toBeDefined();
+    expect(
+      routeSatisfiesRequirement(collision!, {
+        schema_version: "gateway-route-requirement.v1",
+        alias: "atomic-reviewer",
+        tools: true,
+        json_schema: false,
+        vision: false,
+        reasoning: true,
+        streaming: false,
+        max_output_tokens: 4_000,
+      }),
+    ).toBe(true);
+
+    expect(blocked(input).block_code).toBe("RUNTIME_ROUTING_REVIEW_UNAVAILABLE");
+  });
+
+  it.each([
+    [
       "route ID",
       (liveValue: AgentgatewayCapabilitiesV1) => ({
         ...liveValue,
@@ -1086,6 +1235,23 @@ describe("effective catalog/live capability authority", () => {
       "RUNTIME_ROUTING_POLICY_DENIED",
     );
   });
+
+  it.each(["toString", "constructor", "__proto__"])(
+    "rejects inherited latency key %s instead of widening to the policy ceiling",
+    (maxLatency) => {
+      const input = fixture();
+      const operation = () =>
+        planModelSelection({
+          ...input,
+          task: {
+            ...input.task,
+            max_latency_class: maxLatency,
+          } as RoutingTaskProfile,
+        });
+
+      expect(operation).toThrowError(expect.objectContaining({ code: "RUNTIME_ROUTING_INVALID" }));
+    },
+  );
 });
 
 describe("circuit, budget, and stale-state blocking", () => {
@@ -1576,6 +1742,34 @@ describe("circuit, budget, and stale-state blocking", () => {
 });
 
 describe("canonical explanations and exact authoritative bindings", () => {
+  it("normalizes the semantic task risk set before decision and attempt identity hashing", () => {
+    const entries = [
+      reviewWorker("risk-worker", "openai", "worker-model", 1),
+      reviewer("risk-reviewer", "anthropic", "reviewer-model", 1),
+    ];
+    const first = planned(
+      fixture({
+        entries,
+        request: deepRequest(),
+        task: { risks: ["security", "architecture"] },
+      }),
+    );
+    const second = planned(
+      fixture({
+        entries,
+        request: deepRequest(),
+        task: { risks: ["architecture", "security"] },
+      }),
+    );
+
+    expect(second.decision_id).toBe(first.decision_id);
+    expect(second.worker_attempts.map((attempt) => attempt.attempt_id)).toEqual(
+      first.worker_attempts.map((attempt) => attempt.attempt_id),
+    );
+    expect(second.reviewer_attempt?.attempt_id).toBe(first.reviewer_attempt?.attempt_id);
+    expect(second.document_hash).toBe(first.document_hash);
+  });
+
   it.each(["task", "ceilings"] as const)("rejects an unknown %s input field", (target) => {
     const input = fixture();
     const operation = () =>

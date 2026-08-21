@@ -1,6 +1,7 @@
 import {
   hashAgentgatewayCapabilities,
   parseAgentgatewayCapabilities,
+  routeSatisfiesRequirement,
   type AgentgatewayCapabilitiesV1,
   type AgentgatewayRouteV1,
 } from "../gateway/index.js";
@@ -80,6 +81,7 @@ const ROUTING_CAPABILITIES = new Set([
 const TASK_PHASES = new Set<TaskPhase>(["analysis", "implementation", "review"]);
 const TASK_COMPLEXITIES = new Set<TaskComplexity>(["low", "medium", "high", "critical"]);
 const TASK_RISKS = new Set<string>(["architecture", "irreversible", "security"]);
+const LATENCY_CLASSES = new Set<LatencyClass>(["interactive", "standard", "extended"]);
 const LATENCY_RANK: Readonly<Record<LatencyClass, number>> = Object.freeze({
   interactive: 0,
   standard: 1,
@@ -240,7 +242,7 @@ function validateTask(task: RoutingTaskProfile): void {
     task.task_contract.document_type !== "task-contract" ||
     !TASK_PHASES.has(task.phase) ||
     !TASK_COMPLEXITIES.has(task.complexity) ||
-    !(task.max_latency_class in LATENCY_RANK) ||
+    !LATENCY_CLASSES.has(task.max_latency_class) ||
     !Array.isArray(riskValues)
   ) {
     invalid();
@@ -520,20 +522,6 @@ function effectiveLatency(task: RoutingTaskProfile, rule: RoutingPolicyRuleV1): 
     : rule.max_latency_class;
 }
 
-function exactLiveRoutes(
-  entry: ModelCatalogEntryV1,
-  catalogRoute: CatalogRouteV1,
-  live: AgentgatewayCapabilitiesV1,
-): readonly AgentgatewayRouteV1[] {
-  return live.routes.filter(
-    (route) =>
-      route.alias === entry.route_alias &&
-      route.route_id === catalogRoute.route_id &&
-      route.provider === catalogRoute.provider &&
-      route.model === catalogRoute.model,
-  );
-}
-
 function routeHasCapabilities(
   entry: ModelCatalogEntryV1,
   effective: EffectiveRoute,
@@ -605,22 +593,34 @@ function candidateForEntry(input: {
     return { candidate: null, reason: "policy" };
   }
 
-  const exact: EffectiveRoute[] = [];
-  for (const catalogRoute of input.entry.routes) {
-    for (const liveRoute of exactLiveRoutes(input.entry, catalogRoute, input.live)) {
-      exact.push({ catalog: catalogRoute, live: liveRoute });
-    }
-  }
-  if (exact.length === 0) return { candidate: null, reason: "live-route" };
+  const requirement = routeRequirement(input.entry.route_alias, input.required, input.ceilings);
+  const aliasedLiveRoutes = input.live.routes.filter(
+    (liveRoute) => liveRoute.alias === input.entry.route_alias,
+  );
+  if (aliasedLiveRoutes.length === 0) return { candidate: null, reason: "live-route" };
+  const executableLiveRoutes = aliasedLiveRoutes.filter((liveRoute) =>
+    routeSatisfiesRequirement(liveRoute, requirement),
+  );
+  if (executableLiveRoutes.length === 0) return { candidate: null, reason: "capability" };
 
-  const capable = exact.filter((value) =>
-    routeHasCapabilities(input.entry, value, input.required, input.ceilings),
-  );
-  if (capable.length === 0) return { candidate: null, reason: "capability" };
-  const accepted = capable.filter(
-    (value) => LATENCY_RANK[value.catalog.latency_class] <= LATENCY_RANK[input.maxLatency],
-  );
-  if (accepted.length === 0) return { candidate: null, reason: "latency" };
+  const accepted: EffectiveRoute[] = [];
+  for (const liveRoute of executableLiveRoutes) {
+    const catalogRoute = input.entry.routes.find(
+      (candidate) =>
+        candidate.route_id === liveRoute.route_id &&
+        candidate.provider === liveRoute.provider &&
+        candidate.model === liveRoute.model,
+    );
+    if (catalogRoute === undefined) return { candidate: null, reason: "live-route" };
+    const effective = { catalog: catalogRoute, live: liveRoute };
+    if (!routeHasCapabilities(input.entry, effective, input.required, input.ceilings)) {
+      return { candidate: null, reason: "capability" };
+    }
+    if (LATENCY_RANK[catalogRoute.latency_class] > LATENCY_RANK[input.maxLatency]) {
+      return { candidate: null, reason: "latency" };
+    }
+    accepted.push(effective);
+  }
 
   accepted.sort((left, right) => compareAscii(left.catalog.route_id, right.catalog.route_id));
   let allocation = estimateRoutingAllocation({
@@ -929,7 +929,7 @@ export function planModelSelection(input: PlanModelSelectionInput): RoutingDecis
   const override = validatedOverride(input.override);
   const id = decisionId({
     request_hash: requestHash,
-    task: input.task,
+    task: { ...input.task, risks: sortedRisks(input.task.risks) },
     ceilings: input.ceilings,
     catalog_hash: validated.catalog.document_hash,
     policy_hash: validated.policy.document_hash,
@@ -1295,6 +1295,8 @@ export function planModelSelection(input: PlanModelSelectionInput): RoutingDecis
   let draft: PlannedModelSelectionPlanV1 = {
     ...bindings,
     status: "planned",
+    request_deadline: validated.request.deadline,
+    live_expires_at: validated.live.expires_at,
     worker_attempts: workerAttempts,
     reviewer_attempt: reviewerAttempt,
     reservation,

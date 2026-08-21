@@ -254,11 +254,13 @@ An override issued after the explicit decision time is invalid.
 3. Match exactly one policy rule from phase, complexity, and sorted risk set.
 4. Combine execution-request logical class and capabilities with all stronger
    rule requirements; never subtract a request requirement.
-5. Intersect catalog routes with the fresh, unexpired agentgateway capability
-   document by exact alias, route ID, provider, and model.
-6. Reject entries with insufficient catalog or live capabilities, excessive
-   latency, open or reserved circuits, stale bindings, forbidden review
-   identity, or insufficient remaining budget.
+5. For each candidate alias, enumerate the complete set of live routes the
+   gateway could execute for the exact emitted requirement and require an exact
+   catalog alias, route ID, provider, and model match for every route.
+6. Reject the whole alias when any executable route is live-only, denied,
+   under-capable, too small, too slow, unpriced, reviewer-colliding, circuit
+   blocked, or over budget. Include the complete safe set in `accepted_routes`
+   and reserve its maximum governed price.
 7. Sort eligible entries by rule class preference, catalog priority,
    worst-case microusd cost, worst latency class, and stable entry ID.
 8. Apply a valid governed override by narrowing the already eligible set to its
@@ -294,6 +296,7 @@ A planned document contains:
   capability requirement, worst-case cost, and latency class;
 - independent reviewer selection where required;
 - one combined budget reservation;
+- the closed, hash-bound request deadline and live-capability expiry;
 - all eliminated catalog entries with one stable allowlisted reason code;
 - prior and reserved next-state revisions/hashes.
 

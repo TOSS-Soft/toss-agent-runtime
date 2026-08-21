@@ -17,7 +17,7 @@ import type {
   RoutingOutcomeTransition,
   RoutingStateV1,
 } from "../src/routing/types.js";
-import { plannedRoutingFixture, type PlannedRoutingFixture } from "./helpers/routing-fixtures.js";
+import { routingInputFixture, type PlannedRoutingFixture } from "./helpers/routing-fixtures.js";
 
 const OCCURRED_AT = "2026-08-21T12:00:30.000Z";
 const ALLOWED_OUTCOMES = [
@@ -44,6 +44,17 @@ const ALL_PROVIDER_OUTCOMES = [
 const TERMINAL_NON_FALLBACK_OUTCOMES = ALL_PROVIDER_OUTCOMES.filter(
   (outcome) => !ALLOWED_OUTCOMES.includes(outcome as (typeof ALLOWED_OUTCOMES)[number]),
 );
+
+function plannedRoutingFixture(
+  options: Parameters<typeof routingInputFixture>[0] = {},
+): PlannedRoutingFixture {
+  const fixture = routingInputFixture(options);
+  const decision = planModelSelection(fixture.input);
+  if (decision.status !== "planned") {
+    throw new Error(`expected planned circuit fixture, got ${decision.plan.block_code}`);
+  }
+  return Object.freeze({ ...fixture, plan: decision.plan, state: decision.next_state });
+}
 
 function primary(fixture: PlannedRoutingFixture): RoutingAttemptV1 {
   const attempt = fixture.plan.worker_attempts[0];
@@ -394,7 +405,7 @@ describe("recordRoutingOutcome", () => {
     ).toThrowError(expect.objectContaining({ code: "RUNTIME_ROUTING_STALE_STATE" }));
   });
 
-  it("resets an observed closed circuit on success and preserves an already reset state by identity", () => {
+  it("resets an observed closed circuit on success and returns a parsed frozen no-op state", () => {
     const observed = plannedRoutingFixture({
       circuits: [
         {
@@ -423,7 +434,29 @@ describe("recordRoutingOutcome", () => {
         },
       ],
     });
-    expect(record(alreadyReset, "RUNTIME_PROVIDER_SUCCESS")).toBe(alreadyReset.state);
+    const unchanged = record(alreadyReset, "RUNTIME_PROVIDER_SUCCESS");
+    expect(unchanged).not.toBe(alreadyReset.state);
+    expect(unchanged).toEqual(alreadyReset.state);
+    expect(Object.isFrozen(unchanged)).toBe(true);
+  });
+
+  it("returns the parsed frozen state for a no-op outcome instead of mutable caller state", () => {
+    const fixture = plannedRoutingFixture();
+    const mutableState = structuredClone(fixture.state);
+
+    const result = recordRoutingOutcome({
+      state: mutableState,
+      plan: fixture.plan,
+      policy: fixture.policy,
+      attempt_id: primary(fixture).attempt_id,
+      outcome: "RUNTIME_PROVIDER_SUCCESS",
+      occurred_at: OCCURRED_AT,
+    });
+
+    expect(result.state).not.toBe(mutableState);
+    expect(Object.isFrozen(result.state)).toBe(true);
+    expect(Object.isFrozen(result.state.reservations)).toBe(true);
+    expect(result.state).toEqual(fixture.state);
   });
 
   it.each(ALL_PROVIDER_OUTCOMES)(
@@ -443,7 +476,9 @@ describe("recordRoutingOutcome", () => {
         const result = fallback(fixture, { state: next, outcome });
         expect(result).toEqual({ status: "ready", attempt: fixture.plan.worker_attempts[1] });
       } else {
-        expect(next).toBe(fixture.state);
+        expect(next).not.toBe(fixture.state);
+        expect(next).toEqual(fixture.state);
+        expect(Object.isFrozen(next)).toBe(true);
         const result = fallback(fixture, { state: next, outcome });
         expect(result).toEqual({
           status: "blocked",
@@ -717,6 +752,79 @@ describe("nextModelFallback", () => {
     }
   });
 
+  it.each([
+    ["at live expiry", "2026-08-21T12:04:00.000Z"],
+    ["after live expiry", "2026-08-21T12:04:00.001Z"],
+  ])("blocks fallback %s using the exact outcome occurrence", (_name, occurredAt) => {
+    const fixture = plannedRoutingFixture();
+    const outcome = recorded(
+      fixture,
+      "RUNTIME_PROVIDER_TIMEOUT",
+      fixture.state,
+      primary(fixture),
+      occurredAt,
+    );
+
+    expect(
+      fallback(fixture, {
+        state: outcome.state,
+        transition: outcome.transition,
+        occurred_at: occurredAt,
+      }),
+    ).toEqual({
+      status: "blocked",
+      code: "RUNTIME_ROUTING_STALE_STATE",
+      retryable: false,
+    });
+  });
+
+  it.each([
+    ["at request deadline", "2026-08-21T12:03:30.000Z"],
+    ["after request deadline", "2026-08-21T12:03:30.001Z"],
+    ["without the full reserved duration", "2026-08-21T12:01:30.001Z"],
+  ])("blocks fallback %s", (_name, occurredAt) => {
+    const fixture = plannedRoutingFixture({ request_deadline: "2026-08-21T12:03:30.000Z" });
+    const outcome = recorded(
+      fixture,
+      "RUNTIME_PROVIDER_TIMEOUT",
+      fixture.state,
+      primary(fixture),
+      occurredAt,
+    );
+
+    expect(
+      fallback(fixture, {
+        state: outcome.state,
+        transition: outcome.transition,
+        occurred_at: occurredAt,
+      }),
+    ).toEqual({
+      status: "blocked",
+      code: "RUNTIME_ROUTING_BUDGET_EXCEEDED",
+      retryable: false,
+    });
+  });
+
+  it("allows fallback when its full reserved duration ends exactly at the request deadline", () => {
+    const occurredAt = "2026-08-21T12:01:30.000Z";
+    const fixture = plannedRoutingFixture({ request_deadline: "2026-08-21T12:03:30.000Z" });
+    const outcome = recorded(
+      fixture,
+      "RUNTIME_PROVIDER_TIMEOUT",
+      fixture.state,
+      primary(fixture),
+      occurredAt,
+    );
+
+    expect(
+      fallback(fixture, {
+        state: outcome.state,
+        transition: outcome.transition,
+        occurred_at: occurredAt,
+      }),
+    ).toEqual({ status: "ready", attempt: fixture.plan.worker_attempts[1] });
+  });
+
   it("consumes a unique ordered result prefix ending at the current attempt", () => {
     const fixture = plannedRoutingFixture();
     const first = primary(fixture);
@@ -864,7 +972,7 @@ describe("nextModelFallback", () => {
     expect(result.status).toBe("ready");
   });
 
-  it("blocks an attestation outside the current attempt accepted route", () => {
+  it("blocks a possible-effect attestation outside the accepted route as unknown usage", () => {
     const fixture = plannedRoutingFixture();
     const nextState = record(fixture, "RUNTIME_PROVIDER_TIMEOUT");
     const attempt = primary(fixture);
@@ -875,6 +983,28 @@ describe("nextModelFallback", () => {
         results: [
           attemptResult(attempt, {
             route_identity: routeIdentity(attempt, { route_id: "route-unaccepted" }),
+          }),
+        ],
+      }),
+    ).toEqual({
+      status: "blocked",
+      code: "RUNTIME_ROUTING_USAGE_UNKNOWN",
+      retryable: false,
+    });
+  });
+
+  it("keeps a pre-effect unaccepted complete attestation as a resolution mismatch", () => {
+    const fixture = plannedRoutingFixture();
+    const nextState = record(fixture, "RUNTIME_PROVIDER_TIMEOUT");
+    const attempt = primary(fixture);
+
+    expect(
+      fallback(fixture, {
+        state: nextState,
+        results: [
+          attemptResult(attempt, {
+            route_identity: routeIdentity(attempt, { route_id: "route-unaccepted" }),
+            effect_may_have_occurred: false,
           }),
         ],
       }),
