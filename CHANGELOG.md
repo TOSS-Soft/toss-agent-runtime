@@ -17,6 +17,7 @@ All notable changes to this project are documented here. The format follows Keep
 - Closed `operational-event.v1` envelopes, one synchronized writer queue, crash-safe rotation/recovery, bounded retention, deterministic filters and human/JSON/follow rendering, sticky degraded health, and structural metadata redaction (#30).
 - Closed `provider-event.v1` normalization, capability preflight, stable provider failures, and recorded-fixture OpenAI/Anthropic/Gemini streaming and non-streaming adapters over injected wire transports (#5).
 - Authenticated agentgateway transport with short-lived virtual credentials, fresh capability discovery, required correlation, route attestation, downgrade rejection, bounded JSON/SSE handling, and opt-in redacted structural observations (#3).
+- Governed model routing with four closed hash-bound documents, deterministic catalog/live capability intersection, atomic primary/fallback/independent-review planning, exact integer-microusd reservation and settlement, explicit witnessed circuit/fallback transitions, override narrowing, and exact route verification (#6). This pure boundary does not execute a provider or reviewer.
 - Native launchd/systemd definition validation and installed-package supervision smoke tests for duplicate instances, permissions, status, signals, cleanup, and process reaping.
 - Deterministic package-content tests and credential-free Node.js 22/24 CI baseline.
 - Commit-bound acceptance evidence for the Runtime Contract Protocol/package baseline (#2 and #4).
@@ -41,5 +42,5 @@ All notable changes to this project are documented here. The format follows Keep
 ### Known limitations
 
 - Automatic login-session activation and actual native crash-loop observation remain platform-integration pending; deterministic definitions, syntax lint, exact manager arrays, parsers, doctor checks, and direct supervisor smoke do not replace those gates.
-- Routing policy/fallback, skills, MCP, agent execution, review, and execution evidence capture remain unavailable until later v1 waves.
+- Skills and MCP execution remain pending their later v1 waves. Worker/fallback execution remains pending Issue #10, independent review execution proof remains pending Issue #11, final reconciliation/evidence remains pending Issue #12, full runtime hardening remains pending Issue #13, and protected live-provider routing smoke remains pending Issue #15.
 - The package is not publishable as `1.0.0` until protected live-provider and agentgateway release gates are implemented and pass.

@@ -1,0 +1,230 @@
+{
+  "capability_document_hash": "sha256:a4733bdd9394ff52f636fd003a08f048dec590e7d7191e175968e6a760f6cf7c",
+  "catalog_hash": "sha256:894dd8db8ee23d7e4081a9c523ad34beb181636e87a32a4dd19d3507ff9bb107",
+  "catalog_id": "catalog-circuit",
+  "catalog_revision": 1,
+  "decision_at": "2026-08-21T12:00:00.000Z",
+  "decision_id": "decision-0be5712217867461fdc2bc3a8d47ffb9ec977219fb7f6cc2052d7908e0766de9",
+  "document_hash": "sha256:5a97b639321f83914b6d38263a4f2bbfe320774d6bcb2a68848812f51f46f72b",
+  "document_type": "model-selection-plan",
+  "eliminations": [],
+  "gateway_profile": "gateway-primary",
+  "gateway_revision": 11,
+  "matched_rule_id": "risk-default",
+  "next_state_hash": "sha256:c61df6d27250eb23d467ece40b225b1069852cd01c2d826287fd21f291843c52",
+  "next_state_revision": 2,
+  "override": null,
+  "policy_hash": "sha256:68844bf69d113ba143fdbc486919a7afffc8fa66af8643d12c7769d40ccee321",
+  "policy_id": "routing-production",
+  "policy_revision": 3,
+  "prior_state_hash": "sha256:c5b100e4c82beedb933ae7e096f050dcce9c4a1e68608cc7cc15b00984bffe7d",
+  "prior_state_id": "routing-circuit-1",
+  "prior_state_revision": 1,
+  "protocol_version": "runtime-contract.v1",
+  "request_hash": "sha256:29bd3c6190625d77a9415298ae38675e7f21965ccdfb4299f497cd6f14dba521",
+  "request_id": "request-circuit-1",
+  "reservation": {
+    "allocations": [
+      {
+        "attempt_id": "attempt-0be5712217867461fdc2bc3a8d47ffb9-reviewer-00",
+        "cost_microusd": 88002,
+        "duration_ms": 120000,
+        "entry_id": "reviewer-independent",
+        "input_tokens": 20000,
+        "output_tokens": 4000,
+        "role": "reviewer",
+        "turns": 1
+      },
+      {
+        "attempt_id": "attempt-0be5712217867461fdc2bc3a8d47ffb9-worker-00",
+        "cost_microusd": 88002,
+        "duration_ms": 120000,
+        "entry_id": "worker-primary",
+        "input_tokens": 20000,
+        "output_tokens": 4000,
+        "role": "worker",
+        "turns": 1
+      },
+      {
+        "attempt_id": "attempt-0be5712217867461fdc2bc3a8d47ffb9-worker-01",
+        "cost_microusd": 88002,
+        "duration_ms": 120000,
+        "entry_id": "worker-fallback-a",
+        "input_tokens": 20000,
+        "output_tokens": 4000,
+        "role": "worker",
+        "turns": 1
+      },
+      {
+        "attempt_id": "attempt-0be5712217867461fdc2bc3a8d47ffb9-worker-02",
+        "cost_microusd": 88002,
+        "duration_ms": 120000,
+        "entry_id": "worker-fallback-b",
+        "input_tokens": 20000,
+        "output_tokens": 4000,
+        "role": "worker",
+        "turns": 1
+      }
+    ],
+    "created_at": "2026-08-21T12:00:00.000Z",
+    "decision_hash": "sha256:bdff56c37a7b681dd1ab1dea91449d0083a9955e3da92df36420f5d60a492598",
+    "decision_id": "decision-0be5712217867461fdc2bc3a8d47ffb9ec977219fb7f6cc2052d7908e0766de9",
+    "request_id": "request-circuit-1"
+  },
+  "reviewer_attempt": {
+    "accepted_routes": [
+      {
+        "model": "claude-sonnet-4-5",
+        "pricing": {
+          "cached_input_microusd_per_million": 200000,
+          "input_microusd_per_million": 2000000,
+          "output_microusd_per_million": 10000000,
+          "reasoning_output_microusd_per_million": 12000000
+        },
+        "provider": "anthropic",
+        "route_id": "route-reviewer-independent"
+      }
+    ],
+    "alias": "reviewer-independent",
+    "attempt_id": "attempt-0be5712217867461fdc2bc3a8d47ffb9-reviewer-00",
+    "capability_document_hash": "sha256:a4733bdd9394ff52f636fd003a08f048dec590e7d7191e175968e6a760f6cf7c",
+    "entry_id": "reviewer-independent",
+    "fallback_index": null,
+    "gateway_profile": "gateway-primary",
+    "gateway_revision": 11,
+    "latency_class": "standard",
+    "requirement": {
+      "alias": "reviewer-independent",
+      "json_schema": false,
+      "max_output_tokens": 4000,
+      "reasoning": true,
+      "schema_version": "gateway-route-requirement.v1",
+      "streaming": false,
+      "tools": true,
+      "vision": false
+    },
+    "requirement_hash": "sha256:3e7751ad78d3eefd4225f925710a1882a522fcd42b524fcfb8d7757a91e204df",
+    "reserved_cost_microusd": 88002,
+    "role": "reviewer"
+  },
+  "revision": 1,
+  "run_id": "run-circuit-1",
+  "schema_version": "model-selection-plan.v1",
+  "status": "planned",
+  "task_contract": {
+    "artifact_id": "task-circuit-1",
+    "document_type": "task-contract",
+    "hash": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+    "revision": 1
+  },
+  "worker_attempts": [
+    {
+      "accepted_routes": [
+        {
+          "model": "gpt-5",
+          "pricing": {
+            "cached_input_microusd_per_million": 200000,
+            "input_microusd_per_million": 2000000,
+            "output_microusd_per_million": 10000000,
+            "reasoning_output_microusd_per_million": 12000000
+          },
+          "provider": "openai",
+          "route_id": "route-worker-primary"
+        }
+      ],
+      "alias": "worker-primary",
+      "attempt_id": "attempt-0be5712217867461fdc2bc3a8d47ffb9-worker-00",
+      "capability_document_hash": "sha256:a4733bdd9394ff52f636fd003a08f048dec590e7d7191e175968e6a760f6cf7c",
+      "entry_id": "worker-primary",
+      "fallback_index": 0,
+      "gateway_profile": "gateway-primary",
+      "gateway_revision": 11,
+      "latency_class": "standard",
+      "requirement": {
+        "alias": "worker-primary",
+        "json_schema": false,
+        "max_output_tokens": 4000,
+        "reasoning": true,
+        "schema_version": "gateway-route-requirement.v1",
+        "streaming": false,
+        "tools": true,
+        "vision": false
+      },
+      "requirement_hash": "sha256:3c6e20923a5dd38c569995b069c2b824f2c4c3eea2b00559b2737681557130ea",
+      "reserved_cost_microusd": 88002,
+      "role": "worker"
+    },
+    {
+      "accepted_routes": [
+        {
+          "model": "gpt-5-mini",
+          "pricing": {
+            "cached_input_microusd_per_million": 200000,
+            "input_microusd_per_million": 2000000,
+            "output_microusd_per_million": 10000000,
+            "reasoning_output_microusd_per_million": 12000000
+          },
+          "provider": "openai",
+          "route_id": "route-worker-fallback-a"
+        }
+      ],
+      "alias": "worker-fallback-a",
+      "attempt_id": "attempt-0be5712217867461fdc2bc3a8d47ffb9-worker-01",
+      "capability_document_hash": "sha256:a4733bdd9394ff52f636fd003a08f048dec590e7d7191e175968e6a760f6cf7c",
+      "entry_id": "worker-fallback-a",
+      "fallback_index": 1,
+      "gateway_profile": "gateway-primary",
+      "gateway_revision": 11,
+      "latency_class": "standard",
+      "requirement": {
+        "alias": "worker-fallback-a",
+        "json_schema": false,
+        "max_output_tokens": 4000,
+        "reasoning": true,
+        "schema_version": "gateway-route-requirement.v1",
+        "streaming": false,
+        "tools": true,
+        "vision": false
+      },
+      "requirement_hash": "sha256:5a5f11543aa1b9ef6c2e6b85a5b652c6eb3ecf03e8a1a2dc37f3ee828c0cfbd1",
+      "reserved_cost_microusd": 88002,
+      "role": "worker"
+    },
+    {
+      "accepted_routes": [
+        {
+          "model": "gpt-5-nano",
+          "pricing": {
+            "cached_input_microusd_per_million": 200000,
+            "input_microusd_per_million": 2000000,
+            "output_microusd_per_million": 10000000,
+            "reasoning_output_microusd_per_million": 12000000
+          },
+          "provider": "openai",
+          "route_id": "route-worker-fallback-b"
+        }
+      ],
+      "alias": "worker-fallback-b",
+      "attempt_id": "attempt-0be5712217867461fdc2bc3a8d47ffb9-worker-02",
+      "capability_document_hash": "sha256:a4733bdd9394ff52f636fd003a08f048dec590e7d7191e175968e6a760f6cf7c",
+      "entry_id": "worker-fallback-b",
+      "fallback_index": 2,
+      "gateway_profile": "gateway-primary",
+      "gateway_revision": 11,
+      "latency_class": "standard",
+      "requirement": {
+        "alias": "worker-fallback-b",
+        "json_schema": false,
+        "max_output_tokens": 4000,
+        "reasoning": true,
+        "schema_version": "gateway-route-requirement.v1",
+        "streaming": false,
+        "tools": true,
+        "vision": false
+      },
+      "requirement_hash": "sha256:01ab8786cf638512ab7d9903f99e872a5a8996a41e55cc416f3fc57d55eeb27e",
+      "reserved_cost_microusd": 88002,
+      "role": "worker"
+    }
+  ]
+}

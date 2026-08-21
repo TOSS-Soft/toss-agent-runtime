@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+
 import { describe, expect, expectTypeOf, it } from "vitest";
 
 import * as packageApi from "../src/index.js";
@@ -138,5 +140,52 @@ describe("package metadata", () => {
     ]) {
       expect(packageApi).not.toHaveProperty(internalName);
     }
+  });
+
+  it("publishes the exact governed routing schemas, examples, and built modules", async () => {
+    const packageFiles = JSON.parse(
+      await readFile("scripts/package-files.json", "utf8"),
+    ) as readonly string[];
+    const routingSchemas = [
+      "model-catalog.v1",
+      "model-selection-plan.v1",
+      "routing-policy.v1",
+      "routing-state.v1",
+    ];
+    for (const schema of routingSchemas) {
+      expect(packageFiles).toContain(`contracts/runtime/${schema}.schema.json`);
+      expect(packageFiles).toContain(`dist/contracts/runtime/${schema}.schema.json`);
+    }
+    for (const example of [
+      "model-catalog",
+      "model-selection-plan",
+      "routing-policy",
+      "routing-state",
+    ]) {
+      expect(packageFiles).toContain(`examples/runtime-contract-v1/${example}.json`);
+    }
+    for (const module of [
+      "circuit",
+      "contracts",
+      "cost",
+      "errors",
+      "index",
+      "resolution",
+      "selection",
+      "types",
+    ]) {
+      expect(packageFiles).toContain(`dist/src/routing/${module}.js`);
+      expect(packageFiles).toContain(`dist/src/routing/${module}.d.ts`);
+    }
+
+    expect(packageFiles).toEqual([...packageFiles].sort());
+    expect(packageFiles).not.toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/(?:^|\/)\.superpowers(?:\/|$)/u),
+        expect.stringMatching(/(?:^|\/)test\/helpers(?:\/|$)/u),
+        expect.stringMatching(/release-evidence/iu),
+        expect.stringMatching(/(?:^|\/)(?:\.env|id_rsa|id_ed25519)(?:\.|$)/iu),
+      ]),
+    );
   });
 });
