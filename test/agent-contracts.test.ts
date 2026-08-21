@@ -10,10 +10,16 @@ import {
   parseCompiledContext,
   parsePromptTemplate,
 } from "../src/agents/contracts.js";
+import { sha256 } from "../src/protocol/json.js";
+import type { ArtifactReference } from "../src/protocol/types.js";
 import type {
   AgentDefinitionV1,
   AgentRegistryEntryV1,
   CompiledContextV1,
+  HashableAgentDefinitionV1,
+  HashableAgentRegistryEntryV1,
+  HashableCompiledContextV1,
+  HashablePromptTemplateV1,
   PromptTemplateV1,
 } from "../src/agents/types.js";
 
@@ -21,6 +27,7 @@ const ZERO_HASH = `sha256:${"0".repeat(64)}` as const;
 const TASK_HASH = `sha256:${"1".repeat(64)}` as const;
 const MCP_HASH = `sha256:${"2".repeat(64)}` as const;
 const OUTPUT_HASH = `sha256:${"3".repeat(64)}` as const;
+const INPUT_HASH = sha256("untrusted source artifact");
 const TEMPLATE_ID = "template-implementation";
 const AGENT_ID = "agent-implementation";
 const TASK_ID = "task-contract-implementation";
@@ -140,29 +147,119 @@ function fixtureContext(
     },
     runtime_policy: { revision: 1, hash: OUTPUT_HASH },
     segments: [
-      {
-        segment_id: "runtime-safety",
-        kind: "runtime-safety",
-        trust: "trusted-runtime",
-        source: null,
-        original_hash: TASK_HASH,
-        included_hash: TASK_HASH,
-        original_bytes: 1,
-        included_bytes: 1,
-        tokens: 1,
-        content: "x",
-      },
+      segment(
+        "runtime-safety",
+        "trusted-runtime",
+        null,
+        sha256("runtime safety"),
+        "runtime safety",
+      ),
+      segment(
+        "task-contract",
+        "trusted-control",
+        ref("task-contract", TASK_ID, 3, TASK_HASH),
+        TASK_HASH,
+        "task contract",
+      ),
+      segment(
+        "prompt-template",
+        "trusted-control",
+        ref("prompt-template", TEMPLATE_ID, 1, promptHash),
+        promptHash,
+        "prompt template",
+      ),
+      segment(
+        "output-schema",
+        "trusted-control",
+        ref("output-schema", OUTPUT_ID, 4, OUTPUT_HASH),
+        OUTPUT_HASH,
+        "output schema",
+      ),
+      segment(
+        "input-artifact",
+        "untrusted-content",
+        ref("source-artifact", "source-implementation", 1, INPUT_HASH),
+        INPUT_HASH,
+        "untrusted source artifact",
+      ),
     ],
-    accounting: {
-      input_tokens: 1,
-      input_bytes: 1,
-      untrusted_bytes: 0,
-      remaining_input_tokens: 7999,
-    },
+    accounting: { input_tokens: 0, input_bytes: 0, untrusted_bytes: 0, remaining_input_tokens: 0 },
     truncations: [],
     document_hash: ZERO_HASH,
   };
-  return { ...context, document_hash: hashCompiledContext(context) };
+  return resignedContext(context);
+}
+
+function segment(
+  kind: string,
+  trust: string,
+  source: ReturnType<typeof ref> | null,
+  original_hash: `sha256:${string}`,
+  content: string,
+): CompiledContextV1["segments"][number] {
+  const included_bytes = Buffer.byteLength(content, "utf8");
+  return {
+    segment_id: `${kind}-segment`,
+    kind,
+    trust,
+    source,
+    original_hash,
+    included_hash: sha256(content),
+    original_bytes: included_bytes,
+    included_bytes,
+    tokens: included_bytes,
+    content,
+  } as unknown as CompiledContextV1["segments"][number];
+}
+
+function resignedDefinition(value: AgentDefinitionV1): AgentDefinitionV1 {
+  return { ...value, document_hash: hashAgentDefinition(value) };
+}
+
+function resignedRegistry(value: AgentRegistryEntryV1): AgentRegistryEntryV1 {
+  return { ...value, entry_hash: hashAgentRegistryEntry(value) };
+}
+
+interface ContextSegmentForHash {
+  readonly segment_id: string;
+  readonly kind: string;
+  readonly trust: string;
+  readonly source: ArtifactReference | null;
+  readonly original_hash: `sha256:${string}`;
+  readonly included_hash: `sha256:${string}`;
+  readonly original_bytes: number;
+  readonly included_bytes: number;
+  readonly tokens: number;
+  readonly content: string;
+}
+
+type ContextForHash = Omit<CompiledContextV1, "authority" | "segments"> & {
+  readonly authority: Omit<CompiledContextV1["authority"], "mcp_profile"> & {
+    readonly mcp_profile: ArtifactReference;
+  };
+  readonly segments: readonly ContextSegmentForHash[];
+};
+
+function resignedContext(value: ContextForHash): CompiledContextV1 {
+  const input_tokens = value.segments.reduce((total, item) => total + item.tokens, 0);
+  const input_bytes = value.segments.reduce((total, item) => total + item.included_bytes, 0);
+  const untrusted_bytes = value.segments.reduce(
+    (total, item) => total + (item.trust === "untrusted-content" ? item.included_bytes : 0),
+    0,
+  );
+  const unsigned = {
+    ...value,
+    accounting: {
+      input_tokens,
+      input_bytes,
+      untrusted_bytes,
+      remaining_input_tokens: value.authority.budget.max_input_tokens - input_tokens,
+    },
+  };
+  return {
+    ...unsigned,
+    document_hash: hashCompiledContext(unsigned as unknown as HashableCompiledContextV1),
+  } as CompiledContextV1;
 }
 
 describe("agent contract documents", () => {
@@ -181,6 +278,124 @@ describe("agent contract documents", () => {
       const parsed = parse(JSON.stringify(value));
       expect(parsed.ok).toBe(true);
       if (parsed.ok) expect(Object.isFrozen(parsed.value)).toBe(true);
+    }
+    const parsedPrompt = parsePromptTemplate(JSON.stringify(prompt));
+    const parsedDefinition = parseAgentDefinition(JSON.stringify(definition));
+    const parsedRegistry = parseAgentRegistryEntry(JSON.stringify(registry));
+    const parsedContext = parseCompiledContext(JSON.stringify(context));
+    if (parsedPrompt.ok) {
+      expect(Object.isFrozen(parsedPrompt.value.instruction_blocks)).toBe(true);
+      expect(Object.isFrozen(parsedPrompt.value.instruction_blocks[0]!)).toBe(true);
+    }
+    if (parsedDefinition.ok) expect(Object.isFrozen(parsedDefinition.value.model)).toBe(true);
+    if (parsedRegistry.ok) expect(Object.isFrozen(parsedRegistry.value.definition)).toBe(true);
+    if (parsedContext.ok) expect(Object.isFrozen(parsedContext.value.segments[0]!)).toBe(true);
+  });
+
+  it("rejects duplicate keys, unknown fields, and bounds for every document", () => {
+    const prompt = fixturePrompt();
+    const definition = fixtureDefinition(prompt.document_hash);
+    const registry = fixtureRegistry(prompt.document_hash, definition.document_hash);
+    const context = fixtureContext(prompt.document_hash, definition.document_hash);
+    const matrix = [
+      [parsePromptTemplate, prompt],
+      [parseAgentDefinition, definition],
+      [parseAgentRegistryEntry, registry],
+      [parseCompiledContext, context],
+    ] as const;
+    for (const [parse, value] of matrix) {
+      const duplicate = JSON.stringify(value).replace(
+        '"protocol_version"',
+        '"protocol_version":"runtime-contract.v1","protocol_version"',
+      );
+      expect(parse(duplicate).ok).toBe(false);
+      expect(parse(JSON.stringify({ ...value, unexpected: true })).ok).toBe(false);
+    }
+    expect(
+      parsePromptTemplate(
+        JSON.stringify({
+          ...prompt,
+          instruction_blocks: Array.from({ length: 1025 }, () => prompt.instruction_blocks[0]),
+        }),
+      ).ok,
+    ).toBe(false);
+    expect(
+      parseAgentDefinition(
+        JSON.stringify({
+          ...definition,
+          task_contracts: Array.from({ length: 257 }, () => definition.task_contracts[0]),
+        }),
+      ).ok,
+    ).toBe(false);
+    expect(parseAgentRegistryEntry(JSON.stringify({ ...registry, registry_revision: 0 })).ok).toBe(
+      false,
+    );
+    expect(
+      parseCompiledContext(
+        JSON.stringify({
+          ...context,
+          segments: Array.from({ length: 4097 }, () => context.segments[0]),
+        }),
+      ).ok,
+    ).toBe(false);
+  });
+
+  it("keeps all document hashes invariant across object key permutations", () => {
+    const prompt = fixturePrompt();
+    const definition = fixtureDefinition(prompt.document_hash);
+    const registry = fixtureRegistry(prompt.document_hash, definition.document_hash);
+    const context = fixtureContext(prompt.document_hash, definition.document_hash);
+    const permute = (value: unknown): unknown => {
+      if (Array.isArray(value)) return value.map(permute);
+      if (typeof value !== "object" || value === null) return value;
+      return Object.fromEntries(
+        Object.entries(value)
+          .reverse()
+          .map(([key, item]) => [key, permute(item)]),
+      );
+    };
+
+    expect(hashPromptTemplate(permute(prompt) as HashablePromptTemplateV1)).toBe(
+      prompt.document_hash,
+    );
+    expect(hashAgentDefinition(permute(definition) as HashableAgentDefinitionV1)).toBe(
+      definition.document_hash,
+    );
+    expect(hashAgentRegistryEntry(permute(registry) as HashableAgentRegistryEntryV1)).toBe(
+      registry.entry_hash,
+    );
+    expect(hashCompiledContext(permute(context) as HashableCompiledContextV1)).toBe(
+      context.document_hash,
+    );
+  });
+
+  it("rejects bad document and entry hashes plus parser byte/member overflows", () => {
+    const prompt = fixturePrompt();
+    const definition = fixtureDefinition(prompt.document_hash);
+    const registry = fixtureRegistry(prompt.document_hash, definition.document_hash);
+    const context = fixtureContext(prompt.document_hash, definition.document_hash);
+    expect(parsePromptTemplate(JSON.stringify({ ...prompt, document_hash: ZERO_HASH })).ok).toBe(
+      false,
+    );
+    expect(
+      parseAgentDefinition(JSON.stringify({ ...definition, document_hash: ZERO_HASH })).ok,
+    ).toBe(false);
+    expect(parseAgentRegistryEntry(JSON.stringify({ ...registry, entry_hash: ZERO_HASH })).ok).toBe(
+      false,
+    );
+    expect(parseCompiledContext(JSON.stringify({ ...context, document_hash: ZERO_HASH })).ok).toBe(
+      false,
+    );
+    const overBytes = new Uint8Array(2 * 1024 * 1024 + 1);
+    const overMembers = JSON.stringify({ values: Array.from({ length: 100_001 }, () => 0) });
+    for (const parse of [
+      parsePromptTemplate,
+      parseAgentDefinition,
+      parseAgentRegistryEntry,
+      parseCompiledContext,
+    ]) {
+      expect(parse(overBytes).ok).toBe(false);
+      expect(parse(overMembers).ok).toBe(false);
     }
   });
 
@@ -207,18 +422,222 @@ describe("agent contract documents", () => {
     expect(
       parseAgentDefinition(
         JSON.stringify({
-          ...definition,
-          model: { ...definition.model, allowed_capabilities: ["text", "json-schema"] },
+          ...resignedDefinition({
+            ...definition,
+            model: { ...definition.model, allowed_capabilities: ["text", "json-schema"] },
+          }),
         }),
       ).ok,
     ).toBe(false);
     expect(
       parseAgentDefinition(
         JSON.stringify({
-          ...definition,
-          task_contracts: [...definition.task_contracts, definition.task_contracts[0]],
+          ...resignedDefinition({
+            ...definition,
+            task_contracts: [...definition.task_contracts, definition.task_contracts[0]!],
+          }),
         }),
       ).ok,
     ).toBe(false);
+  });
+
+  it("rejects a hash-valid context without all fixed trusted segments", () => {
+    const prompt = fixturePrompt();
+    const definition = fixtureDefinition(prompt.document_hash);
+    const context = fixtureContext(prompt.document_hash, definition.document_hash);
+    const missing = resignedContext({
+      ...context,
+      segments: [context.segments[0]!],
+    });
+
+    expect(parseCompiledContext(JSON.stringify(missing)).ok).toBe(false);
+  });
+
+  it("rejects a hash-valid context that relabels input content as trusted", () => {
+    const prompt = fixturePrompt();
+    const definition = fixtureDefinition(prompt.document_hash);
+    const context = fixtureContext(prompt.document_hash, definition.document_hash);
+    const relabeled = resignedContext({
+      ...context,
+      segments: context.segments.map((entry) =>
+        entry.kind === "input-artifact" ? { ...entry, trust: "trusted-control" } : entry,
+      ),
+    });
+
+    expect(parseCompiledContext(JSON.stringify(relabeled)).ok).toBe(false);
+  });
+
+  it("rejects hash-valid contexts whose trusted segment sources differ from top-level bindings", () => {
+    const prompt = fixturePrompt();
+    const definition = fixtureDefinition(prompt.document_hash);
+    const context = fixtureContext(prompt.document_hash, definition.document_hash);
+    for (const kind of ["task-contract", "prompt-template", "output-schema"] as const) {
+      const mismatched = resignedContext({
+        ...context,
+        segments: context.segments.map((entry) =>
+          entry.kind === kind
+            ? {
+                ...entry,
+                source: ref(entry.source.document_type, `other-${kind}`, 1, entry.original_hash),
+              }
+            : entry,
+        ),
+      });
+      expect(parseCompiledContext(JSON.stringify(mismatched)).ok).toBe(false);
+    }
+  });
+
+  it("rejects hash-valid contexts with invalid runtime source, MCP profile, or segment precedence", () => {
+    const prompt = fixturePrompt();
+    const definition = fixtureDefinition(prompt.document_hash);
+    const context = fixtureContext(prompt.document_hash, definition.document_hash);
+    const runtimeSource = resignedContext({
+      ...context,
+      segments: context.segments.map((entry) =>
+        entry.kind === "runtime-safety"
+          ? { ...entry, source: ref("source-artifact", "unsafe-runtime", 1, entry.original_hash) }
+          : entry,
+      ),
+    });
+    const wrongMcp = resignedContext({
+      ...context,
+      authority: {
+        ...context.authority,
+        mcp_profile: ref("source-artifact", "not-an-mcp-profile", 1, MCP_HASH),
+      },
+    });
+    const reordered = resignedContext({
+      ...context,
+      segments: [context.segments[1]!, context.segments[0]!, ...context.segments.slice(2)],
+    });
+
+    expect(parseCompiledContext(JSON.stringify(runtimeSource)).ok).toBe(false);
+    expect(parseCompiledContext(JSON.stringify(wrongMcp)).ok).toBe(false);
+    expect(parseCompiledContext(JSON.stringify(reordered)).ok).toBe(false);
+  });
+
+  it("rejects a hash-valid context with unbound source or included content hashes", () => {
+    const prompt = fixturePrompt();
+    const definition = fixtureDefinition(prompt.document_hash);
+    const context = fixtureContext(prompt.document_hash, definition.document_hash);
+    const sourceMismatch = resignedContext({
+      ...context,
+      segments: context.segments.map((entry) =>
+        entry.kind === "input-artifact" ? { ...entry, original_hash: ZERO_HASH } : entry,
+      ),
+    });
+    const contentMismatch = resignedContext({
+      ...context,
+      segments: context.segments.map((entry) =>
+        entry.kind === "input-artifact" ? { ...entry, included_hash: ZERO_HASH } : entry,
+      ),
+    });
+
+    expect(parseCompiledContext(JSON.stringify(sourceMismatch)).ok).toBe(false);
+    expect(parseCompiledContext(JSON.stringify(contentMismatch)).ok).toBe(false);
+  });
+
+  it("rejects a hash-valid shortened input without its exact truncation record", () => {
+    const prompt = fixturePrompt();
+    const definition = fixtureDefinition(prompt.document_hash);
+    const context = fixtureContext(prompt.document_hash, definition.document_hash);
+    const shortened = resignedContext({
+      ...context,
+      segments: context.segments.map((entry) =>
+        entry.kind === "input-artifact"
+          ? {
+              ...entry,
+              content: "untrusted",
+              included_bytes: 9,
+              tokens: 9,
+              original_bytes: 24,
+              included_hash: sha256("untrusted"),
+            }
+          : entry,
+      ),
+    });
+
+    expect(parseCompiledContext(JSON.stringify(shortened)).ok).toBe(false);
+  });
+
+  it("accepts one exact truncation record and rejects duplicate or unrelated records", () => {
+    const prompt = fixturePrompt();
+    const definition = fixtureDefinition(prompt.document_hash);
+    const context = fixtureContext(prompt.document_hash, definition.document_hash);
+    const input = context.segments.find((entry) => entry.kind === "input-artifact");
+    if (input === undefined || input.source === null) throw new Error("input fixture is invalid");
+    const shortened = resignedContext({
+      ...context,
+      segments: context.segments.map((entry) =>
+        entry.kind === "input-artifact"
+          ? {
+              ...entry,
+              content: "untrusted",
+              included_bytes: 9,
+              tokens: 9,
+              original_bytes: 24,
+              included_hash: sha256("untrusted"),
+            }
+          : entry,
+      ),
+      truncations: [
+        {
+          source: input.source,
+          reason: "input-budget",
+          original_bytes: 24,
+          included_bytes: 9,
+        },
+      ],
+    });
+    const duplicate = resignedContext({
+      ...shortened,
+      truncations: [...shortened.truncations, shortened.truncations[0]!],
+    });
+    const unrelated = resignedContext({
+      ...shortened,
+      truncations: [
+        {
+          source: ref("source-artifact", "unrelated-source", 1, INPUT_HASH),
+          reason: "input-budget",
+          original_bytes: 24,
+          included_bytes: 9,
+        },
+      ],
+    });
+
+    expect(parseCompiledContext(JSON.stringify(shortened)).ok).toBe(true);
+    expect(parseCompiledContext(JSON.stringify(duplicate)).ok).toBe(false);
+    expect(parseCompiledContext(JSON.stringify(unrelated)).ok).toBe(false);
+  });
+
+  it("rejects hash-valid unsorted authority sets and noncanonical operation UUID aliases", () => {
+    const prompt = fixturePrompt();
+    const definition = fixtureDefinition(prompt.document_hash);
+    const context = fixtureContext(prompt.document_hash, definition.document_hash);
+    const registry = fixtureRegistry(prompt.document_hash, definition.document_hash);
+    const unsorted = resignedContext({
+      ...context,
+      authority: { ...context.authority, model_capabilities: ["text", "json-schema"] },
+    });
+    const duplicate = resignedContext({
+      ...context,
+      authority: {
+        ...context.authority,
+        superpowers: ["test-driven-development", "test-driven-development"],
+      },
+    });
+    const uppercase = resignedRegistry({
+      ...registry,
+      operation_id: registry.operation_id.toUpperCase(),
+    });
+    const urn = resignedRegistry({
+      ...registry,
+      operation_id: `urn:uuid:${registry.operation_id}`,
+    });
+
+    expect(parseCompiledContext(JSON.stringify(unsorted)).ok).toBe(false);
+    expect(parseCompiledContext(JSON.stringify(duplicate)).ok).toBe(false);
+    expect(parseAgentRegistryEntry(JSON.stringify(uppercase)).ok).toBe(false);
+    expect(parseAgentRegistryEntry(JSON.stringify(urn)).ok).toBe(false);
   });
 });

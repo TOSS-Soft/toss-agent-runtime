@@ -26,7 +26,11 @@
     "previous_entry_hash": {
       "oneOf": [{ "type": "null" }, { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }]
     },
-    "operation_id": { "type": "string", "format": "uuid" },
+    "operation_id": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
     "operation_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
     "definition": { "$ref": "#/$defs/definition_reference" },
     "prompt_template": { "$ref": "#/$defs/prompt_template_reference" },

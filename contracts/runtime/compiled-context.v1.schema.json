@@ -33,7 +33,7 @@
     "runtime_policy": { "$ref": "#/$defs/runtime_policy" },
     "segments": {
       "type": "array",
-      "minItems": 1,
+      "minItems": 4,
       "maxItems": 4096,
       "items": { "$ref": "#/$defs/segment" }
     },
@@ -68,6 +68,12 @@
         { "type": "object", "properties": { "document_type": { "const": "output-schema" } } }
       ]
     },
+    "mcp_profile_reference": {
+      "allOf": [
+        { "$ref": "runtime-common.v1.schema.json#/$defs/artifact_reference" },
+        { "type": "object", "properties": { "document_type": { "const": "mcp-profile" } } }
+      ]
+    },
     "authority": {
       "type": "object",
       "additionalProperties": false,
@@ -85,7 +91,7 @@
         },
         "model_capabilities": { "$ref": "#/$defs/model_capabilities" },
         "superpowers": { "$ref": "#/$defs/names" },
-        "mcp_profile": { "$ref": "runtime-common.v1.schema.json#/$defs/artifact_reference" },
+        "mcp_profile": { "$ref": "#/$defs/mcp_profile_reference" },
         "budget": { "$ref": "runtime-common.v1.schema.json#/$defs/budget" }
       }
     },
@@ -121,7 +127,7 @@
         "hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
       }
     },
-    "segment": {
+    "segment_common": {
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -138,16 +144,8 @@
       ],
       "properties": {
         "segment_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
-        "kind": {
-          "enum": [
-            "runtime-safety",
-            "task-contract",
-            "prompt-template",
-            "output-schema",
-            "input-artifact"
-          ]
-        },
-        "trust": { "enum": ["trusted-runtime", "trusted-control", "untrusted-content"] },
+        "kind": { "type": "string" },
+        "trust": { "type": "string" },
         "source": {
           "oneOf": [
             { "type": "null" },
@@ -161,6 +159,80 @@
         "tokens": { "$ref": "#/$defs/nonnegative_safe_integer" },
         "content": { "type": "string", "maxLength": 1048576 }
       }
+    },
+    "segment": {
+      "oneOf": [
+        { "$ref": "#/$defs/runtime_safety_segment" },
+        { "$ref": "#/$defs/task_contract_segment" },
+        { "$ref": "#/$defs/prompt_template_segment" },
+        { "$ref": "#/$defs/output_schema_segment" },
+        { "$ref": "#/$defs/input_artifact_segment" }
+      ]
+    },
+    "runtime_safety_segment": {
+      "allOf": [
+        { "$ref": "#/$defs/segment_common" },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "runtime-safety" },
+            "trust": { "const": "trusted-runtime" },
+            "source": { "type": "null" }
+          }
+        }
+      ]
+    },
+    "task_contract_segment": {
+      "allOf": [
+        { "$ref": "#/$defs/segment_common" },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "task-contract" },
+            "trust": { "const": "trusted-control" },
+            "source": { "$ref": "#/$defs/task_contract_reference" }
+          }
+        }
+      ]
+    },
+    "prompt_template_segment": {
+      "allOf": [
+        { "$ref": "#/$defs/segment_common" },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "prompt-template" },
+            "trust": { "const": "trusted-control" },
+            "source": { "$ref": "#/$defs/prompt_template_reference" }
+          }
+        }
+      ]
+    },
+    "output_schema_segment": {
+      "allOf": [
+        { "$ref": "#/$defs/segment_common" },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "output-schema" },
+            "trust": { "const": "trusted-control" },
+            "source": { "$ref": "#/$defs/output_schema_reference" }
+          }
+        }
+      ]
+    },
+    "input_artifact_segment": {
+      "allOf": [
+        { "$ref": "#/$defs/segment_common" },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "input-artifact" },
+            "trust": { "const": "untrusted-content" },
+            "source": { "$ref": "runtime-common.v1.schema.json#/$defs/artifact_reference" }
+          }
+        }
+      ]
     },
     "accounting": {
       "type": "object",

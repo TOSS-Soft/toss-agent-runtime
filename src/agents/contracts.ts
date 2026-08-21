@@ -18,7 +18,6 @@ import type { ValidationFailure, ValidationIssue, ValidationResult } from "../pr
 import type {
   AgentDefinitionV1,
   AgentRegistryEntryV1,
-  CompiledContextSegmentKind,
   CompiledContextV1,
   HashableAgentDefinitionV1,
   HashableAgentRegistryEntryV1,
@@ -244,6 +243,9 @@ function validateRegistrySemantics(value: AgentRegistryEntryV1): readonly Valida
       ),
     );
   }
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(value.operation_id)) {
+    issues.push(issue("/operation_id", "canonicalUuid", "operation ID must be a canonical UUID"));
+  }
   try {
     const expected = hashAgentRegistryEntry(value);
     if (value.entry_hash !== expected) {
@@ -257,13 +259,22 @@ function validateRegistrySemantics(value: AgentRegistryEntryV1): readonly Valida
   return issues;
 }
 
-const SEGMENT_ORDER: Readonly<Record<CompiledContextSegmentKind, number>> = {
-  "runtime-safety": 0,
-  "task-contract": 1,
-  "prompt-template": 2,
-  "output-schema": 3,
-  "input-artifact": 4,
-};
+function exactReference(
+  left: {
+    readonly document_type: string;
+    readonly artifact_id: string;
+    readonly revision: number;
+    readonly hash: string;
+  },
+  right: {
+    readonly document_type: string;
+    readonly artifact_id: string;
+    readonly revision: number;
+    readonly hash: string;
+  },
+): boolean {
+  return artifactKey(left) === artifactKey(right);
+}
 
 function validateContextSemantics(value: CompiledContextV1): readonly ValidationIssue[] {
   const issues: ValidationIssue[] = [];
@@ -271,18 +282,56 @@ function validateContextSemantics(value: CompiledContextV1): readonly Validation
   if (new Set(segmentIds).size !== segmentIds.length) {
     issues.push(issue("/segments", "uniqueSegment", "segment IDs must be unique"));
   }
-  if (
-    !value.segments.every(
-      (segment, index) =>
-        index === 0 ||
-        SEGMENT_ORDER[value.segments[index - 1]!.kind] <= SEGMENT_ORDER[segment.kind],
-    )
-  ) {
-    issues.push(issue("/segments", "order", "segments must follow fixed precedence"));
+  if (!orderedUnique(value.authority.model_capabilities)) {
+    issues.push(
+      issue(
+        "/authority/model_capabilities",
+        "order",
+        "model capabilities must be ASCII-sorted and unique",
+      ),
+    );
   }
+  if (!orderedUnique(value.authority.superpowers)) {
+    issues.push(
+      issue("/authority/superpowers", "order", "Superpowers must be ASCII-sorted and unique"),
+    );
+  }
+  if (value.authority.mcp_profile.document_type !== "mcp-profile") {
+    issues.push(
+      issue("/authority/mcp_profile/document_type", "const", "MCP profile must be exact"),
+    );
+  }
+
+  const runtime = value.segments[0];
+  const task = value.segments[1];
+  if (runtime?.kind !== "runtime-safety" || task?.kind !== "task-contract") {
+    issues.push(
+      issue("/segments", "precedence", "context must begin with runtime safety and task contract"),
+    );
+  }
+  let promptEnd = 2;
+  while (value.segments[promptEnd]?.kind === "prompt-template") promptEnd += 1;
+  if (promptEnd === 2 || value.segments[promptEnd]?.kind !== "output-schema") {
+    issues.push(
+      issue(
+        "/segments",
+        "precedence",
+        "context must contain prompt template blocks followed by output schema",
+      ),
+    );
+  }
+  if (value.segments.slice(promptEnd + 1).some((segment) => segment.kind !== "input-artifact")) {
+    issues.push(issue("/segments", "precedence", "only input artifacts may follow output schema"));
+  }
+
   let inputTokens = 0;
   let inputBytes = 0;
   let untrustedBytes = 0;
+  const shortenedInputs = new Map<
+    string,
+    { readonly original_bytes: number; readonly included_bytes: number }
+  >();
+  const inputSources = new Set<string>();
   for (const [index, segment] of value.segments.entries()) {
     const bytes = Buffer.byteLength(segment.content, "utf8");
     if (segment.included_bytes !== bytes || segment.original_bytes < segment.included_bytes) {
@@ -293,14 +342,91 @@ function validateContextSemantics(value: CompiledContextV1): readonly Validation
         issue(`/segments/${index}/tokens`, "tokenCount", "tokens must equal included bytes"),
       );
     }
-    if ((segment.kind === "runtime-safety") !== (segment.source === null)) {
+    const expectedIncludedHash = sha256(segment.content, AGENT_DOCUMENT_LIMITS);
+    if (segment.included_hash !== expectedIncludedHash) {
       issues.push(
-        issue(`/segments/${index}/source`, "source", "runtime safety source must be null"),
+        issue(
+          `/segments/${index}/included_hash`,
+          "contentHash",
+          "included hash must match content",
+        ),
       );
+    }
+    if (segment.source === null) {
+      if (segment.original_hash !== segment.included_hash) {
+        issues.push(
+          issue(
+            `/segments/${index}/original_hash`,
+            "contentHash",
+            "runtime hash must match content",
+          ),
+        );
+      }
+    } else if (segment.original_hash !== segment.source.hash) {
+      issues.push(
+        issue(`/segments/${index}/original_hash`, "sourceHash", "original hash must match source"),
+      );
+    }
+    if (segment.kind === "task-contract" && !exactReference(segment.source, value.task_contract)) {
+      issues.push(
+        issue(`/segments/${index}/source`, "reference", "task contract source must match"),
+      );
+    }
+    if (
+      segment.kind === "prompt-template" &&
+      !exactReference(segment.source, value.prompt_template)
+    ) {
+      issues.push(
+        issue(`/segments/${index}/source`, "reference", "prompt template source must match"),
+      );
+    }
+    if (segment.kind === "output-schema" && !exactReference(segment.source, value.output_schema)) {
+      issues.push(
+        issue(`/segments/${index}/source`, "reference", "output schema source must match"),
+      );
+    }
+    if (segment.kind !== "input-artifact" && segment.original_bytes !== segment.included_bytes) {
+      issues.push(
+        issue(`/segments/${index}`, "truncation", "trusted segments must not be truncated"),
+      );
+    }
+    if (segment.kind === "input-artifact") {
+      const sourceKey = artifactKey(segment.source);
+      if (inputSources.has(sourceKey)) {
+        issues.push(
+          issue(`/segments/${index}/source`, "uniqueSource", "input sources must be unique"),
+        );
+      }
+      inputSources.add(sourceKey);
+      if (segment.original_bytes > segment.included_bytes) {
+        shortenedInputs.set(sourceKey, {
+          original_bytes: segment.original_bytes,
+          included_bytes: segment.included_bytes,
+        });
+      }
     }
     inputTokens += segment.tokens;
     inputBytes += segment.included_bytes;
     if (segment.trust === "untrusted-content") untrustedBytes += segment.included_bytes;
+  }
+  const truncationSources = new Set<string>();
+  for (const [index, truncation] of value.truncations.entries()) {
+    const sourceKey = artifactKey(truncation.source);
+    const shortened = shortenedInputs.get(sourceKey);
+    if (
+      shortened === undefined ||
+      truncationSources.has(sourceKey) ||
+      truncation.original_bytes !== shortened.original_bytes ||
+      truncation.included_bytes !== shortened.included_bytes
+    ) {
+      issues.push(
+        issue(`/truncations/${index}`, "truncation", "truncation must bind one shortened input"),
+      );
+    }
+    truncationSources.add(sourceKey);
+  }
+  if (truncationSources.size !== shortenedInputs.size) {
+    issues.push(issue("/truncations", "truncation", "every shortened input requires one record"));
   }
   if (
     value.accounting.input_tokens !== inputTokens ||

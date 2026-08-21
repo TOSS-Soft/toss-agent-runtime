@@ -14,6 +14,14 @@ export type AgentCapability =
   | "tools"
   | "vision";
 
+export type AgentArtifactReference<TDocumentType extends string> = ArtifactReference &
+  Readonly<{ document_type: TDocumentType }>;
+export type PromptTemplateReference = AgentArtifactReference<"prompt-template">;
+export type TaskContractReference = AgentArtifactReference<"task-contract">;
+export type McpProfileReference = AgentArtifactReference<"mcp-profile">;
+export type OutputSchemaReference = AgentArtifactReference<"output-schema">;
+export type AgentDefinitionReference = AgentArtifactReference<"agent-definition">;
+
 export interface PromptInstructionBlockV1 {
   readonly block_id: string;
   readonly content: string;
@@ -63,14 +71,14 @@ export interface HashableAgentDefinitionV1 extends RuntimeDocument {
   readonly revision: number;
   readonly name: string;
   readonly role: AgentRole;
-  readonly prompt_template: ArtifactReference & Readonly<{ document_type: "prompt-template" }>;
-  readonly task_contracts: readonly ArtifactReference[];
+  readonly prompt_template: PromptTemplateReference;
+  readonly task_contracts: readonly TaskContractReference[];
   readonly model: AgentModelPolicyV1;
   readonly superpowers: AgentSuperpowersPolicyV1;
-  readonly mcp_profiles: readonly ArtifactReference[];
+  readonly mcp_profiles: readonly McpProfileReference[];
   readonly budget_class: AgentBudgetClass;
   readonly budget_ceiling: RuntimeBudget;
-  readonly output_schemas: readonly ArtifactReference[];
+  readonly output_schemas: readonly OutputSchemaReference[];
   readonly context_policy: AgentContextPolicyV1;
 }
 
@@ -86,8 +94,8 @@ export interface HashableAgentRegistryEntryV1 extends RuntimeDocument {
   readonly previous_entry_hash: `sha256:${string}` | null;
   readonly operation_id: string;
   readonly operation_hash: `sha256:${string}`;
-  readonly definition: ArtifactReference & Readonly<{ document_type: "agent-definition" }>;
-  readonly prompt_template: ArtifactReference & Readonly<{ document_type: "prompt-template" }>;
+  readonly definition: AgentDefinitionReference;
+  readonly prompt_template: PromptTemplateReference;
   readonly state: "ACTIVE" | "RETIRED";
   readonly occurred_at: string;
 }
@@ -100,11 +108,8 @@ export type CompiledContextTrust = "trusted-runtime" | "trusted-control" | "untr
 export type CompiledContextSegmentKind =
   "runtime-safety" | "task-contract" | "prompt-template" | "output-schema" | "input-artifact";
 
-export interface CompiledContextSegmentV1 {
+export interface CompiledContextSegmentBaseV1 {
   readonly segment_id: string;
-  readonly kind: CompiledContextSegmentKind;
-  readonly trust: CompiledContextTrust;
-  readonly source: ArtifactReference | null;
   readonly original_hash: `sha256:${string}`;
   readonly included_hash: `sha256:${string}`;
   readonly original_bytes: number;
@@ -113,11 +118,48 @@ export interface CompiledContextSegmentV1 {
   readonly content: string;
 }
 
+export interface RuntimeSafetySegmentV1 extends CompiledContextSegmentBaseV1 {
+  readonly kind: "runtime-safety";
+  readonly trust: "trusted-runtime";
+  readonly source: null;
+}
+
+export interface TaskContractSegmentV1 extends CompiledContextSegmentBaseV1 {
+  readonly kind: "task-contract";
+  readonly trust: "trusted-control";
+  readonly source: TaskContractReference;
+}
+
+export interface PromptTemplateSegmentV1 extends CompiledContextSegmentBaseV1 {
+  readonly kind: "prompt-template";
+  readonly trust: "trusted-control";
+  readonly source: PromptTemplateReference;
+}
+
+export interface OutputSchemaSegmentV1 extends CompiledContextSegmentBaseV1 {
+  readonly kind: "output-schema";
+  readonly trust: "trusted-control";
+  readonly source: OutputSchemaReference;
+}
+
+export interface InputArtifactSegmentV1 extends CompiledContextSegmentBaseV1 {
+  readonly kind: "input-artifact";
+  readonly trust: "untrusted-content";
+  readonly source: ArtifactReference;
+}
+
+export type CompiledContextSegmentV1 =
+  | RuntimeSafetySegmentV1
+  | TaskContractSegmentV1
+  | PromptTemplateSegmentV1
+  | OutputSchemaSegmentV1
+  | InputArtifactSegmentV1;
+
 export interface CompiledContextAuthorityV1 {
   readonly logical_class: AgentLogicalModelClass;
   readonly model_capabilities: readonly AgentCapability[];
   readonly superpowers: readonly string[];
-  readonly mcp_profile: ArtifactReference;
+  readonly mcp_profile: McpProfileReference;
   readonly budget: RuntimeBudget;
 }
 
@@ -140,10 +182,10 @@ export interface HashableCompiledContextV1 extends RuntimeDocument {
   readonly schema_version: "compiled-context.v1";
   readonly document_type: "compiled-context";
   readonly request_hash: `sha256:${string}`;
-  readonly definition: ArtifactReference & Readonly<{ document_type: "agent-definition" }>;
-  readonly prompt_template: ArtifactReference & Readonly<{ document_type: "prompt-template" }>;
-  readonly task_contract: ArtifactReference & Readonly<{ document_type: "task-contract" }>;
-  readonly output_schema: ArtifactReference & Readonly<{ document_type: "output-schema" }>;
+  readonly definition: AgentDefinitionReference;
+  readonly prompt_template: PromptTemplateReference;
+  readonly task_contract: TaskContractReference;
+  readonly output_schema: OutputSchemaReference;
   readonly authority: CompiledContextAuthorityV1;
   readonly runtime_policy: Readonly<{ revision: number; hash: `sha256:${string}` }>;
   readonly segments: readonly CompiledContextSegmentV1[];
