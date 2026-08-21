@@ -8,6 +8,7 @@ export {
   parseCompiledContext,
   parsePromptTemplate,
 } from "./contracts.js";
+export { matchAgentAuthority, type EffectiveAgentAuthority } from "./authority.js";
 import { UnavailableCapabilityError } from "../version.js";
 
 export function requireAgentRegistry(): never {
