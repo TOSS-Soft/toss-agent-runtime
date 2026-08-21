@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  chmod,
   link,
   lstat,
   mkdir,
@@ -13,6 +14,8 @@ import {
   truncate,
   writeFile,
 } from "node:fs/promises";
+import { renameSync, writeFileSync } from "node:fs";
+import { createConnection, createServer, type Server } from "node:net";
 import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -26,6 +29,7 @@ import {
 } from "../src/agents/private-store.js";
 
 const roots: string[] = [];
+const servers: Server[] = [];
 
 function contentHash(bytes: Uint8Array): `sha256:${string}` {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
@@ -78,8 +82,40 @@ async function publishedFixture(): Promise<{
 }
 
 afterEach(async () => {
+  for (const server of servers.splice(0)) {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error === undefined ? resolve() : reject(error))),
+    );
+  }
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
+
+async function listen(socketPath: string): Promise<void> {
+  const server = createServer((socket) => socket.end());
+  servers.push(server);
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, resolve);
+  });
+  await chmod(socketPath, 0o600);
+}
+
+async function probeListener(socketPath: string): Promise<"present" | "absent" | "unknown"> {
+  return new Promise((resolve) => {
+    const socket = createConnection({ path: socketPath });
+    socket.once("connect", () => {
+      socket.destroy();
+      resolve("present");
+    });
+    socket.once("error", (error) => {
+      resolve(
+        typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT"
+          ? "absent"
+          : "unknown",
+      );
+    });
+  });
+}
 
 describe.sequential("private agent object store", () => {
   it("creates only hash-derived private roots and publishes current-user private objects", async () => {
@@ -153,6 +189,21 @@ describe.sequential("private agent object store", () => {
     await writeFile(objectPath, Buffer.from("changed-agent-object", "utf8"), { mode: 0o600 });
     await expectAgentError(store.publishObject(hash, bytes), "RUNTIME_AGENT_REGISTRY_CORRUPT");
     expect(await readFile(objectPath)).toEqual(Buffer.from("changed-agent-object", "utf8"));
+  });
+
+  it("snapshots mutable caller bytes synchronously before its first suspension", async () => {
+    const { statePath } = await fixture();
+    const callerBytes = Buffer.from("entry-snapshot-A", "utf8");
+    const entryBytes = Buffer.from(callerBytes);
+    const hash = contentHash(entryBytes);
+    const store = createPrivateAgentStore(options(statePath));
+
+    const pending = store.publishObject(hash, callerBytes);
+    callerBytes.fill("B".charCodeAt(0));
+    const published = await pending;
+
+    expect(published.bytes).toEqual(entryBytes);
+    expect((await store.readObject(hash))?.bytes).toEqual(entryBytes);
   });
 
   it("rejects malformed hashes, hash mismatches, oversized publication, and non-absolute state paths", async () => {
@@ -368,6 +419,168 @@ describe.sequential("private agent object store", () => {
     await expectAgentError(store.publishObject(hash, bytes), "RUNTIME_AGENT_PATH_UNSAFE");
     expect(await readFile(replacementPath)).toEqual(Buffer.from("replacement", "utf8"));
   });
+
+  it("orders after-stage-cleanup only after the held cleanup-directory barrier", async () => {
+    const { statePath } = await fixture();
+    const bytes = Buffer.from("cleanup-order", "utf8");
+    const order: string[] = [];
+    const operationHooks = {
+      afterCleanupSync: (kind: string) => {
+        if (kind === "stage") order.push("cleanup-synced");
+        return Promise.resolve();
+      },
+      afterStageCleanup: () => {
+        order.push("after-cleanup");
+        return Promise.resolve();
+      },
+    } as unknown as PrivateAgentStoreOperationHooks;
+
+    await createPrivateAgentStore(options(statePath, { operationHooks })).publishObject(
+      contentHash(bytes),
+      bytes,
+    );
+    expect(order).toEqual(["cleanup-synced", "after-cleanup"]);
+  });
+
+  it("runs a cleanup barrier after pre-publication failure and allows exact retry", async () => {
+    const { statePath } = await fixture();
+    const bytes = Buffer.from("catch-cleanup-barrier", "utf8");
+    const hash = contentHash(bytes);
+    const order: string[] = [];
+    const operationHooks = {
+      beforeFileSync: () => {
+        order.push("file-fault");
+        return Promise.reject(new Error("file sync fault"));
+      },
+      afterCleanupSync: (kind: string) => {
+        if (kind === "stage") order.push("cleanup-synced");
+        return Promise.resolve();
+      },
+    } as unknown as PrivateAgentStoreOperationHooks;
+    const failing = createPrivateAgentStore(options(statePath, { operationHooks }));
+
+    await expectAgentError(failing.publishObject(hash, bytes), "RUNTIME_AGENT_REGISTRY_CORRUPT");
+    expect(order).toEqual(["file-fault", "cleanup-synced"]);
+    await expect(
+      createPrivateAgentStore(options(statePath)).publishObject(hash, bytes),
+    ).resolves.toMatchObject({
+      bytes,
+    });
+  });
+
+  it("fails replay when its cleanup barrier fails and remains exactly retryable", async () => {
+    const { statePath } = await fixture();
+    const bytes = Buffer.from("replay-cleanup-barrier", "utf8");
+    const hash = contentHash(bytes);
+    await createPrivateAgentStore(options(statePath)).publishObject(hash, bytes);
+    const operationHooks = {
+      beforeCleanupSync: (kind: string) => {
+        return kind === "stage"
+          ? Promise.reject(new Error("cleanup sync fault"))
+          : Promise.resolve();
+      },
+    } as unknown as PrivateAgentStoreOperationHooks;
+
+    await expectAgentError(
+      createPrivateAgentStore(options(statePath, { operationHooks })).publishObject(hash, bytes),
+      "RUNTIME_AGENT_REGISTRY_CORRUPT",
+    );
+    await expect(
+      createPrivateAgentStore(options(statePath)).publishObject(hash, bytes),
+    ).resolves.toMatchObject({
+      bytes,
+    });
+  });
+
+  it("tombstones a stage replacement after final identity validation without deleting it", async () => {
+    const { statePath } = await fixture();
+    const bytes = Buffer.from("stage-tombstone-race", "utf8");
+    const replacement = Buffer.from("stage-replacement", "utf8");
+    let sourcePath = "";
+    const operationHooks = {
+      afterFinalSourceIdentityValidation: (kind: string, candidate: string) => {
+        if (kind !== "stage") return;
+        sourcePath = candidate;
+        renameSync(candidate, `${candidate}.original`);
+        writeFileSync(candidate, replacement, { mode: 0o600 });
+      },
+    } as unknown as PrivateAgentStoreOperationHooks;
+    const store = createPrivateAgentStore(options(statePath, { operationHooks }));
+
+    await expectAgentError(
+      store.publishObject(contentHash(bytes), bytes),
+      "RUNTIME_AGENT_PATH_UNSAFE",
+    );
+    await expect(lstat(sourcePath)).rejects.toMatchObject({ code: "ENOENT" });
+    const tombstones = (await readdir(store.objectsPath)).filter((name) =>
+      name.endsWith(".tombstone"),
+    );
+    expect(tombstones).toHaveLength(1);
+    expect(await readFile(path.join(store.objectsPath, tombstones[0]!))).toEqual(replacement);
+  });
+
+  it("preserves both a tombstoned stage and a source entry that reappears", async () => {
+    const { statePath } = await fixture();
+    const bytes = Buffer.from("stage-source-reappearance", "utf8");
+    const replacement = Buffer.from("reappeared-source", "utf8");
+    let sourcePath = "";
+    const operationHooks = {
+      afterTombstoneRename: (kind: string, candidate: string) => {
+        if (kind !== "stage") return;
+        sourcePath = candidate;
+        writeFileSync(candidate, replacement, { mode: 0o600 });
+      },
+    } as unknown as PrivateAgentStoreOperationHooks;
+    const store = createPrivateAgentStore(options(statePath, { operationHooks }));
+
+    await expectAgentError(
+      store.publishObject(contentHash(bytes), bytes),
+      "RUNTIME_AGENT_PATH_UNSAFE",
+    );
+    expect(await readFile(sourcePath)).toEqual(replacement);
+    const tombstones = (await readdir(store.objectsPath)).filter((name) =>
+      name.endsWith(".tombstone"),
+    );
+    expect(tombstones).toHaveLength(1);
+    expect(await readFile(path.join(store.objectsPath, tombstones[0]!))).toEqual(bytes);
+  });
+
+  it("revalidates held ancestry before returning a missing object", async () => {
+    const { statePath } = await fixture();
+    const agentsPath = path.join(statePath, "agents");
+    const operationHooks = {
+      afterObjectMissing: async () => {
+        await rename(agentsPath, `${agentsPath}.original`);
+        await mkdir(agentsPath, { mode: 0o700 });
+      },
+    } as unknown as PrivateAgentStoreOperationHooks;
+    const store = createPrivateAgentStore(options(statePath, { operationHooks }));
+
+    await expectAgentError(
+      store.readObject(`sha256:${"a".repeat(64)}`),
+      "RUNTIME_AGENT_PATH_UNSAFE",
+    );
+  });
+
+  it("revalidates the original publication ancestry before exact replay returns", async () => {
+    const { statePath } = await fixture();
+    const bytes = Buffer.from("replay-ancestry", "utf8");
+    const hash = contentHash(bytes);
+    const first = createPrivateAgentStore(options(statePath));
+    await first.publishObject(hash, bytes);
+    const agentsPath = first.agentsPath;
+    const operationHooks = {
+      afterLinkCollision: async () => {
+        await rename(agentsPath, `${agentsPath}.original`);
+        await mkdir(agentsPath, { mode: 0o700 });
+      },
+    } as unknown as PrivateAgentStoreOperationHooks;
+
+    await expectAgentError(
+      createPrivateAgentStore(options(statePath, { operationHooks })).publishObject(hash, bytes),
+      "RUNTIME_AGENT_PATH_UNSAFE",
+    );
+  });
 });
 
 describe.sequential("private agent mutation claim", () => {
@@ -427,20 +640,63 @@ describe.sequential("private agent mutation claim", () => {
     await replacement.release();
   });
 
-  it("treats an unsafe production socket candidate as unknown and preserves the claim", async () => {
+  it("preserves a stale claim when the authoritative listener is present at a non-default socket", async () => {
     const { root, statePath } = await fixture();
+    const socketPath = path.join(root, "custom-control.sock");
+    await listen(socketPath);
     const first = createPrivateAgentStore(options(statePath));
     const held = await first.acquireMutationClaim();
-    await symlink(path.join(root, "missing.sock"), path.join(root, "runtime.sock"));
-    const contender = createPrivateAgentStore({
-      statePath,
-      isProcessAlive: () => "dead",
-    });
+    const contender = createPrivateAgentStore(
+      options(statePath, {
+        isProcessAlive: () => "dead",
+        hasServiceListener: () => probeListener(socketPath),
+      }),
+    );
 
     await expectAgentError(contender.acquireMutationClaim(), "RUNTIME_AGENT_REGISTRY_CORRUPT");
     expect((await lstat(first.mutationClaimPath)).isFile()).toBe(true);
     await held.release();
   });
+
+  it("never guesses listener absence when the mandatory authoritative probe is omitted", async () => {
+    const { root, statePath } = await fixture();
+    await listen(path.join(root, "live-non-default.sock"));
+    const first = createPrivateAgentStore(options(statePath));
+    const held = await first.acquireMutationClaim();
+    const contender = createPrivateAgentStore({
+      statePath,
+      isProcessAlive: () => "dead",
+    } as unknown as CreatePrivateAgentStoreOptions);
+
+    const result = await contender.acquireMutationClaim().then(
+      (claim) => ({ claim }) as const,
+      (error: unknown) => ({ error }) as const,
+    );
+    if ("claim" in result) {
+      await expectAgentError(held.release(), "RUNTIME_AGENT_PATH_UNSAFE");
+      await result.claim.release();
+      expect.fail("store recovered without an authoritative listener probe");
+    }
+    expect(result.error).toBeInstanceOf(RuntimeAgentError);
+    expect(result.error).toMatchObject({ code: "RUNTIME_AGENT_REGISTRY_CORRUPT" });
+    await held.release();
+  });
+
+  it("bounds a never-settling authoritative listener probe and fails closed", async () => {
+    const { statePath } = await fixture();
+    const first = createPrivateAgentStore(options(statePath));
+    const held = await first.acquireMutationClaim();
+    const contender = createPrivateAgentStore(
+      options(statePath, {
+        isProcessAlive: () => "dead",
+        hasServiceListener: () => new Promise(() => undefined),
+      }),
+    );
+
+    await expectAgentError(contender.acquireMutationClaim(), "RUNTIME_AGENT_REGISTRY_CORRUPT");
+    expect((await lstat(first.mutationClaimPath)).isFile()).toBe(true);
+    await held.release();
+  }, 2_000);
 
   it.each(["file", "directory", "symlink", "hard-link"] as const)(
     "rejects an unsafe %s mutation-claim candidate without removing it",
@@ -477,5 +733,97 @@ describe.sequential("private agent mutation claim", () => {
 
     await expectAgentError(claim.release(), "RUNTIME_AGENT_PATH_UNSAFE");
     expect((await lstat(store.mutationClaimPath)).isFile()).toBe(true);
+  });
+
+  it("durably cleans a failed claim creation before an exact retry", async () => {
+    const { statePath } = await fixture();
+    const order: string[] = [];
+    const operationHooks = {
+      beforeClaimFileSync: () => {
+        order.push("claim-fault");
+        return Promise.reject(new Error("claim sync fault"));
+      },
+      afterCleanupSync: (kind: string) => {
+        if (kind === "claim") order.push("cleanup-synced");
+        return Promise.resolve();
+      },
+    } as unknown as PrivateAgentStoreOperationHooks;
+    const failing = createPrivateAgentStore(options(statePath, { operationHooks }));
+
+    await expectAgentError(failing.acquireMutationClaim(), "RUNTIME_AGENT_REGISTRY_CORRUPT");
+    expect(order).toEqual(["claim-fault", "cleanup-synced"]);
+    await expect(lstat(failing.mutationClaimPath)).rejects.toMatchObject({ code: "ENOENT" });
+    const retry = await createPrivateAgentStore(options(statePath)).acquireMutationClaim();
+    await retry.release();
+  });
+
+  it("tombstones a claim replacement after final identity validation without deleting it", async () => {
+    const { statePath } = await fixture();
+    const replacement = Buffer.from(JSON.stringify({ pid: process.pid + 1 }), "utf8");
+    let sourcePath = "";
+    const operationHooks = {
+      afterFinalSourceIdentityValidation: (kind: string, candidate: string) => {
+        if (kind !== "claim-release") return;
+        sourcePath = candidate;
+        renameSync(candidate, `${candidate}.original`);
+        writeFileSync(candidate, replacement, { mode: 0o700 });
+      },
+    } as unknown as PrivateAgentStoreOperationHooks;
+    const store = createPrivateAgentStore(options(statePath, { operationHooks }));
+    const claim = await store.acquireMutationClaim();
+
+    await expectAgentError(claim.release(), "RUNTIME_AGENT_PATH_UNSAFE");
+    await expect(lstat(sourcePath)).rejects.toMatchObject({ code: "ENOENT" });
+    const tombstones = (await readdir(store.registryPath)).filter((name) =>
+      name.endsWith(".tombstone"),
+    );
+    expect(tombstones).toHaveLength(1);
+    expect(await readFile(path.join(store.registryPath, tombstones[0]!))).toEqual(replacement);
+  });
+
+  it("memoizes normal sequential and concurrent release and closes once", async () => {
+    const sequentialStore = createPrivateAgentStore(options((await fixture()).statePath));
+    const sequential = await sequentialStore.acquireMutationClaim();
+    const firstRelease = sequential.release();
+    const secondRelease = sequential.release();
+    expect(secondRelease).toBe(firstRelease);
+    await Promise.all([firstRelease, secondRelease]);
+    expect(sequential.release()).toBe(firstRelease);
+    await sequential.release();
+
+    const concurrentStore = createPrivateAgentStore(options((await fixture()).statePath));
+    const concurrent = await concurrentStore.acquireMutationClaim();
+    await expect(
+      Promise.all([concurrent.release(), concurrent.release(), concurrent.release()]),
+    ).resolves.toEqual([undefined, undefined, undefined]);
+  });
+
+  it("memoizes a cleanup-sync release failure for all concurrent and repeated callers", async () => {
+    const { statePath } = await fixture();
+    let syncAttempts = 0;
+    const operationHooks = {
+      beforeCleanupSync: (kind: string) => {
+        if (kind !== "claim-release") return Promise.resolve();
+        syncAttempts += 1;
+        return Promise.reject(new Error("release cleanup sync fault"));
+      },
+    } as unknown as PrivateAgentStoreOperationHooks;
+    const store = createPrivateAgentStore(options(statePath, { operationHooks }));
+    const claim = await store.acquireMutationClaim();
+
+    const firstRelease = claim.release();
+    const secondRelease = claim.release();
+    expect(secondRelease).toBe(firstRelease);
+    const results = await Promise.allSettled([firstRelease, secondRelease]);
+    expect(results[0]?.status).toBe("rejected");
+    expect(results[1]?.status).toBe("rejected");
+    if (results[0]?.status === "rejected" && results[1]?.status === "rejected") {
+      expect(results[1].reason).toBe(results[0].reason);
+    }
+    expect(syncAttempts).toBe(1);
+    expect(claim.release()).toBe(firstRelease);
+    await expect(claim.release()).rejects.toMatchObject({
+      code: "RUNTIME_AGENT_REGISTRY_CORRUPT",
+    });
   });
 });
