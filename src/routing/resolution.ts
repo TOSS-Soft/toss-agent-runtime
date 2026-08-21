@@ -146,7 +146,8 @@ function normalizedIdentity(value: unknown): ProviderRouteIdentity {
     Number(record.gateway_revision) < 0 ||
     typeof record.route_id !== "string" ||
     typeof record.requested_model !== "string" ||
-    !["openai", "anthropic", "gemini"].includes(String(record.resolved_provider)) ||
+    typeof record.resolved_provider !== "string" ||
+    !["openai", "anthropic", "gemini"].includes(record.resolved_provider) ||
     typeof record.resolved_model !== "string" ||
     typeof record.capability_document_hash !== "string" ||
     typeof record.requirement_hash !== "string" ||

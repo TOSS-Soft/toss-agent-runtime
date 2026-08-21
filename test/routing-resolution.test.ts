@@ -234,6 +234,39 @@ describe("planned agentgateway route resolution", () => {
     );
     expect(getterCalls).toBe(0);
   });
+
+  it("rejects a coercive provider identity without invoking conversion hooks", () => {
+    const fixture = plannedRoutingFixture();
+    const attempt = fixture.plan.worker_attempts[0]!;
+    const identity = plannedRouteIdentity(fixture, attempt.attempt_id);
+    let toStringCalls = 0;
+    let primitiveCalls = 0;
+    const nativeDetail = "native-secret-provider-coercion";
+    const coerciveProvider = Object.freeze({
+      toString() {
+        toStringCalls += 1;
+        throw new Error(nativeDetail);
+      },
+      [Symbol.toPrimitive]() {
+        primitiveCalls += 1;
+        throw new Error(nativeDetail);
+      },
+    });
+    const hostile = immutableIdentity(identity, { resolved_provider: coerciveProvider });
+
+    assertResolutionMismatch(
+      () =>
+        verifyResolvedRoute({
+          state: fixture.state,
+          plan: fixture.plan,
+          attempt_id: attempt.attempt_id,
+          route_identity: hostile,
+        }),
+      nativeDetail,
+    );
+    expect(toStringCalls).toBe(0);
+    expect(primitiveCalls).toBe(0);
+  });
 });
 
 function nativeCompletion(model: string): string {
