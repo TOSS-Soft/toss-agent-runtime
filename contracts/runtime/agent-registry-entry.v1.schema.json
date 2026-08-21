@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toss.software/schemas/runtime/v1/agent-registry-entry.v1.schema.json",
+  "title": "TOSS agent registry entry v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "schema_version",
+    "document_type",
+    "registry_revision",
+    "previous_entry_hash",
+    "operation_id",
+    "operation_hash",
+    "definition",
+    "prompt_template",
+    "state",
+    "occurred_at",
+    "entry_hash"
+  ],
+  "properties": {
+    "protocol_version": { "const": "runtime-contract.v1" },
+    "schema_version": { "const": "agent-registry-entry.v1" },
+    "document_type": { "const": "agent-registry-entry" },
+    "registry_revision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "previous_entry_hash": {
+      "oneOf": [{ "type": "null" }, { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }]
+    },
+    "operation_id": { "type": "string", "format": "uuid" },
+    "operation_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+    "definition": { "$ref": "#/$defs/definition_reference" },
+    "prompt_template": { "$ref": "#/$defs/prompt_template_reference" },
+    "state": { "enum": ["ACTIVE", "RETIRED"] },
+    "occurred_at": { "$ref": "runtime-common.v1.schema.json#/$defs/utc_timestamp" },
+    "entry_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
+  },
+  "$defs": {
+    "definition_reference": {
+      "allOf": [
+        { "$ref": "runtime-common.v1.schema.json#/$defs/artifact_reference" },
+        { "type": "object", "properties": { "document_type": { "const": "agent-definition" } } }
+      ]
+    },
+    "prompt_template_reference": {
+      "allOf": [
+        { "$ref": "runtime-common.v1.schema.json#/$defs/artifact_reference" },
+        { "type": "object", "properties": { "document_type": { "const": "prompt-template" } } }
+      ]
+    }
+  }
+}

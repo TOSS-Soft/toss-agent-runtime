@@ -1,0 +1,165 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toss.software/schemas/runtime/v1/agent-definition.v1.schema.json",
+  "title": "TOSS agent definition v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "schema_version",
+    "document_type",
+    "agent_id",
+    "revision",
+    "name",
+    "role",
+    "prompt_template",
+    "task_contracts",
+    "model",
+    "superpowers",
+    "mcp_profiles",
+    "budget_class",
+    "budget_ceiling",
+    "output_schemas",
+    "context_policy",
+    "document_hash"
+  ],
+  "properties": {
+    "protocol_version": { "const": "runtime-contract.v1" },
+    "schema_version": { "const": "agent-definition.v1" },
+    "document_type": { "const": "agent-definition" },
+    "agent_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+    "revision": { "$ref": "#/$defs/positive_safe_integer" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "role": { "enum": ["worker", "reviewer"] },
+    "prompt_template": { "$ref": "#/$defs/prompt_template_reference" },
+    "task_contracts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 256,
+      "items": { "$ref": "#/$defs/task_contract_reference" }
+    },
+    "model": { "$ref": "#/$defs/model" },
+    "superpowers": { "$ref": "#/$defs/superpowers" },
+    "mcp_profiles": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 256,
+      "items": { "$ref": "#/$defs/mcp_profile_reference" }
+    },
+    "budget_class": { "enum": ["interactive", "standard", "extended"] },
+    "budget_ceiling": { "$ref": "runtime-common.v1.schema.json#/$defs/budget" },
+    "output_schemas": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 256,
+      "items": { "$ref": "#/$defs/output_schema_reference" }
+    },
+    "context_policy": { "$ref": "#/$defs/context_policy" },
+    "document_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
+  },
+  "$defs": {
+    "positive_safe_integer": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "nonnegative_safe_integer": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "artifact_reference": { "$ref": "runtime-common.v1.schema.json#/$defs/artifact_reference" },
+    "prompt_template_reference": {
+      "allOf": [
+        { "$ref": "#/$defs/artifact_reference" },
+        { "type": "object", "properties": { "document_type": { "const": "prompt-template" } } }
+      ]
+    },
+    "task_contract_reference": {
+      "allOf": [
+        { "$ref": "#/$defs/artifact_reference" },
+        { "type": "object", "properties": { "document_type": { "const": "task-contract" } } }
+      ]
+    },
+    "mcp_profile_reference": {
+      "allOf": [
+        { "$ref": "#/$defs/artifact_reference" },
+        { "type": "object", "properties": { "document_type": { "const": "mcp-profile" } } }
+      ]
+    },
+    "output_schema_reference": {
+      "allOf": [
+        { "$ref": "#/$defs/artifact_reference" },
+        { "type": "object", "properties": { "document_type": { "const": "output-schema" } } }
+      ]
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["logical_class", "required_capabilities", "allowed_capabilities"],
+      "properties": {
+        "logical_class": {
+          "enum": [
+            "economy",
+            "balanced-code",
+            "deep-reasoning",
+            "long-context",
+            "vision",
+            "independent-review"
+          ]
+        },
+        "required_capabilities": { "$ref": "#/$defs/capabilities" },
+        "allowed_capabilities": { "$ref": "#/$defs/capabilities" }
+      }
+    },
+    "capabilities": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "items": {
+        "enum": [
+          "independent-review",
+          "json-schema",
+          "long-context",
+          "reasoning",
+          "streaming",
+          "text",
+          "tools",
+          "vision"
+        ]
+      }
+    },
+    "superpowers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "allowed"],
+      "properties": {
+        "required": { "$ref": "#/$defs/capability_names" },
+        "allowed": { "$ref": "#/$defs/capability_names" }
+      }
+    },
+    "capability_names": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 256,
+      "items": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" }
+    },
+    "context_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["truncation", "max_untrusted_bytes", "inputs"],
+      "properties": {
+        "truncation": { "const": "utf8-prefix.v1" },
+        "max_untrusted_bytes": { "$ref": "#/$defs/nonnegative_safe_integer" },
+        "inputs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/context_input" }
+        }
+      }
+    },
+    "context_input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["document_type", "priority", "max_bytes"],
+      "properties": {
+        "document_type": { "$ref": "runtime-common.v1.schema.json#/$defs/document_type" },
+        "priority": { "$ref": "#/$defs/nonnegative_safe_integer" },
+        "max_bytes": { "$ref": "#/$defs/nonnegative_safe_integer" }
+      }
+    }
+  }
+}
