@@ -17,6 +17,7 @@ import {
   parseRoutingPolicy,
   parseRoutingState,
 } from "../src/routing/contracts.js";
+import { reserveRoutingBudget } from "../src/routing/cost.js";
 import { planModelSelection, type PlanModelSelectionInput } from "../src/routing/selection.js";
 import { RuntimeRoutingError } from "../src/routing/errors.js";
 import type {
@@ -27,6 +28,7 @@ import type {
   PlannedModelSelectionPlanV1,
   RoutingCircuitV1,
   RoutingPolicyV1,
+  RoutingReservationV1,
   RoutingStateV1,
   RoutingTaskProfile,
   TaskComplexity,
@@ -279,6 +281,7 @@ function fixture(
     readonly entries?: readonly ModelCatalogEntryV1[];
     readonly request?: ExecutionRequestV1;
     readonly task?: Partial<RoutingTaskProfile>;
+    readonly ceilings?: PlanModelSelectionInput["ceilings"];
     readonly circuits?: readonly RoutingCircuitV1[];
     readonly budget?: RoutingStateV1["budget"];
     readonly budget_status?: RoutingStateV1["budget_status"];
@@ -301,7 +304,7 @@ function fixture(
       max_latency_class: "standard",
       ...options.task,
     },
-    ceilings: {
+    ceilings: options.ceilings ?? {
       max_input_tokens: 20_000,
       max_output_tokens: 4_000,
       max_duration_ms: 120_000,
@@ -714,21 +717,312 @@ describe("circuit, budget, and stale-state blocking", () => {
       expect(second.plan.block_code).toBe("RUNTIME_ROUTING_STALE_STATE");
   });
 
-  it("blocks the full primary-plus-fallback reservation when any budget dimension is exceeded", () => {
+  it("prunes a fallback instead of blocking a budget-feasible primary tuple", () => {
+    const plan = planned(
+      fixture({
+        entries: defaultEntries().slice(0, 3),
+        budget: {
+          max_input_tokens: 59_999,
+          max_output_tokens: 12_000,
+          max_cost_microusd: 5_000_000,
+          max_duration_ms: 360_000,
+          max_turns: 3,
+        },
+      }),
+    );
+
+    expect(selectedEntryIds(plan)).toEqual(["balanced-primary", "balanced-fallback-a"]);
+    expect(plan.eliminations).toContainEqual({
+      entry_id: "balanced-fallback-b",
+      reason: "budget",
+    });
+  });
+
+  it("eliminates an individually unaffordable higher-priority entry before ordering", () => {
+    const entries = [
+      entry("expensive-primary", "expensive-primary", 1, [
+        route("route-expensive-primary", "openai", "gpt-5", {
+          pricing: pricing(1_000_000_000, 1_000_000_000, 1_000_000_000, 1_000_000_000),
+        }),
+      ]),
+      entry("feasible-secondary", "feasible-secondary", 2, [
+        route("route-feasible-secondary", "openai", "gpt-5", {
+          pricing: pricing(1, 1, 1, 1),
+        }),
+      ]),
+    ];
+    const plan = planned(
+      fixture({
+        entries,
+        ceilings: { max_input_tokens: 1, max_output_tokens: 1, max_duration_ms: 1 },
+        budget: {
+          max_input_tokens: 10,
+          max_output_tokens: 10,
+          max_cost_microusd: 1_000,
+          max_duration_ms: 10,
+          max_turns: 10,
+        },
+      }),
+    );
+
+    expect(plan.worker_attempts).toHaveLength(1);
+    expect(plan.worker_attempts[0]?.entry_id).toBe("feasible-secondary");
+    expect(plan.worker_attempts[0]?.reserved_cost_microusd).toBe(2);
+    expect(plan.eliminations).toContainEqual({
+      entry_id: "expensive-primary",
+      reason: "budget",
+    });
+  });
+
+  it("skips a combined-cost-infeasible fallback and includes a cheaper later fallback", () => {
+    const entries = [
+      entry("primary", "primary", 1, [
+        route("route-primary", "openai", "gpt-5", { pricing: pricing(1, 1, 1, 1) }),
+      ]),
+      entry("expensive-fallback", "expensive-fallback", 2, [
+        route("route-expensive-fallback", "openai", "gpt-5", {
+          pricing: pricing(2_000_000, 2_000_000, 2_000_000, 2_000_000),
+        }),
+      ]),
+      entry("cheap-later-fallback", "cheap-later-fallback", 3, [
+        route("route-cheap-later", "openai", "gpt-5", {
+          pricing: pricing(1, 1, 1, 1),
+        }),
+      ]),
+    ];
+    const plan = planned(
+      fixture({
+        entries,
+        ceilings: { max_input_tokens: 1, max_output_tokens: 1, max_duration_ms: 1 },
+        budget: {
+          max_input_tokens: 10,
+          max_output_tokens: 10,
+          max_cost_microusd: 4,
+          max_duration_ms: 10,
+          max_turns: 10,
+        },
+      }),
+    );
+
+    expect(selectedEntryIds(plan)).toEqual(["primary", "cheap-later-fallback"]);
+    expect(plan.eliminations).toContainEqual({
+      entry_id: "expensive-fallback",
+      reason: "budget",
+    });
+  });
+
+  it.each([
+    [
+      "input",
+      {
+        max_input_tokens: 2,
+        max_output_tokens: 10,
+        max_cost_microusd: 100,
+        max_duration_ms: 10,
+        max_turns: 10,
+      },
+    ],
+    [
+      "output",
+      {
+        max_input_tokens: 10,
+        max_output_tokens: 2,
+        max_cost_microusd: 100,
+        max_duration_ms: 10,
+        max_turns: 10,
+      },
+    ],
+    [
+      "cost",
+      {
+        max_input_tokens: 10,
+        max_output_tokens: 10,
+        max_cost_microusd: 4,
+        max_duration_ms: 10,
+        max_turns: 10,
+      },
+    ],
+    [
+      "duration",
+      {
+        max_input_tokens: 10,
+        max_output_tokens: 10,
+        max_cost_microusd: 100,
+        max_duration_ms: 2,
+        max_turns: 10,
+      },
+    ],
+    [
+      "turn",
+      {
+        max_input_tokens: 10,
+        max_output_tokens: 10,
+        max_cost_microusd: 100,
+        max_duration_ms: 10,
+        max_turns: 2,
+      },
+    ],
+  ] as const)(
+    "prunes a fallback when the combined tuple exceeds the %s budget",
+    (_name, budget) => {
+      const entries = ["primary", "fallback-a", "fallback-b"].map((entryId, index) =>
+        entry(entryId, entryId, index + 1, [
+          route(`route-${entryId}`, "openai", "gpt-5", { pricing: pricing(1, 1, 1, 1) }),
+        ]),
+      );
+      const plan = planned(
+        fixture({
+          entries,
+          ceilings: { max_input_tokens: 1, max_output_tokens: 1, max_duration_ms: 1 },
+          budget,
+        }),
+      );
+
+      expect(selectedEntryIds(plan)).toEqual(["primary", "fallback-a"]);
+      expect(plan.eliminations).toContainEqual({ entry_id: "fallback-b", reason: "budget" });
+    },
+  );
+
+  it("accounts for every active reservation before constructing the tuple", () => {
+    const entries = ["primary", "fallback-a", "fallback-b"].map((entryId, index) =>
+      entry(entryId, entryId, index + 1, [
+        route(`route-${entryId}`, "openai", "gpt-5", { pricing: pricing(1, 1, 1, 1) }),
+      ]),
+    );
+    const input = fixture({
+      entries,
+      ceilings: { max_input_tokens: 1, max_output_tokens: 1, max_duration_ms: 1 },
+      budget: {
+        max_input_tokens: 3,
+        max_output_tokens: 3,
+        max_cost_microusd: 6,
+        max_duration_ms: 3,
+        max_turns: 3,
+      },
+    });
+    const activeReservation: RoutingReservationV1 = {
+      decision_id: "decision-active",
+      decision_hash: `sha256:${"f".repeat(64)}`,
+      request_id: input.request.request_id,
+      allocations: [
+        {
+          attempt_id: "attempt-active",
+          entry_id: "primary",
+          role: "worker",
+          input_tokens: 1,
+          output_tokens: 1,
+          cost_microusd: 2,
+          duration_ms: 1,
+          turns: 1,
+        },
+      ],
+      created_at: "2026-08-21T11:59:30.000Z",
+    };
+    const activeState = reserveRoutingBudget({
+      state: input.state,
+      reservation: activeReservation,
+    });
+    const plan = planned({ ...input, state: activeState });
+
+    expect(selectedEntryIds(plan)).toEqual(["primary", "fallback-a"]);
+    expect(plan.eliminations).toContainEqual({ entry_id: "fallback-b", reason: "budget" });
+  });
+
+  it("returns a budget block when every otherwise capable entry is unaffordable", () => {
+    const entries = [
+      entry("expensive-only", "expensive-only", 1, [
+        route("route-expensive-only", "openai", "gpt-5", {
+          pricing: pricing(1_000_000_000, 1_000_000_000, 1_000_000_000, 1_000_000_000),
+        }),
+      ]),
+    ];
     expect(
       blocked(
         fixture({
-          entries: defaultEntries().slice(0, 3),
+          entries,
+          ceilings: { max_input_tokens: 1, max_output_tokens: 1, max_duration_ms: 1 },
+          circuits: [
+            {
+              entry_id: "expensive-only",
+              status: "open",
+              consecutive_failures: 3,
+              retry_at: "2026-08-21T12:01:00.000Z",
+              probe_decision_id: null,
+            },
+          ],
           budget: {
-            max_input_tokens: 59_999,
-            max_output_tokens: 12_000,
-            max_cost_microusd: 5_000_000,
-            max_duration_ms: 360_000,
-            max_turns: 3,
+            max_input_tokens: 10,
+            max_output_tokens: 10,
+            max_cost_microusd: 1_000,
+            max_duration_ms: 10,
+            max_turns: 10,
           },
         }),
-      ).block_code,
-    ).toBe("RUNTIME_ROUTING_BUDGET_EXCEEDED");
+      ),
+    ).toMatchObject({
+      block_code: "RUNTIME_ROUTING_BUDGET_EXCEEDED",
+      eliminations: [{ entry_id: "expensive-only", reason: "budget" }],
+    });
+  });
+
+  it.each([
+    ["after deadline", "2026-08-21T12:03:00.000Z", 1],
+    ["at deadline", "2026-08-21T12:02:00.000Z", 1],
+    ["duration exceeds remaining window", "2026-08-21T12:01:30.000Z", 30_001],
+  ] as const)("does not advertise retry %s", (_name, retryAt, maxDurationMs) => {
+    const selectedRequest = request({ deadline: "2026-08-21T12:02:00.000Z" });
+    const plan = blocked(
+      fixture({
+        entries: [defaultEntries()[1]!],
+        request: selectedRequest,
+        ceilings: {
+          max_input_tokens: 1,
+          max_output_tokens: 1,
+          max_duration_ms: maxDurationMs,
+        },
+        circuits: [
+          {
+            entry_id: "balanced-fallback-a",
+            status: "open",
+            consecutive_failures: 3,
+            retry_at: retryAt,
+            probe_decision_id: null,
+          },
+        ],
+      }),
+    );
+
+    expect(plan).toMatchObject({
+      block_code: "RUNTIME_ROUTING_NO_CAPABLE_ROUTE",
+      retryable: false,
+      next_retry_at: null,
+    });
+  });
+
+  it("advertises a capable retry whose full duration fits before the deadline", () => {
+    const selectedRequest = request({ deadline: "2026-08-21T12:02:00.000Z" });
+    expect(
+      blocked(
+        fixture({
+          entries: [defaultEntries()[1]!],
+          request: selectedRequest,
+          ceilings: { max_input_tokens: 1, max_output_tokens: 1, max_duration_ms: 60_000 },
+          circuits: [
+            {
+              entry_id: "balanced-fallback-a",
+              status: "open",
+              consecutive_failures: 3,
+              retry_at: "2026-08-21T12:01:00.000Z",
+              probe_decision_id: null,
+            },
+          ],
+        }),
+      ),
+    ).toMatchObject({
+      block_code: "RUNTIME_ROUTING_CIRCUIT_OPEN",
+      retryable: true,
+      next_retry_at: "2026-08-21T12:01:00.000Z",
+    });
   });
 
   it("blocks unknown usage without mutating the supplied state", () => {

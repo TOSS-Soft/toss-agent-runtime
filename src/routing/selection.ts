@@ -114,6 +114,14 @@ interface Candidate {
   readonly probe: boolean;
 }
 
+interface BudgetVector {
+  readonly input_tokens: bigint;
+  readonly output_tokens: bigint;
+  readonly cost_microusd: bigint;
+  readonly duration_ms: bigint;
+  readonly turns: bigint;
+}
+
 function invalid(): never {
   throw new RuntimeRoutingError("RUNTIME_ROUTING_INVALID");
 }
@@ -252,6 +260,65 @@ function validateCeilings(ceilings: RoutingCallCeilings): void {
   ]) {
     if (!Number.isSafeInteger(value) || value <= 0) invalid();
   }
+}
+
+function addBudget(left: BudgetVector, right: BudgetVector): BudgetVector {
+  return {
+    input_tokens: left.input_tokens + right.input_tokens,
+    output_tokens: left.output_tokens + right.output_tokens,
+    cost_microusd: left.cost_microusd + right.cost_microusd,
+    duration_ms: left.duration_ms + right.duration_ms,
+    turns: left.turns + right.turns,
+  };
+}
+
+function allocationBudget(allocation: Candidate["allocation"]): BudgetVector {
+  return {
+    input_tokens: BigInt(allocation.input_tokens),
+    output_tokens: BigInt(allocation.output_tokens),
+    cost_microusd: BigInt(allocation.cost_microusd),
+    duration_ms: BigInt(allocation.duration_ms),
+    turns: BigInt(allocation.turns),
+  };
+}
+
+function remainingBudget(state: RoutingStateV1): BudgetVector {
+  if (state.settled.cost_microusd === null) invalid();
+  let used: BudgetVector = {
+    input_tokens: BigInt(state.settled.input_tokens),
+    output_tokens: BigInt(state.settled.output_tokens),
+    cost_microusd: BigInt(state.settled.cost_microusd),
+    duration_ms: BigInt(state.settled.duration_ms),
+    turns: BigInt(state.settled.turns),
+  };
+  for (const reservation of state.reservations) {
+    for (const allocation of reservation.allocations) {
+      used = addBudget(used, {
+        input_tokens: BigInt(allocation.input_tokens),
+        output_tokens: BigInt(allocation.output_tokens),
+        cost_microusd: BigInt(allocation.cost_microusd),
+        duration_ms: BigInt(allocation.duration_ms),
+        turns: BigInt(allocation.turns),
+      });
+    }
+  }
+  return {
+    input_tokens: BigInt(state.budget.max_input_tokens) - used.input_tokens,
+    output_tokens: BigInt(state.budget.max_output_tokens) - used.output_tokens,
+    cost_microusd: BigInt(state.budget.max_cost_microusd) - used.cost_microusd,
+    duration_ms: BigInt(state.budget.max_duration_ms) - used.duration_ms,
+    turns: BigInt(state.budget.max_turns) - used.turns,
+  };
+}
+
+function fitsBudget(usage: BudgetVector, remaining: BudgetVector): boolean {
+  return (
+    usage.input_tokens <= remaining.input_tokens &&
+    usage.output_tokens <= remaining.output_tokens &&
+    usage.cost_microusd <= remaining.cost_microusd &&
+    usage.duration_ms <= remaining.duration_ms &&
+    usage.turns <= remaining.turns
+  );
 }
 
 function validateInputs(input: PlanModelSelectionInput): ValidatedInputs {
@@ -508,6 +575,7 @@ function candidateForEntry(input: {
   readonly live: AgentgatewayCapabilitiesV1;
   readonly state: RoutingStateV1;
   readonly decisionMs: number;
+  readonly remainingBudget: BudgetVector;
 }): Readonly<{ candidate: Candidate | null; reason: RoutingEliminationV1["reason"] }> {
   const classRank = input.rule.worker_class_preference.findIndex((value) =>
     input.entry.logical_classes.includes(value),
@@ -533,16 +601,6 @@ function candidateForEntry(input: {
   );
   if (accepted.length === 0) return { candidate: null, reason: "latency" };
 
-  const circuit = input.state.circuits.find((value) => value.entry_id === input.entry.entry_id);
-  let probe = false;
-  if (circuit?.status === "probe-reserved") return { candidate: null, reason: "circuit" };
-  if (circuit?.status === "open") {
-    const retryAt = timestamp(circuit.retry_at);
-    if (retryAt === null) invalid();
-    if (input.decisionMs < retryAt) return { candidate: null, reason: "circuit" };
-    probe = true;
-  }
-
   accepted.sort((left, right) => compareAscii(left.catalog.route_id, right.catalog.route_id));
   let allocation = estimateRoutingAllocation({
     pricing: accepted[0]!.catalog.pricing,
@@ -558,6 +616,18 @@ function candidateForEntry(input: {
     if (LATENCY_RANK[value.catalog.latency_class] > LATENCY_RANK[worstLatency]) {
       worstLatency = value.catalog.latency_class;
     }
+  }
+  if (!fitsBudget(allocationBudget(allocation), input.remainingBudget)) {
+    return { candidate: null, reason: "budget" };
+  }
+  const circuit = input.state.circuits.find((value) => value.entry_id === input.entry.entry_id);
+  let probe = false;
+  if (circuit?.status === "probe-reserved") return { candidate: null, reason: "circuit" };
+  if (circuit?.status === "open") {
+    const retryAt = timestamp(circuit.retry_at);
+    if (retryAt === null) invalid();
+    if (input.decisionMs < retryAt) return { candidate: null, reason: "circuit" };
+    probe = true;
   }
   return {
     candidate: {
@@ -746,6 +816,7 @@ export function planModelSelection(input: PlanModelSelectionInput): RoutingDecis
 
   const candidates: Candidate[] = [];
   const maxLatency = effectiveLatency(input.task, rule);
+  const availableBudget = remainingBudget(state);
   for (const catalogEntry of validated.catalog.entries) {
     const evaluated = candidateForEntry({
       entry: catalogEntry,
@@ -757,6 +828,7 @@ export function planModelSelection(input: PlanModelSelectionInput): RoutingDecis
       live: validated.live,
       state,
       decisionMs: validated.decision_ms,
+      remainingBudget: availableBudget,
     });
     if (evaluated.candidate === null) reasons.set(catalogEntry.entry_id, evaluated.reason);
     else candidates.push(evaluated.candidate);
@@ -779,6 +851,8 @@ export function planModelSelection(input: PlanModelSelectionInput): RoutingDecis
         "circuit",
       );
     }
+    const requestDeadline = timestamp(validated.request.deadline);
+    if (requestDeadline === null) invalid();
     const retryTimes = state.circuits
       .flatMap((circuit) =>
         circuit.status === "open" && circuitEntryIds.has(circuit.entry_id)
@@ -787,7 +861,12 @@ export function planModelSelection(input: PlanModelSelectionInput): RoutingDecis
       )
       .filter((value) => {
         const retryAt = timestamp(value);
-        return retryAt !== null && retryAt > validated.decision_ms;
+        return (
+          retryAt !== null &&
+          retryAt > validated.decision_ms &&
+          retryAt < requestDeadline &&
+          input.ceilings.max_duration_ms <= requestDeadline - retryAt
+        );
       })
       .sort(compareAscii);
     if (retryTimes.length > 0) {
@@ -800,6 +879,15 @@ export function planModelSelection(input: PlanModelSelectionInput): RoutingDecis
         retryTimes[0],
       );
     }
+    if ([...reasons.values()].includes("budget")) {
+      return blockedDecision(
+        bindings,
+        validated.catalog,
+        reasons,
+        "RUNTIME_ROUTING_BUDGET_EXCEEDED",
+        "budget",
+      );
+    }
     return blockedDecision(
       bindings,
       validated.catalog,
@@ -810,15 +898,26 @@ export function planModelSelection(input: PlanModelSelectionInput): RoutingDecis
   }
 
   const primary = candidates[0]!;
-  const fallbacks = candidates
-    .slice(1)
-    .filter((candidate) => !candidate.probe)
-    .slice(0, rule.max_fallbacks);
-  const selected = [primary, ...fallbacks];
-  const selectedIds = new Set(selected.map((candidate) => candidate.entry.entry_id));
-  for (const candidate of candidates) {
-    if (selectedIds.has(candidate.entry.entry_id)) reasons.delete(candidate.entry.entry_id);
-    else reasons.set(candidate.entry.entry_id, candidate.probe ? "circuit" : "policy");
+  const selected: Candidate[] = [primary];
+  let selectedBudget = allocationBudget(primary.allocation);
+  reasons.delete(primary.entry.entry_id);
+  for (const candidate of candidates.slice(1)) {
+    if (candidate.probe) {
+      reasons.set(candidate.entry.entry_id, "circuit");
+      continue;
+    }
+    if (selected.length > rule.max_fallbacks) {
+      reasons.set(candidate.entry.entry_id, "policy");
+      continue;
+    }
+    const combinedBudget = addBudget(selectedBudget, allocationBudget(candidate.allocation));
+    if (!fitsBudget(combinedBudget, availableBudget)) {
+      reasons.set(candidate.entry.entry_id, "budget");
+      continue;
+    }
+    selected.push(candidate);
+    selectedBudget = combinedBudget;
+    reasons.delete(candidate.entry.entry_id);
   }
 
   if (rule.review === "independent") {
