@@ -9,7 +9,11 @@ import {
   parseExecutionRequest,
   type ExecutionRequestV1,
 } from "../../src/protocol/request.js";
-import type { ProviderAdapterCapabilities, ProviderKind } from "../../src/providers/types.js";
+import type {
+  ProviderAdapterCapabilities,
+  ProviderKind,
+  ProviderRouteIdentity,
+} from "../../src/providers/types.js";
 import {
   parseModelCatalog,
   parseRoutingPolicy,
@@ -377,6 +381,33 @@ export interface PlannedRoutingFixture {
   readonly prior_state: RoutingStateV1;
   readonly plan: PlannedModelSelectionPlanV1;
   readonly state: RoutingStateV1;
+}
+
+export function plannedRouteIdentity(
+  fixture: PlannedRoutingFixture,
+  attemptId: string = fixture.plan.worker_attempts[0]?.attempt_id ?? "",
+): ProviderRouteIdentity {
+  const attempts = [
+    ...fixture.plan.worker_attempts,
+    ...(fixture.plan.reviewer_attempt === null ? [] : [fixture.plan.reviewer_attempt]),
+  ];
+  const attempt = attempts.find((candidate) => candidate.attempt_id === attemptId);
+  const route = attempt?.accepted_routes[0];
+  if (attempt === undefined || route === undefined) {
+    throw new Error("planned route identity fixture requires one accepted route");
+  }
+  return Object.freeze({
+    transport: "agentgateway",
+    gateway_profile: attempt.gateway_profile,
+    gateway_revision: attempt.gateway_revision,
+    route_id: route.route_id,
+    requested_model: attempt.alias,
+    resolved_provider: route.provider,
+    resolved_model: route.model,
+    capability_document_hash: attempt.capability_document_hash,
+    requirement_hash: attempt.requirement_hash,
+    gateway_request_id: "gateway-planned-route-1",
+  });
 }
 
 export function plannedRoutingFixture(
