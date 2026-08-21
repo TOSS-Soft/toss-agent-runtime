@@ -62,6 +62,19 @@ function pricedComponent(tokens: number, microusdPerMillion: number): bigint {
   return ceilDiv(safeBigInt(tokens) * safeBigInt(microusdPerMillion), MICROS_PER_UNIT);
 }
 
+function worstCaseTwoComponentCost(
+  totalTokens: number,
+  firstRate: number,
+  secondRate: number,
+): bigint {
+  const total = safeBigInt(totalTokens);
+  const first = safeBigInt(firstRate);
+  const second = safeBigInt(secondRate);
+  const maximumRate = first > second ? first : second;
+  const splitRoundingSlack = total >= 2n && first > 0n && second > 0n ? 1n : 0n;
+  return ceilDiv(total * maximumRate, MICROS_PER_UNIT) + splitRoundingSlack;
+}
+
 function validatePricing(pricing: CatalogPricingV1): void {
   assertSafeNonnegative(pricing.input_microusd_per_million);
   assertSafeNonnegative(pricing.cached_input_microusd_per_million);
@@ -224,13 +237,17 @@ export function estimateRoutingAllocation(input: {
   assertSafeNonnegative(input.ceilings.max_input_tokens);
   assertSafeNonnegative(input.ceilings.max_output_tokens);
   assertSafeNonnegative(input.ceilings.max_duration_ms);
-  const outputRate = Math.max(
-    input.pricing.output_microusd_per_million,
-    input.pricing.reasoning_output_microusd_per_million,
-  );
   const cost =
-    pricedComponent(input.ceilings.max_input_tokens, input.pricing.input_microusd_per_million) +
-    pricedComponent(input.ceilings.max_output_tokens, outputRate);
+    worstCaseTwoComponentCost(
+      input.ceilings.max_input_tokens,
+      input.pricing.input_microusd_per_million,
+      input.pricing.cached_input_microusd_per_million,
+    ) +
+    worstCaseTwoComponentCost(
+      input.ceilings.max_output_tokens,
+      input.pricing.output_microusd_per_million,
+      input.pricing.reasoning_output_microusd_per_million,
+    );
   return Object.freeze({
     input_tokens: input.ceilings.max_input_tokens,
     output_tokens: input.ceilings.max_output_tokens,
@@ -280,21 +297,83 @@ export function reserveRoutingBudget(input: {
   });
 }
 
-function assertPlanBindings(state: RoutingStateV1, plan: PlannedModelSelectionPlanV1): void {
+function assertReservedPlanBindings(
+  reservedState: RoutingStateV1,
+  plan: PlannedModelSelectionPlanV1,
+): void {
   if (
-    state.state_id !== plan.prior_state_id ||
-    state.run_id !== plan.run_id ||
-    state.request_hash !== plan.request_hash ||
-    state.catalog_hash !== plan.catalog_hash ||
-    state.policy_hash !== plan.policy_hash ||
+    reservedState.state_id !== plan.prior_state_id ||
+    reservedState.revision !== plan.next_state_revision ||
+    reservedState.previous_state_hash !== plan.prior_state_hash ||
+    reservedState.document_hash !== plan.next_state_hash ||
+    reservedState.run_id !== plan.run_id ||
+    reservedState.request_hash !== plan.request_hash ||
+    reservedState.catalog_hash !== plan.catalog_hash ||
+    reservedState.policy_hash !== plan.policy_hash ||
     plan.reservation.decision_id !== plan.decision_id ||
     plan.reservation.request_id !== plan.request_id
   ) {
     throw new RuntimeRoutingError("RUNTIME_ROUTING_STALE_STATE");
   }
+}
+
+function stateWithoutTransitionFields(state: RoutingStateV1): unknown {
+  const {
+    circuits: _circuits,
+    document_hash: _documentHash,
+    previous_state_hash: _previousStateHash,
+    revision: _revision,
+    ...governed
+  } = state;
+  void _circuits;
+  void _documentHash;
+  void _previousStateHash;
+  void _revision;
+  return governed;
+}
+
+function changedCircuitEntryIds(
+  reservedState: RoutingStateV1,
+  currentState: RoutingStateV1,
+): readonly string[] {
+  const reserved = new Map(reservedState.circuits.map((circuit) => [circuit.entry_id, circuit]));
+  const current = new Map(currentState.circuits.map((circuit) => [circuit.entry_id, circuit]));
+  const entryIds = [...new Set([...reserved.keys(), ...current.keys()])].sort();
+  return entryIds.filter((entryId) => !canonicalEqual(reserved.get(entryId), current.get(entryId)));
+}
+
+function assertCurrentStateDescendsFromReservation(
+  currentState: RoutingStateV1,
+  reservedState: RoutingStateV1,
+  plan: PlannedModelSelectionPlanV1,
+): void {
   if (
-    state.revision < plan.next_state_revision ||
-    (state.revision === plan.next_state_revision && state.document_hash !== plan.next_state_hash)
+    currentState.document_hash === reservedState.document_hash &&
+    canonicalEqual(currentState, reservedState)
+  ) {
+    return;
+  }
+  if (
+    currentState.revision !== reservedState.revision + 1 ||
+    currentState.previous_state_hash !== reservedState.document_hash ||
+    !canonicalEqual(
+      stateWithoutTransitionFields(currentState),
+      stateWithoutTransitionFields(reservedState),
+    )
+  ) {
+    throw new RuntimeRoutingError("RUNTIME_ROUTING_STALE_STATE");
+  }
+
+  const changedEntryIds = changedCircuitEntryIds(reservedState, currentState);
+  const plannedEntryIds = new Set([
+    ...plan.worker_attempts.map((attempt) => attempt.entry_id),
+    ...(plan.reviewer_attempt === null ? [] : [plan.reviewer_attempt.entry_id]),
+  ]);
+  const changedEntryId = changedEntryIds[0];
+  if (
+    changedEntryIds.length !== 1 ||
+    changedEntryId === undefined ||
+    !plannedEntryIds.has(changedEntryId)
   ) {
     throw new RuntimeRoutingError("RUNTIME_ROUTING_STALE_STATE");
   }
@@ -368,19 +447,32 @@ function addKnownUsage(
 
 export function settleRoutingDecision(input: {
   readonly state: RoutingStateV1;
+  readonly reserved_state: RoutingStateV1;
   readonly plan: PlannedModelSelectionPlanV1;
   readonly attempts: readonly RoutingAttemptResult[];
   readonly settled_at: string;
 }): Readonly<{ status: "SETTLED" | "FAILED"; state: RoutingStateV1 }> {
   if (!isCanonicalUtcTimestamp(input.settled_at)) invalid();
   const state = stateOrThrow(input.state);
+  const reservedState = stateOrThrow(input.reserved_state);
   const plan = planOrThrow(input.plan);
+  if (state.revision >= Number.MAX_SAFE_INTEGER) invalid();
+  assertReservedPlanBindings(reservedState, plan);
+  assertCurrentStateDescendsFromReservation(state, reservedState, plan);
+  exactReservation(reservedState, plan);
+  const reservation = exactReservation(state, plan);
+  if (
+    state.circuits.some(
+      (circuit) =>
+        circuit.status === "probe-reserved" &&
+        circuit.probe_decision_id === reservation.decision_id,
+    )
+  ) {
+    throw new RuntimeRoutingError("RUNTIME_ROUTING_STALE_STATE");
+  }
   if (state.budget_status !== "known" || state.settled.cost_microusd === null) {
     throw new RuntimeRoutingError("RUNTIME_ROUTING_USAGE_UNKNOWN");
   }
-  if (state.revision >= Number.MAX_SAFE_INTEGER) invalid();
-  assertPlanBindings(state, plan);
-  const reservation = exactReservation(state, plan);
   const allocations = new Map(
     reservation.allocations.map((allocation) => [allocation.attempt_id, allocation]),
   );
@@ -405,6 +497,17 @@ export function settleRoutingDecision(input: {
     (value) => value.decision_id !== reservation.decision_id,
   );
   const budgetStatus = unknown ? "unknown" : "known";
+  const removedDecisionIds = new Set(
+    unknown ? state.reservations.map((value) => value.decision_id) : [reservation.decision_id],
+  );
+  if (
+    state.circuits.some(
+      (circuit) =>
+        circuit.status === "probe-reserved" && removedDecisionIds.has(circuit.probe_decision_id),
+    )
+  ) {
+    throw new RuntimeRoutingError("RUNTIME_ROUTING_STALE_STATE");
+  }
   const settled: UsageSummary = unknown ? { ...nextSettled, cost_microusd: null } : nextSettled;
   const nextState = freezeState({
     ...state,

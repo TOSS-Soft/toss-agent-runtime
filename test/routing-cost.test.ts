@@ -13,6 +13,7 @@ import { RuntimeRoutingError, type RuntimeRoutingErrorCode } from "../src/routin
 import type {
   CatalogPricingV1,
   PlannedModelSelectionPlanV1,
+  RoutingCircuitV1,
   RoutingReservationV1,
   RoutingStateV1,
 } from "../src/routing/types.js";
@@ -109,6 +110,71 @@ function reservedPlanFixture(
   return { state, plan: planValue as unknown as PlannedModelSelectionPlanV1 };
 }
 
+function rehashState(value: RoutingStateV1): RoutingStateV1 {
+  const candidate = { ...value, document_hash: `sha256:${"0".repeat(64)}` } as RoutingStateV1;
+  return { ...candidate, document_hash: hashRoutingState(candidate) };
+}
+
+function rehashPlan(value: PlannedModelSelectionPlanV1): PlannedModelSelectionPlanV1 {
+  const candidate = {
+    ...value,
+    document_hash: `sha256:${"0".repeat(64)}`,
+  } as PlannedModelSelectionPlanV1;
+  return {
+    ...candidate,
+    document_hash: selectionPlanDocumentHash(candidate as unknown as Record<string, unknown>),
+  };
+}
+
+function immediateCircuitDescendant(
+  reservedState: RoutingStateV1,
+  circuits: readonly RoutingCircuitV1[],
+  overrides: Partial<RoutingStateV1> = {},
+): RoutingStateV1 {
+  return rehashState({
+    ...reservedState,
+    revision: reservedState.revision + 1,
+    previous_state_hash: reservedState.document_hash,
+    circuits,
+    ...overrides,
+  });
+}
+
+function probeReservedPlanFixture(): Readonly<{
+  state: RoutingStateV1;
+  plan: PlannedModelSelectionPlanV1;
+}> {
+  const fixture = reservedPlanFixture();
+  const state = rehashState({
+    ...fixture.state,
+    circuits: [
+      {
+        entry_id: "balanced-primary",
+        status: "probe-reserved",
+        consecutive_failures: 1,
+        retry_at: "2026-08-21T12:00:00.000Z",
+        probe_decision_id: fixture.plan.decision_id,
+      },
+    ],
+  });
+  return {
+    state,
+    plan: rehashPlan({ ...fixture.plan, next_state_hash: state.document_hash }),
+  };
+}
+
+function successfulAttempt(plan: PlannedModelSelectionPlanV1): RoutingAttemptResult {
+  const attempt = plan.worker_attempts[0];
+  if (attempt === undefined) throw new Error("missing attempt fixture");
+  return {
+    attempt_id: attempt.attempt_id,
+    route_identity: routeIdentity(plan),
+    usage: usage(),
+    duration_ms: 1,
+    effect_may_have_occurred: true,
+  };
+}
+
 describe("exact routing cost", () => {
   it("rounds each nonzero priced component upward independently", () => {
     expect(
@@ -200,6 +266,89 @@ describe("exact routing cost", () => {
       duration_ms: 7,
       turns: 1,
     });
+  });
+
+  it("bounds four independently rounded components when every unit rate is equal", () => {
+    const pricing = {
+      input_microusd_per_million: 1,
+      cached_input_microusd_per_million: 1,
+      output_microusd_per_million: 1,
+      reasoning_output_microusd_per_million: 1,
+    };
+    const allocation = estimateRoutingAllocation({
+      pricing,
+      ceilings: { max_input_tokens: 2, max_output_tokens: 2, max_duration_ms: 1 },
+    });
+
+    expect(allocation.cost_microusd).toBe(4);
+    expect(
+      calculateRoutingCost(pricing, {
+        input_tokens: 2,
+        output_tokens: 2,
+        cached_input_tokens: 1,
+        reasoning_tokens: 1,
+      }),
+    ).toBeLessThanOrEqual(allocation.cost_microusd);
+  });
+
+  it("is an upper bound for every valid cached/reasoning split in a bounded matrix", () => {
+    const pricingMatrix: readonly CatalogPricingV1[] = [
+      {
+        input_microusd_per_million: 1,
+        cached_input_microusd_per_million: 1,
+        output_microusd_per_million: 1,
+        reasoning_output_microusd_per_million: 1,
+      },
+      {
+        input_microusd_per_million: 1,
+        cached_input_microusd_per_million: 2_000_000,
+        output_microusd_per_million: 3,
+        reasoning_output_microusd_per_million: 3_000_000,
+      },
+      {
+        input_microusd_per_million: 999_999,
+        cached_input_microusd_per_million: 1_000_001,
+        output_microusd_per_million: 999_999,
+        reasoning_output_microusd_per_million: 1_000_001,
+      },
+      {
+        input_microusd_per_million: 0,
+        cached_input_microusd_per_million: 7,
+        output_microusd_per_million: 11,
+        reasoning_output_microusd_per_million: 0,
+      },
+    ];
+
+    for (const pricing of pricingMatrix) {
+      for (let inputTokens = 0; inputTokens <= 5; inputTokens += 1) {
+        for (let outputTokens = 0; outputTokens <= 5; outputTokens += 1) {
+          const estimate = estimateRoutingAllocation({
+            pricing,
+            ceilings: {
+              max_input_tokens: inputTokens,
+              max_output_tokens: outputTokens,
+              max_duration_ms: 1,
+            },
+          }).cost_microusd;
+          for (
+            let cachedInputTokens = 0;
+            cachedInputTokens <= inputTokens;
+            cachedInputTokens += 1
+          ) {
+            for (let reasoningTokens = 0; reasoningTokens <= outputTokens; reasoningTokens += 1) {
+              expect(
+                calculateRoutingCost(pricing, {
+                  input_tokens: inputTokens,
+                  output_tokens: outputTokens,
+                  cached_input_tokens: cachedInputTokens,
+                  reasoning_tokens: reasoningTokens,
+                }),
+              ).toBeLessThanOrEqual(estimate);
+            }
+          }
+        }
+      }
+    }
   });
 });
 
@@ -425,6 +574,7 @@ describe("routing budget settlement", () => {
 
     const settled = settleRoutingDecision({
       state: fixture.state,
+      reserved_state: fixture.state,
       plan: fixture.plan,
       attempts: [result],
       settled_at: "2026-08-21T12:00:01.000Z",
@@ -471,6 +621,7 @@ describe("routing budget settlement", () => {
 
     const settled = settleRoutingDecision({
       state: fixture.state,
+      reserved_state: fixture.state,
       plan: fixture.plan,
       attempts: [
         {
@@ -503,6 +654,7 @@ describe("routing budget settlement", () => {
 
       const settled = settleRoutingDecision({
         state: fixture.state,
+        reserved_state: fixture.state,
         plan: fixture.plan,
         attempts: [
           {
@@ -549,6 +701,7 @@ describe("routing budget settlement", () => {
     ) =>
       settleRoutingDecision({
         state,
+        reserved_state: fixture.state,
         plan,
         attempts,
         settled_at: "2026-08-21T12:00:01.000Z",
@@ -615,6 +768,7 @@ describe("routing budget settlement", () => {
 
     const settled = settleRoutingDecision({
       state: later,
+      reserved_state: fixture.state,
       plan: fixture.plan,
       attempts: [
         {
@@ -631,5 +785,205 @@ describe("routing budget settlement", () => {
     expect(settled.status).toBe("SETTLED");
     expect(settled.state.previous_state_hash).toBe(later.document_hash);
     expect(settled.state.revision).toBe(later.revision + 1);
+  });
+
+  it("rejects forks, jumps, and non-circuit drift in a claimed descendant", () => {
+    const fixture = reservedPlanFixture();
+    const circuits: readonly RoutingCircuitV1[] = [
+      {
+        entry_id: "balanced-primary",
+        status: "closed",
+        consecutive_failures: 0,
+        retry_at: null,
+        probe_decision_id: null,
+      },
+    ];
+    const otherReservation = reservationFixture({
+      decision_id: "decision-2",
+      decision_hash: `sha256:${"9".repeat(64)}`,
+      request_id: "request-2",
+      allocations: [
+        {
+          attempt_id: "attempt-worker-1",
+          entry_id: "balanced-secondary",
+          role: "worker",
+          input_tokens: 1,
+          output_tokens: 1,
+          cost_microusd: 1,
+          duration_ms: 1,
+          turns: 1,
+        },
+      ],
+    });
+    const cases: readonly [string, RoutingStateV1][] = [
+      ["same-revision fork", rehashState({ ...fixture.state, circuits })],
+      [
+        "wrong predecessor",
+        immediateCircuitDescendant(fixture.state, circuits, {
+          previous_state_hash: `sha256:${"f".repeat(64)}`,
+        }),
+      ],
+      [
+        "revision jump",
+        immediateCircuitDescendant(fixture.state, circuits, {
+          revision: fixture.state.revision + 2,
+        }),
+      ],
+      [
+        "budget drift",
+        immediateCircuitDescendant(fixture.state, circuits, {
+          budget: { ...fixture.state.budget, max_input_tokens: 200_001 },
+        }),
+      ],
+      [
+        "settled drift",
+        immediateCircuitDescendant(fixture.state, circuits, {
+          settled: { ...fixture.state.settled, input_tokens: 1 },
+        }),
+      ],
+      [
+        "reservation drift",
+        immediateCircuitDescendant(fixture.state, circuits, {
+          reservations: [...fixture.state.reservations, otherReservation],
+        }),
+      ],
+    ];
+
+    for (const [, state] of cases) {
+      expectRoutingError(
+        () =>
+          settleRoutingDecision({
+            state,
+            reserved_state: fixture.state,
+            plan: fixture.plan,
+            attempts: [successfulAttempt(fixture.plan)],
+            settled_at: "2026-08-21T12:00:01.000Z",
+          }),
+        "RUNTIME_ROUTING_STALE_STATE",
+      );
+    }
+  });
+
+  it("requires the supplied reserved state to match the plan's exact next head", () => {
+    const fixture = reservedPlanFixture();
+    const driftedReservedState = rehashState({
+      ...fixture.state,
+      budget: { ...fixture.state.budget, max_input_tokens: 200_001 },
+    });
+
+    expectRoutingError(
+      () =>
+        settleRoutingDecision({
+          state: fixture.state,
+          reserved_state: driftedReservedState,
+          plan: fixture.plan,
+          attempts: [successfulAttempt(fixture.plan)],
+          settled_at: "2026-08-21T12:00:01.000Z",
+        }),
+      "RUNTIME_ROUTING_STALE_STATE",
+    );
+  });
+
+  it.each(["known", "unknown"] as const)(
+    "requires an outcome transition before settling a %s probe reservation",
+    (usageStatus) => {
+      const fixture = probeReservedPlanFixture();
+      const attempt = successfulAttempt(fixture.plan);
+      expectRoutingError(
+        () =>
+          settleRoutingDecision({
+            state: fixture.state,
+            reserved_state: fixture.state,
+            plan: fixture.plan,
+            attempts: [
+              usageStatus === "known" ? attempt : { ...attempt, route_identity: null, usage: null },
+            ],
+            settled_at: "2026-08-21T12:00:01.000Z",
+          }),
+        "RUNTIME_ROUTING_STALE_STATE",
+      );
+    },
+  );
+
+  it.each(["known", "unknown"] as const)(
+    "settles %s probe usage after one immediate circuit descendant resolves the lease",
+    (usageStatus) => {
+      const fixture = probeReservedPlanFixture();
+      const current = immediateCircuitDescendant(fixture.state, [
+        {
+          entry_id: "balanced-primary",
+          status: "closed",
+          consecutive_failures: 0,
+          retry_at: null,
+          probe_decision_id: null,
+        },
+      ]);
+      const attempt = successfulAttempt(fixture.plan);
+
+      const settled = settleRoutingDecision({
+        state: current,
+        reserved_state: fixture.state,
+        plan: fixture.plan,
+        attempts: [
+          usageStatus === "known" ? attempt : { ...attempt, route_identity: null, usage: null },
+        ],
+        settled_at: "2026-08-21T12:00:01.000Z",
+      });
+
+      expect(settled.status).toBe(usageStatus === "known" ? "SETTLED" : "FAILED");
+      expect(settled.state.budget_status).toBe(usageStatus);
+      expect(settled.state.reservations).toEqual([]);
+      expect(settled.state.circuits).toEqual(current.circuits);
+    },
+  );
+
+  it("rejects unknown settlement that would orphan another active probe lease", () => {
+    const otherReservation = reservationFixture({
+      decision_id: "decision-0",
+      decision_hash: `sha256:${"9".repeat(64)}`,
+      request_id: "request-0",
+      allocations: [
+        {
+          attempt_id: "attempt-other-probe",
+          entry_id: "other-probe",
+          role: "worker",
+          input_tokens: 1,
+          output_tokens: 1,
+          cost_microusd: 1,
+          duration_ms: 1,
+          turns: 1,
+        },
+      ],
+    });
+    const active = reserveRoutingBudget({
+      state: stateFixture(),
+      reservation: otherReservation,
+    });
+    const prior = rehashState({
+      ...active,
+      circuits: [
+        {
+          entry_id: "other-probe",
+          status: "probe-reserved",
+          consecutive_failures: 1,
+          retry_at: "2026-08-21T12:00:00.000Z",
+          probe_decision_id: otherReservation.decision_id,
+        },
+      ],
+    });
+    const fixture = reservedPlanFixture({ state: prior });
+    const attempt = successfulAttempt(fixture.plan);
+
+    expectRoutingError(
+      () =>
+        settleRoutingDecision({
+          state: fixture.state,
+          reserved_state: fixture.state,
+          plan: fixture.plan,
+          attempts: [{ ...attempt, route_identity: null, usage: null }],
+          settled_at: "2026-08-21T12:00:01.000Z",
+        }),
+      "RUNTIME_ROUTING_STALE_STATE",
+    );
   });
 });
