@@ -18,6 +18,7 @@ import {
   hashModelSelectionPlan,
   hashRoutingPolicy,
   hashRoutingState,
+  parseGovernedRoutingOverride,
   parseModelCatalog,
   parseModelSelectionPlan,
   parseRoutingPolicy,
@@ -27,6 +28,7 @@ import { RuntimeRoutingError } from "./errors.js";
 import type {
   BlockedModelSelectionPlanV1,
   CatalogRouteV1,
+  GovernedRoutingOverride,
   LatencyClass,
   LogicalModelClass,
   ModelCatalogEntryV1,
@@ -321,6 +323,17 @@ function fitsBudget(usage: BudgetVector, remaining: BudgetVector): boolean {
   );
 }
 
+function subtractBudget(available: BudgetVector, used: BudgetVector): BudgetVector {
+  if (!fitsBudget(used, available)) invalid();
+  return {
+    input_tokens: available.input_tokens - used.input_tokens,
+    output_tokens: available.output_tokens - used.output_tokens,
+    cost_microusd: available.cost_microusd - used.cost_microusd,
+    duration_ms: available.duration_ms - used.duration_ms,
+    turns: available.turns - used.turns,
+  };
+}
+
 function validateInputs(input: PlanModelSelectionInput): ValidatedInputs {
   const decisionMs = timestamp(input.decision_at);
   if (decisionMs === null || !IDENTIFIER_PATTERN.test(input.gateway_profile)) invalid();
@@ -398,7 +411,8 @@ function decisionId(input: {
   readonly live_hash: `sha256:${string}`;
   readonly gateway_profile: string;
   readonly decision_at: string;
-  readonly override: PlanModelSelectionInput["override"] | null;
+  readonly override: GovernedRoutingOverride | null;
+  readonly override_supplied: boolean;
 }): string {
   return `decision-${sha256(input, ROUTING_JSON_LIMITS).slice("sha256:".length)}`;
 }
@@ -408,6 +422,7 @@ function inputBindings(
   validated: ValidatedInputs,
   rule: RoutingPolicyRuleV1,
   id: string,
+  override: GovernedRoutingOverride | null,
 ) {
   return {
     protocol_version: "runtime-contract.v1" as const,
@@ -432,9 +447,7 @@ function inputBindings(
     gateway_revision: validated.live.gateway.revision,
     capability_document_hash: validated.live.document_hash,
     override:
-      input.override === undefined
-        ? null
-        : (input.override.artifact as PlannedModelSelectionPlanV1["override"]),
+      override === null ? null : (override.artifact as PlannedModelSelectionPlanV1["override"]),
     decision_at: input.decision_at,
     matched_rule_id: rule.rule_id,
   };
@@ -576,11 +589,19 @@ function candidateForEntry(input: {
   readonly state: RoutingStateV1;
   readonly decisionMs: number;
   readonly remainingBudget: BudgetVector;
+  readonly role: "reviewer" | "worker";
 }): Readonly<{ candidate: Candidate | null; reason: RoutingEliminationV1["reason"] }> {
-  const classRank = input.rule.worker_class_preference.findIndex((value) =>
-    input.entry.logical_classes.includes(value),
-  );
-  if (!input.entry.logical_classes.includes(input.requestClass) || classRank < 0) {
+  const classRank =
+    input.role === "worker"
+      ? input.rule.worker_class_preference.findIndex((value) =>
+          input.entry.logical_classes.includes(value),
+        )
+      : 0;
+  if (
+    (input.role === "worker" &&
+      (!input.entry.logical_classes.includes(input.requestClass) || classRank < 0)) ||
+    (input.role === "reviewer" && !input.entry.logical_classes.includes("independent-review"))
+  ) {
     return { candidate: null, reason: "policy" };
   }
 
@@ -674,8 +695,8 @@ function routeRequirement(
   });
 }
 
-function attemptId(decision: string, index: number): string {
-  return `attempt-${decision.slice("decision-".length, "decision-".length + 32)}-worker-${String(index).padStart(2, "0")}`;
+function attemptId(decision: string, role: "reviewer" | "worker", index: number): string {
+  return `attempt-${decision.slice("decision-".length, "decision-".length + 32)}-${role}-${String(index).padStart(2, "0")}`;
 }
 
 function plannedDecisionHash(value: PlannedModelSelectionPlanV1): `sha256:${string}` {
@@ -726,10 +747,186 @@ function initialReasons(catalog: ModelCatalogV1): Map<string, RoutingElimination
   return new Map(catalog.entries.map((entry) => [entry.entry_id, "policy" as const]));
 }
 
+function validatedOverride(
+  value: GovernedRoutingOverride | undefined,
+): GovernedRoutingOverride | null {
+  if (value === undefined) return null;
+  try {
+    assertExactDataRecord(value, ["artifact", "value"]);
+    const parsed = parseGovernedRoutingOverride(value);
+    return parsed.ok ? parsed.value : null;
+  } catch {
+    return null;
+  }
+}
+
+function independentRoutes(reviewer: Candidate, workers: readonly Candidate[]): boolean {
+  return workers.every((worker) =>
+    reviewer.accepted_routes.every((reviewRoute) =>
+      worker.accepted_routes.every(
+        (workerRoute) =>
+          reviewRoute.provider !== workerRoute.provider && reviewRoute.model !== workerRoute.model,
+      ),
+    ),
+  );
+}
+
+interface ReviewPairing {
+  readonly primary: Candidate;
+  readonly fallbacks: readonly Candidate[];
+  readonly reviewer: Candidate;
+  readonly reasons: ReadonlyMap<string, RoutingEliminationV1["reason"]>;
+}
+
+function chooseReviewFallbacks(input: {
+  readonly candidates: readonly Candidate[];
+  readonly reviewer: Candidate;
+  readonly maxFallbacks: number;
+  readonly baseBudget: BudgetVector;
+  readonly availableBudget: BudgetVector;
+}): Readonly<{
+  fallbacks: readonly Candidate[];
+  reasons: ReadonlyMap<string, RoutingEliminationV1["reason"]>;
+}> {
+  const reasons = new Map<string, RoutingEliminationV1["reason"]>();
+  const valid: Candidate[] = [];
+  for (const candidate of input.candidates) {
+    if (candidate.probe) {
+      reasons.set(candidate.entry.entry_id, "circuit");
+    } else if (
+      candidate.entry.entry_id === input.reviewer.entry.entry_id ||
+      !independentRoutes(input.reviewer, [candidate])
+    ) {
+      reasons.set(candidate.entry.entry_id, "review-independence");
+    } else {
+      valid.push(candidate);
+    }
+  }
+  if (valid.length === 0 || input.maxFallbacks === 0) {
+    for (const candidate of valid) reasons.set(candidate.entry.entry_id, "policy");
+    return Object.freeze({ fallbacks: [], reasons });
+  }
+
+  const remaining = subtractBudget(input.availableBudget, input.baseBudget);
+  const firstAllocation = allocationBudget(valid[0]!.allocation);
+  const nonCostLimit = [
+    remaining.input_tokens / firstAllocation.input_tokens,
+    remaining.output_tokens / firstAllocation.output_tokens,
+    remaining.duration_ms / firstAllocation.duration_ms,
+    remaining.turns / firstAllocation.turns,
+    BigInt(input.maxFallbacks),
+    BigInt(valid.length),
+  ].reduce((minimum, value) => (value < minimum ? value : minimum));
+  const countLimit = Number(nonCostLimit);
+  const suffix: (bigint | null)[][] = Array.from({ length: valid.length + 1 }, () =>
+    Array<bigint | null>(countLimit + 1).fill(null),
+  );
+  suffix[valid.length]![0] = 0n;
+  for (let index = valid.length - 1; index >= 0; index -= 1) {
+    suffix[index]![0] = 0n;
+    const cost = BigInt(valid[index]!.allocation.cost_microusd);
+    for (let count = 1; count <= countLimit; count += 1) {
+      const skipped = suffix[index + 1]![count] ?? null;
+      const tail = suffix[index + 1]![count - 1] ?? null;
+      const taken = tail === null ? null : cost + tail;
+      suffix[index]![count] =
+        skipped === null ? taken : taken === null || skipped <= taken ? skipped : taken;
+    }
+  }
+
+  let targetCount = countLimit;
+  while (
+    targetCount > 0 &&
+    ((suffix[0]![targetCount] ?? null) === null ||
+      (suffix[0]![targetCount] ?? 0n) > remaining.cost_microusd)
+  ) {
+    targetCount -= 1;
+  }
+  const selected: Candidate[] = [];
+  let start = 0;
+  let remainingCost = remaining.cost_microusd;
+  for (let slots = targetCount; slots > 0; slots -= 1) {
+    const choices = valid
+      .map((candidate, index) => ({ candidate, index }))
+      .filter(({ index }) => index >= start && valid.length - index >= slots)
+      .sort(
+        (left, right) =>
+          compareAscii(left.candidate.entry.entry_id, right.candidate.entry.entry_id) ||
+          left.index - right.index,
+      );
+    const choice = choices.find(({ candidate, index }) => {
+      const tail = suffix[index + 1]![slots - 1] ?? null;
+      return tail !== null && BigInt(candidate.allocation.cost_microusd) + tail <= remainingCost;
+    });
+    if (choice === undefined) invalid();
+    selected.push(choice.candidate);
+    remainingCost -= BigInt(choice.candidate.allocation.cost_microusd);
+    start = choice.index + 1;
+  }
+
+  const selectedIds = new Set(selected.map((candidate) => candidate.entry.entry_id));
+  for (const candidate of valid) {
+    if (!selectedIds.has(candidate.entry.entry_id)) {
+      reasons.set(candidate.entry.entry_id, targetCount < input.maxFallbacks ? "budget" : "policy");
+    }
+  }
+  return Object.freeze({ fallbacks: selected, reasons });
+}
+
+function chooseReviewPairing(input: {
+  readonly workers: readonly Candidate[];
+  readonly reviewers: readonly Candidate[];
+  readonly maxFallbacks: number;
+  readonly availableBudget: BudgetVector;
+}): ReviewPairing | null {
+  const observedReasons = new Map<string, RoutingEliminationV1["reason"]>();
+  for (const [workerRank, primary] of input.workers.entries()) {
+    for (const reviewer of input.reviewers) {
+      if (reviewer.probe) {
+        observedReasons.set(reviewer.entry.entry_id, "circuit");
+        continue;
+      }
+      if (
+        reviewer.entry.entry_id === primary.entry.entry_id ||
+        !independentRoutes(reviewer, [primary])
+      ) {
+        observedReasons.set(reviewer.entry.entry_id, "review-independence");
+        continue;
+      }
+      const selectedBudget = addBudget(
+        allocationBudget(primary.allocation),
+        allocationBudget(reviewer.allocation),
+      );
+      if (!fitsBudget(selectedBudget, input.availableBudget)) {
+        observedReasons.set(reviewer.entry.entry_id, "budget");
+        continue;
+      }
+
+      const fallbackSelection = chooseReviewFallbacks({
+        candidates: input.workers.slice(workerRank + 1),
+        reviewer,
+        maxFallbacks: input.maxFallbacks,
+        baseBudget: selectedBudget,
+        availableBudget: input.availableBudget,
+      });
+      return Object.freeze({
+        primary,
+        fallbacks: fallbackSelection.fallbacks,
+        reviewer,
+        reasons: new Map([...observedReasons, ...fallbackSelection.reasons]),
+      });
+    }
+    observedReasons.set(primary.entry.entry_id, "review-independence");
+  }
+  return null;
+}
+
 export function planModelSelection(input: PlanModelSelectionInput): RoutingDecision {
   const validated = validateInputs(input);
   const rule = matchedRule(validated.policy, input.task);
   const requestHash = hashExecutionRequest(validated.request);
+  const overrideSupplied = input.override !== undefined;
+  const override = validatedOverride(input.override);
   const id = decisionId({
     request_hash: requestHash,
     task: input.task,
@@ -740,9 +937,10 @@ export function planModelSelection(input: PlanModelSelectionInput): RoutingDecis
     live_hash: validated.live.document_hash,
     gateway_profile: input.gateway_profile,
     decision_at: input.decision_at,
-    override: input.override ?? null,
+    override,
+    override_supplied: overrideSupplied,
   });
-  const bindings = inputBindings(input, validated, rule, id);
+  const bindings = inputBindings(input, validated, rule, id, override);
   const reasons = initialReasons(validated.catalog);
 
   if (
@@ -785,7 +983,14 @@ export function planModelSelection(input: PlanModelSelectionInput): RoutingDecis
       "budget",
     );
   }
-  if (input.override !== undefined) {
+  if (
+    overrideSupplied &&
+    (override === null ||
+      override.value.catalog_hash !== validated.catalog.document_hash ||
+      override.value.policy_hash !== validated.policy.document_hash ||
+      timestamp(override.value.issued_at) === null ||
+      timestamp(override.value.issued_at)! > validated.decision_ms)
+  ) {
     return blockedDecision(
       bindings,
       validated.catalog,
@@ -814,7 +1019,7 @@ export function planModelSelection(input: PlanModelSelectionInput): RoutingDecis
     );
   }
 
-  const candidates: Candidate[] = [];
+  let candidates: Candidate[] = [];
   const maxLatency = effectiveLatency(input.task, rule);
   const availableBudget = remainingBudget(state);
   for (const catalogEntry of validated.catalog.entries) {
@@ -829,11 +1034,33 @@ export function planModelSelection(input: PlanModelSelectionInput): RoutingDecis
       state,
       decisionMs: validated.decision_ms,
       remainingBudget: availableBudget,
+      role: "worker",
     });
     if (evaluated.candidate === null) reasons.set(catalogEntry.entry_id, evaluated.reason);
     else candidates.push(evaluated.candidate);
   }
   candidates.sort(compareCandidate);
+
+  if (override !== null) {
+    const target = candidates.find(
+      (candidate) => candidate.entry.entry_id === override.value.target_entry_id,
+    );
+    if (target === undefined) {
+      return blockedDecision(
+        bindings,
+        validated.catalog,
+        reasons,
+        "RUNTIME_ROUTING_POLICY_DENIED",
+        "override",
+      );
+    }
+    for (const candidate of candidates) {
+      if (candidate.entry.entry_id !== target.entry.entry_id) {
+        reasons.set(candidate.entry.entry_id, "override");
+      }
+    }
+    candidates = [target];
+  }
 
   if (candidates.length === 0) {
     const circuitEntryIds = new Set(
@@ -897,43 +1124,102 @@ export function planModelSelection(input: PlanModelSelectionInput): RoutingDecis
     );
   }
 
-  const primary = candidates[0]!;
-  const selected: Candidate[] = [primary];
-  let selectedBudget = allocationBudget(primary.allocation);
-  reasons.delete(primary.entry.entry_id);
-  for (const candidate of candidates.slice(1)) {
-    if (candidate.probe) {
-      reasons.set(candidate.entry.entry_id, "circuit");
-      continue;
-    }
-    if (selected.length > rule.max_fallbacks) {
-      reasons.set(candidate.entry.entry_id, "policy");
-      continue;
-    }
-    const combinedBudget = addBudget(selectedBudget, allocationBudget(candidate.allocation));
-    if (!fitsBudget(combinedBudget, availableBudget)) {
-      reasons.set(candidate.entry.entry_id, "budget");
-      continue;
-    }
-    selected.push(candidate);
-    selectedBudget = combinedBudget;
-    reasons.delete(candidate.entry.entry_id);
-  }
-
+  let selected: Candidate[];
+  let selectedReviewer: Candidate | null = null;
+  let reviewerRequired: readonly string[] = [];
   if (rule.review === "independent") {
-    return blockedDecision(
-      bindings,
-      validated.catalog,
-      reasons,
-      "RUNTIME_ROUTING_REVIEW_UNAVAILABLE",
-      "review-independence",
-    );
+    reviewerRequired = [...new Set([...required, "independent-review"])].sort(compareAscii);
+    const reviewerCandidates: Candidate[] = [];
+    const reviewerReasons = new Map<string, RoutingEliminationV1["reason"]>();
+    for (const catalogEntry of validated.catalog.entries) {
+      const evaluated = candidateForEntry({
+        entry: catalogEntry,
+        rule,
+        requestClass: validated.request.model.logical_class as LogicalModelClass,
+        required: reviewerRequired,
+        ceilings: input.ceilings,
+        maxLatency,
+        live: validated.live,
+        state,
+        decisionMs: validated.decision_ms,
+        remainingBudget: availableBudget,
+        role: "reviewer",
+      });
+      if (evaluated.candidate === null) {
+        reviewerReasons.set(catalogEntry.entry_id, evaluated.reason);
+      } else {
+        reviewerCandidates.push(evaluated.candidate);
+      }
+    }
+    reviewerCandidates.sort(compareCandidate);
+    const pairing = chooseReviewPairing({
+      workers: candidates,
+      reviewers: reviewerCandidates,
+      maxFallbacks: rule.max_fallbacks,
+      availableBudget,
+    });
+    if (pairing === null) {
+      for (const candidate of candidates) {
+        reasons.set(candidate.entry.entry_id, "review-independence");
+      }
+      for (const candidate of reviewerCandidates) {
+        reasons.set(candidate.entry.entry_id, candidate.probe ? "circuit" : "review-independence");
+      }
+      for (const [entryId, reason] of reviewerReasons) {
+        if (reasons.get(entryId) === "policy") reasons.set(entryId, reason);
+      }
+      return blockedDecision(
+        bindings,
+        validated.catalog,
+        reasons,
+        "RUNTIME_ROUTING_REVIEW_UNAVAILABLE",
+        "review-independence",
+      );
+    }
+    selected = [pairing.primary, ...pairing.fallbacks];
+    selectedReviewer = pairing.reviewer;
+    for (const [entryId, reason] of reviewerReasons) {
+      if (reasons.get(entryId) === "policy") reasons.set(entryId, reason);
+    }
+    for (const [entryId, reason] of pairing.reasons) reasons.set(entryId, reason);
+    for (const candidate of reviewerCandidates) {
+      if (candidate.entry.entry_id !== selectedReviewer.entry.entry_id) {
+        reasons.set(
+          candidate.entry.entry_id,
+          pairing.reasons.get(candidate.entry.entry_id) ?? "review-independence",
+        );
+      }
+    }
+  } else {
+    const primary = candidates[0]!;
+    selected = [primary];
+    let selectedBudget = allocationBudget(primary.allocation);
+    for (const candidate of candidates.slice(1)) {
+      if (candidate.probe) {
+        reasons.set(candidate.entry.entry_id, "circuit");
+        continue;
+      }
+      if (selected.length > rule.max_fallbacks) {
+        reasons.set(candidate.entry.entry_id, "policy");
+        continue;
+      }
+      const combinedBudget = addBudget(selectedBudget, allocationBudget(candidate.allocation));
+      if (!fitsBudget(combinedBudget, availableBudget)) {
+        reasons.set(candidate.entry.entry_id, "budget");
+        continue;
+      }
+      selected.push(candidate);
+      selectedBudget = combinedBudget;
+    }
   }
+  const primary = selected[0]!;
+  for (const candidate of selected) reasons.delete(candidate.entry.entry_id);
+  if (selectedReviewer !== null) reasons.delete(selectedReviewer.entry.entry_id);
 
   const workerAttempts = selected.map((candidate, index) => {
     const requirement = routeRequirement(candidate.entry.route_alias, required, input.ceilings);
     return {
-      attempt_id: attemptId(id, index),
+      attempt_id: attemptId(id, "worker", index),
       role: "worker" as const,
       fallback_index: index,
       entry_id: candidate.entry.entry_id,
@@ -948,9 +1234,34 @@ export function planModelSelection(input: PlanModelSelectionInput): RoutingDecis
       reserved_cost_microusd: candidate.allocation.cost_microusd,
     };
   });
-  const allocations = selected
-    .map((candidate, index) => ({
-      attempt_id: attemptId(id, index),
+  const reviewerAttempt =
+    selectedReviewer === null
+      ? null
+      : (() => {
+          const requirement = routeRequirement(
+            selectedReviewer.entry.route_alias,
+            reviewerRequired,
+            input.ceilings,
+          );
+          return {
+            attempt_id: attemptId(id, "reviewer", 0),
+            role: "reviewer" as const,
+            fallback_index: null,
+            entry_id: selectedReviewer.entry.entry_id,
+            alias: selectedReviewer.entry.route_alias,
+            gateway_profile: input.gateway_profile,
+            gateway_revision: validated.live.gateway.revision,
+            capability_document_hash: validated.live.document_hash,
+            latency_class: selectedReviewer.latency_class,
+            requirement,
+            requirement_hash: hashProviderRouteRequirement(requirement),
+            accepted_routes: selectedReviewer.accepted_routes,
+            reserved_cost_microusd: selectedReviewer.allocation.cost_microusd,
+          };
+        })();
+  const allocations = [
+    ...selected.map((candidate, index) => ({
+      attempt_id: attemptId(id, "worker", index),
       entry_id: candidate.entry.entry_id,
       role: "worker" as const,
       input_tokens: candidate.allocation.input_tokens,
@@ -958,8 +1269,22 @@ export function planModelSelection(input: PlanModelSelectionInput): RoutingDecis
       cost_microusd: candidate.allocation.cost_microusd,
       duration_ms: candidate.allocation.duration_ms,
       turns: 1 as const,
-    }))
-    .sort((left, right) => compareAscii(left.attempt_id, right.attempt_id));
+    })),
+    ...(selectedReviewer === null
+      ? []
+      : [
+          {
+            attempt_id: attemptId(id, "reviewer", 0),
+            entry_id: selectedReviewer.entry.entry_id,
+            role: "reviewer" as const,
+            input_tokens: selectedReviewer.allocation.input_tokens,
+            output_tokens: selectedReviewer.allocation.output_tokens,
+            cost_microusd: selectedReviewer.allocation.cost_microusd,
+            duration_ms: selectedReviewer.allocation.duration_ms,
+            turns: 1 as const,
+          },
+        ]),
+  ].sort((left, right) => compareAscii(left.attempt_id, right.attempt_id));
   const reservation: RoutingReservationV1 = {
     decision_id: id,
     decision_hash: `sha256:${"0".repeat(64)}`,
@@ -971,7 +1296,7 @@ export function planModelSelection(input: PlanModelSelectionInput): RoutingDecis
     ...bindings,
     status: "planned",
     worker_attempts: workerAttempts,
-    reviewer_attempt: null,
+    reviewer_attempt: reviewerAttempt,
     reservation,
     next_state_revision: state.revision + 1,
     next_state_hash: `sha256:${"0".repeat(64)}`,

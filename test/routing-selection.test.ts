@@ -5,7 +5,7 @@ import {
   parseAgentgatewayCapabilities,
   type AgentgatewayCapabilitiesV1,
 } from "../src/gateway/index.js";
-import { canonicalJson } from "../src/protocol/json.js";
+import { canonicalJson, sha256 } from "../src/protocol/json.js";
 import {
   hashExecutionRequest,
   parseExecutionRequest,
@@ -23,6 +23,7 @@ import { RuntimeRoutingError } from "../src/routing/errors.js";
 import type {
   BlockedModelSelectionPlanV1,
   CatalogRouteV1,
+  GovernedRoutingOverride,
   ModelCatalogEntryV1,
   ModelCatalogV1,
   PlannedModelSelectionPlanV1,
@@ -345,6 +346,65 @@ function selectedEntryIds(plan: PlannedModelSelectionPlanV1): readonly string[] 
   return plan.worker_attempts.map((attempt) => attempt.entry_id);
 }
 
+function deepRequest(budget?: ExecutionRequestV1["budget"]): ExecutionRequestV1 {
+  return request(budget === undefined ? {} : { budget }, {
+    logical_class: "deep-reasoning",
+    required_capabilities: ["reasoning", "text", "tools"],
+  });
+}
+
+function reviewWorker(
+  entryId: string,
+  provider: "openai" | "anthropic" | "gemini",
+  model: string,
+  priority: number,
+  routes: readonly CatalogRouteV1[] = [route(`route-${entryId}`, provider, model)],
+): ModelCatalogEntryV1 {
+  return entry(entryId, entryId, priority, routes, {
+    logical_classes: ["deep-reasoning"],
+  });
+}
+
+function reviewer(
+  entryId: string,
+  provider: "openai" | "anthropic" | "gemini",
+  model: string,
+  priority: number,
+  routes: readonly CatalogRouteV1[] = [route(`route-${entryId}`, provider, model)],
+): ModelCatalogEntryV1 {
+  return entry(entryId, entryId, priority, routes, {
+    logical_classes: ["independent-review"],
+  });
+}
+
+function governedOverride(
+  input: PlanModelSelectionInput,
+  targetEntryId: string,
+  valueOverrides: Readonly<Record<string, unknown>> = {},
+  artifactOverrides: Readonly<Record<string, unknown>> = {},
+): GovernedRoutingOverride {
+  const value = {
+    version: "routing-override.v1",
+    override_id: "override-selection-1",
+    issued_at: "2026-08-21T11:59:30.000Z",
+    catalog_hash: input.catalog.document_hash,
+    policy_hash: input.policy.document_hash,
+    target_entry_id: targetEntryId,
+    reason_code: "incident-mitigation",
+    ...valueOverrides,
+  };
+  return {
+    artifact: {
+      document_type: "routing-override",
+      artifact_id: "override-selection-1",
+      revision: 1,
+      hash: sha256(value),
+      ...artifactOverrides,
+    },
+    value,
+  } as GovernedRoutingOverride;
+}
+
 describe("deterministic worker selection", () => {
   it("plans the primary and every allowed capability-equivalent fallback atomically", () => {
     const input = fixture();
@@ -475,6 +535,440 @@ describe("deterministic worker selection", () => {
       matched_rule_id: "security-review",
       block_code: "RUNTIME_ROUTING_REVIEW_UNAVAILABLE",
     });
+  });
+});
+
+describe("independent review routing", () => {
+  it.each([
+    ["security review", ["security"], "high", "security-review"],
+    ["architecture review", ["architecture"], "medium", "risk-default"],
+    ["irreversible review", ["irreversible"], "medium", "risk-default"],
+    ["multi-risk review", ["architecture", "security"], "critical", "risk-default"],
+  ] as const)("plans an independent reviewer for %s", (_name, risks, complexity, matchedRuleId) => {
+    const entries = [
+      reviewWorker("deep-worker", "openai", "gpt-5", 1),
+      reviewer("independent-reviewer", "anthropic", "claude-review", 1),
+    ];
+    const plan = planned(
+      fixture({
+        entries,
+        request: deepRequest(),
+        task: { risks, complexity },
+      }),
+    );
+
+    expect(plan.matched_rule_id).toBe(matchedRuleId);
+    expect(plan.worker_attempts.map((attempt) => attempt.entry_id)).toEqual(["deep-worker"]);
+    expect(plan.reviewer_attempt).toMatchObject({
+      entry_id: "independent-reviewer",
+      role: "reviewer",
+      fallback_index: null,
+    });
+    expect(plan.reservation.allocations.map((allocation) => allocation.role).sort()).toEqual([
+      "reviewer",
+      "worker",
+    ]);
+    expect(plan.eliminations).toEqual([]);
+  });
+
+  it("rejects different aliases whose accepted reviewer and worker routes resolve to the same provider/model", () => {
+    const plan = blocked(
+      fixture({
+        entries: [
+          reviewWorker("deep-worker", "openai", "shared-model", 1),
+          reviewer("independent-reviewer", "openai", "shared-model", 1),
+        ],
+        request: deepRequest(),
+        task: { risks: ["architecture"] },
+      }),
+    );
+
+    expect(plan.block_code).toBe("RUNTIME_ROUTING_REVIEW_UNAVAILABLE");
+  });
+
+  it("rejects a multi-route reviewer alias when any accepted provider/model pair collides", () => {
+    const workerRoutes = [
+      route("route-worker-openai", "openai", "worker-model-a"),
+      route("route-worker-anthropic", "anthropic", "worker-model-b"),
+    ];
+    const reviewerRoutes = [
+      route("route-reviewer-unique", "gemini", "review-model"),
+      route("route-reviewer-collision", "gemini", "worker-model-a"),
+    ];
+    const plan = blocked(
+      fixture({
+        entries: [
+          reviewWorker("deep-worker", "openai", "unused", 1, workerRoutes),
+          reviewer("independent-reviewer", "gemini", "unused", 1, reviewerRoutes),
+        ],
+        request: deepRequest(),
+        task: { risks: ["architecture"] },
+      }),
+    );
+
+    expect(plan.block_code).toBe("RUNTIME_ROUTING_REVIEW_UNAVAILABLE");
+  });
+
+  it("ranks independent reviewers deterministically by the stable candidate order", () => {
+    const entries = [
+      reviewWorker("deep-worker", "openai", "worker-model", 1),
+      reviewer("reviewer-z", "anthropic", "reviewer-z-model", 10),
+      reviewer("reviewer-A", "gemini", "reviewer-a-model", 10),
+    ];
+
+    const plan = planned(
+      fixture({ entries, request: deepRequest(), task: { risks: ["architecture"] } }),
+    );
+
+    expect(plan.reviewer_attempt?.entry_id).toBe("reviewer-A");
+  });
+
+  it("reserves primary, fallback, and reviewer ceilings as one review budget", () => {
+    const entries = [
+      reviewWorker("deep-worker", "openai", "worker-model", 1, [
+        route("route-deep-worker", "openai", "worker-model", {
+          pricing: pricing(1, 1, 1, 1),
+        }),
+      ]),
+      reviewWorker("deep-fallback", "gemini", "fallback-model", 2, [
+        route("route-deep-fallback", "gemini", "fallback-model", {
+          pricing: pricing(1, 1, 1, 1),
+        }),
+      ]),
+      reviewer("independent-reviewer", "anthropic", "review-model", 1, [
+        route("route-independent-reviewer", "anthropic", "review-model", {
+          pricing: pricing(1, 1, 1, 1),
+        }),
+      ]),
+    ];
+    const exactBudget = {
+      max_input_tokens: 3,
+      max_output_tokens: 3,
+      max_cost_microusd: 6,
+      max_duration_ms: 3,
+      max_turns: 3,
+    };
+    const input = fixture({
+      entries,
+      request: deepRequest(exactBudget),
+      task: { complexity: "high", risks: ["security"] },
+      ceilings: { max_input_tokens: 1, max_output_tokens: 1, max_duration_ms: 1 },
+      budget: exactBudget,
+    });
+    const plan = planned(input);
+
+    expect(plan.worker_attempts.map((attempt) => attempt.entry_id)).toEqual([
+      "deep-worker",
+      "deep-fallback",
+    ]);
+    expect(plan.reviewer_attempt?.entry_id).toBe("independent-reviewer");
+    expect(plan.reservation.allocations).toHaveLength(3);
+    const insufficientBudget = { ...exactBudget, max_cost_microusd: 3 };
+    expect(
+      blocked(
+        fixture({
+          entries,
+          request: deepRequest(insufficientBudget),
+          task: { complexity: "high", risks: ["security"] },
+          ceilings: { max_input_tokens: 1, max_output_tokens: 1, max_duration_ms: 1 },
+          budget: insufficientBudget,
+        }),
+      ).block_code,
+    ).toBe("RUNTIME_ROUTING_REVIEW_UNAVAILABLE");
+  });
+
+  it("selects a cheaper lower-ranked reviewer when the leading review pair exceeds budget", () => {
+    const entries = [
+      reviewWorker("deep-worker", "openai", "worker-model", 1, [
+        route("route-deep-worker", "openai", "worker-model", {
+          pricing: pricing(1, 1, 1, 1),
+        }),
+      ]),
+      reviewer("expensive-reviewer", "anthropic", "expensive-review-model", 1, [
+        route("route-expensive-reviewer", "anthropic", "expensive-review-model", {
+          pricing: pricing(2_000_000, 2_000_000, 2_000_000, 2_000_000),
+        }),
+      ]),
+      reviewer("cheap-reviewer", "gemini", "cheap-review-model", 2, [
+        route("route-cheap-reviewer", "gemini", "cheap-review-model", {
+          pricing: pricing(1, 1, 1, 1),
+        }),
+      ]),
+    ];
+    const budget = {
+      max_input_tokens: 2,
+      max_output_tokens: 2,
+      max_cost_microusd: 5,
+      max_duration_ms: 2,
+      max_turns: 2,
+    };
+    const plan = planned(
+      fixture({
+        entries,
+        request: deepRequest(budget),
+        task: { risks: ["architecture"] },
+        ceilings: { max_input_tokens: 1, max_output_tokens: 1, max_duration_ms: 1 },
+        budget,
+      }),
+    );
+
+    expect(plan.reviewer_attempt?.entry_id).toBe("cheap-reviewer");
+    expect(plan.eliminations).toContainEqual({ entry_id: "expensive-reviewer", reason: "budget" });
+  });
+
+  it("audits review independence against every included fallback and skips a colliding fallback", () => {
+    const entries = [
+      reviewWorker("deep-worker", "openai", "worker-model", 1),
+      reviewWorker("colliding-fallback", "anthropic", "other-worker-model", 2),
+      reviewWorker("independent-fallback", "gemini", "fallback-model", 3),
+      reviewer("independent-reviewer", "anthropic", "review-model", 1),
+    ];
+    const plan = planned(
+      fixture({
+        entries,
+        request: deepRequest(),
+        task: { complexity: "high", risks: ["security"] },
+      }),
+    );
+
+    expect(plan.worker_attempts.map((attempt) => attempt.entry_id)).toEqual([
+      "deep-worker",
+      "independent-fallback",
+    ]);
+    expect(plan.reviewer_attempt?.entry_id).toBe("independent-reviewer");
+    expect(plan.eliminations).toContainEqual({
+      entry_id: "colliding-fallback",
+      reason: "review-independence",
+    });
+  });
+
+  it("prefers more budget-feasible review fallbacks before their ordered entry-ID tuple", () => {
+    const budget = {
+      max_input_tokens: 4,
+      max_output_tokens: 4,
+      max_cost_microusd: 8,
+      max_duration_ms: 4,
+      max_turns: 4,
+    };
+    const entries = [
+      reviewWorker("primary", "openai", "primary-model", 1, [
+        route("route-primary", "openai", "primary-model", {
+          pricing: pricing(1, 1, 1, 1),
+        }),
+      ]),
+      reviewWorker("expensive-fallback", "gemini", "expensive-model", 2, [
+        route("route-expensive-fallback", "gemini", "expensive-model", {
+          pricing: pricing(2_000_000, 2_000_000, 2_000_000, 2_000_000),
+        }),
+      ]),
+      reviewWorker("cheap-fallback-b", "gemini", "cheap-model-b", 3, [
+        route("route-cheap-fallback-b", "gemini", "cheap-model-b", {
+          pricing: pricing(1, 1, 1, 1),
+        }),
+      ]),
+      reviewWorker("cheap-fallback-a", "gemini", "cheap-model-a", 4, [
+        route("route-cheap-fallback-a", "gemini", "cheap-model-a", {
+          pricing: pricing(1, 1, 1, 1),
+        }),
+      ]),
+      reviewer("independent-reviewer", "anthropic", "review-model", 1, [
+        route("route-independent-reviewer", "anthropic", "review-model", {
+          pricing: pricing(1, 1, 1, 1),
+        }),
+      ]),
+    ];
+    const plan = planned(
+      fixture({
+        entries,
+        request: deepRequest(budget),
+        task: { risks: ["architecture"] },
+        ceilings: { max_input_tokens: 1, max_output_tokens: 1, max_duration_ms: 1 },
+        budget,
+      }),
+    );
+
+    expect(plan.worker_attempts.map((attempt) => attempt.entry_id)).toEqual([
+      "primary",
+      "cheap-fallback-b",
+      "cheap-fallback-a",
+    ]);
+    expect(plan.eliminations).toContainEqual({
+      entry_id: "expensive-fallback",
+      reason: "budget",
+    });
+  });
+
+  it("returns a fixed review-unavailable result when no independent reviewer exists", () => {
+    const plan = blocked(
+      fixture({
+        entries: [reviewWorker("deep-worker", "openai", "worker-model", 1)],
+        request: deepRequest(),
+        task: { risks: ["irreversible"] },
+      }),
+    );
+    expect(plan).toMatchObject({
+      block_code: "RUNTIME_ROUTING_REVIEW_UNAVAILABLE",
+      retryable: false,
+      next_retry_at: null,
+    });
+  });
+});
+
+describe("governed routing override", () => {
+  it("applies a valid override only as a narrowing filter", () => {
+    const input = fixture();
+    const plan = planned({
+      ...input,
+      override: governedOverride(input, "balanced-fallback-b"),
+    });
+
+    expect(plan.worker_attempts.map((attempt) => attempt.entry_id)).toEqual([
+      "balanced-fallback-b",
+    ]);
+    expect(plan.override).toEqual(governedOverride(input, "balanced-fallback-b").artifact);
+    expect(plan.eliminations).toEqual([
+      { entry_id: "balanced-fallback-a", reason: "override" },
+      { entry_id: "balanced-primary", reason: "override" },
+      { entry_id: "economy-only", reason: "policy" },
+    ]);
+  });
+
+  it.each([
+    ["stale catalog override", { catalog_hash: `sha256:${"1".repeat(64)}` }],
+    ["stale policy override", { policy_hash: `sha256:${"2".repeat(64)}` }],
+    ["future override", { issued_at: "2026-08-21T12:00:00.001Z" }],
+  ] as const)("denies a %s without ignoring it", (_name, valueOverrides) => {
+    const input = fixture();
+    const plan = blocked({
+      ...input,
+      override: governedOverride(input, "balanced-fallback-a", valueOverrides),
+    });
+    expect(plan.block_code).toBe("RUNTIME_ROUTING_POLICY_DENIED");
+  });
+
+  it("denies an override whose exact artifact hash does not bind its value", () => {
+    const input = fixture();
+    const plan = blocked({
+      ...input,
+      override: governedOverride(
+        input,
+        "balanced-fallback-a",
+        {},
+        {
+          hash: `sha256:${"f".repeat(64)}`,
+        },
+      ),
+    });
+    expect(plan.block_code).toBe("RUNTIME_ROUTING_POLICY_DENIED");
+  });
+
+  it.each([
+    ["absent override target", "absent-target", fixture()],
+    [
+      "circuit-open override target",
+      "balanced-primary",
+      fixture({
+        circuits: [
+          {
+            entry_id: "balanced-primary",
+            status: "open",
+            consecutive_failures: 3,
+            retry_at: "2026-08-21T12:01:00.000Z",
+            probe_decision_id: null,
+          },
+        ],
+      }),
+    ],
+    [
+      "too-slow override target",
+      "slow-target",
+      fixture({
+        entries: [
+          entry("slow-target", "slow-target", 1, [
+            route("route-slow-target", "openai", "slow-model", {
+              latency_class: "extended",
+            }),
+          ]),
+          defaultEntries()[1]!,
+        ],
+      }),
+    ],
+    [
+      "under-capable override target",
+      "weak-target",
+      fixture({
+        entries: [
+          entry("weak-target", "weak-target", 1, [
+            route("route-weak-target", "openai", "weak-model", {
+              capabilities: { ...providerCapabilities("openai"), tools: false },
+            }),
+          ]),
+          defaultEntries()[1]!,
+        ],
+      }),
+    ],
+    [
+      "over-budget override target",
+      "expensive-target",
+      fixture({
+        entries: [
+          entry("expensive-target", "expensive-target", 1, [
+            route("route-expensive-target", "openai", "expensive-model", {
+              pricing: pricing(1_000_000_000, 1_000_000_000, 1_000_000_000, 1_000_000_000),
+            }),
+          ]),
+          entry("cheap-target", "cheap-target", 2, [
+            route("route-cheap-target", "anthropic", "cheap-model", {
+              pricing: pricing(1, 1, 1, 1),
+            }),
+          ]),
+        ],
+        ceilings: { max_input_tokens: 1, max_output_tokens: 1, max_duration_ms: 1 },
+        budget: {
+          max_input_tokens: 2,
+          max_output_tokens: 2,
+          max_cost_microusd: 4,
+          max_duration_ms: 2,
+          max_turns: 2,
+        },
+      }),
+    ],
+  ] as const)("denies an %s that is not already eligible", (_name, target, input) => {
+    const plan = blocked({ ...input, override: governedOverride(input, target) });
+    expect(plan.block_code).toBe("RUNTIME_ROUTING_POLICY_DENIED");
+  });
+
+  it.each([
+    ["reduce review", { review: "none" }],
+    ["increase override budget", { max_cost_microusd: Number.MAX_SAFE_INTEGER }],
+    ["increase override tool capability", { required_capabilities: ["tools"] }],
+  ] as const)("denies an override attempt to %s", (_name, escalation) => {
+    const input = fixture();
+    const plan = blocked({
+      ...input,
+      override: governedOverride(input, "balanced-primary", escalation),
+    });
+    expect(plan.block_code).toBe("RUNTIME_ROUTING_POLICY_DENIED");
+  });
+
+  it("keeps independent review mandatory after a valid worker override", () => {
+    const entries = [
+      reviewWorker("deep-worker-a", "openai", "worker-model-a", 1),
+      reviewWorker("deep-worker-b", "gemini", "worker-model-b", 2),
+      reviewer("independent-reviewer", "anthropic", "review-model", 1),
+    ];
+    const input = fixture({
+      entries,
+      request: deepRequest(),
+      task: { risks: ["architecture"] },
+    });
+    const plan = planned({
+      ...input,
+      override: governedOverride(input, "deep-worker-b"),
+    });
+
+    expect(plan.worker_attempts.map((attempt) => attempt.entry_id)).toEqual(["deep-worker-b"]);
+    expect(plan.reviewer_attempt?.entry_id).toBe("independent-reviewer");
   });
 });
 
