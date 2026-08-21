@@ -369,7 +369,7 @@ describe("agent contract documents", () => {
     );
   });
 
-  it("rejects bad document and entry hashes plus parser byte/member overflows", () => {
+  it("rejects bad document and entry hashes", () => {
     const prompt = fixturePrompt();
     const definition = fixtureDefinition(prompt.document_hash);
     const registry = fixtureRegistry(prompt.document_hash, definition.document_hash);
@@ -386,16 +386,45 @@ describe("agent contract documents", () => {
     expect(parseCompiledContext(JSON.stringify({ ...context, document_hash: ZERO_HASH })).ok).toBe(
       false,
     );
-    const overBytes = new Uint8Array(2 * 1024 * 1024 + 1);
-    const overMembers = JSON.stringify({ values: Array.from({ length: 100_001 }, () => 0) });
+  });
+
+  it("reports fixed safe failures for syntactically valid byte and member limit overflows", () => {
+    const overBytes = JSON.stringify({
+      protocol_version: "runtime-contract.v1",
+      schema_version: "prompt-template.v1",
+      document_type: "prompt-template",
+      template_id: TEMPLATE_ID,
+      revision: 1,
+      instruction_blocks: Array.from({ length: 33 }, (_, index) => ({
+        block_id: `block-${String(index).padStart(4, "0")}`,
+        content: "x".repeat(65_536),
+      })),
+      document_hash: ZERO_HASH,
+    });
+    const overMembers = `{${Array.from(
+      { length: 100_001 },
+      (_, index) => `"member-${index}":0`,
+    ).join(",")}}`;
+    expect(Buffer.byteLength(overBytes, "utf8")).toBeGreaterThan(2 * 1024 * 1024);
+    expect(Buffer.byteLength(overMembers, "utf8")).toBeLessThan(2 * 1024 * 1024);
     for (const parse of [
       parsePromptTemplate,
       parseAgentDefinition,
       parseAgentRegistryEntry,
       parseCompiledContext,
     ]) {
-      expect(parse(overBytes).ok).toBe(false);
-      expect(parse(overMembers).ok).toBe(false);
+      expect(parse(overBytes)).toEqual({
+        ok: false,
+        code: "RUNTIME_DOCUMENT_INVALID",
+        issues: [{ path: "", keyword: "maxBytes", message: "agent document exceeds byte limit" }],
+      });
+      expect(parse(overMembers)).toEqual({
+        ok: false,
+        code: "RUNTIME_DOCUMENT_INVALID",
+        issues: [
+          { path: "", keyword: "maxMembers", message: "agent document exceeds member limit" },
+        ],
+      });
     }
   });
 

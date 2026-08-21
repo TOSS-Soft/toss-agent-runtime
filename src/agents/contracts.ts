@@ -6,6 +6,7 @@ import registrySchema from "../../contracts/runtime/agent-registry-entry.v1.sche
 import contextSchema from "../../contracts/runtime/compiled-context.v1.schema.json" with { type: "json" };
 import promptSchema from "../../contracts/runtime/prompt-template.v1.schema.json" with { type: "json" };
 import commonSchema from "../../contracts/runtime/runtime-common.v1.schema.json" with { type: "json" };
+import { ProtocolJsonError } from "../protocol/errors.js";
 import {
   canonicalJson,
   deepFreezeJson,
@@ -79,6 +80,18 @@ function normalizeIssues(errors: readonly ErrorObject[] | null | undefined): Val
   );
 }
 
+function parseFailure(error: unknown): ValidationFailure {
+  if (error instanceof ProtocolJsonError) {
+    if (error.message.startsWith("JSON byte limit exceeded:")) {
+      return failure([issue("", "maxBytes", "agent document exceeds byte limit")]);
+    }
+    if (error.message.startsWith("JSON member limit exceeded:")) {
+      return failure([issue("", "maxMembers", "agent document exceeds member limit")]);
+    }
+  }
+  return failure([issue("", "json", "agent document is invalid")]);
+}
+
 function parseAndValidateAgentDocument<T>(
   input: string | Uint8Array,
   validator: ValidateFunction,
@@ -87,8 +100,8 @@ function parseAndValidateAgentDocument<T>(
   let candidate: JsonValue;
   try {
     candidate = deepFreezeJson(parseJsonBytes(input, AGENT_DOCUMENT_LIMITS), AGENT_DOCUMENT_LIMITS);
-  } catch {
-    return failure([issue("", "json", "agent document is invalid")]);
+  } catch (error) {
+    return parseFailure(error);
   }
   if (!validator(candidate)) return failure(normalizeIssues(validator.errors));
 
