@@ -13,6 +13,8 @@ import type {
   ProviderRouteRequirement,
   ProviderUsage,
 } from "../providers/types.js";
+import type { RuntimeProviderErrorCode } from "../providers/errors.js";
+import type { RuntimeRoutingErrorCode } from "./errors.js";
 
 export type LogicalModelClass =
   "economy" | "balanced-code" | "deep-reasoning" | "long-context" | "vision" | "independent-review";
@@ -308,4 +310,14 @@ export type RoutingDecision =
       status: "blocked";
       plan: BlockedModelSelectionPlanV1;
       next_state: null;
+    }>;
+
+export type RoutingProviderOutcome = RuntimeProviderErrorCode | "RUNTIME_PROVIDER_SUCCESS";
+
+export type ModelFallbackDecision =
+  | Readonly<{ status: "ready"; attempt: RoutingAttemptV1 }>
+  | Readonly<{
+      status: "blocked";
+      code: RuntimeRoutingErrorCode;
+      retryable: boolean;
     }>;

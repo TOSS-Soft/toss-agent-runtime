@@ -1,5 +1,31 @@
+import {
+  hashAgentgatewayCapabilities,
+  parseAgentgatewayCapabilities,
+  type AgentgatewayCapabilitiesV1,
+} from "../../src/gateway/index.js";
 import { canonicalJson, sha256 } from "../../src/protocol/json.js";
+import {
+  hashExecutionRequest,
+  parseExecutionRequest,
+  type ExecutionRequestV1,
+} from "../../src/protocol/request.js";
 import type { ProviderAdapterCapabilities, ProviderKind } from "../../src/providers/types.js";
+import {
+  parseModelCatalog,
+  parseRoutingPolicy,
+  parseRoutingState,
+} from "../../src/routing/contracts.js";
+import { planModelSelection } from "../../src/routing/selection.js";
+import type {
+  CatalogRouteV1,
+  ModelCatalogEntryV1,
+  ModelCatalogV1,
+  PlanModelSelectionInput,
+  PlannedModelSelectionPlanV1,
+  RoutingCircuitV1,
+  RoutingPolicyV1,
+  RoutingStateV1,
+} from "../../src/routing/types.js";
 
 export function providerCapabilities(provider: ProviderKind): ProviderAdapterCapabilities {
   return {
@@ -342,4 +368,247 @@ export function validBlockedSelectionPlan(): Record<string, unknown> {
     retryable: true,
     next_retry_at: "2026-08-21T12:01:00.000Z",
   };
+}
+
+export interface PlannedRoutingFixture {
+  readonly input: PlanModelSelectionInput;
+  readonly catalog: ModelCatalogV1;
+  readonly policy: RoutingPolicyV1;
+  readonly prior_state: RoutingStateV1;
+  readonly plan: PlannedModelSelectionPlanV1;
+  readonly state: RoutingStateV1;
+}
+
+export function plannedRoutingFixture(
+  options: Readonly<{
+    circuits?: readonly RoutingCircuitV1[];
+    cooldown_ms?: number;
+    consecutive_failure_threshold?: number;
+    decision_at?: string;
+    review?: boolean;
+  }> = {},
+): PlannedRoutingFixture {
+  const decisionAt = options.decision_at ?? "2026-08-21T12:00:00.000Z";
+  const review = options.review ?? false;
+  const workerEntries: readonly ModelCatalogEntryV1[] = [
+    ["worker-primary", 10, "gpt-5"],
+    ["worker-fallback-a", 20, "gpt-5-mini"],
+    ["worker-fallback-b", 30, "gpt-5-nano"],
+  ].map(([entryId, priority, model]) => {
+    const routeValue: CatalogRouteV1 = {
+      route_id: `route-${entryId}`,
+      provider: "openai",
+      model: String(model),
+      capabilities: providerCapabilities("openai"),
+      latency_class: "standard",
+      pricing: pricing(2_000_000, 200_000, 10_000_000, 12_000_000),
+    };
+    return {
+      entry_id: String(entryId),
+      logical_classes: ["balanced-code", "deep-reasoning", "economy"],
+      route_alias: String(entryId),
+      priority: Number(priority),
+      routes: [routeValue],
+    };
+  });
+  const reviewerEntry: ModelCatalogEntryV1 = {
+    entry_id: "reviewer-independent",
+    logical_classes: ["independent-review"],
+    route_alias: "reviewer-independent",
+    priority: 10,
+    routes: [
+      {
+        route_id: "route-reviewer-independent",
+        provider: "anthropic",
+        model: "claude-sonnet-4-5",
+        capabilities: providerCapabilities("anthropic"),
+        latency_class: "standard",
+        pricing: pricing(2_000_000, 200_000, 10_000_000, 12_000_000),
+      },
+    ],
+  };
+  const entries = [...workerEntries, ...(review ? [reviewerEntry] : [])];
+  const parsedCatalog = parseModelCatalog(
+    catalogBytes({
+      protocol_version: "runtime-contract.v1",
+      schema_version: "model-catalog.v1",
+      document_type: "model-catalog",
+      catalog_id: "catalog-circuit",
+      revision: 1,
+      entries,
+    }),
+  );
+  if (!parsedCatalog.ok) {
+    throw new Error(`invalid circuit catalog fixture: ${JSON.stringify(parsedCatalog.issues)}`);
+  }
+  const catalog = parsedCatalog.value;
+
+  const policyValue = validRoutingPolicy();
+  const rules = (policyValue.rules as readonly Record<string, unknown>[]).map((rule) => ({
+    ...rule,
+    circuit: {
+      consecutive_failure_threshold: options.consecutive_failure_threshold ?? 3,
+      cooldown_ms: options.cooldown_ms ?? 60_000,
+    },
+  }));
+  const parsedPolicy = parseRoutingPolicy(policyBytes({ ...policyValue, rules }));
+  if (!parsedPolicy.ok) {
+    throw new Error(`invalid circuit policy fixture: ${JSON.stringify(parsedPolicy.issues)}`);
+  }
+  const policy = parsedPolicy.value;
+
+  const requestValue: ExecutionRequestV1 = {
+    protocol_version: "runtime-contract.v1",
+    schema_version: "execution-request.v1",
+    document_type: "execution-request",
+    request_id: "request-circuit-1",
+    run_id: "run-circuit-1",
+    created_at: "2026-08-21T10:00:00.000Z",
+    deadline: "2026-08-21T14:00:00.000Z",
+    task_contract: {
+      document_type: "task-contract",
+      artifact_id: "task-circuit-1",
+      revision: 1,
+      hash: `sha256:${"6".repeat(64)}`,
+    },
+    input_artifacts: [],
+    agent: {
+      definition: {
+        document_type: "agent-definition",
+        artifact_id: "agent-worker",
+        revision: 1,
+        hash: `sha256:${"7".repeat(64)}`,
+      },
+      role: "worker",
+    },
+    model: {
+      logical_class: review ? "deep-reasoning" : "balanced-code",
+      required_capabilities: review
+        ? ["reasoning", "text", "tools"]
+        : ["json-schema", "text", "tools"],
+    },
+    superpowers: { required: ["test-driven-development"] },
+    mcp: {
+      profile: {
+        document_type: "mcp-profile",
+        artifact_id: "mcp-readonly",
+        revision: 1,
+        hash: `sha256:${"8".repeat(64)}`,
+      },
+    },
+    budget: {
+      max_input_tokens: 200_000,
+      max_output_tokens: 50_000,
+      max_cost_microusd: 5_000_000,
+      max_duration_ms: 900_000,
+      max_turns: 16,
+    },
+    review_policy: {
+      document_type: "review-policy",
+      artifact_id: "review-medium",
+      revision: 1,
+      hash: `sha256:${"9".repeat(64)}`,
+    },
+    output: {
+      schema: {
+        document_type: "output-schema",
+        artifact_id: "output-circuit",
+        revision: 1,
+        hash: `sha256:${"a".repeat(64)}`,
+      },
+    },
+    trace: {
+      trace_id: "0123456789abcdef0123456789abcdef",
+      span_id: "0123456789abcdef",
+      trace_flags: 1,
+    },
+  };
+  const parsedRequest = parseExecutionRequest(canonicalJson(requestValue));
+  if (!parsedRequest.ok) {
+    throw new Error(`invalid circuit request fixture: ${JSON.stringify(parsedRequest.issues)}`);
+  }
+  const request = parsedRequest.value;
+
+  const liveWithoutHash = {
+    protocol_version: "runtime-contract.v1",
+    schema_version: "agentgateway-capabilities.v1",
+    document_type: "agentgateway-capabilities",
+    gateway: { name: "agentgateway", version: "0.10.0", revision: 11 },
+    generated_at: "2026-08-21T11:59:00.000Z",
+    expires_at: "2026-08-21T12:04:00.000Z",
+    routes: entries.flatMap((catalogEntry) =>
+      catalogEntry.routes.map((catalogRoute) => ({
+        alias: catalogEntry.route_alias,
+        route_id: catalogRoute.route_id,
+        provider: catalogRoute.provider,
+        model: catalogRoute.model,
+        capabilities: catalogRoute.capabilities,
+      })),
+    ),
+  } as const;
+  const liveCandidate = {
+    ...liveWithoutHash,
+    document_hash: hashAgentgatewayCapabilities({
+      ...liveWithoutHash,
+      document_hash: `sha256:${"0".repeat(64)}`,
+    }),
+  } as AgentgatewayCapabilitiesV1;
+  const parsedLive = parseAgentgatewayCapabilities(canonicalJson(liveCandidate), {
+    now: () => new Date(decisionAt),
+  });
+  if (!parsedLive.ok) {
+    throw new Error(`invalid circuit live fixture: ${JSON.stringify(parsedLive.issues)}`);
+  }
+
+  const parsedState = parseRoutingState(
+    routingStateBytes({
+      ...validRoutingState(),
+      state_id: "routing-circuit-1",
+      run_id: request.run_id,
+      request_hash: hashExecutionRequest(request),
+      catalog_hash: catalog.document_hash,
+      policy_hash: policy.document_hash,
+      budget: request.budget,
+      circuits: [...(options.circuits ?? [])].sort((left, right) =>
+        left.entry_id < right.entry_id ? -1 : left.entry_id > right.entry_id ? 1 : 0,
+      ),
+    }),
+  );
+  if (!parsedState.ok) {
+    throw new Error(`invalid circuit state fixture: ${JSON.stringify(parsedState.issues)}`);
+  }
+  const priorState = parsedState.value;
+  const input: PlanModelSelectionInput = {
+    request,
+    task: {
+      task_contract: request.task_contract,
+      phase: "implementation",
+      complexity: "medium",
+      risks: review ? ["security"] : [],
+      max_latency_class: "standard",
+    },
+    ceilings: {
+      max_input_tokens: 20_000,
+      max_output_tokens: 4_000,
+      max_duration_ms: 120_000,
+    },
+    catalog,
+    policy,
+    state: priorState,
+    live: parsedLive.value,
+    gateway_profile: "gateway-primary",
+    decision_at: decisionAt,
+  };
+  const decision = planModelSelection(input);
+  if (decision.status !== "planned") {
+    throw new Error(`expected planned circuit fixture, got ${decision.plan.block_code}`);
+  }
+  return Object.freeze({
+    input,
+    catalog,
+    policy,
+    prior_state: priorState,
+    plan: decision.plan,
+    state: decision.next_state,
+  });
 }
