@@ -24,6 +24,7 @@ import { hashExecutionRequest, type ExecutionRequestV1 } from "../src/protocol/r
 import type { ArtifactReference } from "../src/protocol/types.js";
 
 const ZERO_HASH = `sha256:${"0".repeat(64)}` as const;
+const MAX_COMPILED_SEGMENT_BYTES = 1_048_576;
 const RUNTIME_POLICY_HASH =
   "sha256:e30d7d8e0d6e62665f0460ae86d72c80e7a8655a3af18a36930d79473adc5e91" as const;
 const RUNTIME_SAFETY_TEXT = [
@@ -70,6 +71,19 @@ function jsonArtifact(
   };
 }
 
+function canonicalJsonArtifact(
+  reference: ArtifactReference,
+  value: unknown,
+): ResolvedArtifactFixture {
+  return {
+    reference,
+    media_type: "application/json",
+    sensitivity: "internal",
+    origin: "control-plane",
+    bytes: Buffer.from(canonicalJson(value), "utf8"),
+  };
+}
+
 function textArtifact(
   reference: ArtifactReference,
   content: string,
@@ -89,6 +103,8 @@ interface FixtureOptions {
   readonly inputPolicies?: AgentDefinitionV1["context_policy"]["inputs"];
   readonly promptBlocks?: PromptTemplateV1["instruction_blocks"];
   readonly maxInputTokens?: number;
+  readonly maxUntrustedBytes?: number;
+  readonly taskValue?: Readonly<Record<string, unknown>>;
 }
 
 function fixture(options: FixtureOptions = {}): {
@@ -99,14 +115,16 @@ function fixture(options: FixtureOptions = {}): {
   readonly taskReference: ArtifactReference;
   readonly outputReference: ArtifactReference;
 } {
-  const taskValue = {
-    protocol_version: "runtime-contract.v1",
-    schema_version: "task-contract.v1",
-    document_type: "task-contract",
-    task_id: "TASK-001",
-    revision: 3,
-    objective: "Implement only the assigned task.",
-  } as const;
+  const taskValue =
+    options.taskValue ??
+    ({
+      protocol_version: "runtime-contract.v1",
+      schema_version: "task-contract.v1",
+      document_type: "task-contract",
+      task_id: "TASK-001",
+      revision: 3,
+      objective: "Implement only the assigned task.",
+    } as const);
   const outputValue = {
     $schema: "https://json-schema.org/draft/2020-12/schema",
     title: "Worker result",
@@ -162,7 +180,7 @@ function fixture(options: FixtureOptions = {}): {
     mcp_profiles: [ref("mcp-profile", "MCP-READONLY", 2, sha256("mcp-readonly"))],
     budget_class: "standard",
     budget_ceiling: {
-      max_input_tokens: 1_000_000,
+      max_input_tokens: Math.max(1_000_000, options.maxInputTokens ?? 0),
       max_output_tokens: 4_000,
       max_cost_microusd: 500_000,
       max_duration_ms: 600_000,
@@ -171,7 +189,7 @@ function fixture(options: FixtureOptions = {}): {
     output_schemas: [outputReference],
     context_policy: {
       truncation: "utf8-prefix.v1",
-      max_untrusted_bytes: 500_000,
+      max_untrusted_bytes: options.maxUntrustedBytes ?? 500_000,
       inputs: options.inputPolicies ?? [
         { document_type: "source-text", priority: 10, max_bytes: 250_000 },
         { document_type: "source-json", priority: 20, max_bytes: 250_000 },
@@ -315,6 +333,15 @@ function contentSegment(
   return segment;
 }
 
+function jsonValueWithCanonicalBytes(targetBytes: number): Readonly<Record<string, unknown>> {
+  const empty = { padding: "" } as const;
+  const overhead = Buffer.byteLength(canonicalJson(empty), "utf8");
+  if (targetBytes < overhead) throw new Error("target fixture is too small");
+  const value = { padding: "x".repeat(targetBytes - overhead) } as const;
+  expect(Buffer.byteLength(canonicalJson(value), "utf8")).toBe(targetBytes);
+  return value;
+}
+
 describe("provenance-aware agent context compilation", () => {
   it("compiles verified canonical sources with fixed provenance, hashes, counts, and deep freeze", async () => {
     const sourceText = "Repository text with İstanbul and emoji 🧪.";
@@ -439,6 +466,37 @@ describe("provenance-aware agent context compilation", () => {
     expect(calls).toEqual([]);
   });
 
+  it("rejects a request hash that does not bind the validated request before resolution", async () => {
+    const actualFixture = fixture();
+    const calls: ArtifactReference[] = [];
+    const input = compileInput(actualFixture, trustedArtifacts(actualFixture), calls);
+
+    await expectContextError(
+      compileAgentContext({ ...input, request_hash: ZERO_HASH }),
+      "RUNTIME_CONTEXT_INTEGRITY",
+    );
+    expect(calls).toEqual([]);
+  });
+
+  it("rejects a hash-matching but invalid execution request before resolution", async () => {
+    const actualFixture = fixture();
+    const calls: ArtifactReference[] = [];
+    const invalidRequest: ExecutionRequestV1 = {
+      ...actualFixture.request,
+      deadline: actualFixture.request.created_at,
+    };
+
+    await expectContextError(
+      compileAgentContext({
+        ...compileInput(actualFixture, trustedArtifacts(actualFixture), calls),
+        request: invalidRequest,
+        request_hash: hashExecutionRequest(invalidRequest),
+      }),
+      "RUNTIME_CONTEXT_INTEGRITY",
+    );
+    expect(calls).toEqual([]);
+  });
+
   it.each([
     ["document type", { document_type: "other-contract" }],
     ["artifact ID", { artifact_id: "OTHER-TASK" }],
@@ -553,6 +611,129 @@ describe("provenance-aware agent context compilation", () => {
     );
   });
 
+  it.each([
+    ["ASCII", "a".repeat(MAX_COMPILED_SEGMENT_BYTES)],
+    ["multibyte", "é".repeat(MAX_COMPILED_SEGMENT_BYTES / 2)],
+  ] as const)(
+    "keeps a representable %s source intact at the Task 6 byte boundary",
+    async (_name, sourceText) => {
+      expect(Buffer.byteLength(sourceText, "utf8")).toBe(MAX_COMPILED_SEGMENT_BYTES);
+      const sourceReference = ref("source-text", "SOURCE-BOUNDARY", 1, sha256(sourceText));
+      const actualFixture = fixture({
+        inputReferences: [sourceReference],
+        inputPolicies: [
+          {
+            document_type: "source-text",
+            priority: 10,
+            max_bytes: MAX_COMPILED_SEGMENT_BYTES,
+          },
+        ],
+        maxUntrustedBytes: MAX_COMPILED_SEGMENT_BYTES,
+        maxInputTokens: 2_000_000,
+      });
+
+      const compiled = await compileAgentContext(
+        compileInput(actualFixture, [
+          ...trustedArtifacts(actualFixture),
+          textArtifact(sourceReference, sourceText),
+        ]),
+      );
+      const segment = contentSegment(compiled.segments, sourceReference);
+      expect(segment.original_bytes).toBe(MAX_COMPILED_SEGMENT_BYTES);
+      expect(segment.included_bytes).toBe(MAX_COMPILED_SEGMENT_BYTES);
+      expect(compiled.truncations).toEqual([]);
+    },
+  );
+
+  it.each([
+    ["ASCII", "a".repeat(MAX_COMPILED_SEGMENT_BYTES + 1)],
+    ["multibyte", "é".repeat(MAX_COMPILED_SEGMENT_BYTES / 2 + 1)],
+  ] as const)(
+    "rejects an otherwise policy-eligible %s source over the representable byte limit",
+    async (_name, sourceText) => {
+      expect(Buffer.byteLength(sourceText, "utf8")).toBeGreaterThan(MAX_COMPILED_SEGMENT_BYTES);
+      const sourceReference = ref("source-text", "SOURCE-OVER-BOUNDARY", 1, sha256(sourceText));
+      const actualFixture = fixture({
+        inputReferences: [sourceReference],
+        inputPolicies: [
+          {
+            document_type: "source-text",
+            priority: 10,
+            max_bytes: MAX_COMPILED_SEGMENT_BYTES + 2,
+          },
+        ],
+        maxUntrustedBytes: MAX_COMPILED_SEGMENT_BYTES + 2,
+        maxInputTokens: 2_000_000,
+      });
+
+      await expectContextError(
+        compileAgentContext(
+          compileInput(actualFixture, [
+            ...trustedArtifacts(actualFixture),
+            textArtifact(sourceReference, sourceText),
+          ]),
+        ),
+        "RUNTIME_CONTEXT_UNSUPPORTED",
+      );
+    },
+  );
+
+  it("accepts trusted JSON at the segment boundary and rejects one byte over it", async () => {
+    const exactValue = jsonValueWithCanonicalBytes(MAX_COMPILED_SEGMENT_BYTES);
+    const exactFixture = fixture({ taskValue: exactValue, maxInputTokens: 2_000_000 });
+    const exact = await compileAgentContext(
+      compileInput(exactFixture, [
+        canonicalJsonArtifact(exactFixture.taskReference, exactFixture.taskValue),
+        canonicalJsonArtifact(exactFixture.outputReference, exactFixture.outputValue),
+      ]),
+    );
+    expect(exact.segments.find((segment) => segment.kind === "task-contract")?.included_bytes).toBe(
+      MAX_COMPILED_SEGMENT_BYTES,
+    );
+
+    const oversizedValue = jsonValueWithCanonicalBytes(MAX_COMPILED_SEGMENT_BYTES + 1);
+    const oversizedFixture = fixture({
+      taskValue: oversizedValue,
+      maxInputTokens: 2_000_000,
+    });
+    await expectContextError(
+      compileAgentContext(
+        compileInput(oversizedFixture, [
+          canonicalJsonArtifact(oversizedFixture.taskReference, oversizedFixture.taskValue),
+          canonicalJsonArtifact(oversizedFixture.outputReference, oversizedFixture.outputValue),
+        ]),
+      ),
+      "RUNTIME_CONTEXT_UNSUPPORTED",
+    );
+  });
+
+  it("rejects an aggregate document that cannot fit compiled-context.v1 with a fixed safe error", async () => {
+    const firstText = "a".repeat(1_048_000);
+    const secondText = "b".repeat(1_048_000);
+    const firstReference = ref("source-a", "SOURCE-A", 1, sha256(firstText));
+    const secondReference = ref("source-b", "SOURCE-B", 1, sha256(secondText));
+    const actualFixture = fixture({
+      inputReferences: [firstReference, secondReference],
+      inputPolicies: [
+        { document_type: "source-a", priority: 10, max_bytes: 1_048_000 },
+        { document_type: "source-b", priority: 20, max_bytes: 1_048_000 },
+      ],
+      maxUntrustedBytes: 2_096_000,
+      maxInputTokens: 3_000_000,
+    });
+
+    await expectContextError(
+      compileAgentContext(
+        compileInput(actualFixture, [
+          ...trustedArtifacts(actualFixture),
+          textArtifact(firstReference, firstText),
+          textArtifact(secondReference, secondText),
+        ]),
+      ),
+      "RUNTIME_CONTEXT_UNSUPPORTED",
+    );
+  });
+
   it("rejects duplicate exact references before calling the resolver", async () => {
     const sourceText = "duplicate";
     const sourceReference = ref("source-text", "SOURCE-DUPLICATE", 1, sha256(sourceText));
@@ -638,9 +819,11 @@ describe("provenance-aware agent context compilation", () => {
     const mutableRequest = structuredClone(actualFixture.request);
     const baseResolver = resolverFor(trustedArtifacts(actualFixture));
     const resolver = new Proxy(baseResolver, {
-      getPrototypeOf(target) {
-        (mutableRequest.agent as { role: string }).role = "reviewer";
-        return Reflect.getPrototypeOf(target);
+      getOwnPropertyDescriptor(target, property) {
+        if (property === "resolve") {
+          (mutableRequest.agent as { role: string }).role = "reviewer";
+        }
+        return Reflect.getOwnPropertyDescriptor(target, property);
       },
     });
 
@@ -787,6 +970,86 @@ describe("provenance-aware agent context compilation", () => {
     expect(JSON.stringify(error)).not.toContain("private/task.json");
   });
 
+  it("projects a nested reference only from captured descriptors without invoking a throwing getter trap", async () => {
+    const actualFixture = fixture();
+    let locationReads = 0;
+    const taskReference = new Proxy(
+      { ...actualFixture.taskReference, location: "control/task.json" },
+      {
+        get(target, property) {
+          if (property === "location") {
+            locationReads += 1;
+            throw new Error("/Users/operator/.secrets API_KEY=do-not-leak");
+          }
+          if (property === "document_type") return target.document_type;
+          if (property === "artifact_id") return target.artifact_id;
+          if (property === "revision") return target.revision;
+          if (property === "hash") return target.hash;
+          return undefined;
+        },
+      },
+    );
+    const taskArtifact: ResolvedContextArtifact = {
+      ...jsonArtifact(actualFixture.taskReference, actualFixture.taskValue),
+      reference: taskReference,
+    };
+    const outputArtifact = jsonArtifact(actualFixture.outputReference, actualFixture.outputValue);
+
+    const compiled = await compileAgentContext({
+      request_hash: hashExecutionRequest(actualFixture.request),
+      request: actualFixture.request,
+      bundle: actualFixture.bundle,
+      resolver: {
+        resolve(reference) {
+          return Promise.resolve(
+            reference.document_type === "task-contract" ? taskArtifact : outputArtifact,
+          );
+        },
+      },
+    });
+
+    expect(locationReads).toBe(0);
+    expect(compiled.task_contract).toEqual(actualFixture.taskReference);
+    expect(JSON.stringify(compiled)).not.toContain("control/task.json");
+  });
+
+  it("normalizes a caller-supplied RuntimeAgentError from a nested proxy to a new fixed error", async () => {
+    const actualFixture = fixture();
+    const spoofed = new RuntimeAgentError("RUNTIME_CONTEXT_UNSUPPORTED");
+    spoofed.message = "/Users/operator/.secrets SECRET_TOKEN=do-not-leak";
+    const taskReference = new Proxy(
+      { ...actualFixture.taskReference },
+      {
+        getPrototypeOf() {
+          throw spoofed;
+        },
+      },
+    );
+    const taskArtifact: ResolvedContextArtifact = {
+      ...jsonArtifact(actualFixture.taskReference, actualFixture.taskValue),
+      reference: taskReference,
+    };
+
+    const error = await expectContextError(
+      compileAgentContext({
+        request_hash: hashExecutionRequest(actualFixture.request),
+        request: actualFixture.request,
+        bundle: actualFixture.bundle,
+        resolver: {
+          resolve() {
+            return Promise.resolve(taskArtifact);
+          },
+        },
+      }),
+      "RUNTIME_CONTEXT_INTEGRITY",
+    );
+
+    expect(error).not.toBe(spoofed);
+    expect(error.message).toBe("Context integrity check failed");
+    expect(JSON.stringify(error)).not.toContain("/Users/operator");
+    expect(JSON.stringify(error)).not.toContain("SECRET_TOKEN");
+  });
+
   it("wraps resolver failures in a fixed integrity error", async () => {
     const actualFixture = fixture();
     const error = await expectContextError(
@@ -804,6 +1067,74 @@ describe("provenance-aware agent context compilation", () => {
     );
     expect(error.message).toBe("Context integrity check failed");
     expect(JSON.stringify(error)).not.toContain("API_KEY");
+  });
+
+  it("accepts a stateful class resolver, preserves this, and ignores unrelated accessors", async () => {
+    const actualFixture = fixture();
+    const artifacts = trustedArtifacts(actualFixture);
+    let unrelatedAccessorReads = 0;
+
+    class StatefulResolver implements ContextArtifactResolver {
+      readonly byReference = new Map(
+        artifacts.map((artifact) => [referenceKey(artifact.reference), artifact]),
+      );
+      calls = 0;
+
+      get unrelatedSecretState(): never {
+        unrelatedAccessorReads += 1;
+        throw new Error("/Users/operator/.secrets API_KEY=do-not-read");
+      }
+
+      resolve(reference: ArtifactReference): Promise<ResolvedContextArtifact> {
+        this.calls += 1;
+        const artifact = this.byReference.get(referenceKey(reference));
+        return artifact === undefined
+          ? Promise.reject(new Error("fixture artifact missing"))
+          : Promise.resolve(artifact);
+      }
+    }
+
+    const resolver = new StatefulResolver();
+    const compiled = await compileAgentContext({
+      request_hash: hashExecutionRequest(actualFixture.request),
+      request: actualFixture.request,
+      bundle: actualFixture.bundle,
+      resolver,
+    });
+
+    expect(resolver.calls).toBe(2);
+    expect(unrelatedAccessorReads).toBe(0);
+    expect(compiled.segments.map((segment) => segment.kind)).toEqual([
+      "runtime-safety",
+      "task-contract",
+      "prompt-template",
+      "prompt-template",
+      "output-schema",
+    ]);
+  });
+
+  it("rejects an accessor-backed resolve method without invoking it", async () => {
+    const actualFixture = fixture();
+    let resolveGetterReads = 0;
+    const resolver = {
+      get resolve(): ContextArtifactResolver["resolve"] {
+        resolveGetterReads += 1;
+        throw new Error("/Users/operator/.secrets SECRET_TOKEN=do-not-read");
+      },
+    } as ContextArtifactResolver;
+
+    const error = await expectContextError(
+      compileAgentContext({
+        request_hash: hashExecutionRequest(actualFixture.request),
+        request: actualFixture.request,
+        bundle: actualFixture.bundle,
+        resolver,
+      }),
+      "RUNTIME_CONTEXT_INTEGRITY",
+    );
+
+    expect(resolveGetterReads).toBe(0);
+    expect(error.message).toBe("Context integrity check failed");
   });
 
   it("keeps injection-shaped repository content structurally after every trusted segment", async () => {
@@ -885,10 +1216,7 @@ describe("provenance-aware agent context compilation", () => {
       ...artifacts,
     ]);
     const first = await compileAgentContext(firstInput);
-    const second = await compileAgentContext({
-      ...secondInput,
-      request_hash: firstInput.request_hash,
-    });
+    const second = await compileAgentContext(secondInput);
 
     const inputIds = (context: typeof first) =>
       context.segments
@@ -899,8 +1227,9 @@ describe("provenance-aware agent context compilation", () => {
     expect(second.segments.map((segment) => segment.segment_id)).toEqual(
       first.segments.map((segment) => segment.segment_id),
     );
-    expect(second.document_hash).toBe(first.document_hash);
-    expect(canonicalJson(second)).toBe(canonicalJson(first));
+    expect(second.request_hash).not.toBe(first.request_hash);
+    expect(second.document_hash).not.toBe(first.document_hash);
+    expect(second.segments).toEqual(first.segments);
   });
 
   it("rejects unknown input document types before resolving any source", async () => {

@@ -1,4 +1,8 @@
-import type { ExecutionRequestV1 } from "../protocol/request.js";
+import {
+  hashExecutionRequest,
+  parseExecutionRequest,
+  type ExecutionRequestV1,
+} from "../protocol/request.js";
 import {
   canonicalJson,
   deepFreezeJson,
@@ -43,7 +47,8 @@ const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const DOCUMENT_TYPE_PATTERN = /^[a-z][a-z0-9-]{0,63}$/u;
 const IDENTIFIER_PATTERN = /^[A-Za-z][A-Za-z0-9._:-]{0,127}$/u;
 const RELATIVE_LOCATION_PATTERN = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\\)[^\u0000]+$/u;
-const MAX_RESOLVED_ARTIFACT_BYTES = AGENT_DOCUMENT_LIMITS.maxBytes;
+const MAX_COMPILED_SEGMENT_BYTES = 1_048_576;
+const ZERO_HASH = `sha256:${"0".repeat(64)}` as const;
 
 const RUNTIME_SAFETY_TEXT = [
   "TOSS Runtime Context Safety Policy v1.",
@@ -85,7 +90,6 @@ const RUNTIME_CONTEXT_POLICY_V1 = deepFreezeJson({
 } as const);
 
 const COMPILE_INPUT_KEYS = ["bundle", "request", "request_hash", "resolver"] as const;
-const RESOLVER_KEYS = ["resolve"] as const;
 const RESOLVED_ARTIFACT_KEYS = [
   "bytes",
   "media_type",
@@ -146,76 +150,145 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function captureDataDescriptors(value: unknown): Record<string, PropertyDescriptor> {
+  let prototype: object | null;
+  let symbols: readonly symbol[];
+  let descriptors: Record<string, PropertyDescriptor>;
+  try {
+    if (!isRecord(value)) return integrityError();
+    prototype = Object.getPrototypeOf(value) as object | null;
+    symbols = Object.getOwnPropertySymbols(value);
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    return integrityError();
+  }
+  if (prototype !== Object.prototype && prototype !== null) integrityError();
+  if (symbols.length !== 0) integrityError();
+  for (const descriptor of Object.values(descriptors)) {
+    if (
+      !descriptor.enumerable ||
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined ||
+      !("value" in descriptor)
+    ) {
+      integrityError();
+    }
+  }
+  return descriptors;
+}
+
+function requireExactDescriptorKeys(
+  descriptors: Record<string, PropertyDescriptor>,
+  expectedKeys: readonly string[],
+): void {
+  const actualKeys = Object.keys(descriptors).sort(bytewiseCompare);
+  const sortedExpected = [...expectedKeys].sort(bytewiseCompare);
+  if (
+    actualKeys.length !== sortedExpected.length ||
+    actualKeys.some((key, index) => key !== sortedExpected[index])
+  ) {
+    integrityError();
+  }
+}
+
 function exactDataDescriptors(
   value: unknown,
   expectedKeys: readonly string[],
 ): Record<string, PropertyDescriptor> {
-  try {
-    if (!isRecord(value)) integrityError();
-    const prototype = Object.getPrototypeOf(value) as object | null;
-    if (prototype !== Object.prototype && prototype !== null) integrityError();
-    const symbols = Object.getOwnPropertySymbols(value);
-    if (symbols.length !== 0) integrityError();
-    const descriptors = Object.getOwnPropertyDescriptors(value);
-    const actualKeys = Object.keys(descriptors).sort(bytewiseCompare);
-    const sortedExpected = [...expectedKeys].sort(bytewiseCompare);
-    if (
-      actualKeys.length !== sortedExpected.length ||
-      actualKeys.some((key, index) => key !== sortedExpected[index])
-    ) {
-      integrityError();
-    }
-    for (const key of actualKeys) {
-      const descriptor = descriptors[key];
-      if (
-        descriptor === undefined ||
-        !descriptor.enumerable ||
-        descriptor.get !== undefined ||
-        descriptor.set !== undefined ||
-        !("value" in descriptor)
-      ) {
-        integrityError();
-      }
-    }
-    return descriptors;
-  } catch (error) {
-    if (error instanceof RuntimeAgentError) throw error;
-    return integrityError();
-  }
+  const descriptors = captureDataDescriptors(value);
+  requireExactDescriptorKeys(descriptors, expectedKeys);
+  return descriptors;
 }
 
 function snapshotJson<T>(value: T): T {
+  let encoded: string;
   try {
-    const encoded = canonicalJson(value, AGENT_DOCUMENT_LIMITS);
-    if (Buffer.byteLength(encoded, "utf8") > AGENT_DOCUMENT_LIMITS.maxBytes) integrityError();
+    encoded = canonicalJson(value, AGENT_DOCUMENT_LIMITS);
+  } catch {
+    return integrityError();
+  }
+  if (Buffer.byteLength(encoded, "utf8") > AGENT_DOCUMENT_LIMITS.maxBytes) integrityError();
+  try {
     return deepFreezeJson(
       parseJsonBytes(encoded, AGENT_DOCUMENT_LIMITS),
       AGENT_DOCUMENT_LIMITS,
     ) as unknown as T;
-  } catch (error) {
-    if (error instanceof RuntimeAgentError) throw error;
+  } catch {
     return integrityError();
   }
+}
+
+function acquireResolverMethod(value: unknown): {
+  readonly resolve: ContextArtifactResolver["resolve"];
+  readonly receiver: ContextArtifactResolver;
+} {
+  if ((typeof value !== "object" || value === null) && typeof value !== "function") {
+    integrityError();
+  }
+  const receiver = value as ContextArtifactResolver;
+  const visited = new Set<object>();
+  let owner = value as object | null;
+  for (let depth = 0; owner !== null && depth < 32; depth += 1) {
+    if (visited.has(owner)) integrityError();
+    visited.add(owner);
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(owner, "resolve");
+    } catch {
+      return integrityError();
+    }
+    if (descriptor !== undefined) {
+      if (
+        descriptor.get !== undefined ||
+        descriptor.set !== undefined ||
+        !("value" in descriptor) ||
+        typeof descriptor.value !== "function"
+      ) {
+        integrityError();
+      }
+      return {
+        resolve: descriptor.value as ContextArtifactResolver["resolve"],
+        receiver,
+      };
+    }
+    let prototype: unknown;
+    try {
+      prototype = Object.getPrototypeOf(owner) as unknown;
+    } catch {
+      return integrityError();
+    }
+    if (prototype !== null && typeof prototype !== "object") integrityError();
+    owner = prototype;
+  }
+  return integrityError();
 }
 
 function projectCompileInput(input: CompileAgentContextInput): CompileProjection {
   const descriptors = exactDataDescriptors(input, COMPILE_INPUT_KEYS);
   const requestHash = descriptors.request_hash?.value as unknown;
   if (typeof requestHash !== "string" || !SHA256_PATTERN.test(requestHash)) integrityError();
-  const request = snapshotJson(descriptors.request?.value) as ExecutionRequestV1;
+  const requestSnapshot = snapshotJson(descriptors.request?.value) as ExecutionRequestV1;
+  let requestResult: ReturnType<typeof parseExecutionRequest>;
+  try {
+    requestResult = parseExecutionRequest(canonicalJson(requestSnapshot, AGENT_DOCUMENT_LIMITS));
+  } catch {
+    return integrityError();
+  }
+  if (!requestResult.ok || hashExecutionRequest(requestResult.value) !== requestHash) {
+    integrityError();
+  }
+  const request = requestResult.value;
   const bundle = snapshotJson(descriptors.bundle?.value) as ResolvedAgentBundle;
 
   const resolver = descriptors.resolver?.value as unknown;
-  const resolverDescriptors = exactDataDescriptors(resolver, RESOLVER_KEYS);
-  const resolve = resolverDescriptors.resolve?.value as unknown;
-  if (typeof resolve !== "function") integrityError();
+  const resolverMethod = acquireResolverMethod(resolver);
 
   return {
-    request_hash: requestHash as `sha256:${string}`,
+    request_hash: requestHash,
     request,
     bundle,
-    resolve: resolve as ContextArtifactResolver["resolve"],
-    resolverReceiver: resolver as ContextArtifactResolver,
+    resolve: resolverMethod.resolve,
+    resolverReceiver: resolverMethod.receiver,
   };
 }
 
@@ -231,16 +304,12 @@ function validateLocation(location: unknown): void {
 }
 
 function projectReference(value: unknown): ArtifactReference {
-  const raw = value as Record<string, unknown>;
-  let expectedKeys: readonly string[] = REFERENCE_KEYS;
-  try {
-    if (isRecord(value) && Object.prototype.hasOwnProperty.call(value, "location")) {
-      expectedKeys = REFERENCE_KEYS_WITH_LOCATION;
-    }
-  } catch {
-    return integrityError();
-  }
-  const descriptors = exactDataDescriptors(value, expectedKeys);
+  const descriptors = captureDataDescriptors(value);
+  const hasLocation = Object.prototype.hasOwnProperty.call(descriptors, "location");
+  requireExactDescriptorKeys(
+    descriptors,
+    hasLocation ? REFERENCE_KEYS_WITH_LOCATION : REFERENCE_KEYS,
+  );
   const documentType = descriptors.document_type?.value as unknown;
   const artifactId = descriptors.artifact_id?.value as unknown;
   const revision = descriptors.revision?.value as unknown;
@@ -257,7 +326,7 @@ function projectReference(value: unknown): ArtifactReference {
   ) {
     integrityError();
   }
-  if (expectedKeys === REFERENCE_KEYS_WITH_LOCATION) validateLocation(raw.location);
+  if (hasLocation) validateLocation(descriptors.location?.value);
   return Object.freeze({
     document_type: documentType,
     artifact_id: artifactId,
@@ -395,20 +464,21 @@ function snapshotResolvedArtifact(value: unknown): ResolvedProjection {
   const descriptors = exactDataDescriptors(value, RESOLVED_ARTIFACT_KEYS);
   const bytesValue = descriptors.bytes?.value as unknown;
   let byteLength: number;
+  let byteArray: Uint8Array;
   try {
-    if (!(bytesValue instanceof Uint8Array)) integrityError();
-    byteLength = bytesValue.byteLength;
-  } catch (error) {
-    if (error instanceof RuntimeAgentError) throw error;
+    if (!(bytesValue instanceof Uint8Array)) return integrityError();
+    byteArray = bytesValue;
+    byteLength = byteArray.byteLength;
+  } catch {
     return integrityError();
   }
   if (!Number.isSafeInteger(byteLength) || byteLength < 0) integrityError();
-  if (byteLength > MAX_RESOLVED_ARTIFACT_BYTES) unsupportedError();
+  if (byteLength > MAX_COMPILED_SEGMENT_BYTES) unsupportedError();
 
   let bytes: Uint8Array;
   try {
     bytes = new Uint8Array(byteLength);
-    bytes.set(bytesValue);
+    bytes.set(byteArray);
   } catch {
     return integrityError();
   }
@@ -438,10 +508,9 @@ async function resolveExactArtifact(
 ): Promise<NormalizedArtifact> {
   let rawArtifact: unknown;
   try {
-    rawArtifact = await projection.resolve.call(
-      projection.resolverReceiver,
+    rawArtifact = await Reflect.apply(projection.resolve, projection.resolverReceiver, [
       Object.freeze({ ...requestedReference }),
-    );
+    ]);
   } catch {
     return integrityError();
   }
@@ -471,11 +540,13 @@ async function resolveExactArtifact(
     contentHash = sha256(content, AGENT_DOCUMENT_LIMITS);
   }
   if (contentHash !== requestedReference.hash) referenceMismatchError();
+  const contentBytes = Buffer.byteLength(content, "utf8");
+  if (contentBytes > MAX_COMPILED_SEGMENT_BYTES) unsupportedError();
 
   return Object.freeze({
     reference: requestedReference,
     content,
-    original_bytes: Buffer.byteLength(content, "utf8"),
+    original_bytes: contentBytes,
   });
 }
 
@@ -623,6 +694,19 @@ function buildCompiledContext(
     },
     truncations: [],
   };
+
+  let representableDocument: string;
+  try {
+    representableDocument = canonicalJson(
+      { ...unsigned, document_hash: ZERO_HASH },
+      AGENT_DOCUMENT_LIMITS,
+    );
+  } catch {
+    return unsupportedError();
+  }
+  if (Buffer.byteLength(representableDocument, "utf8") > AGENT_DOCUMENT_LIMITS.maxBytes) {
+    unsupportedError();
+  }
 
   let document: CompiledContextV1;
   try {
