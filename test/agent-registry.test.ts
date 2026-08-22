@@ -22,6 +22,7 @@ import {
 } from "../src/agents/contracts.js";
 import {
   createAgentRegistry,
+  createAgentRegistryForTest,
   type AgentRegistry,
   type CreateAgentRegistryOptions,
 } from "../src/agents/registry.js";
@@ -47,6 +48,18 @@ const OPERATION_3 = "10000000-0000-4000-8000-000000000003";
 const OPERATION_4 = "10000000-0000-4000-8000-000000000004";
 const roots: string[] = [];
 
+interface CandidateDirectoryEntry {
+  readonly name: string;
+  isFile(): boolean;
+  isDirectory(): boolean;
+  isSymbolicLink(): boolean;
+}
+
+interface CandidateDirectoryReader {
+  readSync(): CandidateDirectoryEntry | null;
+  closeSync(): void;
+}
+
 interface RegistryTestDependencies {
   readonly isProcessAlive?: (pid: number) => "alive" | "dead" | "unknown";
   readonly isCurrentUser?: (userId: bigint, candidate: string) => boolean;
@@ -61,6 +74,14 @@ interface RegistryTestDependencies {
     ) => void;
     readonly beforeHistoryDirectorySync?: (directoryPath: string) => void;
     readonly afterObjectsPublished?: () => Promise<void>;
+  };
+  readonly openCandidateDirectory?: (candidate: string) => CandidateDirectoryReader | undefined;
+  readonly candidateLimits?: {
+    readonly objectCount?: number;
+    readonly registryCount?: number;
+    readonly registryAggregateBytes?: number;
+    readonly quarantineCount?: number;
+    readonly quarantineAggregateBytes?: number;
   };
 }
 
@@ -189,9 +210,11 @@ function registry(statePath: string, overrides: RegistryTestOverrides = {}): Age
     isCurrentUser,
     privateStoreOperationHooks,
     operationHooks,
+    openCandidateDirectory,
+    candidateLimits,
     ...publicOverrides
   } = overrides;
-  const createInternal: InternalCreateAgentRegistry = createAgentRegistry;
+  const createInternal: InternalCreateAgentRegistry = createAgentRegistryForTest;
   return createInternal(
     {
       statePath,
@@ -205,6 +228,8 @@ function registry(statePath: string, overrides: RegistryTestOverrides = {}): Age
       ...(isCurrentUser === undefined ? {} : { isCurrentUser }),
       ...(privateStoreOperationHooks === undefined ? {} : { privateStoreOperationHooks }),
       ...(operationHooks === undefined ? {} : { operationHooks }),
+      ...(openCandidateDirectory === undefined ? {} : { openCandidateDirectory }),
+      ...(candidateLimits === undefined ? {} : { candidateLimits }),
     },
   );
 }
@@ -242,6 +267,18 @@ function rawSha256(bytes: Uint8Array): `sha256:${string}` {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 }
 
+function candidateEntry(
+  name: string,
+  kind: "file" | "directory" = "file",
+): CandidateDirectoryEntry {
+  return {
+    name,
+    isFile: () => kind === "file",
+    isDirectory: () => kind === "directory",
+    isSymbolicLink: () => false,
+  };
+}
+
 function registrationFromEntry(entry: AgentRegistryEntryV1): AgentRegistration {
   return {
     registry_revision: entry.registry_revision,
@@ -269,6 +306,42 @@ describe("immutable agent lifecycle registry", () => {
     expectTypeOf<keyof CreateAgentRegistryOptions>().toEqualTypeOf<
       "statePath" | "now" | "randomId" | "hasServiceListener"
     >();
+    expectTypeOf<
+      Awaited<ReturnType<CreateAgentRegistryOptions["hasServiceListener"]>>
+    >().toEqualTypeOf<"present" | "absent" | "unknown">();
+  });
+
+  it("provides a direct-module internal seam without exporting it from the public agent index", async () => {
+    const registryModule = await import("../src/agents/registry.js");
+    const publicModule = await import("../src/agents/index.js");
+
+    expect(registryModule).toHaveProperty("createAgentRegistryForTest", expect.any(Function));
+    expect(publicModule).not.toHaveProperty("createAgentRegistryForTest");
+  });
+
+  it("does not let JavaScript extra arguments activate internal dependencies", async () => {
+    const { statePath } = await fixture();
+    let hookCalls = 0;
+    const publicRuntimeFactory: InternalCreateAgentRegistry = createAgentRegistry;
+    const agents = publicRuntimeFactory(
+      {
+        statePath,
+        now: () => new Date(0),
+        randomId: () => OPERATION_1,
+        hasServiceListener: () => Promise.resolve("absent"),
+      },
+      {
+        privateStoreOperationHooks: {
+          beforeClaimFileSync: () => {
+            hookCalls += 1;
+            return Promise.resolve();
+          },
+        },
+      },
+    );
+
+    await agents.recover();
+    expect(hookCalls).toBe(0);
   });
 
   it("rejects a missing authoritative listener dependency before state creation", async () => {
@@ -723,6 +796,88 @@ describe("agent registry recovery and fail-closed history validation", () => {
       await expect(registry(statePath).recover()).resolves.toBeUndefined();
     },
   );
+
+  it("stops streaming object enumeration at the configured count plus one", async () => {
+    const { statePath } = await fixture();
+    await registry(statePath).recover();
+    const v1 = bundle(1);
+    const names: string[] = [];
+    for (const document of [v1.prompt_template, v1.definition]) {
+      const { document_hash: hash, ...hashable } = document;
+      await writeFile(objectPath(statePath, hash), canonicalJson(hashable), { mode: 0o600 });
+      names.push(hash.slice("sha256:".length));
+    }
+    names.push("f".repeat(64), "e".repeat(64), "d".repeat(64));
+    const objectsDirectory = path.join(statePath, "agents", "objects");
+    let reads = 0;
+    let closes = 0;
+    const agents = registry(statePath, {
+      candidateLimits: { objectCount: 2 },
+      openCandidateDirectory: (candidate) => {
+        if (candidate !== objectsDirectory) return undefined;
+        let index = 0;
+        return {
+          readSync: () => {
+            reads += 1;
+            const name = names[index++];
+            return name === undefined ? null : candidateEntry(name);
+          },
+          closeSync: () => {
+            closes += 1;
+          },
+        };
+      },
+    });
+
+    await expect(agents.recover()).rejects.toMatchObject({
+      code: "RUNTIME_AGENT_REGISTRY_CORRUPT",
+    });
+    expect(reads).toBe(3);
+    expect(closes).toBe(1);
+  });
+
+  it.each([
+    ["count", { quarantineCount: 1 }],
+    ["aggregate bytes", { quarantineAggregateBytes: 3 }],
+  ] as const)("rejects quarantine %s overflow without deleting candidates", async (_, limits) => {
+    const { statePath } = await fixture();
+    await registry(statePath).recover();
+    const quarantine = path.join(statePath, "agents", "quarantine");
+    const first = path.join(quarantine, `agent-registry-${OPERATION_1}.bin`);
+    const second = path.join(quarantine, `agent-registry-operations-${OPERATION_2}.bin`);
+    await writeFile(first, "ab", { mode: 0o600 });
+    await writeFile(second, "cd", { mode: 0o600 });
+
+    await expect(registry(statePath, { candidateLimits: limits }).recover()).rejects.toMatchObject({
+      code: "RUNTIME_AGENT_REGISTRY_CORRUPT",
+    });
+    expect(await readFile(first, "utf8")).toBe("ab");
+    expect(await readFile(second, "utf8")).toBe("cd");
+  });
+
+  it("does not create a recovery artifact that would cross the quarantine ceiling", async () => {
+    const { statePath } = await fixture();
+    await registry(statePath).publish(bundle(1), OPERATION_1);
+    const history = entriesPath(statePath);
+    await appendFile(history, "{");
+    const before = await readFile(history);
+
+    await expect(
+      registry(statePath, { candidateLimits: { quarantineCount: 0 } }).recover(),
+    ).rejects.toMatchObject({ code: "RUNTIME_AGENT_REGISTRY_CORRUPT" });
+    expect(await readFile(history)).toEqual(before);
+    expect(await readdir(path.join(statePath, "agents", "quarantine"))).toEqual([]);
+  });
+
+  it("enforces an aggregate byte ceiling for registry candidates", async () => {
+    const { statePath } = await fixture();
+    await registry(statePath).publish(bundle(1), OPERATION_1);
+
+    await expect(
+      registry(statePath, { candidateLimits: { registryAggregateBytes: 1 } }).recover(),
+    ).rejects.toMatchObject({ code: "RUNTIME_AGENT_REGISTRY_CORRUPT" });
+    expect(await lines(entriesPath(statePath))).toHaveLength(1);
+  });
 
   it("rejects an operation result that is not bound to an exact durable lifecycle result", async () => {
     const { statePath } = await fixture();

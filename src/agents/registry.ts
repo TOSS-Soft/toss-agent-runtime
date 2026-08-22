@@ -7,8 +7,8 @@ import {
   fsyncSync,
   lstatSync,
   openSync,
+  opendirSync,
   readSync,
-  readdirSync,
   realpathSync,
   renameSync,
   writeSync,
@@ -31,7 +31,6 @@ import {
   createPrivateAgentStore,
   type PrivateAgentStoreOperationHooks,
   type PrivateFileIdentity,
-  type PrivateStoreListenerState,
   type PrivateStoreProcessLiveness,
 } from "./private-store.js";
 import type {
@@ -50,7 +49,13 @@ export type { AgentRegistry } from "./types.js";
 
 const MAX_HISTORY_BYTES = 16 * 1024 * 1024;
 const MAX_OPERATION_RECORD_BYTES = 65_536;
+const MAX_AGENTS_CANDIDATES = 3;
 const MAX_OBJECT_CANDIDATES = 65_536;
+const MAX_REGISTRY_CANDIDATES = 3;
+const MAX_MUTATION_CLAIM_BYTES = 128;
+const MAX_REGISTRY_AGGREGATE_BYTES = MAX_HISTORY_BYTES * 2 + MAX_MUTATION_CLAIM_BYTES;
+const MAX_QUARANTINE_CANDIDATES = 4096;
+const MAX_QUARANTINE_AGGREGATE_BYTES = MAX_HISTORY_BYTES;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const IDENTIFIER_PATTERN = /^[A-Za-z][A-Za-z0-9._:-]{0,127}$/u;
@@ -69,7 +74,37 @@ export interface CreateAgentRegistryOptions {
   readonly statePath: string;
   readonly now: () => Date;
   readonly randomId: () => string;
-  readonly hasServiceListener: () => Promise<PrivateStoreListenerState>;
+  readonly hasServiceListener: () => Promise<"present" | "absent" | "unknown">;
+}
+
+interface CandidateDirectoryEntry {
+  readonly name: string;
+  isFile(): boolean;
+  isDirectory(): boolean;
+  isSymbolicLink(): boolean;
+}
+
+interface CandidateDirectoryReader {
+  readSync(): CandidateDirectoryEntry | null;
+  closeSync(): void;
+}
+
+interface CandidateLimits {
+  readonly objectCount: number;
+  readonly registryCount: number;
+  readonly registryAggregateBytes: number;
+  readonly quarantineCount: number;
+  readonly quarantineAggregateBytes: number;
+}
+
+interface CandidateScanOptions {
+  readonly openCandidateDirectory?: (candidate: string) => CandidateDirectoryReader | undefined;
+  readonly limits: CandidateLimits;
+}
+
+interface CandidateUsage {
+  readonly count: number;
+  readonly aggregateBytes: bigint;
 }
 
 interface AgentRegistryInternalDependencies {
@@ -77,6 +112,8 @@ interface AgentRegistryInternalDependencies {
   readonly isCurrentUser?: (userId: bigint, candidate: string) => boolean;
   readonly privateStoreOperationHooks?: PrivateAgentStoreOperationHooks;
   readonly operationHooks?: AgentRegistryOperationHooks;
+  readonly openCandidateDirectory?: (candidate: string) => CandidateDirectoryReader | undefined;
+  readonly candidateLimits?: Partial<CandidateLimits>;
 }
 
 interface PrivateFileSnapshot {
@@ -226,6 +263,7 @@ function assertPinnedDirectories(directories: readonly PinnedDirectory[]): void 
 function assertPrivateFile(
   metadata: BigIntStats,
   expected?: PrivateFileIdentity,
+  expectedMode = 0o600,
 ): PrivateFileIdentity {
   const candidate = identity(metadata);
   const uid = currentUid();
@@ -234,12 +272,70 @@ function assertPrivateFile(
     !metadata.isFile() ||
     metadata.nlink !== 1n ||
     (uid !== undefined && metadata.uid !== uid) ||
-    Number(metadata.mode & 0o7777n) !== 0o600 ||
+    Number(metadata.mode & 0o7777n) !== expectedMode ||
     (expected !== undefined && !identitiesMatch(expected, candidate))
   ) {
     registryCorrupt();
   }
   return candidate;
+}
+
+function boundedCandidateLimit(candidate: number | undefined, fallback: number): number {
+  if (candidate === undefined) return fallback;
+  if (!Number.isSafeInteger(candidate) || candidate < 0 || candidate > fallback) {
+    registryCorrupt();
+  }
+  return candidate;
+}
+
+function resolveCandidateLimits(overrides?: Partial<CandidateLimits>): CandidateLimits {
+  return Object.freeze({
+    objectCount: boundedCandidateLimit(overrides?.objectCount, MAX_OBJECT_CANDIDATES),
+    registryCount: boundedCandidateLimit(overrides?.registryCount, MAX_REGISTRY_CANDIDATES),
+    registryAggregateBytes: boundedCandidateLimit(
+      overrides?.registryAggregateBytes,
+      MAX_REGISTRY_AGGREGATE_BYTES,
+    ),
+    quarantineCount: boundedCandidateLimit(overrides?.quarantineCount, MAX_QUARANTINE_CANDIDATES),
+    quarantineAggregateBytes: boundedCandidateLimit(
+      overrides?.quarantineAggregateBytes,
+      MAX_QUARANTINE_AGGREGATE_BYTES,
+    ),
+  });
+}
+
+function scanCandidateDirectory(
+  candidate: string,
+  maximumCount: number,
+  visit: (entry: CandidateDirectoryEntry) => void,
+  openCandidateDirectory?: (candidate: string) => CandidateDirectoryReader | undefined,
+): void {
+  let directory: CandidateDirectoryReader | undefined;
+  let failure: unknown;
+  try {
+    directory = openCandidateDirectory?.(candidate) ?? opendirSync(candidate, { bufferSize: 32 });
+    let count = 0;
+    for (;;) {
+      const entry = directory.readSync();
+      if (entry === null) break;
+      count += 1;
+      if (count > maximumCount) registryCorrupt();
+      visit(entry);
+    }
+  } catch (error) {
+    failure = error;
+  }
+  if (directory !== undefined) {
+    try {
+      directory.closeSync();
+    } catch (error) {
+      failure ??= error;
+    }
+  }
+  if (failure !== undefined) {
+    if (failure instanceof RuntimeAgentError) throw failure;
+    registryCorrupt();
+  }
 }
 
 function syncPrivateDirectory(candidate: string, beforeSync?: (candidate: string) => void): void {
@@ -329,16 +425,26 @@ function canonicalStatePath(candidate: string): string {
   }
 }
 
-function assertRegistryCandidates(registryPath: string): void {
+function assertRegistryCandidates(registryPath: string, scans: CandidateScanOptions): void {
   const allowed = new Set(["entries.jsonl", "operations.jsonl", "mutation.claim"]);
-  try {
-    for (const entry of readdirSync(registryPath, { withFileTypes: true })) {
-      if (!allowed.has(entry.name) || entry.isSymbolicLink()) registryCorrupt();
-    }
-  } catch (error) {
-    if (error instanceof RuntimeAgentError) throw error;
-    registryCorrupt();
-  }
+  let aggregateBytes = 0n;
+  scanCandidateDirectory(
+    registryPath,
+    scans.limits.registryCount,
+    (entry) => {
+      if (!allowed.has(entry.name) || !entry.isFile() || entry.isSymbolicLink()) {
+        registryCorrupt();
+      }
+      const claim = entry.name === "mutation.claim";
+      const maximumBytes = claim ? MAX_MUTATION_CLAIM_BYTES : MAX_HISTORY_BYTES;
+      const metadata = lstatSync(path.join(registryPath, entry.name), { bigint: true });
+      assertPrivateFile(metadata, undefined, claim ? 0o700 : 0o600);
+      if (metadata.size > BigInt(maximumBytes)) registryCorrupt();
+      aggregateBytes += metadata.size;
+      if (aggregateBytes > BigInt(scans.limits.registryAggregateBytes)) registryCorrupt();
+    },
+    scans.openCandidateDirectory,
+  );
 }
 
 function assertCanonicalStoredAgentObject(bytes: Uint8Array, hash: `sha256:${string}`): void {
@@ -372,17 +478,26 @@ function assertCanonicalStoredAgentObject(bytes: Uint8Array, hash: `sha256:${str
   registryCorrupt();
 }
 
-function assertAgentCandidates(agentsPath: string, objectsPath: string): void {
+function assertAgentCandidates(
+  agentsPath: string,
+  objectsPath: string,
+  scans: CandidateScanOptions,
+): void {
   const ownedDirectories = new Set(["objects", "quarantine", "registry"]);
-  try {
-    for (const entry of readdirSync(agentsPath, { withFileTypes: true })) {
+  scanCandidateDirectory(
+    agentsPath,
+    MAX_AGENTS_CANDIDATES,
+    (entry) => {
       if (!ownedDirectories.has(entry.name) || !entry.isDirectory() || entry.isSymbolicLink()) {
         registryCorrupt();
       }
-    }
-    const objectCandidates = readdirSync(objectsPath, { withFileTypes: true });
-    if (objectCandidates.length > MAX_OBJECT_CANDIDATES) registryCorrupt();
-    for (const entry of objectCandidates) {
+    },
+    scans.openCandidateDirectory,
+  );
+  scanCandidateDirectory(
+    objectsPath,
+    scans.limits.objectCount,
+    (entry) => {
       if (!entry.isFile() || !/^[0-9a-f]{64}$/u.test(entry.name)) registryCorrupt();
       const candidate = path.join(objectsPath, entry.name);
       let descriptor: number | undefined;
@@ -401,29 +516,40 @@ function assertAgentCandidates(agentsPath: string, objectsPath: string): void {
       } finally {
         if (descriptor !== undefined) closeSync(descriptor);
       }
-    }
-  } catch (error) {
-    if (error instanceof RuntimeAgentError) throw error;
-    registryCorrupt();
-  }
+    },
+    scans.openCandidateDirectory,
+  );
 }
 
-function assertQuarantineCandidates(quarantinePath: string): void {
-  try {
-    for (const entry of readdirSync(quarantinePath, { withFileTypes: true })) {
+function assertQuarantineCandidates(
+  quarantinePath: string,
+  scans: CandidateScanOptions,
+): CandidateUsage {
+  let count = 0;
+  let aggregateBytes = 0n;
+  scanCandidateDirectory(
+    quarantinePath,
+    scans.limits.quarantineCount,
+    (entry) => {
+      count += 1;
       if (!entry.isFile() || !QUARANTINE_PATTERN.test(entry.name)) registryCorrupt();
       const metadata = lstatSync(path.join(quarantinePath, entry.name), { bigint: true });
       assertPrivateFile(metadata);
       if (metadata.size > BigInt(MAX_HISTORY_BYTES)) registryCorrupt();
-    }
-  } catch (error) {
-    if (error instanceof RuntimeAgentError) throw error;
-    registryCorrupt();
-  }
+      aggregateBytes += metadata.size;
+      if (aggregateBytes > BigInt(scans.limits.quarantineAggregateBytes)) registryCorrupt();
+    },
+    scans.openCandidateDirectory,
+  );
+  return { count, aggregateBytes };
 }
 
-function readHistoryFile(candidate: string, registryPath: string): PrivateFileSnapshot | null {
-  assertRegistryCandidates(registryPath);
+function readHistoryFile(
+  candidate: string,
+  registryPath: string,
+  scans: CandidateScanOptions,
+): PrivateFileSnapshot | null {
+  assertRegistryCandidates(registryPath, scans);
   let descriptor: number | undefined;
   try {
     let before: BigIntStats;
@@ -459,9 +585,10 @@ function appendHistoryFile(options: {
   readonly expected: PrivateFileSnapshot | null;
   readonly bytes: Uint8Array;
   readonly kind: "lifecycle" | "operations";
+  readonly scans: CandidateScanOptions;
   readonly hooks?: AgentRegistryOperationHooks;
 }): void {
-  assertRegistryCandidates(options.registryPath);
+  assertRegistryCandidates(options.registryPath, options.scans);
   const prefix = options.expected?.bytes ?? new Uint8Array();
   if (prefix.byteLength + options.bytes.byteLength > MAX_HISTORY_BYTES) registryCorrupt();
   let descriptor: number | undefined;
@@ -517,11 +644,19 @@ function recoverPartial(options: {
   readonly fragment: Uint8Array;
   readonly kind: "lifecycle" | "operations";
   readonly randomId: () => string;
+  readonly scans: CandidateScanOptions;
   readonly hooks?: AgentRegistryOperationHooks;
 }): void {
   if (options.prefix.byteLength === 0 || options.fragment.byteLength === 0) registryCorrupt();
-  assertRegistryCandidates(options.registryPath);
-  assertQuarantineCandidates(options.quarantinePath);
+  assertRegistryCandidates(options.registryPath, options.scans);
+  const quarantineUsage = assertQuarantineCandidates(options.quarantinePath, options.scans);
+  if (
+    quarantineUsage.count >= options.scans.limits.quarantineCount ||
+    quarantineUsage.aggregateBytes + BigInt(options.fragment.byteLength) >
+      BigInt(options.scans.limits.quarantineAggregateBytes)
+  ) {
+    registryCorrupt();
+  }
   const randomId = canonicalUuid(options.randomId(), "RUNTIME_AGENT_REGISTRY_CORRUPT");
   const artifact =
     options.kind === "lifecycle"
@@ -956,10 +1091,23 @@ function operationRecordFor(options: {
   return Object.freeze({ ...hashable, operation_record_hash: sha256(hashable) });
 }
 
-export function createAgentRegistry(options: CreateAgentRegistryOptions): AgentRegistry;
-export function createAgentRegistry(
+export function createAgentRegistry(options: CreateAgentRegistryOptions): AgentRegistry {
+  return createAgentRegistryImplementation(options, {});
+}
+
+export function createAgentRegistryForTest(
   options: CreateAgentRegistryOptions,
-  dependencies: AgentRegistryInternalDependencies = {},
+  dependencies: unknown = {},
+): AgentRegistry {
+  if (typeof dependencies !== "object" || dependencies === null || Array.isArray(dependencies)) {
+    registryCorrupt();
+  }
+  return createAgentRegistryImplementation(options, dependencies);
+}
+
+function createAgentRegistryImplementation(
+  options: CreateAgentRegistryOptions,
+  dependencies: AgentRegistryInternalDependencies,
 ): AgentRegistry {
   if (typeof options.hasServiceListener !== "function") registryCorrupt();
   const statePath = canonicalStatePath(options.statePath);
@@ -979,6 +1127,12 @@ export function createAgentRegistry(
   const store = createPrivateAgentStore(storeOptions);
   const lifecyclePath = path.join(store.registryPath, "entries.jsonl");
   const operationPath = path.join(store.registryPath, "operations.jsonl");
+  const scans = Object.freeze({
+    ...(dependencies.openCandidateDirectory === undefined
+      ? {}
+      : { openCandidateDirectory: dependencies.openCandidateDirectory }),
+    limits: resolveCandidateLimits(dependencies.candidateLimits),
+  });
   let contextPromise: Promise<RegistryContext> | undefined;
   let pinnedDirectories: readonly PinnedDirectory[] | undefined;
   const pendingMutations = new Set<Promise<unknown>>();
@@ -1243,11 +1397,11 @@ export function createAgentRegistry(
 
   const load = async (): Promise<RegistryHistory> => {
     assertRegistryIdentity();
-    assertAgentCandidates(store.agentsPath, store.objectsPath);
-    assertQuarantineCandidates(store.quarantinePath);
-    let lifecycleFile = readHistoryFile(lifecyclePath, store.registryPath);
+    assertAgentCandidates(store.agentsPath, store.objectsPath, scans);
+    assertQuarantineCandidates(store.quarantinePath, scans);
+    let lifecycleFile = readHistoryFile(lifecyclePath, store.registryPath, scans);
     if (lifecycleFile === null) {
-      if (readHistoryFile(operationPath, store.registryPath) !== null) registryCorrupt();
+      if (readHistoryFile(operationPath, store.registryPath, scans) !== null) registryCorrupt();
       assertRegistryIdentity();
       return {
         lifecycleFile: null,
@@ -1277,19 +1431,20 @@ export function createAgentRegistry(
         fragment: lifecycle.fragment,
         kind: "lifecycle",
         randomId: options.randomId,
+        scans,
         ...(dependencies.operationHooks === undefined
           ? {}
           : { hooks: dependencies.operationHooks }),
       });
       assertRegistryIdentity();
-      lifecycleFile = readHistoryFile(lifecyclePath, store.registryPath);
+      lifecycleFile = readHistoryFile(lifecyclePath, store.registryPath, scans);
       if (lifecycleFile === null) registryCorrupt();
       lifecycle = parseJsonl(lifecycleFile.bytes, parseLifecycleLine);
       if (lifecycle.fragment.byteLength > 0) registryCorrupt();
     }
     const lifecycleState = await validateLifecycle(lifecycle.records);
 
-    let operationFile = readHistoryFile(operationPath, store.registryPath);
+    let operationFile = readHistoryFile(operationPath, store.registryPath, scans);
     let operationRecords: readonly AgentOperationRecordV1[] = Object.freeze([]);
     if (operationFile !== null) {
       let operationHistory = parseJsonl(operationFile.bytes, parseOperationRecord);
@@ -1310,12 +1465,13 @@ export function createAgentRegistry(
           fragment: operationHistory.fragment,
           kind: "operations",
           randomId: options.randomId,
+          scans,
           ...(dependencies.operationHooks === undefined
             ? {}
             : { hooks: dependencies.operationHooks }),
         });
         assertRegistryIdentity();
-        operationFile = readHistoryFile(operationPath, store.registryPath);
+        operationFile = readHistoryFile(operationPath, store.registryPath, scans);
         if (operationFile === null) registryCorrupt();
         operationHistory = parseJsonl(operationFile.bytes, parseOperationRecord);
         if (operationHistory.fragment.byteLength > 0) registryCorrupt();
@@ -1363,6 +1519,7 @@ export function createAgentRegistry(
       expected: history.lifecycleFile,
       bytes: Buffer.from(`${canonicalJson(entry as never)}\n`, "utf8"),
       kind: "lifecycle",
+      scans,
       ...(dependencies.operationHooks === undefined ? {} : { hooks: dependencies.operationHooks }),
     });
     assertRegistryIdentity();
@@ -1376,6 +1533,7 @@ export function createAgentRegistry(
       expected: history.operationFile,
       bytes: Buffer.from(`${canonicalJson(record as never)}\n`, "utf8"),
       kind: "operations",
+      scans,
       ...(dependencies.operationHooks === undefined ? {} : { hooks: dependencies.operationHooks }),
     });
     assertRegistryIdentity();
