@@ -73,6 +73,7 @@ interface RegistryTestDependencies {
       filePath: string,
     ) => void;
     readonly beforeHistoryDirectorySync?: (directoryPath: string) => void;
+    readonly afterQuarantinePublished?: (filePath: string) => void;
     readonly afterObjectsPublished?: () => Promise<void>;
   };
   readonly openCandidateDirectory?: (candidate: string) => CandidateDirectoryReader | undefined;
@@ -867,6 +868,82 @@ describe("agent registry recovery and fail-closed history validation", () => {
     ).rejects.toMatchObject({ code: "RUNTIME_AGENT_REGISTRY_CORRUPT" });
     expect(await readFile(history)).toEqual(before);
     expect(await readdir(path.join(statePath, "agents", "quarantine"))).toEqual([]);
+  });
+
+  it.each([
+    ["count", { quarantineCount: 1 }, "x"],
+    ["aggregate bytes", { quarantineAggregateBytes: 3 }, "xyz"],
+  ] as const)(
+    "revalidates quarantine %s after publishing the recovery artifact",
+    async (_, limits, insertedBytes) => {
+      const { statePath } = await fixture();
+      await registry(statePath).publish(bundle(1), OPERATION_1);
+      const history = entriesPath(statePath);
+      await appendFile(history, "{");
+      const before = await readFile(history);
+      const quarantine = path.join(statePath, "agents", "quarantine");
+      const inserted = path.join(quarantine, `agent-registry-${OPERATION_3}.bin`);
+      const owned = path.join(quarantine, `agent-registry-${OPERATION_4}.bin`);
+      let recoveryStageSyncs = 0;
+
+      await expect(
+        registry(statePath, {
+          candidateLimits: limits,
+          randomId: () => {
+            writeFileSync(inserted, insertedBytes, { mode: 0o600 });
+            return OPERATION_4;
+          },
+          operationHooks: {
+            beforeHistoryFileSync: (kind) => {
+              if (kind === "recovery") recoveryStageSyncs += 1;
+            },
+          },
+        }).recover(),
+      ).rejects.toMatchObject({ code: "RUNTIME_AGENT_REGISTRY_CORRUPT" });
+
+      expect(recoveryStageSyncs).toBe(0);
+      expect(await readFile(history)).toEqual(before);
+      expect((await readdir(quarantine)).sort()).toEqual(
+        [path.basename(inserted), path.basename(owned)].sort(),
+      );
+      expect(await readFile(inserted, "utf8")).toBe(insertedBytes);
+      expect(await readFile(owned, "utf8")).toBe("{");
+    },
+  );
+
+  it("preserves a replaced recovery artifact and its displaced original", async () => {
+    const { statePath } = await fixture();
+    await registry(statePath).publish(bundle(1), OPERATION_1);
+    const history = entriesPath(statePath);
+    await appendFile(history, "{");
+    const before = await readFile(history);
+    const quarantine = path.join(statePath, "agents", "quarantine");
+    const displaced = path.join(quarantine, `agent-registry-${OPERATION_3}.bin`);
+    const owned = path.join(quarantine, `agent-registry-${OPERATION_4}.bin`);
+    let recoveryStageSyncs = 0;
+
+    await expect(
+      registry(statePath, {
+        randomId: () => OPERATION_4,
+        operationHooks: {
+          beforeHistoryFileSync: (kind) => {
+            if (kind === "recovery") recoveryStageSyncs += 1;
+          },
+          afterQuarantinePublished: (filePath) => {
+            renameSync(filePath, displaced);
+            writeFileSync(filePath, "replacement", { mode: 0o600 });
+          },
+        },
+      }).recover(),
+    ).rejects.toMatchObject({ code: "RUNTIME_AGENT_REGISTRY_CORRUPT" });
+
+    expect(recoveryStageSyncs).toBe(0);
+    expect(await readFile(history)).toEqual(before);
+    expect((await readdir(quarantine)).sort()).toEqual(
+      [path.basename(displaced), path.basename(owned)].sort(),
+    );
+    expect(await readFile(displaced, "utf8")).toBe("{");
+    expect(await readFile(owned, "utf8")).toBe("replacement");
   });
 
   it("enforces an aggregate byte ceiling for registry candidates", async () => {

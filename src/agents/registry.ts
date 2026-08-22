@@ -67,6 +67,7 @@ type AgentRegistryHistoryKind = "lifecycle" | "operations" | "quarantine" | "rec
 interface AgentRegistryOperationHooks {
   readonly beforeHistoryFileSync?: (history: AgentRegistryHistoryKind, filePath: string) => void;
   readonly beforeHistoryDirectorySync?: (directoryPath: string) => void;
+  readonly afterQuarantinePublished?: (filePath: string) => void;
   readonly afterObjectsPublished?: () => Promise<void>;
 }
 
@@ -645,6 +646,7 @@ function recoverPartial(options: {
   readonly kind: "lifecycle" | "operations";
   readonly randomId: () => string;
   readonly scans: CandidateScanOptions;
+  readonly assertRegistryIdentity: () => void;
   readonly hooks?: AgentRegistryOperationHooks;
 }): void {
   if (options.prefix.byteLength === 0 || options.fragment.byteLength === 0) registryCorrupt();
@@ -680,6 +682,14 @@ function recoverPartial(options: {
     fsyncSync(quarantine);
     exactFile(quarantineFile, quarantine, quarantineIdentity, options.fragment);
     syncPrivateDirectory(options.quarantinePath, options.hooks?.beforeHistoryDirectorySync);
+    exactFile(quarantineFile, quarantine, quarantineIdentity, options.fragment);
+    options.hooks?.afterQuarantinePublished?.(quarantineFile);
+    options.assertRegistryIdentity();
+    try {
+      assertQuarantineCandidates(options.quarantinePath, options.scans);
+    } finally {
+      options.assertRegistryIdentity();
+    }
     exactFile(quarantineFile, quarantine, quarantineIdentity, options.fragment);
 
     stage = openSync(
@@ -1432,6 +1442,7 @@ function createAgentRegistryImplementation(
         kind: "lifecycle",
         randomId: options.randomId,
         scans,
+        assertRegistryIdentity,
         ...(dependencies.operationHooks === undefined
           ? {}
           : { hooks: dependencies.operationHooks }),
@@ -1466,6 +1477,7 @@ function createAgentRegistryImplementation(
           kind: "operations",
           randomId: options.randomId,
           scans,
+          assertRegistryIdentity,
           ...(dependencies.operationHooks === undefined
             ? {}
             : { hooks: dependencies.operationHooks }),
