@@ -106,6 +106,20 @@ interface CandidateScanOptions {
 interface CandidateUsage {
   readonly count: number;
   readonly aggregateBytes: bigint;
+  readonly candidates: readonly CandidateFileSnapshot[];
+}
+
+interface CandidateFileSnapshot {
+  readonly name: string;
+  readonly identity: PrivateFileIdentity;
+  readonly size: bigint;
+}
+
+interface DirectoryContentToken {
+  readonly identity: PrivateFileIdentity;
+  readonly size: bigint;
+  readonly modificationTimeNanoseconds: bigint;
+  readonly changeTimeNanoseconds: bigint;
 }
 
 interface AgentRegistryInternalDependencies {
@@ -204,6 +218,27 @@ function identity(metadata: Pick<BigIntStats, "dev" | "ino">): PrivateFileIdenti
 
 function identitiesMatch(left: PrivateFileIdentity, right: PrivateFileIdentity): boolean {
   return left.device === right.device && left.inode === right.inode;
+}
+
+function directoryContentToken(metadata: BigIntStats): DirectoryContentToken {
+  return {
+    identity: assertPrivateDirectory(metadata),
+    size: metadata.size,
+    modificationTimeNanoseconds: metadata.mtimeNs,
+    changeTimeNanoseconds: metadata.ctimeNs,
+  };
+}
+
+function directoryContentTokensMatch(
+  left: DirectoryContentToken,
+  right: DirectoryContentToken,
+): boolean {
+  return (
+    identitiesMatch(left.identity, right.identity) &&
+    left.size === right.size &&
+    left.modificationTimeNanoseconds === right.modificationTimeNanoseconds &&
+    left.changeTimeNanoseconds === right.changeTimeNanoseconds
+  );
 }
 
 function assertPrivateDirectory(metadata: BigIntStats): PrivateFileIdentity {
@@ -528,6 +563,7 @@ function assertQuarantineCandidates(
 ): CandidateUsage {
   let count = 0;
   let aggregateBytes = 0n;
+  const candidates: CandidateFileSnapshot[] = [];
   scanCandidateDirectory(
     quarantinePath,
     scans.limits.quarantineCount,
@@ -535,14 +571,76 @@ function assertQuarantineCandidates(
       count += 1;
       if (!entry.isFile() || !QUARANTINE_PATTERN.test(entry.name)) registryCorrupt();
       const metadata = lstatSync(path.join(quarantinePath, entry.name), { bigint: true });
-      assertPrivateFile(metadata);
+      const candidateIdentity = assertPrivateFile(metadata);
       if (metadata.size > BigInt(MAX_HISTORY_BYTES)) registryCorrupt();
       aggregateBytes += metadata.size;
       if (aggregateBytes > BigInt(scans.limits.quarantineAggregateBytes)) registryCorrupt();
+      candidates.push({ name: entry.name, identity: candidateIdentity, size: metadata.size });
     },
     scans.openCandidateDirectory,
   );
-  return { count, aggregateBytes };
+  return { count, aggregateBytes, candidates };
+}
+
+function assertCandidateSnapshot(directoryPath: string, candidate: CandidateFileSnapshot): void {
+  const candidatePath = path.join(directoryPath, candidate.name);
+  let descriptor: number | undefined;
+  try {
+    const before = lstatSync(candidatePath, { bigint: true });
+    assertPrivateFile(before, candidate.identity);
+    if (before.size !== candidate.size) registryCorrupt();
+    descriptor = openSync(candidatePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const held = fstatSync(descriptor, { bigint: true });
+    const after = lstatSync(candidatePath, { bigint: true });
+    assertPrivateFile(held, candidate.identity);
+    assertPrivateFile(after, candidate.identity);
+    if (held.size !== candidate.size || after.size !== candidate.size) registryCorrupt();
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+function assertStableQuarantineCandidates(
+  quarantinePath: string,
+  scans: CandidateScanOptions,
+): CandidateUsage {
+  let descriptor: number | undefined;
+  try {
+    const pathBefore = lstatSync(quarantinePath, { bigint: true });
+    const expectedIdentity = assertPrivateDirectory(pathBefore);
+    descriptor = openSync(
+      quarantinePath,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    const before = directoryContentToken(fstatSync(descriptor, { bigint: true }));
+    const pathAfterOpen = assertPrivateDirectory(lstatSync(quarantinePath, { bigint: true }));
+    if (
+      !identitiesMatch(expectedIdentity, before.identity) ||
+      !identitiesMatch(expectedIdentity, pathAfterOpen)
+    ) {
+      registryCorrupt();
+    }
+
+    const usage = assertQuarantineCandidates(quarantinePath, scans);
+    for (const candidate of usage.candidates) {
+      assertCandidateSnapshot(quarantinePath, candidate);
+    }
+
+    const after = directoryContentToken(fstatSync(descriptor, { bigint: true }));
+    const pathAfterScan = assertPrivateDirectory(lstatSync(quarantinePath, { bigint: true }));
+    if (
+      !identitiesMatch(expectedIdentity, pathAfterScan) ||
+      !directoryContentTokensMatch(before, after)
+    ) {
+      registryCorrupt();
+    }
+    return usage;
+  } catch (error) {
+    if (error instanceof RuntimeAgentError) throw error;
+    return registryCorrupt();
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
 }
 
 function readHistoryFile(
@@ -686,7 +784,7 @@ function recoverPartial(options: {
     options.hooks?.afterQuarantinePublished?.(quarantineFile);
     options.assertRegistryIdentity();
     try {
-      assertQuarantineCandidates(options.quarantinePath, options.scans);
+      assertStableQuarantineCandidates(options.quarantinePath, options.scans);
     } finally {
       options.assertRegistryIdentity();
     }

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, opendirSync, renameSync, writeFileSync } from "node:fs";
 import {
   appendFile,
   chmod,
@@ -903,6 +903,80 @@ describe("agent registry recovery and fail-closed history validation", () => {
 
       expect(recoveryStageSyncs).toBe(0);
       expect(await readFile(history)).toEqual(before);
+      expect((await readdir(quarantine)).sort()).toEqual(
+        [path.basename(inserted), path.basename(owned)].sort(),
+      );
+      expect(await readFile(inserted, "utf8")).toBe(insertedBytes);
+      expect(await readFile(owned, "utf8")).toBe("{");
+    },
+  );
+
+  it.each([
+    ["count", { quarantineCount: 1 }, "x"],
+    ["aggregate bytes", { quarantineAggregateBytes: 3 }, "xyz"],
+  ] as const)(
+    "fails closed when quarantine %s changes at the terminal post-publication read",
+    async (_, limits, insertedBytes) => {
+      const { statePath } = await fixture();
+      await registry(statePath).publish(bundle(1), OPERATION_1);
+      const history = entriesPath(statePath);
+      await appendFile(history, "{");
+      const before = await readFile(history);
+      const quarantine = path.join(statePath, "agents", "quarantine");
+      const inserted = path.join(quarantine, `agent-registry-${OPERATION_3}.bin`);
+      const owned = path.join(quarantine, `agent-registry-${OPERATION_4}.bin`);
+      let postPublicationScan = false;
+      let injected = false;
+      let recoveryStageSyncs = 0;
+      let rejection: unknown;
+
+      try {
+        await registry(statePath, {
+          candidateLimits: limits,
+          randomId: () => OPERATION_4,
+          openCandidateDirectory: (candidate) => {
+            if (candidate !== quarantine) return undefined;
+            const directory = opendirSync(candidate, { bufferSize: 32 });
+            return {
+              readSync: () => {
+                const entry = directory.readSync();
+                if (entry === null && postPublicationScan && !injected) {
+                  writeFileSync(inserted, insertedBytes, { mode: 0o600 });
+                  injected = true;
+                }
+                return entry;
+              },
+              closeSync: () => directory.closeSync(),
+            };
+          },
+          operationHooks: {
+            beforeHistoryFileSync: (kind) => {
+              if (kind === "recovery") recoveryStageSyncs += 1;
+            },
+            afterQuarantinePublished: () => {
+              postPublicationScan = true;
+            },
+          },
+        }).recover();
+      } catch (error) {
+        rejection = error;
+      }
+
+      const code =
+        typeof rejection === "object" && rejection !== null && "code" in rejection
+          ? rejection.code
+          : undefined;
+      expect({
+        code,
+        injected,
+        recoveryStageSyncs,
+        historyPreserved: (await readFile(history)).equals(before),
+      }).toEqual({
+        code: "RUNTIME_AGENT_REGISTRY_CORRUPT",
+        injected: true,
+        recoveryStageSyncs: 0,
+        historyPreserved: true,
+      });
       expect((await readdir(quarantine)).sort()).toEqual(
         [path.basename(inserted), path.basename(owned)].sort(),
       );
