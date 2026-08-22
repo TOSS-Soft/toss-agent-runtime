@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   closeSync,
   constants,
@@ -49,15 +50,16 @@ export type { AgentRegistry } from "./types.js";
 
 const MAX_HISTORY_BYTES = 16 * 1024 * 1024;
 const MAX_OPERATION_RECORD_BYTES = 65_536;
+const MAX_OBJECT_CANDIDATES = 65_536;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const IDENTIFIER_PATTERN = /^[A-Za-z][A-Za-z0-9._:-]{0,127}$/u;
 const QUARANTINE_PATTERN =
   /^agent-registry(?:-operations)?-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.bin$/u;
 
-export type AgentRegistryHistoryKind = "lifecycle" | "operations" | "quarantine" | "recovery";
+type AgentRegistryHistoryKind = "lifecycle" | "operations" | "quarantine" | "recovery";
 
-export interface AgentRegistryOperationHooks {
+interface AgentRegistryOperationHooks {
   readonly beforeHistoryFileSync?: (history: AgentRegistryHistoryKind, filePath: string) => void;
   readonly beforeHistoryDirectorySync?: (directoryPath: string) => void;
   readonly afterObjectsPublished?: () => Promise<void>;
@@ -68,6 +70,9 @@ export interface CreateAgentRegistryOptions {
   readonly now: () => Date;
   readonly randomId: () => string;
   readonly hasServiceListener: () => Promise<PrivateStoreListenerState>;
+}
+
+interface AgentRegistryInternalDependencies {
   readonly isProcessAlive?: (pid: number) => PrivateStoreProcessLiveness;
   readonly isCurrentUser?: (userId: bigint, candidate: string) => boolean;
   readonly privateStoreOperationHooks?: PrivateAgentStoreOperationHooks;
@@ -86,6 +91,8 @@ interface HashableAgentOperationRecordV1 {
   readonly previous_operation_hash: `sha256:${string}` | null;
   readonly operation_id: string;
   readonly operation_hash: `sha256:${string}`;
+  readonly lifecycle_head_revision: number;
+  readonly lifecycle_head_hash: `sha256:${string}`;
   readonly result: AgentRegistration;
 }
 
@@ -115,6 +122,16 @@ interface Coordinator {
   tail: Promise<unknown>;
 }
 
+interface PinnedDirectory {
+  readonly candidate: string;
+  readonly identity: PrivateFileIdentity;
+}
+
+interface RegistryContext {
+  readonly shared: Coordinator;
+  readonly directories: readonly PinnedDirectory[];
+}
+
 const coordinators = new Map<string, WeakRef<Coordinator>>();
 
 function agentError(code: RuntimeAgentErrorCode): never {
@@ -123,6 +140,10 @@ function agentError(code: RuntimeAgentErrorCode): never {
 
 function registryCorrupt(): never {
   return agentError("RUNTIME_AGENT_REGISTRY_CORRUPT");
+}
+
+function pathUnsafe(): never {
+  return agentError("RUNTIME_AGENT_PATH_UNSAFE");
 }
 
 function definitionInvalid(): never {
@@ -158,6 +179,48 @@ function assertPrivateDirectory(metadata: BigIntStats): PrivateFileIdentity {
     registryCorrupt();
   }
   return identity(metadata);
+}
+
+function pinPrivateDirectories(candidates: readonly string[]): readonly PinnedDirectory[] {
+  try {
+    return Object.freeze(
+      candidates.map((candidate) => {
+        if (realpathSync(candidate) !== candidate) pathUnsafe();
+        return Object.freeze({
+          candidate,
+          identity: assertPrivateDirectory(lstatSync(candidate, { bigint: true })),
+        });
+      }),
+    );
+  } catch {
+    return pathUnsafe();
+  }
+}
+
+function assertPinnedDirectories(directories: readonly PinnedDirectory[]): void {
+  for (const directory of directories) {
+    let descriptor: number | undefined;
+    try {
+      const before = assertPrivateDirectory(lstatSync(directory.candidate, { bigint: true }));
+      if (!identitiesMatch(before, directory.identity)) pathUnsafe();
+      descriptor = openSync(
+        directory.candidate,
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+      );
+      const held = assertPrivateDirectory(fstatSync(descriptor, { bigint: true }));
+      const after = assertPrivateDirectory(lstatSync(directory.candidate, { bigint: true }));
+      if (
+        !identitiesMatch(held, directory.identity) ||
+        !identitiesMatch(after, directory.identity)
+      ) {
+        pathUnsafe();
+      }
+    } catch {
+      return pathUnsafe();
+    } finally {
+      if (descriptor !== undefined) closeSync(descriptor);
+    }
+  }
 }
 
 function assertPrivateFile(
@@ -278,6 +341,37 @@ function assertRegistryCandidates(registryPath: string): void {
   }
 }
 
+function assertCanonicalStoredAgentObject(bytes: Uint8Array, hash: `sha256:${string}`): void {
+  if (createHash("sha256").update(bytes).digest("hex") !== hash.slice("sha256:".length)) {
+    registryCorrupt();
+  }
+  let value: JsonValue;
+  try {
+    value = parseJsonBytes(bytes, AGENT_DOCUMENT_LIMITS);
+  } catch {
+    return registryCorrupt();
+  }
+  if (
+    !jsonObject(value) ||
+    "document_hash" in value ||
+    !Buffer.from(canonicalJson(value), "utf8").equals(Buffer.from(bytes))
+  ) {
+    registryCorrupt();
+  }
+  const candidate = Buffer.from(canonicalJson({ ...value, document_hash: hash }), "utf8");
+  if (value.document_type === "agent-definition") {
+    const parsed = parseAgentDefinition(candidate);
+    if (!parsed.ok || parsed.value.document_hash !== hash) registryCorrupt();
+    return;
+  }
+  if (value.document_type === "prompt-template") {
+    const parsed = parsePromptTemplate(candidate);
+    if (!parsed.ok || parsed.value.document_hash !== hash) registryCorrupt();
+    return;
+  }
+  registryCorrupt();
+}
+
 function assertAgentCandidates(agentsPath: string, objectsPath: string): void {
   const ownedDirectories = new Set(["objects", "quarantine", "registry"]);
   try {
@@ -286,11 +380,27 @@ function assertAgentCandidates(agentsPath: string, objectsPath: string): void {
         registryCorrupt();
       }
     }
-    for (const entry of readdirSync(objectsPath, { withFileTypes: true })) {
+    const objectCandidates = readdirSync(objectsPath, { withFileTypes: true });
+    if (objectCandidates.length > MAX_OBJECT_CANDIDATES) registryCorrupt();
+    for (const entry of objectCandidates) {
       if (!entry.isFile() || !/^[0-9a-f]{64}$/u.test(entry.name)) registryCorrupt();
-      const metadata = lstatSync(path.join(objectsPath, entry.name), { bigint: true });
-      assertPrivateFile(metadata);
-      if (metadata.size > BigInt(MAX_PRIVATE_OBJECT_BYTES)) registryCorrupt();
+      const candidate = path.join(objectsPath, entry.name);
+      let descriptor: number | undefined;
+      try {
+        const metadata = lstatSync(candidate, { bigint: true });
+        const expected = assertPrivateFile(metadata);
+        if (metadata.size > BigInt(MAX_PRIVATE_OBJECT_BYTES)) registryCorrupt();
+        descriptor = openSync(candidate, constants.O_RDONLY | constants.O_NOFOLLOW);
+        const held = fstatSync(descriptor, { bigint: true });
+        assertPrivateFile(held, expected);
+        if (held.size > BigInt(MAX_PRIVATE_OBJECT_BYTES)) registryCorrupt();
+        const bytes = readAll(descriptor, Number(held.size));
+        fsyncSync(descriptor);
+        exactFile(candidate, descriptor, expected, bytes);
+        assertCanonicalStoredAgentObject(bytes, `sha256:${entry.name}`);
+      } finally {
+        if (descriptor !== undefined) closeSync(descriptor);
+      }
     }
   } catch (error) {
     if (error instanceof RuntimeAgentError) throw error;
@@ -702,6 +812,8 @@ function parseOperationRecord(bytes: Uint8Array): AgentOperationRecordV1 {
       "previous_operation_hash",
       "operation_id",
       "operation_hash",
+      "lifecycle_head_revision",
+      "lifecycle_head_hash",
       "result",
       "operation_record_hash",
     ]) ||
@@ -719,6 +831,11 @@ function parseOperationRecord(bytes: Uint8Array): AgentOperationRecordV1 {
     !UUID_PATTERN.test(value.operation_id) ||
     typeof value.operation_hash !== "string" ||
     !SHA256_PATTERN.test(value.operation_hash) ||
+    typeof value.lifecycle_head_revision !== "number" ||
+    !Number.isSafeInteger(value.lifecycle_head_revision) ||
+    value.lifecycle_head_revision < 1 ||
+    typeof value.lifecycle_head_hash !== "string" ||
+    !SHA256_PATTERN.test(value.lifecycle_head_hash) ||
     typeof value.operation_record_hash !== "string" ||
     !SHA256_PATTERN.test(value.operation_record_hash)
   ) {
@@ -732,6 +849,8 @@ function parseOperationRecord(bytes: Uint8Array): AgentOperationRecordV1 {
     previous_operation_hash: value.previous_operation_hash as `sha256:${string}` | null,
     operation_id: value.operation_id,
     operation_hash: value.operation_hash as `sha256:${string}`,
+    lifecycle_head_revision: value.lifecycle_head_revision,
+    lifecycle_head_hash: value.lifecycle_head_hash as `sha256:${string}`,
     result,
     operation_record_hash: value.operation_record_hash as `sha256:${string}`,
   } satisfies AgentOperationRecordV1;
@@ -818,8 +937,11 @@ function operationRecordFor(options: {
   readonly operationHash: `sha256:${string}`;
   readonly result: AgentRegistration;
   readonly records: readonly AgentOperationRecordV1[];
+  readonly entries: readonly AgentRegistryEntryV1[];
 }): AgentOperationRecordV1 {
   const previous = options.records.at(-1);
+  const head = options.entries.at(-1);
+  if (head === undefined) registryCorrupt();
   const hashable = {
     schema_version: "agent-registry-operation.v1",
     document_type: "agent-registry-operation",
@@ -827,49 +949,85 @@ function operationRecordFor(options: {
     previous_operation_hash: previous?.operation_record_hash ?? null,
     operation_id: options.operationId,
     operation_hash: options.operationHash,
+    lifecycle_head_revision: head.registry_revision,
+    lifecycle_head_hash: head.entry_hash,
     result: options.result,
   } as const;
   return Object.freeze({ ...hashable, operation_record_hash: sha256(hashable) });
 }
 
-export function createAgentRegistry(options: CreateAgentRegistryOptions): AgentRegistry {
+export function createAgentRegistry(options: CreateAgentRegistryOptions): AgentRegistry;
+export function createAgentRegistry(
+  options: CreateAgentRegistryOptions,
+  dependencies: AgentRegistryInternalDependencies = {},
+): AgentRegistry {
+  if (typeof options.hasServiceListener !== "function") registryCorrupt();
   const statePath = canonicalStatePath(options.statePath);
   const storeOptions = {
     statePath,
     hasServiceListener: options.hasServiceListener,
-    ...(options.isProcessAlive === undefined ? {} : { isProcessAlive: options.isProcessAlive }),
-    ...(options.isCurrentUser === undefined ? {} : { isCurrentUser: options.isCurrentUser }),
-    ...(options.privateStoreOperationHooks === undefined
+    ...(dependencies.isProcessAlive === undefined
       ? {}
-      : { operationHooks: options.privateStoreOperationHooks }),
+      : { isProcessAlive: dependencies.isProcessAlive }),
+    ...(dependencies.isCurrentUser === undefined
+      ? {}
+      : { isCurrentUser: dependencies.isCurrentUser }),
+    ...(dependencies.privateStoreOperationHooks === undefined
+      ? {}
+      : { operationHooks: dependencies.privateStoreOperationHooks }),
   };
   const store = createPrivateAgentStore(storeOptions);
   const lifecyclePath = path.join(store.registryPath, "entries.jsonl");
   const operationPath = path.join(store.registryPath, "operations.jsonl");
-  let coordinatorPromise: Promise<Coordinator> | undefined;
+  let contextPromise: Promise<RegistryContext> | undefined;
+  let pinnedDirectories: readonly PinnedDirectory[] | undefined;
   const pendingMutations = new Set<Promise<unknown>>();
   let intakeStopped = false;
 
-  const coordinator = (): Promise<Coordinator> => {
-    coordinatorPromise ??= (async () => {
+  const context = (): Promise<RegistryContext> => {
+    contextPromise ??= (async () => {
       await store.ensureRoots();
       const canonical = realpathSync(statePath);
-      const metadata = lstatSync(canonical, { bigint: true });
-      const stateIdentity = assertPrivateDirectory(metadata);
+      if (canonical !== statePath) pathUnsafe();
+      const directories = pinPrivateDirectories([
+        statePath,
+        store.agentsPath,
+        store.objectsPath,
+        store.registryPath,
+        store.quarantinePath,
+      ]);
+      pinnedDirectories = directories;
+      const stateIdentity = directories[0]?.identity;
+      if (stateIdentity === undefined) registryCorrupt();
       const key = `${canonical}\u0000${String(stateIdentity.device)}:${String(stateIdentity.inode)}`;
       let shared = coordinators.get(key)?.deref();
       if (shared === undefined) {
         shared = { tail: Promise.resolve() };
         coordinators.set(key, new WeakRef(shared));
       }
-      return shared;
+      assertPinnedDirectories(directories);
+      return Object.freeze({ shared, directories });
     })();
-    return coordinatorPromise;
+    return contextPromise;
+  };
+
+  const assertRegistryIdentity = (): void => {
+    if (pinnedDirectories === undefined) registryCorrupt();
+    assertPinnedDirectories(pinnedDirectories);
   };
 
   const enqueue = <T>(operation: () => Promise<T>, mutation: boolean): Promise<T> => {
-    const scheduled = coordinator().then(async (shared) => {
-      const current = shared.tail.catch(() => undefined).then(operation);
+    const scheduled = context().then(async ({ shared }) => {
+      const current = shared.tail
+        .catch(() => undefined)
+        .then(async () => {
+          assertRegistryIdentity();
+          try {
+            return await operation();
+          } finally {
+            assertRegistryIdentity();
+          }
+        });
       shared.tail = current;
       return current;
     });
@@ -881,13 +1039,18 @@ export function createAgentRegistry(options: CreateAgentRegistryOptions): AgentR
   };
 
   const withClaim = async <T>(operation: () => Promise<T>): Promise<T> => {
+    assertRegistryIdentity();
     const claim = await store.acquireMutationClaim();
     try {
+      assertRegistryIdentity();
       const result = await operation();
+      assertRegistryIdentity();
       await claim.release();
+      assertRegistryIdentity();
       return result;
     } catch (error) {
       await claim.release().catch(() => undefined);
+      assertRegistryIdentity();
       throw error;
     }
   };
@@ -1033,21 +1196,39 @@ export function createAgentRegistry(options: CreateAgentRegistryOptions): AgentR
     base: ReadonlyMap<string, OperationResult>,
   ): ReadonlyMap<string, OperationResult> => {
     const operations = new Map(base);
-    const durableResults = new Set(
-      entries.map((entry) => canonicalJson(registration(entry) as never)),
-    );
+    const activeAtHead = new Map<string, AgentRegistration>();
+    let lifecycleIndex = 0;
     let previousHash: `sha256:${string}` | null = null;
     for (const [index, record] of records.entries()) {
-      const expectedOperationHash =
-        record.result.state === "ACTIVE"
-          ? publishOperationHash(record.result.definition, record.result.prompt_template)
-          : retireOperationHash(record.result.definition);
+      if (
+        record.lifecycle_head_revision < lifecycleIndex ||
+        record.lifecycle_head_revision > entries.length
+      ) {
+        registryCorrupt();
+      }
+      while (lifecycleIndex < record.lifecycle_head_revision) {
+        const entry = entries[lifecycleIndex];
+        if (entry === undefined) registryCorrupt();
+        if (entry.state === "ACTIVE") {
+          activeAtHead.set(entry.definition.artifact_id, registration(entry));
+        } else {
+          activeAtHead.delete(entry.definition.artifact_id);
+        }
+        lifecycleIndex += 1;
+      }
+      const head = entries[record.lifecycle_head_revision - 1];
+      const active = activeAtHead.get(record.result.definition.artifact_id);
       if (
         record.operation_revision !== index + 1 ||
         record.previous_operation_hash !== previousHash ||
         operations.has(record.operation_id) ||
-        record.operation_hash !== expectedOperationHash ||
-        !durableResults.has(canonicalJson(record.result))
+        record.result.state !== "ACTIVE" ||
+        head === undefined ||
+        head.entry_hash !== record.lifecycle_head_hash ||
+        record.operation_hash !==
+          publishOperationHash(record.result.definition, record.result.prompt_template) ||
+        active === undefined ||
+        canonicalJson(active) !== canonicalJson(record.result)
       ) {
         registryCorrupt();
       }
@@ -1061,11 +1242,13 @@ export function createAgentRegistry(options: CreateAgentRegistryOptions): AgentR
   };
 
   const load = async (): Promise<RegistryHistory> => {
+    assertRegistryIdentity();
     assertAgentCandidates(store.agentsPath, store.objectsPath);
     assertQuarantineCandidates(store.quarantinePath);
     let lifecycleFile = readHistoryFile(lifecyclePath, store.registryPath);
     if (lifecycleFile === null) {
       if (readHistoryFile(operationPath, store.registryPath) !== null) registryCorrupt();
+      assertRegistryIdentity();
       return {
         lifecycleFile: null,
         operationFile: null,
@@ -1084,6 +1267,7 @@ export function createAgentRegistry(options: CreateAgentRegistryOptions): AgentR
     if (lifecycle.fragment.byteLength > 0) {
       if (lifecycle.records.length === 0) registryCorrupt();
       await validateLifecycle(lifecycle.records);
+      assertRegistryIdentity();
       recoverPartial({
         candidate: lifecyclePath,
         registryPath: store.registryPath,
@@ -1093,8 +1277,11 @@ export function createAgentRegistry(options: CreateAgentRegistryOptions): AgentR
         fragment: lifecycle.fragment,
         kind: "lifecycle",
         randomId: options.randomId,
-        ...(options.operationHooks === undefined ? {} : { hooks: options.operationHooks }),
+        ...(dependencies.operationHooks === undefined
+          ? {}
+          : { hooks: dependencies.operationHooks }),
       });
+      assertRegistryIdentity();
       lifecycleFile = readHistoryFile(lifecyclePath, store.registryPath);
       if (lifecycleFile === null) registryCorrupt();
       lifecycle = parseJsonl(lifecycleFile.bytes, parseLifecycleLine);
@@ -1113,6 +1300,7 @@ export function createAgentRegistry(options: CreateAgentRegistryOptions): AgentR
           lifecycle.records,
           lifecycleState.operations,
         );
+        assertRegistryIdentity();
         recoverPartial({
           candidate: operationPath,
           registryPath: store.registryPath,
@@ -1122,8 +1310,11 @@ export function createAgentRegistry(options: CreateAgentRegistryOptions): AgentR
           fragment: operationHistory.fragment,
           kind: "operations",
           randomId: options.randomId,
-          ...(options.operationHooks === undefined ? {} : { hooks: options.operationHooks }),
+          ...(dependencies.operationHooks === undefined
+            ? {}
+            : { hooks: dependencies.operationHooks }),
         });
+        assertRegistryIdentity();
         operationFile = readHistoryFile(operationPath, store.registryPath);
         if (operationFile === null) registryCorrupt();
         operationHistory = parseJsonl(operationFile.bytes, parseOperationRecord);
@@ -1136,6 +1327,7 @@ export function createAgentRegistry(options: CreateAgentRegistryOptions): AgentR
       lifecycle.records,
       lifecycleState.operations,
     );
+    assertRegistryIdentity();
     return {
       lifecycleFile,
       operationFile,
@@ -1164,29 +1356,36 @@ export function createAgentRegistry(options: CreateAgentRegistryOptions): AgentR
   };
 
   const appendEntry = (history: RegistryHistory, entry: AgentRegistryEntryV1): void => {
+    assertRegistryIdentity();
     appendHistoryFile({
       candidate: lifecyclePath,
       registryPath: store.registryPath,
       expected: history.lifecycleFile,
       bytes: Buffer.from(`${canonicalJson(entry as never)}\n`, "utf8"),
       kind: "lifecycle",
-      ...(options.operationHooks === undefined ? {} : { hooks: options.operationHooks }),
+      ...(dependencies.operationHooks === undefined ? {} : { hooks: dependencies.operationHooks }),
     });
+    assertRegistryIdentity();
   };
 
   const appendOperation = (history: RegistryHistory, record: AgentOperationRecordV1): void => {
+    assertRegistryIdentity();
     appendHistoryFile({
       candidate: operationPath,
       registryPath: store.registryPath,
       expected: history.operationFile,
       bytes: Buffer.from(`${canonicalJson(record as never)}\n`, "utf8"),
       kind: "operations",
-      ...(options.operationHooks === undefined ? {} : { hooks: options.operationHooks }),
+      ...(dependencies.operationHooks === undefined ? {} : { hooks: dependencies.operationHooks }),
     });
+    assertRegistryIdentity();
   };
 
   return {
-    recover: () => enqueue(() => withClaim(async () => void (await load())), true),
+    recover: () => {
+      if (intakeStopped) return Promise.reject(new RuntimeAgentError("RUNTIME_AGENT_NOT_FOUND"));
+      return enqueue(() => withClaim(async () => void (await load())), true);
+    },
     async publish(candidate, operationId) {
       if (intakeStopped) return Promise.reject(new RuntimeAgentError("RUNTIME_AGENT_NOT_FOUND"));
       const snapshot = snapshotBundle(candidate);
@@ -1211,6 +1410,7 @@ export function createAgentRegistry(options: CreateAgentRegistryOptions): AgentR
                 operationHash,
                 result: active,
                 records: history.operationRecords,
+                entries: history.entries,
               });
               appendOperation(history, record);
               return active;
@@ -1235,7 +1435,9 @@ export function createAgentRegistry(options: CreateAgentRegistryOptions): AgentR
 
             await store.publishObject(promptRef.hash, snapshot.promptBytes);
             await store.publishObject(definitionRef.hash, snapshot.definitionBytes);
-            await options.operationHooks?.afterObjectsPublished?.();
+            assertRegistryIdentity();
+            await dependencies.operationHooks?.afterObjectsPublished?.();
+            assertRegistryIdentity();
             const entry = entryFor({
               operationId: canonicalOperationId,
               operationHash,

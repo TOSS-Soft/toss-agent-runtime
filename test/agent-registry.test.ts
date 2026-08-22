@@ -1,4 +1,5 @@
-import { existsSync, renameSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import {
   appendFile,
   chmod,
@@ -12,7 +13,7 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, expectTypeOf, it } from "vitest";
 
 import {
   hashAgentDefinition,
@@ -43,7 +44,32 @@ const AGENT_ID = "agent-implementation";
 const OPERATION_1 = "10000000-0000-4000-8000-000000000001";
 const OPERATION_2 = "10000000-0000-4000-8000-000000000002";
 const OPERATION_3 = "10000000-0000-4000-8000-000000000003";
+const OPERATION_4 = "10000000-0000-4000-8000-000000000004";
 const roots: string[] = [];
+
+interface RegistryTestDependencies {
+  readonly isProcessAlive?: (pid: number) => "alive" | "dead" | "unknown";
+  readonly isCurrentUser?: (userId: bigint, candidate: string) => boolean;
+  readonly privateStoreOperationHooks?: {
+    readonly afterObjectOpen?: (objectPath: string) => Promise<void>;
+    readonly beforeClaimFileSync?: (claimPath: string) => Promise<void>;
+  };
+  readonly operationHooks?: {
+    readonly beforeHistoryFileSync?: (
+      history: "lifecycle" | "operations" | "quarantine" | "recovery",
+      filePath: string,
+    ) => void;
+    readonly beforeHistoryDirectorySync?: (directoryPath: string) => void;
+    readonly afterObjectsPublished?: () => Promise<void>;
+  };
+}
+
+type RegistryTestOverrides = Partial<CreateAgentRegistryOptions> & RegistryTestDependencies;
+
+type InternalCreateAgentRegistry = (
+  options: CreateAgentRegistryOptions,
+  dependencies?: RegistryTestDependencies,
+) => AgentRegistry;
 
 function reference<T extends string>(
   document_type: T,
@@ -155,19 +181,32 @@ async function fixture(): Promise<{ readonly root: string; readonly statePath: s
   return { root, statePath: path.join(root, "state") };
 }
 
-function registry(
-  statePath: string,
-  overrides: Partial<CreateAgentRegistryOptions> = {},
-): AgentRegistry {
+function registry(statePath: string, overrides: RegistryTestOverrides = {}): AgentRegistry {
   let tick = 0;
   let id = 0;
-  return createAgentRegistry({
-    statePath,
-    now: () => new Date(Date.UTC(2026, 7, 21, 12, 0, tick++)),
-    randomId: () => `70000000-0000-4000-8000-${String(++id).padStart(12, "0")}`,
-    hasServiceListener: () => Promise.resolve("absent"),
-    ...overrides,
-  });
+  const {
+    isProcessAlive,
+    isCurrentUser,
+    privateStoreOperationHooks,
+    operationHooks,
+    ...publicOverrides
+  } = overrides;
+  const createInternal: InternalCreateAgentRegistry = createAgentRegistry;
+  return createInternal(
+    {
+      statePath,
+      now: () => new Date(Date.UTC(2026, 7, 21, 12, 0, tick++)),
+      randomId: () => `70000000-0000-4000-8000-${String(++id).padStart(12, "0")}`,
+      hasServiceListener: () => Promise.resolve("absent"),
+      ...publicOverrides,
+    },
+    {
+      ...(isProcessAlive === undefined ? {} : { isProcessAlive }),
+      ...(isCurrentUser === undefined ? {} : { isCurrentUser }),
+      ...(privateStoreOperationHooks === undefined ? {} : { privateStoreOperationHooks }),
+      ...(operationHooks === undefined ? {} : { operationHooks }),
+    },
+  );
 }
 
 function registryDirectory(statePath: string): string {
@@ -199,6 +238,20 @@ function rehashEntry(value: Record<string, unknown>): AgentRegistryEntryV1 {
   } as unknown as AgentRegistryEntryV1;
 }
 
+function rawSha256(bytes: Uint8Array): `sha256:${string}` {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+function registrationFromEntry(entry: AgentRegistryEntryV1): AgentRegistration {
+  return {
+    registry_revision: entry.registry_revision,
+    definition: entry.definition,
+    prompt_template: entry.prompt_template,
+    state: entry.state,
+    entry_hash: entry.entry_hash,
+  };
+}
+
 function isDeepFrozen(value: unknown, seen = new Set<object>()): boolean {
   if (typeof value !== "object" || value === null || seen.has(value)) return true;
   seen.add(value);
@@ -212,6 +265,26 @@ afterEach(async () => {
 });
 
 describe("immutable agent lifecycle registry", () => {
+  it("exposes only the narrow production construction dependencies", () => {
+    expectTypeOf<keyof CreateAgentRegistryOptions>().toEqualTypeOf<
+      "statePath" | "now" | "randomId" | "hasServiceListener"
+    >();
+  });
+
+  it("rejects a missing authoritative listener dependency before state creation", async () => {
+    const { statePath } = await fixture();
+
+    expect(() =>
+      createAgentRegistry({
+        statePath,
+        now: () => new Date(0),
+        randomId: () => OPERATION_1,
+        hasServiceListener: undefined as never,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "RUNTIME_AGENT_REGISTRY_CORRUPT" }));
+    expect(existsSync(statePath)).toBe(false);
+  });
+
   it("publishes an exact bundle, replays its operation without history growth, and resolves it", async () => {
     const { statePath } = await fixture();
     const agents = registry(statePath);
@@ -421,6 +494,9 @@ describe("immutable agent lifecycle registry", () => {
     ).rejects.toMatchObject({
       code: "RUNTIME_AGENT_NOT_FOUND",
     });
+    await expect(agents.recover()).rejects.toMatchObject({
+      code: "RUNTIME_AGENT_NOT_FOUND",
+    });
     await expect(agents.resolveForExecution(definitionReference(v1.definition))).resolves.toEqual(
       v1,
     );
@@ -608,6 +684,46 @@ describe("agent registry recovery and fail-closed history validation", () => {
     expect(await readFile(candidate, "utf8")).toBe("preserve");
   });
 
+  it("bounded-reads every orphan object and rejects a hash-to-name mismatch", async () => {
+    const { statePath } = await fixture();
+    await registry(statePath).recover();
+    const candidate = path.join(statePath, "agents", "objects", "a".repeat(64));
+    await writeFile(candidate, "garbage", { mode: 0o600 });
+
+    await expect(registry(statePath).recover()).rejects.toMatchObject({
+      code: "RUNTIME_AGENT_REGISTRY_CORRUPT",
+    });
+    expect(await readFile(candidate, "utf8")).toBe("garbage");
+  });
+
+  it("rejects a hash-correct orphan outside the recognized canonical object grammar", async () => {
+    const { statePath } = await fixture();
+    await registry(statePath).recover();
+    const bytes = Buffer.from(canonicalJson({ document_type: "unrecognized" }), "utf8");
+    const candidate = objectPath(statePath, rawSha256(bytes));
+    await writeFile(candidate, bytes, { mode: 0o600 });
+
+    await expect(registry(statePath).recover()).rejects.toMatchObject({
+      code: "RUNTIME_AGENT_REGISTRY_CORRUPT",
+    });
+    expect(await readFile(candidate)).toEqual(bytes);
+  });
+
+  it.each(["prompt", "definition"] as const)(
+    "accepts a hash-correct canonical orphan %s left before lifecycle publication",
+    async (kind) => {
+      const { statePath } = await fixture();
+      await registry(statePath).recover();
+      const orphan = kind === "prompt" ? prompt(1) : definition(1, prompt(1));
+      const { document_hash: hash, ...hashable } = orphan;
+      const bytes = Buffer.from(canonicalJson(hashable), "utf8");
+      expect(rawSha256(bytes)).toBe(hash);
+      await writeFile(objectPath(statePath, hash), bytes, { mode: 0o600 });
+
+      await expect(registry(statePath).recover()).resolves.toBeUndefined();
+    },
+  );
+
   it("rejects an operation result that is not bound to an exact durable lifecycle result", async () => {
     const { statePath } = await fixture();
     const agents = registry(statePath);
@@ -626,6 +742,72 @@ describe("agent registry recovery and fail-closed history validation", () => {
     Reflect.deleteProperty(hashable, "operation_record_hash");
     const rebound = { ...hashable, operation_record_hash: sha256(hashable) };
     await writeFile(operationsPath(statePath), `${canonicalJson(rebound)}\n`, { mode: 0o600 });
+
+    await expect(registry(statePath).recover()).rejects.toMatchObject({
+      code: "RUNTIME_AGENT_REGISTRY_CORRUPT",
+    });
+  });
+
+  it("binds a no-op operation result to the exact lifecycle head", async () => {
+    const { statePath } = await fixture();
+    const agents = registry(statePath);
+    const v1 = bundle(1);
+    await agents.publish(v1, OPERATION_1);
+    await agents.publish(v1, OPERATION_2);
+    const firstEntry = JSON.parse(
+      (await lines(entriesPath(statePath)))[0]!,
+    ) as AgentRegistryEntryV1;
+    const record = JSON.parse((await lines(operationsPath(statePath)))[0]!) as Record<
+      string,
+      unknown
+    >;
+
+    expect(record).toMatchObject({
+      lifecycle_head_revision: 1,
+      lifecycle_head_hash: firstEntry.entry_hash,
+    });
+
+    await agents.publish(bundle(2), OPERATION_3);
+    const secondEntry = JSON.parse(
+      (await lines(entriesPath(statePath)))[1]!,
+    ) as AgentRegistryEntryV1;
+    const rebound = {
+      ...record,
+      lifecycle_head_revision: secondEntry.registry_revision,
+      lifecycle_head_hash: secondEntry.entry_hash,
+    };
+    Reflect.deleteProperty(rebound, "operation_record_hash");
+    await writeFile(
+      operationsPath(statePath),
+      `${canonicalJson({ ...rebound, operation_record_hash: sha256(rebound) })}\n`,
+      { mode: 0o600 },
+    );
+
+    await expect(registry(statePath).recover()).rejects.toMatchObject({
+      code: "RUNTIME_AGENT_REGISTRY_CORRUPT",
+    });
+  });
+
+  it("rejects a canonical operation record containing an impossible retired result", async () => {
+    const { statePath } = await fixture();
+    const agents = registry(statePath);
+    const v1 = bundle(1);
+    await agents.publish(v1, OPERATION_1);
+    await agents.retire(definitionReference(v1.definition), OPERATION_2);
+    const retired = JSON.parse((await lines(entriesPath(statePath)))[1]!) as AgentRegistryEntryV1;
+    const hashable = {
+      schema_version: "agent-registry-operation.v1",
+      document_type: "agent-registry-operation",
+      operation_revision: 1,
+      previous_operation_hash: null,
+      operation_id: OPERATION_4,
+      operation_hash: retireOperationHash(definitionReference(v1.definition)),
+      lifecycle_head_revision: retired.registry_revision,
+      lifecycle_head_hash: retired.entry_hash,
+      result: registrationFromEntry(retired),
+    };
+    const impossible = { ...hashable, operation_record_hash: sha256(hashable) };
+    await writeFile(operationsPath(statePath), `${canonicalJson(impossible)}\n`, { mode: 0o600 });
 
     await expect(registry(statePath).recover()).rejects.toMatchObject({
       code: "RUNTIME_AGENT_REGISTRY_CORRUPT",
@@ -705,6 +887,88 @@ describe("agent registry durability and coordination", () => {
     expect(results[0]).toEqual(results[1]);
     expect(await lines(entriesPath(statePath))).toHaveLength(1);
     expect(await lines(operationsPath(statePath))).toHaveLength(1);
+  });
+
+  it.each(["state root", "registry directory"] as const)(
+    "pins the original %s identity across later operations",
+    async (kind) => {
+      const { root, statePath } = await fixture();
+      const agents = registry(statePath);
+      const v1 = bundle(1);
+      const registration = await agents.publish(v1, OPERATION_1);
+      const candidate = kind === "state root" ? statePath : registryDirectory(statePath);
+      const displaced = path.join(root, kind === "state root" ? "old-state" : "old-registry");
+      renameSync(candidate, displaced);
+      mkdirSync(candidate, { mode: 0o700 });
+
+      try {
+        await expect(agents.list()).rejects.toMatchObject({
+          code: "RUNTIME_AGENT_PATH_UNSAFE",
+        });
+      } finally {
+        await rm(candidate, { recursive: true, force: true });
+        renameSync(displaced, candidate);
+      }
+
+      await expect(agents.list()).resolves.toEqual([registration]);
+    },
+  );
+
+  it("fails closed when the state root is swapped during an object read", async () => {
+    const { root, statePath } = await fixture();
+    const displaced = path.join(root, "state-during-read");
+    let swapped = false;
+    const agents = registry(statePath, {
+      privateStoreOperationHooks: {
+        afterObjectOpen: () => {
+          if (swapped) return Promise.resolve();
+          swapped = true;
+          renameSync(statePath, displaced);
+          mkdirSync(statePath, { mode: 0o700 });
+          return Promise.resolve();
+        },
+      },
+    });
+    const v1 = bundle(1);
+    await agents.publish(v1, OPERATION_1);
+
+    try {
+      await expect(
+        agents.resolveForResume(definitionReference(v1.definition)),
+      ).rejects.toMatchObject({ code: "RUNTIME_AGENT_PATH_UNSAFE" });
+    } finally {
+      await rm(statePath, { recursive: true, force: true });
+      renameSync(displaced, statePath);
+    }
+  });
+
+  it("never makes lifecycle state visible through a root swapped after object barriers", async () => {
+    const { root, statePath } = await fixture();
+    const replacement = path.join(root, "prepared-state");
+    const displaced = path.join(root, "state-after-objects");
+    await registry(replacement).recover();
+    let swapped = false;
+    const agents = registry(statePath, {
+      operationHooks: {
+        afterObjectsPublished: () => {
+          if (swapped) return Promise.resolve();
+          swapped = true;
+          renameSync(statePath, displaced);
+          renameSync(replacement, statePath);
+          return Promise.resolve();
+        },
+      },
+    });
+
+    try {
+      await expect(agents.publish(bundle(1), OPERATION_1)).rejects.toMatchObject({
+        code: "RUNTIME_AGENT_PATH_UNSAFE",
+      });
+      expect(existsSync(entriesPath(statePath))).toBe(false);
+    } finally {
+      await rm(statePath, { recursive: true, force: true });
+      renameSync(displaced, statePath);
+    }
   });
 
   it("rejects and preserves a history path replacement at the final append barrier", async () => {
@@ -799,6 +1063,47 @@ describe("agent registry durability and coordination", () => {
 
     release();
     await expect(accepted).resolves.toMatchObject({ state: "ACTIVE" });
+    await expect(flush).resolves.toBeUndefined();
+  });
+
+  it("rejects post-stop recovery and flushes a recovery accepted before stop", async () => {
+    const { statePath } = await fixture();
+    let release!: () => void;
+    let reached!: () => void;
+    let firstClaim = true;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const claimed = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    const agents = registry(statePath, {
+      privateStoreOperationHooks: {
+        beforeClaimFileSync: async () => {
+          if (!firstClaim) return;
+          firstClaim = false;
+          reached();
+          await gate;
+        },
+      },
+    });
+    const accepted = agents.recover();
+    await claimed;
+    agents.stopIntake();
+    const rejected = expect(agents.recover()).rejects.toMatchObject({
+      code: "RUNTIME_AGENT_NOT_FOUND",
+    });
+    const flush = agents.flush(new AbortController().signal);
+    let flushed = false;
+    void flush.then(() => {
+      flushed = true;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(flushed).toBe(false);
+    release();
+    await expect(accepted).resolves.toBeUndefined();
+    await rejected;
     await expect(flush).resolves.toBeUndefined();
   });
 });
