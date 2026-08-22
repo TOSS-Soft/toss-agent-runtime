@@ -1,3 +1,4 @@
+import type { ExecutionRequestV1 } from "../protocol/request.js";
 import type { ArtifactReference, RuntimeBudget, RuntimeDocument } from "../protocol/types.js";
 
 export type AgentRole = "worker" | "reviewer";
@@ -203,6 +204,25 @@ export interface AgentDefinitionBundle {
 }
 
 export type ResolvedAgentBundle = AgentDefinitionBundle;
+
+export interface ResolvedContextArtifact {
+  readonly reference: ArtifactReference;
+  readonly media_type: "application/json" | "text/plain";
+  readonly sensitivity: "public" | "internal" | "confidential" | "secret";
+  readonly origin: "control-plane" | "repository" | "web" | "model" | "skill" | "tool";
+  readonly bytes: Uint8Array;
+}
+
+export interface ContextArtifactResolver {
+  resolve(reference: ArtifactReference): Promise<ResolvedContextArtifact>;
+}
+
+export interface CompileAgentContextInput {
+  readonly request_hash: `sha256:${string}`;
+  readonly request: ExecutionRequestV1;
+  readonly bundle: ResolvedAgentBundle;
+  readonly resolver: ContextArtifactResolver;
+}
 
 export interface AgentRegistration {
   readonly registry_revision: number;

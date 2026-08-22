@@ -9,6 +9,7 @@ export {
   parsePromptTemplate,
 } from "./contracts.js";
 export { matchAgentAuthority, type EffectiveAgentAuthority } from "./authority.js";
+export { compileAgentContext } from "./context.js";
 export { createAgentRegistry, type CreateAgentRegistryOptions } from "./registry.js";
 import { UnavailableCapabilityError } from "../version.js";
 
@@ -31,6 +32,8 @@ export type {
   AgentRole,
   CompiledContextV1,
   CompiledContextSegmentV1,
+  CompileAgentContextInput,
+  ContextArtifactResolver,
   InputArtifactSegmentV1,
   HashableAgentDefinitionV1,
   HashableAgentRegistryEntryV1,
@@ -42,6 +45,7 @@ export type {
   PromptTemplateSegmentV1,
   PromptTemplateV1,
   ResolvedAgentBundle,
+  ResolvedContextArtifact,
   TaskContractReference,
   TaskContractSegmentV1,
   RuntimeSafetySegmentV1,
