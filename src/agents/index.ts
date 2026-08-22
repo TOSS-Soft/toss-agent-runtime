@@ -9,6 +9,7 @@ export {
   parsePromptTemplate,
 } from "./contracts.js";
 export { matchAgentAuthority, type EffectiveAgentAuthority } from "./authority.js";
+export { createAgentRegistry, type CreateAgentRegistryOptions } from "./registry.js";
 import { UnavailableCapabilityError } from "../version.js";
 
 export function requireAgentRegistry(): never {
@@ -25,6 +26,7 @@ export type {
   AgentDefinitionV1,
   AgentLogicalModelClass,
   AgentRegistration,
+  AgentRegistry,
   AgentRegistryEntryV1,
   AgentRole,
   CompiledContextV1,

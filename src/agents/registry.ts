@@ -1,0 +1,1355 @@
+import {
+  closeSync,
+  constants,
+  fchmodSync,
+  fstatSync,
+  fsyncSync,
+  lstatSync,
+  openSync,
+  readSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  writeSync,
+  type BigIntStats,
+} from "node:fs";
+import path from "node:path";
+
+import { canonicalJson, parseJsonBytes, sha256, type JsonValue } from "../protocol/json.js";
+import type { ArtifactReference } from "../protocol/types.js";
+import {
+  AGENT_DOCUMENT_LIMITS,
+  hashAgentRegistryEntry,
+  parseAgentDefinition,
+  parseAgentRegistryEntry,
+  parsePromptTemplate,
+} from "./contracts.js";
+import { RuntimeAgentError, type RuntimeAgentErrorCode } from "./errors.js";
+import {
+  MAX_PRIVATE_OBJECT_BYTES,
+  createPrivateAgentStore,
+  type PrivateAgentStoreOperationHooks,
+  type PrivateFileIdentity,
+  type PrivateStoreListenerState,
+  type PrivateStoreProcessLiveness,
+} from "./private-store.js";
+import type {
+  AgentDefinitionBundle,
+  AgentDefinitionReference,
+  AgentDefinitionV1,
+  AgentRegistration,
+  AgentRegistry,
+  AgentRegistryEntryV1,
+  PromptTemplateV1,
+  PromptTemplateReference,
+  ResolvedAgentBundle,
+} from "./types.js";
+
+export type { AgentRegistry } from "./types.js";
+
+const MAX_HISTORY_BYTES = 16 * 1024 * 1024;
+const MAX_OPERATION_RECORD_BYTES = 65_536;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/u;
+const IDENTIFIER_PATTERN = /^[A-Za-z][A-Za-z0-9._:-]{0,127}$/u;
+const QUARANTINE_PATTERN =
+  /^agent-registry(?:-operations)?-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.bin$/u;
+
+export type AgentRegistryHistoryKind = "lifecycle" | "operations" | "quarantine" | "recovery";
+
+export interface AgentRegistryOperationHooks {
+  readonly beforeHistoryFileSync?: (history: AgentRegistryHistoryKind, filePath: string) => void;
+  readonly beforeHistoryDirectorySync?: (directoryPath: string) => void;
+  readonly afterObjectsPublished?: () => Promise<void>;
+}
+
+export interface CreateAgentRegistryOptions {
+  readonly statePath: string;
+  readonly now: () => Date;
+  readonly randomId: () => string;
+  readonly hasServiceListener: () => Promise<PrivateStoreListenerState>;
+  readonly isProcessAlive?: (pid: number) => PrivateStoreProcessLiveness;
+  readonly isCurrentUser?: (userId: bigint, candidate: string) => boolean;
+  readonly privateStoreOperationHooks?: PrivateAgentStoreOperationHooks;
+  readonly operationHooks?: AgentRegistryOperationHooks;
+}
+
+interface PrivateFileSnapshot {
+  readonly bytes: Uint8Array;
+  readonly identity: PrivateFileIdentity;
+}
+
+interface HashableAgentOperationRecordV1 {
+  readonly schema_version: "agent-registry-operation.v1";
+  readonly document_type: "agent-registry-operation";
+  readonly operation_revision: number;
+  readonly previous_operation_hash: `sha256:${string}` | null;
+  readonly operation_id: string;
+  readonly operation_hash: `sha256:${string}`;
+  readonly result: AgentRegistration;
+}
+
+interface AgentOperationRecordV1 extends HashableAgentOperationRecordV1 {
+  readonly operation_record_hash: `sha256:${string}`;
+}
+
+interface OperationResult {
+  readonly operationHash: `sha256:${string}`;
+  readonly result: AgentRegistration;
+}
+
+interface RegistryHistory {
+  readonly lifecycleFile: PrivateFileSnapshot | null;
+  readonly operationFile: PrivateFileSnapshot | null;
+  readonly entries: readonly AgentRegistryEntryV1[];
+  readonly operationRecords: readonly AgentOperationRecordV1[];
+  readonly active: ReadonlyMap<string, AgentRegistration>;
+  readonly bundles: ReadonlyMap<string, ResolvedAgentBundle>;
+  readonly revisionHashes: ReadonlyMap<string, `sha256:${string}`>;
+  readonly promptRevisionHashes: ReadonlyMap<string, `sha256:${string}`>;
+  readonly maximumRevisions: ReadonlyMap<string, number>;
+  readonly operations: ReadonlyMap<string, OperationResult>;
+}
+
+interface Coordinator {
+  tail: Promise<unknown>;
+}
+
+const coordinators = new Map<string, WeakRef<Coordinator>>();
+
+function agentError(code: RuntimeAgentErrorCode): never {
+  throw new RuntimeAgentError(code);
+}
+
+function registryCorrupt(): never {
+  return agentError("RUNTIME_AGENT_REGISTRY_CORRUPT");
+}
+
+function definitionInvalid(): never {
+  return agentError("RUNTIME_AGENT_DEFINITION_INVALID");
+}
+
+function errorCode(error: unknown): string | undefined {
+  return typeof error === "object" && error !== null && "code" in error
+    ? String(error.code)
+    : undefined;
+}
+
+function currentUid(): bigint | undefined {
+  return typeof process.getuid === "function" ? BigInt(process.getuid()) : undefined;
+}
+
+function identity(metadata: Pick<BigIntStats, "dev" | "ino">): PrivateFileIdentity {
+  return { device: metadata.dev, inode: metadata.ino };
+}
+
+function identitiesMatch(left: PrivateFileIdentity, right: PrivateFileIdentity): boolean {
+  return left.device === right.device && left.inode === right.inode;
+}
+
+function assertPrivateDirectory(metadata: BigIntStats): PrivateFileIdentity {
+  const uid = currentUid();
+  if (
+    metadata.isSymbolicLink() ||
+    !metadata.isDirectory() ||
+    (uid !== undefined && metadata.uid !== uid) ||
+    Number(metadata.mode & 0o7777n) !== 0o700
+  ) {
+    registryCorrupt();
+  }
+  return identity(metadata);
+}
+
+function assertPrivateFile(
+  metadata: BigIntStats,
+  expected?: PrivateFileIdentity,
+): PrivateFileIdentity {
+  const candidate = identity(metadata);
+  const uid = currentUid();
+  if (
+    metadata.isSymbolicLink() ||
+    !metadata.isFile() ||
+    metadata.nlink !== 1n ||
+    (uid !== undefined && metadata.uid !== uid) ||
+    Number(metadata.mode & 0o7777n) !== 0o600 ||
+    (expected !== undefined && !identitiesMatch(expected, candidate))
+  ) {
+    registryCorrupt();
+  }
+  return candidate;
+}
+
+function syncPrivateDirectory(candidate: string, beforeSync?: (candidate: string) => void): void {
+  let descriptor: number | undefined;
+  try {
+    const before = lstatSync(candidate, { bigint: true });
+    const expected = assertPrivateDirectory(before);
+    descriptor = openSync(
+      candidate,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    assertPrivateDirectory(fstatSync(descriptor, { bigint: true }));
+    beforeSync?.(candidate);
+    fsyncSync(descriptor);
+    assertPrivateDirectory(lstatSync(candidate, { bigint: true }));
+    const held = assertPrivateDirectory(fstatSync(descriptor, { bigint: true }));
+    if (!identitiesMatch(expected, held)) registryCorrupt();
+  } catch (error) {
+    if (error instanceof RuntimeAgentError) throw error;
+    return registryCorrupt();
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+function readAll(descriptor: number, size: number): Buffer {
+  const bytes = Buffer.allocUnsafe(size);
+  let offset = 0;
+  while (offset < size) {
+    const count = readSync(descriptor, bytes, offset, size - offset, offset);
+    if (count === 0) registryCorrupt();
+    offset += count;
+  }
+  return bytes;
+}
+
+function writeAll(descriptor: number, bytes: Uint8Array): void {
+  const source = Buffer.from(bytes);
+  let offset = 0;
+  while (offset < source.byteLength) {
+    const count = writeSync(descriptor, source, offset, source.byteLength - offset, null);
+    if (count === 0) registryCorrupt();
+    offset += count;
+  }
+}
+
+function exactFile(
+  candidate: string,
+  descriptor: number,
+  expectedIdentity: PrivateFileIdentity,
+  expectedBytes: Uint8Array,
+): void {
+  const pathMetadata = lstatSync(candidate, { bigint: true });
+  const heldMetadata = fstatSync(descriptor, { bigint: true });
+  assertPrivateFile(pathMetadata, expectedIdentity);
+  assertPrivateFile(heldMetadata, expectedIdentity);
+  if (
+    pathMetadata.size !== BigInt(expectedBytes.byteLength) ||
+    heldMetadata.size !== BigInt(expectedBytes.byteLength) ||
+    !readAll(descriptor, expectedBytes.byteLength).equals(Buffer.from(expectedBytes))
+  ) {
+    registryCorrupt();
+  }
+}
+
+function canonicalStatePath(candidate: string): string {
+  if (
+    !path.isAbsolute(candidate) ||
+    path.normalize(candidate) !== candidate ||
+    candidate === path.parse(candidate).root ||
+    /[\u0000-\u001f\u007f]/u.test(candidate)
+  ) {
+    return agentError("RUNTIME_AGENT_PATH_UNSAFE");
+  }
+  const suffix: string[] = [];
+  let cursor = candidate;
+  for (;;) {
+    try {
+      return path.join(realpathSync(cursor), ...suffix);
+    } catch (error) {
+      if (errorCode(error) !== "ENOENT") return agentError("RUNTIME_AGENT_PATH_UNSAFE");
+      const parent = path.dirname(cursor);
+      if (parent === cursor) return agentError("RUNTIME_AGENT_PATH_UNSAFE");
+      suffix.unshift(path.basename(cursor));
+      cursor = parent;
+    }
+  }
+}
+
+function assertRegistryCandidates(registryPath: string): void {
+  const allowed = new Set(["entries.jsonl", "operations.jsonl", "mutation.claim"]);
+  try {
+    for (const entry of readdirSync(registryPath, { withFileTypes: true })) {
+      if (!allowed.has(entry.name) || entry.isSymbolicLink()) registryCorrupt();
+    }
+  } catch (error) {
+    if (error instanceof RuntimeAgentError) throw error;
+    registryCorrupt();
+  }
+}
+
+function assertAgentCandidates(agentsPath: string, objectsPath: string): void {
+  const ownedDirectories = new Set(["objects", "quarantine", "registry"]);
+  try {
+    for (const entry of readdirSync(agentsPath, { withFileTypes: true })) {
+      if (!ownedDirectories.has(entry.name) || !entry.isDirectory() || entry.isSymbolicLink()) {
+        registryCorrupt();
+      }
+    }
+    for (const entry of readdirSync(objectsPath, { withFileTypes: true })) {
+      if (!entry.isFile() || !/^[0-9a-f]{64}$/u.test(entry.name)) registryCorrupt();
+      const metadata = lstatSync(path.join(objectsPath, entry.name), { bigint: true });
+      assertPrivateFile(metadata);
+      if (metadata.size > BigInt(MAX_PRIVATE_OBJECT_BYTES)) registryCorrupt();
+    }
+  } catch (error) {
+    if (error instanceof RuntimeAgentError) throw error;
+    registryCorrupt();
+  }
+}
+
+function assertQuarantineCandidates(quarantinePath: string): void {
+  try {
+    for (const entry of readdirSync(quarantinePath, { withFileTypes: true })) {
+      if (!entry.isFile() || !QUARANTINE_PATTERN.test(entry.name)) registryCorrupt();
+      const metadata = lstatSync(path.join(quarantinePath, entry.name), { bigint: true });
+      assertPrivateFile(metadata);
+      if (metadata.size > BigInt(MAX_HISTORY_BYTES)) registryCorrupt();
+    }
+  } catch (error) {
+    if (error instanceof RuntimeAgentError) throw error;
+    registryCorrupt();
+  }
+}
+
+function readHistoryFile(candidate: string, registryPath: string): PrivateFileSnapshot | null {
+  assertRegistryCandidates(registryPath);
+  let descriptor: number | undefined;
+  try {
+    let before: BigIntStats;
+    try {
+      before = lstatSync(candidate, { bigint: true });
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return null;
+      throw error;
+    }
+    const expectedIdentity = assertPrivateFile(before);
+    if (before.size > BigInt(MAX_HISTORY_BYTES)) registryCorrupt();
+    descriptor = openSync(candidate, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const held = fstatSync(descriptor, { bigint: true });
+    assertPrivateFile(held, expectedIdentity);
+    if (held.size > BigInt(MAX_HISTORY_BYTES)) registryCorrupt();
+    const bytes = readAll(descriptor, Number(held.size));
+    fsyncSync(descriptor);
+    exactFile(candidate, descriptor, expectedIdentity, bytes);
+    syncPrivateDirectory(registryPath);
+    exactFile(candidate, descriptor, expectedIdentity, bytes);
+    return { bytes, identity: expectedIdentity };
+  } catch (error) {
+    if (error instanceof RuntimeAgentError) throw error;
+    return registryCorrupt();
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+function appendHistoryFile(options: {
+  readonly candidate: string;
+  readonly registryPath: string;
+  readonly expected: PrivateFileSnapshot | null;
+  readonly bytes: Uint8Array;
+  readonly kind: "lifecycle" | "operations";
+  readonly hooks?: AgentRegistryOperationHooks;
+}): void {
+  assertRegistryCandidates(options.registryPath);
+  const prefix = options.expected?.bytes ?? new Uint8Array();
+  if (prefix.byteLength + options.bytes.byteLength > MAX_HISTORY_BYTES) registryCorrupt();
+  let descriptor: number | undefined;
+  try {
+    if (options.expected === null) {
+      descriptor = openSync(
+        options.candidate,
+        constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW,
+        0o600,
+      );
+      fchmodSync(descriptor, 0o600);
+      const created = assertPrivateFile(fstatSync(descriptor, { bigint: true }));
+      writeAll(descriptor, options.bytes);
+      options.hooks?.beforeHistoryFileSync?.(options.kind, options.candidate);
+      fsyncSync(descriptor);
+      exactFile(options.candidate, descriptor, created, options.bytes);
+      syncPrivateDirectory(options.registryPath, options.hooks?.beforeHistoryDirectorySync);
+      exactFile(options.candidate, descriptor, created, options.bytes);
+      return;
+    }
+
+    descriptor = openSync(
+      options.candidate,
+      constants.O_APPEND | constants.O_RDWR | constants.O_NOFOLLOW,
+    );
+    exactFile(options.candidate, descriptor, options.expected.identity, prefix);
+    writeAll(descriptor, options.bytes);
+    const combined = Buffer.concat([Buffer.from(prefix), Buffer.from(options.bytes)]);
+    options.hooks?.beforeHistoryFileSync?.(options.kind, options.candidate);
+    fsyncSync(descriptor);
+    exactFile(options.candidate, descriptor, options.expected.identity, combined);
+    syncPrivateDirectory(options.registryPath, options.hooks?.beforeHistoryDirectorySync);
+    exactFile(options.candidate, descriptor, options.expected.identity, combined);
+  } catch (error) {
+    if (error instanceof RuntimeAgentError) throw error;
+    registryCorrupt();
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+function canonicalUuid(value: string, code: RuntimeAgentErrorCode): string {
+  if (!UUID_PATTERN.test(value)) return agentError(code);
+  return value;
+}
+
+function recoverPartial(options: {
+  readonly candidate: string;
+  readonly registryPath: string;
+  readonly quarantinePath: string;
+  readonly expected: PrivateFileSnapshot;
+  readonly prefix: Uint8Array;
+  readonly fragment: Uint8Array;
+  readonly kind: "lifecycle" | "operations";
+  readonly randomId: () => string;
+  readonly hooks?: AgentRegistryOperationHooks;
+}): void {
+  if (options.prefix.byteLength === 0 || options.fragment.byteLength === 0) registryCorrupt();
+  assertRegistryCandidates(options.registryPath);
+  assertQuarantineCandidates(options.quarantinePath);
+  const randomId = canonicalUuid(options.randomId(), "RUNTIME_AGENT_REGISTRY_CORRUPT");
+  const artifact =
+    options.kind === "lifecycle"
+      ? `agent-registry-${randomId}.bin`
+      : `agent-registry-operations-${randomId}.bin`;
+  const quarantineFile = path.join(options.quarantinePath, artifact);
+  const stagePath = path.join(options.registryPath, `.${options.kind}-recovery.${randomId}.stage`);
+  let quarantine: number | undefined;
+  let stage: number | undefined;
+  let current: number | undefined;
+  try {
+    quarantine = openSync(
+      quarantineFile,
+      constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW,
+      0o600,
+    );
+    fchmodSync(quarantine, 0o600);
+    const quarantineIdentity = assertPrivateFile(fstatSync(quarantine, { bigint: true }));
+    writeAll(quarantine, options.fragment);
+    options.hooks?.beforeHistoryFileSync?.("quarantine", quarantineFile);
+    fsyncSync(quarantine);
+    exactFile(quarantineFile, quarantine, quarantineIdentity, options.fragment);
+    syncPrivateDirectory(options.quarantinePath, options.hooks?.beforeHistoryDirectorySync);
+    exactFile(quarantineFile, quarantine, quarantineIdentity, options.fragment);
+
+    stage = openSync(
+      stagePath,
+      constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW,
+      0o600,
+    );
+    fchmodSync(stage, 0o600);
+    const stageIdentity = assertPrivateFile(fstatSync(stage, { bigint: true }));
+    writeAll(stage, options.prefix);
+    options.hooks?.beforeHistoryFileSync?.("recovery", stagePath);
+    fsyncSync(stage);
+    exactFile(stagePath, stage, stageIdentity, options.prefix);
+    current = openSync(options.candidate, constants.O_RDONLY | constants.O_NOFOLLOW);
+    exactFile(options.candidate, current, options.expected.identity, options.expected.bytes);
+    renameSync(stagePath, options.candidate);
+    exactFile(options.candidate, stage, stageIdentity, options.prefix);
+    syncPrivateDirectory(options.registryPath, options.hooks?.beforeHistoryDirectorySync);
+    exactFile(options.candidate, stage, stageIdentity, options.prefix);
+  } catch (error) {
+    if (error instanceof RuntimeAgentError) throw error;
+    registryCorrupt();
+  } finally {
+    if (current !== undefined) closeSync(current);
+    if (stage !== undefined) closeSync(stage);
+    if (quarantine !== undefined) closeSync(quarantine);
+  }
+}
+
+function jsonObject(value: JsonValue | undefined): value is { readonly [key: string]: JsonValue } {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function exactKeys(
+  value: { readonly [key: string]: JsonValue },
+  expected: readonly string[],
+): boolean {
+  const actual = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  return actual.length === wanted.length && actual.every((key, index) => key === wanted[index]);
+}
+
+function exactReference(left: ArtifactReference, right: ArtifactReference): boolean {
+  return (
+    left.document_type === right.document_type &&
+    left.artifact_id === right.artifact_id &&
+    left.revision === right.revision &&
+    left.hash === right.hash
+  );
+}
+
+function referenceKey(candidate: ArtifactReference): string {
+  return `${candidate.document_type}\u0000${candidate.artifact_id}\u0000${String(candidate.revision)}\u0000${candidate.hash}`;
+}
+
+function revisionKey(candidate: ArtifactReference): string {
+  return `${candidate.artifact_id}\u0000${String(candidate.revision)}`;
+}
+
+function immutableReference(candidate: ArtifactReference): ArtifactReference {
+  return Object.freeze({
+    document_type: candidate.document_type,
+    artifact_id: candidate.artifact_id,
+    revision: candidate.revision,
+    hash: candidate.hash,
+  });
+}
+
+function immutableDefinitionReference(candidate: ArtifactReference): AgentDefinitionReference {
+  if (candidate.document_type !== "agent-definition") registryCorrupt();
+  return Object.freeze({
+    document_type: "agent-definition",
+    artifact_id: candidate.artifact_id,
+    revision: candidate.revision,
+    hash: candidate.hash,
+  });
+}
+
+function immutablePromptReference(candidate: ArtifactReference): PromptTemplateReference {
+  if (candidate.document_type !== "prompt-template") registryCorrupt();
+  return Object.freeze({
+    document_type: "prompt-template",
+    artifact_id: candidate.artifact_id,
+    revision: candidate.revision,
+    hash: candidate.hash,
+  });
+}
+
+function definitionReference(candidate: AgentDefinitionV1): AgentDefinitionReference {
+  return Object.freeze({
+    document_type: "agent-definition",
+    artifact_id: candidate.agent_id,
+    revision: candidate.revision,
+    hash: candidate.document_hash,
+  });
+}
+
+function promptReference(candidate: PromptTemplateV1): PromptTemplateReference {
+  return Object.freeze({
+    document_type: "prompt-template",
+    artifact_id: candidate.template_id,
+    revision: candidate.revision,
+    hash: candidate.document_hash,
+  });
+}
+
+function normalizeDefinitionReference(candidate: ArtifactReference): AgentDefinitionReference {
+  try {
+    if (
+      typeof candidate !== "object" ||
+      candidate === null ||
+      !Object.keys(candidate).every((key) =>
+        ["document_type", "artifact_id", "revision", "hash", "location"].includes(key),
+      ) ||
+      candidate.document_type !== "agent-definition" ||
+      typeof candidate.artifact_id !== "string" ||
+      !IDENTIFIER_PATTERN.test(candidate.artifact_id) ||
+      typeof candidate.revision !== "number" ||
+      !Number.isSafeInteger(candidate.revision) ||
+      candidate.revision < 1 ||
+      typeof candidate.hash !== "string" ||
+      !SHA256_PATTERN.test(candidate.hash) ||
+      (candidate.location !== undefined && typeof candidate.location !== "string")
+    ) {
+      return agentError("RUNTIME_AGENT_NOT_FOUND");
+    }
+    return Object.freeze({
+      document_type: "agent-definition",
+      artifact_id: candidate.artifact_id,
+      revision: candidate.revision,
+      hash: candidate.hash,
+    });
+  } catch {
+    return agentError("RUNTIME_AGENT_NOT_FOUND");
+  }
+}
+
+function snapshotBundle(candidate: AgentDefinitionBundle): {
+  readonly bundle: ResolvedAgentBundle;
+  readonly definitionBytes: Uint8Array;
+  readonly promptBytes: Uint8Array;
+} {
+  try {
+    const parsedDefinition = parseAgentDefinition(
+      Buffer.from(canonicalJson(candidate.definition as never), "utf8"),
+    );
+    const parsedPrompt = parsePromptTemplate(
+      Buffer.from(canonicalJson(candidate.prompt_template as never), "utf8"),
+    );
+    if (!parsedDefinition.ok || !parsedPrompt.ok) definitionInvalid();
+    const expectedPrompt = promptReference(parsedPrompt.value);
+    if (!exactReference(parsedDefinition.value.prompt_template, expectedPrompt))
+      definitionInvalid();
+    const { document_hash: definitionHash, ...hashableDefinition } = parsedDefinition.value;
+    const { document_hash: promptHash, ...hashablePrompt } = parsedPrompt.value;
+    const definitionBytes = Buffer.from(canonicalJson(hashableDefinition as never), "utf8");
+    const promptBytes = Buffer.from(canonicalJson(hashablePrompt as never), "utf8");
+    if (sha256(hashableDefinition) !== definitionHash || sha256(hashablePrompt) !== promptHash) {
+      definitionInvalid();
+    }
+    return {
+      bundle: Object.freeze({
+        definition: parsedDefinition.value,
+        prompt_template: parsedPrompt.value,
+      }),
+      definitionBytes,
+      promptBytes,
+    };
+  } catch (error) {
+    if (error instanceof RuntimeAgentError) throw error;
+    definitionInvalid();
+  }
+}
+
+function registration(entry: AgentRegistryEntryV1): AgentRegistration {
+  return Object.freeze({
+    registry_revision: entry.registry_revision,
+    definition: immutableReference(entry.definition),
+    prompt_template: immutableReference(entry.prompt_template),
+    state: entry.state,
+    entry_hash: entry.entry_hash,
+  });
+}
+
+function parseRegistration(value: JsonValue | undefined): AgentRegistration {
+  if (
+    !jsonObject(value) ||
+    !exactKeys(value, [
+      "registry_revision",
+      "definition",
+      "prompt_template",
+      "state",
+      "entry_hash",
+    ]) ||
+    typeof value.registry_revision !== "number" ||
+    !Number.isSafeInteger(value.registry_revision) ||
+    value.registry_revision < 1 ||
+    !jsonObject(value.definition) ||
+    !exactKeys(value.definition, ["document_type", "artifact_id", "revision", "hash"]) ||
+    value.definition.document_type !== "agent-definition" ||
+    typeof value.definition.artifact_id !== "string" ||
+    !IDENTIFIER_PATTERN.test(value.definition.artifact_id) ||
+    typeof value.definition.revision !== "number" ||
+    !Number.isSafeInteger(value.definition.revision) ||
+    value.definition.revision < 1 ||
+    typeof value.definition.hash !== "string" ||
+    !SHA256_PATTERN.test(value.definition.hash) ||
+    !jsonObject(value.prompt_template) ||
+    !exactKeys(value.prompt_template, ["document_type", "artifact_id", "revision", "hash"]) ||
+    value.prompt_template.document_type !== "prompt-template" ||
+    typeof value.prompt_template.artifact_id !== "string" ||
+    !IDENTIFIER_PATTERN.test(value.prompt_template.artifact_id) ||
+    typeof value.prompt_template.revision !== "number" ||
+    !Number.isSafeInteger(value.prompt_template.revision) ||
+    value.prompt_template.revision < 1 ||
+    typeof value.prompt_template.hash !== "string" ||
+    !SHA256_PATTERN.test(value.prompt_template.hash) ||
+    (value.state !== "ACTIVE" && value.state !== "RETIRED") ||
+    typeof value.entry_hash !== "string" ||
+    !SHA256_PATTERN.test(value.entry_hash)
+  ) {
+    registryCorrupt();
+  }
+  return Object.freeze({
+    registry_revision: value.registry_revision,
+    definition: immutableReference(value.definition as unknown as ArtifactReference),
+    prompt_template: immutableReference(value.prompt_template as unknown as ArtifactReference),
+    state: value.state,
+    entry_hash: value.entry_hash as `sha256:${string}`,
+  });
+}
+
+function publishOperationHash(
+  definition: ArtifactReference,
+  promptTemplate: ArtifactReference,
+): `sha256:${string}` {
+  return sha256({
+    command: "agent-publish",
+    definition: immutableReference(definition),
+    prompt_template: immutableReference(promptTemplate),
+  });
+}
+
+function retireOperationHash(definition: ArtifactReference): `sha256:${string}` {
+  return sha256({ command: "agent-retire", definition: immutableReference(definition) });
+}
+
+function parseOperationRecord(bytes: Uint8Array): AgentOperationRecordV1 {
+  let value: JsonValue;
+  try {
+    value = parseJsonBytes(bytes, {
+      maxBytes: MAX_OPERATION_RECORD_BYTES,
+      maxDepth: 8,
+      maxMembers: 64,
+    });
+  } catch {
+    return registryCorrupt();
+  }
+  if (
+    !jsonObject(value) ||
+    !exactKeys(value, [
+      "schema_version",
+      "document_type",
+      "operation_revision",
+      "previous_operation_hash",
+      "operation_id",
+      "operation_hash",
+      "result",
+      "operation_record_hash",
+    ]) ||
+    value.schema_version !== "agent-registry-operation.v1" ||
+    value.document_type !== "agent-registry-operation" ||
+    typeof value.operation_revision !== "number" ||
+    !Number.isSafeInteger(value.operation_revision) ||
+    value.operation_revision < 1 ||
+    !(
+      value.previous_operation_hash === null ||
+      (typeof value.previous_operation_hash === "string" &&
+        SHA256_PATTERN.test(value.previous_operation_hash))
+    ) ||
+    typeof value.operation_id !== "string" ||
+    !UUID_PATTERN.test(value.operation_id) ||
+    typeof value.operation_hash !== "string" ||
+    !SHA256_PATTERN.test(value.operation_hash) ||
+    typeof value.operation_record_hash !== "string" ||
+    !SHA256_PATTERN.test(value.operation_record_hash)
+  ) {
+    return registryCorrupt();
+  }
+  const result = parseRegistration(value.result);
+  const record = {
+    schema_version: value.schema_version,
+    document_type: value.document_type,
+    operation_revision: value.operation_revision,
+    previous_operation_hash: value.previous_operation_hash as `sha256:${string}` | null,
+    operation_id: value.operation_id,
+    operation_hash: value.operation_hash as `sha256:${string}`,
+    result,
+    operation_record_hash: value.operation_record_hash as `sha256:${string}`,
+  } satisfies AgentOperationRecordV1;
+  if (!Buffer.from(canonicalJson(record as never), "utf8").equals(Buffer.from(bytes))) {
+    return registryCorrupt();
+  }
+  const { operation_record_hash: actual, ...hashable } = record;
+  if (sha256(hashable) !== actual) return registryCorrupt();
+  return Object.freeze(record);
+}
+
+function parseJsonl<T>(
+  bytes: Uint8Array,
+  parseLine: (line: Uint8Array) => T,
+): {
+  readonly records: readonly T[];
+  readonly prefixLength: number;
+  readonly fragment: Uint8Array;
+} {
+  const buffer = Buffer.from(bytes);
+  if (buffer.byteLength === 0) registryCorrupt();
+  const lastNewline = buffer.lastIndexOf(0x0a);
+  const prefixLength = lastNewline < 0 ? 0 : lastNewline + 1;
+  const records: T[] = [];
+  let start = 0;
+  for (let end = 0; end < prefixLength; end += 1) {
+    if (buffer[end] !== 0x0a) continue;
+    if (end === start) registryCorrupt();
+    records.push(parseLine(buffer.subarray(start, end)));
+    start = end + 1;
+  }
+  return {
+    records: Object.freeze(records),
+    prefixLength,
+    fragment: Buffer.from(buffer.subarray(prefixLength)),
+  };
+}
+
+function parseLifecycleLine(bytes: Uint8Array): AgentRegistryEntryV1 {
+  const parsed = parseAgentRegistryEntry(bytes);
+  if (!parsed.ok || !Buffer.from(canonicalJson(parsed.value as never), "utf8").equals(bytes)) {
+    return registryCorrupt();
+  }
+  return parsed.value;
+}
+
+function entryFor(options: {
+  readonly operationId: string;
+  readonly operationHash: `sha256:${string}`;
+  readonly definition: AgentDefinitionReference;
+  readonly promptTemplate: PromptTemplateReference;
+  readonly state: "ACTIVE" | "RETIRED";
+  readonly entries: readonly AgentRegistryEntryV1[];
+  readonly now: () => Date;
+}): AgentRegistryEntryV1 {
+  let occurredAt: string;
+  try {
+    const date = options.now();
+    if (!(date instanceof Date) || !Number.isFinite(date.getTime())) definitionInvalid();
+    occurredAt = date.toISOString();
+  } catch (error) {
+    if (error instanceof RuntimeAgentError) throw error;
+    return definitionInvalid();
+  }
+  const previous = options.entries.at(-1);
+  const hashable = {
+    protocol_version: "runtime-contract.v1",
+    schema_version: "agent-registry-entry.v1",
+    document_type: "agent-registry-entry",
+    registry_revision: options.entries.length + 1,
+    previous_entry_hash: previous?.entry_hash ?? null,
+    operation_id: options.operationId,
+    operation_hash: options.operationHash,
+    definition: immutableDefinitionReference(options.definition),
+    prompt_template: immutablePromptReference(options.promptTemplate),
+    state: options.state,
+    occurred_at: occurredAt,
+  } as const;
+  return Object.freeze({ ...hashable, entry_hash: hashAgentRegistryEntry(hashable) });
+}
+
+function operationRecordFor(options: {
+  readonly operationId: string;
+  readonly operationHash: `sha256:${string}`;
+  readonly result: AgentRegistration;
+  readonly records: readonly AgentOperationRecordV1[];
+}): AgentOperationRecordV1 {
+  const previous = options.records.at(-1);
+  const hashable = {
+    schema_version: "agent-registry-operation.v1",
+    document_type: "agent-registry-operation",
+    operation_revision: options.records.length + 1,
+    previous_operation_hash: previous?.operation_record_hash ?? null,
+    operation_id: options.operationId,
+    operation_hash: options.operationHash,
+    result: options.result,
+  } as const;
+  return Object.freeze({ ...hashable, operation_record_hash: sha256(hashable) });
+}
+
+export function createAgentRegistry(options: CreateAgentRegistryOptions): AgentRegistry {
+  const statePath = canonicalStatePath(options.statePath);
+  const storeOptions = {
+    statePath,
+    hasServiceListener: options.hasServiceListener,
+    ...(options.isProcessAlive === undefined ? {} : { isProcessAlive: options.isProcessAlive }),
+    ...(options.isCurrentUser === undefined ? {} : { isCurrentUser: options.isCurrentUser }),
+    ...(options.privateStoreOperationHooks === undefined
+      ? {}
+      : { operationHooks: options.privateStoreOperationHooks }),
+  };
+  const store = createPrivateAgentStore(storeOptions);
+  const lifecyclePath = path.join(store.registryPath, "entries.jsonl");
+  const operationPath = path.join(store.registryPath, "operations.jsonl");
+  let coordinatorPromise: Promise<Coordinator> | undefined;
+  const pendingMutations = new Set<Promise<unknown>>();
+  let intakeStopped = false;
+
+  const coordinator = (): Promise<Coordinator> => {
+    coordinatorPromise ??= (async () => {
+      await store.ensureRoots();
+      const canonical = realpathSync(statePath);
+      const metadata = lstatSync(canonical, { bigint: true });
+      const stateIdentity = assertPrivateDirectory(metadata);
+      const key = `${canonical}\u0000${String(stateIdentity.device)}:${String(stateIdentity.inode)}`;
+      let shared = coordinators.get(key)?.deref();
+      if (shared === undefined) {
+        shared = { tail: Promise.resolve() };
+        coordinators.set(key, new WeakRef(shared));
+      }
+      return shared;
+    })();
+    return coordinatorPromise;
+  };
+
+  const enqueue = <T>(operation: () => Promise<T>, mutation: boolean): Promise<T> => {
+    const scheduled = coordinator().then(async (shared) => {
+      const current = shared.tail.catch(() => undefined).then(operation);
+      shared.tail = current;
+      return current;
+    });
+    if (mutation) {
+      pendingMutations.add(scheduled);
+      void scheduled.finally(() => pendingMutations.delete(scheduled)).catch(() => undefined);
+    }
+    return scheduled;
+  };
+
+  const withClaim = async <T>(operation: () => Promise<T>): Promise<T> => {
+    const claim = await store.acquireMutationClaim();
+    try {
+      const result = await operation();
+      await claim.release();
+      return result;
+    } catch (error) {
+      await claim.release().catch(() => undefined);
+      throw error;
+    }
+  };
+
+  const readBundle = async (
+    definition: ArtifactReference,
+    promptTemplate: ArtifactReference,
+    cache: Map<string, ResolvedAgentBundle>,
+  ): Promise<ResolvedAgentBundle> => {
+    const key = referenceKey(definition);
+    const cached = cache.get(key);
+    if (cached !== undefined) {
+      if (!exactReference(cached.definition.prompt_template, promptTemplate)) registryCorrupt();
+      return cached;
+    }
+    const [definitionObject, promptObject] = await Promise.all([
+      store.readObject(definition.hash),
+      store.readObject(promptTemplate.hash),
+    ]);
+    if (definitionObject === null || promptObject === null) return registryCorrupt();
+    let storedDefinition: JsonValue;
+    let storedPrompt: JsonValue;
+    try {
+      storedDefinition = parseJsonBytes(definitionObject.bytes, AGENT_DOCUMENT_LIMITS);
+      storedPrompt = parseJsonBytes(promptObject.bytes, AGENT_DOCUMENT_LIMITS);
+    } catch {
+      return registryCorrupt();
+    }
+    if (
+      !jsonObject(storedDefinition) ||
+      !jsonObject(storedPrompt) ||
+      "document_hash" in storedDefinition ||
+      "document_hash" in storedPrompt ||
+      !Buffer.from(canonicalJson(storedDefinition), "utf8").equals(
+        Buffer.from(definitionObject.bytes),
+      ) ||
+      !Buffer.from(canonicalJson(storedPrompt), "utf8").equals(Buffer.from(promptObject.bytes))
+    ) {
+      return registryCorrupt();
+    }
+    const parsedDefinition = parseAgentDefinition(
+      Buffer.from(canonicalJson({ ...storedDefinition, document_hash: definition.hash }), "utf8"),
+    );
+    const parsedPrompt = parsePromptTemplate(
+      Buffer.from(canonicalJson({ ...storedPrompt, document_hash: promptTemplate.hash }), "utf8"),
+    );
+    if (
+      !parsedDefinition.ok ||
+      !parsedPrompt.ok ||
+      !exactReference(definitionReference(parsedDefinition.value), definition) ||
+      !exactReference(promptReference(parsedPrompt.value), promptTemplate) ||
+      !exactReference(parsedDefinition.value.prompt_template, promptTemplate)
+    ) {
+      return registryCorrupt();
+    }
+    const resolved = Object.freeze({
+      definition: parsedDefinition.value,
+      prompt_template: parsedPrompt.value,
+    });
+    cache.set(key, resolved);
+    return resolved;
+  };
+
+  const validateLifecycle = async (
+    entries: readonly AgentRegistryEntryV1[],
+  ): Promise<{
+    readonly active: ReadonlyMap<string, AgentRegistration>;
+    readonly bundles: ReadonlyMap<string, ResolvedAgentBundle>;
+    readonly revisionHashes: ReadonlyMap<string, `sha256:${string}`>;
+    readonly promptRevisionHashes: ReadonlyMap<string, `sha256:${string}`>;
+    readonly maximumRevisions: ReadonlyMap<string, number>;
+    readonly operations: ReadonlyMap<string, OperationResult>;
+  }> => {
+    const active = new Map<string, AgentRegistration>();
+    const bundles = new Map<string, ResolvedAgentBundle>();
+    const revisionHashes = new Map<string, `sha256:${string}`>();
+    const promptRevisionHashes = new Map<string, `sha256:${string}`>();
+    const maximumRevisions = new Map<string, number>();
+    const operations = new Map<string, OperationResult>();
+    let previousHash: `sha256:${string}` | null = null;
+    for (const [index, entry] of entries.entries()) {
+      if (
+        entry.registry_revision !== index + 1 ||
+        entry.previous_entry_hash !== previousHash ||
+        operations.has(entry.operation_id)
+      ) {
+        registryCorrupt();
+      }
+      const resolved = await readBundle(entry.definition, entry.prompt_template, bundles);
+      const agentId = resolved.definition.agent_id;
+      if (entry.definition.artifact_id !== agentId) registryCorrupt();
+      const result = registration(entry);
+      if (entry.state === "ACTIVE") {
+        const pair = revisionKey(entry.definition);
+        if (revisionHashes.has(pair)) registryCorrupt();
+        const maximum = maximumRevisions.get(agentId);
+        if (maximum !== undefined && entry.definition.revision <= maximum) registryCorrupt();
+        if (
+          entry.operation_hash !== publishOperationHash(entry.definition, entry.prompt_template)
+        ) {
+          registryCorrupt();
+        }
+        revisionHashes.set(pair, entry.definition.hash);
+        const promptPair = revisionKey(entry.prompt_template);
+        const knownPromptHash = promptRevisionHashes.get(promptPair);
+        if (knownPromptHash !== undefined && knownPromptHash !== entry.prompt_template.hash) {
+          registryCorrupt();
+        }
+        promptRevisionHashes.set(promptPair, entry.prompt_template.hash);
+        maximumRevisions.set(agentId, entry.definition.revision);
+        active.set(agentId, result);
+      } else {
+        const current = active.get(agentId);
+        if (
+          current === undefined ||
+          !exactReference(current.definition, entry.definition) ||
+          !exactReference(current.prompt_template, entry.prompt_template) ||
+          entry.operation_hash !== retireOperationHash(entry.definition)
+        ) {
+          registryCorrupt();
+        }
+        active.delete(agentId);
+      }
+      operations.set(
+        entry.operation_id,
+        Object.freeze({ operationHash: entry.operation_hash, result }),
+      );
+      previousHash = entry.entry_hash;
+    }
+    return {
+      active,
+      bundles,
+      revisionHashes,
+      promptRevisionHashes,
+      maximumRevisions,
+      operations,
+    };
+  };
+
+  const validateOperationRecords = (
+    records: readonly AgentOperationRecordV1[],
+    entries: readonly AgentRegistryEntryV1[],
+    base: ReadonlyMap<string, OperationResult>,
+  ): ReadonlyMap<string, OperationResult> => {
+    const operations = new Map(base);
+    const durableResults = new Set(
+      entries.map((entry) => canonicalJson(registration(entry) as never)),
+    );
+    let previousHash: `sha256:${string}` | null = null;
+    for (const [index, record] of records.entries()) {
+      const expectedOperationHash =
+        record.result.state === "ACTIVE"
+          ? publishOperationHash(record.result.definition, record.result.prompt_template)
+          : retireOperationHash(record.result.definition);
+      if (
+        record.operation_revision !== index + 1 ||
+        record.previous_operation_hash !== previousHash ||
+        operations.has(record.operation_id) ||
+        record.operation_hash !== expectedOperationHash ||
+        !durableResults.has(canonicalJson(record.result))
+      ) {
+        registryCorrupt();
+      }
+      operations.set(
+        record.operation_id,
+        Object.freeze({ operationHash: record.operation_hash, result: record.result }),
+      );
+      previousHash = record.operation_record_hash;
+    }
+    return operations;
+  };
+
+  const load = async (): Promise<RegistryHistory> => {
+    assertAgentCandidates(store.agentsPath, store.objectsPath);
+    assertQuarantineCandidates(store.quarantinePath);
+    let lifecycleFile = readHistoryFile(lifecyclePath, store.registryPath);
+    if (lifecycleFile === null) {
+      if (readHistoryFile(operationPath, store.registryPath) !== null) registryCorrupt();
+      return {
+        lifecycleFile: null,
+        operationFile: null,
+        entries: Object.freeze([]),
+        operationRecords: Object.freeze([]),
+        active: new Map(),
+        bundles: new Map(),
+        revisionHashes: new Map(),
+        promptRevisionHashes: new Map(),
+        maximumRevisions: new Map(),
+        operations: new Map(),
+      };
+    }
+
+    let lifecycle = parseJsonl(lifecycleFile.bytes, parseLifecycleLine);
+    if (lifecycle.fragment.byteLength > 0) {
+      if (lifecycle.records.length === 0) registryCorrupt();
+      await validateLifecycle(lifecycle.records);
+      recoverPartial({
+        candidate: lifecyclePath,
+        registryPath: store.registryPath,
+        quarantinePath: store.quarantinePath,
+        expected: lifecycleFile,
+        prefix: lifecycleFile.bytes.subarray(0, lifecycle.prefixLength),
+        fragment: lifecycle.fragment,
+        kind: "lifecycle",
+        randomId: options.randomId,
+        ...(options.operationHooks === undefined ? {} : { hooks: options.operationHooks }),
+      });
+      lifecycleFile = readHistoryFile(lifecyclePath, store.registryPath);
+      if (lifecycleFile === null) registryCorrupt();
+      lifecycle = parseJsonl(lifecycleFile.bytes, parseLifecycleLine);
+      if (lifecycle.fragment.byteLength > 0) registryCorrupt();
+    }
+    const lifecycleState = await validateLifecycle(lifecycle.records);
+
+    let operationFile = readHistoryFile(operationPath, store.registryPath);
+    let operationRecords: readonly AgentOperationRecordV1[] = Object.freeze([]);
+    if (operationFile !== null) {
+      let operationHistory = parseJsonl(operationFile.bytes, parseOperationRecord);
+      if (operationHistory.fragment.byteLength > 0) {
+        if (operationHistory.records.length === 0) registryCorrupt();
+        validateOperationRecords(
+          operationHistory.records,
+          lifecycle.records,
+          lifecycleState.operations,
+        );
+        recoverPartial({
+          candidate: operationPath,
+          registryPath: store.registryPath,
+          quarantinePath: store.quarantinePath,
+          expected: operationFile,
+          prefix: operationFile.bytes.subarray(0, operationHistory.prefixLength),
+          fragment: operationHistory.fragment,
+          kind: "operations",
+          randomId: options.randomId,
+          ...(options.operationHooks === undefined ? {} : { hooks: options.operationHooks }),
+        });
+        operationFile = readHistoryFile(operationPath, store.registryPath);
+        if (operationFile === null) registryCorrupt();
+        operationHistory = parseJsonl(operationFile.bytes, parseOperationRecord);
+        if (operationHistory.fragment.byteLength > 0) registryCorrupt();
+      }
+      operationRecords = operationHistory.records;
+    }
+    const operations = validateOperationRecords(
+      operationRecords,
+      lifecycle.records,
+      lifecycleState.operations,
+    );
+    return {
+      lifecycleFile,
+      operationFile,
+      entries: lifecycle.records,
+      operationRecords,
+      active: lifecycleState.active,
+      bundles: lifecycleState.bundles,
+      revisionHashes: lifecycleState.revisionHashes,
+      promptRevisionHashes: lifecycleState.promptRevisionHashes,
+      maximumRevisions: lifecycleState.maximumRevisions,
+      operations,
+    };
+  };
+
+  const replay = (
+    history: RegistryHistory,
+    operationId: string,
+    expectedHash: `sha256:${string}`,
+  ): AgentRegistration | undefined => {
+    const known = history.operations.get(operationId);
+    if (known === undefined) return undefined;
+    if (known.operationHash !== expectedHash) {
+      return agentError("RUNTIME_AGENT_OPERATION_CONFLICT");
+    }
+    return known.result;
+  };
+
+  const appendEntry = (history: RegistryHistory, entry: AgentRegistryEntryV1): void => {
+    appendHistoryFile({
+      candidate: lifecyclePath,
+      registryPath: store.registryPath,
+      expected: history.lifecycleFile,
+      bytes: Buffer.from(`${canonicalJson(entry as never)}\n`, "utf8"),
+      kind: "lifecycle",
+      ...(options.operationHooks === undefined ? {} : { hooks: options.operationHooks }),
+    });
+  };
+
+  const appendOperation = (history: RegistryHistory, record: AgentOperationRecordV1): void => {
+    appendHistoryFile({
+      candidate: operationPath,
+      registryPath: store.registryPath,
+      expected: history.operationFile,
+      bytes: Buffer.from(`${canonicalJson(record as never)}\n`, "utf8"),
+      kind: "operations",
+      ...(options.operationHooks === undefined ? {} : { hooks: options.operationHooks }),
+    });
+  };
+
+  return {
+    recover: () => enqueue(() => withClaim(async () => void (await load())), true),
+    async publish(candidate, operationId) {
+      if (intakeStopped) return Promise.reject(new RuntimeAgentError("RUNTIME_AGENT_NOT_FOUND"));
+      const snapshot = snapshotBundle(candidate);
+      const canonicalOperationId = canonicalUuid(operationId, "RUNTIME_AGENT_DEFINITION_INVALID");
+      const definitionRef = definitionReference(snapshot.bundle.definition);
+      const promptRef = promptReference(snapshot.bundle.prompt_template);
+      const operationHash = publishOperationHash(definitionRef, promptRef);
+      return enqueue(
+        () =>
+          withClaim(async () => {
+            const history = await load();
+            const replayed = replay(history, canonicalOperationId, operationHash);
+            if (replayed !== undefined) return replayed;
+            const active = history.active.get(snapshot.bundle.definition.agent_id);
+            if (
+              active !== undefined &&
+              exactReference(active.definition, definitionRef) &&
+              exactReference(active.prompt_template, promptRef)
+            ) {
+              const record = operationRecordFor({
+                operationId: canonicalOperationId,
+                operationHash,
+                result: active,
+                records: history.operationRecords,
+              });
+              appendOperation(history, record);
+              return active;
+            }
+
+            const pair = revisionKey(definitionRef);
+            const knownHash = history.revisionHashes.get(pair);
+            if (knownHash !== undefined) {
+              if (knownHash !== definitionRef.hash) definitionInvalid();
+              return agentError("RUNTIME_AGENT_STALE_REVISION");
+            }
+            const maximumRevision = history.maximumRevisions.get(
+              snapshot.bundle.definition.agent_id,
+            );
+            if (maximumRevision !== undefined && definitionRef.revision <= maximumRevision) {
+              definitionInvalid();
+            }
+            const knownPromptHash = history.promptRevisionHashes.get(revisionKey(promptRef));
+            if (knownPromptHash !== undefined && knownPromptHash !== promptRef.hash) {
+              definitionInvalid();
+            }
+
+            await store.publishObject(promptRef.hash, snapshot.promptBytes);
+            await store.publishObject(definitionRef.hash, snapshot.definitionBytes);
+            await options.operationHooks?.afterObjectsPublished?.();
+            const entry = entryFor({
+              operationId: canonicalOperationId,
+              operationHash,
+              definition: definitionRef,
+              promptTemplate: promptRef,
+              state: "ACTIVE",
+              entries: history.entries,
+              now: options.now,
+            });
+            appendEntry(history, entry);
+            return registration(entry);
+          }),
+        true,
+      );
+    },
+    async retire(candidate, operationId) {
+      if (intakeStopped) return Promise.reject(new RuntimeAgentError("RUNTIME_AGENT_NOT_FOUND"));
+      const definitionRef = normalizeDefinitionReference(candidate);
+      const canonicalOperationId = canonicalUuid(operationId, "RUNTIME_AGENT_DEFINITION_INVALID");
+      const operationHash = retireOperationHash(definitionRef);
+      return enqueue(
+        () =>
+          withClaim(async () => {
+            const history = await load();
+            const replayed = replay(history, canonicalOperationId, operationHash);
+            if (replayed !== undefined) return replayed;
+            const resolved = history.bundles.get(referenceKey(definitionRef));
+            if (resolved === undefined) return agentError("RUNTIME_AGENT_NOT_FOUND");
+            const active = history.active.get(definitionRef.artifact_id);
+            if (active === undefined || !exactReference(active.definition, definitionRef)) {
+              return agentError("RUNTIME_AGENT_STALE_REVISION");
+            }
+            const entry = entryFor({
+              operationId: canonicalOperationId,
+              operationHash,
+              definition: definitionRef,
+              promptTemplate: immutablePromptReference(active.prompt_template),
+              state: "RETIRED",
+              entries: history.entries,
+              now: options.now,
+            });
+            appendEntry(history, entry);
+            return registration(entry);
+          }),
+        true,
+      );
+    },
+    async resolveForExecution(candidate) {
+      const definitionRef = normalizeDefinitionReference(candidate);
+      return enqueue(
+        () =>
+          withClaim(async () => {
+            const history = await load();
+            const resolved = history.bundles.get(referenceKey(definitionRef));
+            if (resolved === undefined) return agentError("RUNTIME_AGENT_NOT_FOUND");
+            const active = history.active.get(definitionRef.artifact_id);
+            if (active === undefined || !exactReference(active.definition, definitionRef)) {
+              return agentError("RUNTIME_AGENT_STALE_REVISION");
+            }
+            return resolved;
+          }),
+        false,
+      );
+    },
+    async resolveForResume(candidate) {
+      const definitionRef = normalizeDefinitionReference(candidate);
+      return enqueue(
+        () =>
+          withClaim(async () => {
+            const resolved = (await load()).bundles.get(referenceKey(definitionRef));
+            if (resolved === undefined) return agentError("RUNTIME_AGENT_NOT_FOUND");
+            return resolved;
+          }),
+        false,
+      );
+    },
+    list: () =>
+      enqueue(
+        () =>
+          withClaim(async () =>
+            Object.freeze(
+              [...(await load()).active.values()].sort((left, right) =>
+                Buffer.from(
+                  `${left.definition.artifact_id}\u0000${String(left.definition.revision)}`,
+                  "utf8",
+                ).compare(
+                  Buffer.from(
+                    `${right.definition.artifact_id}\u0000${String(right.definition.revision)}`,
+                    "utf8",
+                  ),
+                ),
+              ),
+            ),
+          ),
+        false,
+      ),
+    stopIntake() {
+      intakeStopped = true;
+    },
+    async flush(signal) {
+      if (signal.aborted || pendingMutations.size === 0) return;
+      let listener: (() => void) | undefined;
+      const aborted = new Promise<void>((resolve) => {
+        listener = resolve;
+        signal.addEventListener("abort", listener, { once: true });
+      });
+      try {
+        await Promise.race([
+          Promise.allSettled([...pendingMutations]).then(() => undefined),
+          aborted,
+        ]);
+      } finally {
+        if (listener !== undefined) signal.removeEventListener("abort", listener);
+      }
+    },
+  };
+}

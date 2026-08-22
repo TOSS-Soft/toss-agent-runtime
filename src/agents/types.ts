@@ -211,3 +211,14 @@ export interface AgentRegistration {
   readonly state: "ACTIVE" | "RETIRED";
   readonly entry_hash: `sha256:${string}`;
 }
+
+export interface AgentRegistry {
+  recover(): Promise<void>;
+  publish(bundle: AgentDefinitionBundle, operationId: string): Promise<AgentRegistration>;
+  retire(definition: ArtifactReference, operationId: string): Promise<AgentRegistration>;
+  resolveForExecution(definition: ArtifactReference): Promise<ResolvedAgentBundle>;
+  resolveForResume(definition: ArtifactReference): Promise<ResolvedAgentBundle>;
+  list(): Promise<readonly AgentRegistration[]>;
+  stopIntake(): void;
+  flush(signal: AbortSignal): Promise<void>;
+}
