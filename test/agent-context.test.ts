@@ -7,6 +7,7 @@ import {
   type ResolvedContextArtifact,
 } from "../src/agents/context.js";
 import {
+  AGENT_DOCUMENT_LIMITS,
   hashAgentDefinition,
   hashCompiledContext,
   hashPromptTemplate,
@@ -55,6 +56,27 @@ function referenceKey(reference: ArtifactReference): string {
     String(reference.revision),
     reference.hash,
   ].join("\u0000");
+}
+
+function compareArtifactReferences(left: ArtifactReference, right: ArtifactReference): number {
+  return (
+    Buffer.from(left.document_type, "utf8").compare(Buffer.from(right.document_type, "utf8")) ||
+    Buffer.from(left.artifact_id, "utf8").compare(Buffer.from(right.artifact_id, "utf8")) ||
+    (left.revision < right.revision ? -1 : left.revision > right.revision ? 1 : 0) ||
+    Buffer.from(left.hash, "utf8").compare(Buffer.from(right.hash, "utf8"))
+  );
+}
+
+function canonicalSemanticRequestHash(request: ExecutionRequestV1): `sha256:${string}` {
+  const inputArtifacts = request.input_artifacts
+    .map(({ document_type, artifact_id, revision, hash }) => ({
+      document_type,
+      artifact_id,
+      revision,
+      hash,
+    }))
+    .sort(compareArtifactReferences);
+  return hashExecutionRequest({ ...request, input_artifacts: inputArtifacts });
 }
 
 function jsonArtifact(
@@ -273,7 +295,7 @@ function compileInput(
   calls: ArtifactReference[] = [],
 ): CompileAgentContextInput {
   return {
-    request_hash: hashExecutionRequest(actualFixture.request),
+    request_hash: canonicalSemanticRequestHash(actualFixture.request),
     request: actualFixture.request,
     bundle: actualFixture.bundle,
     resolver: resolverFor(artifacts, calls),
@@ -473,6 +495,34 @@ describe("provenance-aware agent context compilation", () => {
 
     await expectContextError(
       compileAgentContext({ ...input, request_hash: ZERO_HASH }),
+      "RUNTIME_CONTEXT_INTEGRITY",
+    );
+    expect(calls).toEqual([]);
+  });
+
+  it("rejects an order-sensitive request hash before resolution", async () => {
+    const firstText = "first";
+    const secondText = "second";
+    const firstReference = ref("source-text", "A-SOURCE", 1, sha256(firstText));
+    const secondReference = ref("source-text", "B-SOURCE", 1, sha256(secondText));
+    const actualFixture = fixture({ inputReferences: [secondReference, firstReference] });
+    const calls: ArtifactReference[] = [];
+    const orderSensitiveHash = hashExecutionRequest(actualFixture.request);
+    expect(orderSensitiveHash).not.toBe(canonicalSemanticRequestHash(actualFixture.request));
+
+    await expectContextError(
+      compileAgentContext({
+        ...compileInput(
+          actualFixture,
+          [
+            ...trustedArtifacts(actualFixture),
+            textArtifact(firstReference, firstText),
+            textArtifact(secondReference, secondText),
+          ],
+          calls,
+        ),
+        request_hash: orderSensitiveHash,
+      }),
       "RUNTIME_CONTEXT_INTEGRITY",
     );
     expect(calls).toEqual([]);
@@ -707,7 +757,31 @@ describe("provenance-aware agent context compilation", () => {
     );
   });
 
-  it("rejects an aggregate document that cannot fit compiled-context.v1 with a fixed safe error", async () => {
+  it("accounts for compiled metadata near the aggregate document boundary", async () => {
+    const fittingFirstText = "a".repeat(1_040_000);
+    const fittingSecondText = "b".repeat(1_040_000);
+    const fittingFirstReference = ref("source-a", "SOURCE-A", 1, sha256(fittingFirstText));
+    const fittingSecondReference = ref("source-b", "SOURCE-B", 1, sha256(fittingSecondText));
+    const fittingFixture = fixture({
+      inputReferences: [fittingFirstReference, fittingSecondReference],
+      inputPolicies: [
+        { document_type: "source-a", priority: 10, max_bytes: 1_048_000 },
+        { document_type: "source-b", priority: 20, max_bytes: 1_048_000 },
+      ],
+      maxUntrustedBytes: 2_096_000,
+      maxInputTokens: 3_000_000,
+    });
+    const fitting = await compileAgentContext(
+      compileInput(fittingFixture, [
+        ...trustedArtifacts(fittingFixture),
+        textArtifact(fittingFirstReference, fittingFirstText),
+        textArtifact(fittingSecondReference, fittingSecondText),
+      ]),
+    );
+    const fittingDocumentBytes = Buffer.byteLength(canonicalJson(fitting), "utf8");
+    expect(fittingDocumentBytes).toBeLessThanOrEqual(AGENT_DOCUMENT_LIMITS.maxBytes);
+    expect(AGENT_DOCUMENT_LIMITS.maxBytes - fittingDocumentBytes).toBeLessThan(20_000);
+
     const firstText = "a".repeat(1_048_000);
     const secondText = "b".repeat(1_048_000);
     const firstReference = ref("source-a", "SOURCE-A", 1, sha256(firstText));
@@ -721,6 +795,10 @@ describe("provenance-aware agent context compilation", () => {
       maxUntrustedBytes: 2_096_000,
       maxInputTokens: 3_000_000,
     });
+    expect(Buffer.byteLength(firstText, "utf8") + Buffer.byteLength(secondText, "utf8")).toBe(
+      2_096_000,
+    );
+    expect(2_096_000).toBeLessThan(AGENT_DOCUMENT_LIMITS.maxBytes);
 
     await expectContextError(
       compileAgentContext(
@@ -732,6 +810,66 @@ describe("provenance-aware agent context compilation", () => {
       ),
       "RUNTIME_CONTEXT_UNSUPPORTED",
     );
+  });
+
+  it("stops before copying an aggregate source that cannot fit and does not resolve later inputs", async () => {
+    const sourceTexts = [
+      "a".repeat(800_000),
+      "b".repeat(800_000),
+      "c".repeat(800_000),
+      "later",
+    ] as const;
+    const references = [
+      ref("source-a", "SOURCE-A", 1, sha256(sourceTexts[0])),
+      ref("source-b", "SOURCE-B", 1, sha256(sourceTexts[1])),
+      ref("source-c", "SOURCE-C", 1, sha256(sourceTexts[2])),
+      ref("source-d", "SOURCE-D", 1, sha256(sourceTexts[3])),
+    ] as const;
+    const actualFixture = fixture({
+      inputReferences: references,
+      inputPolicies: references.map((reference, index) => ({
+        document_type: reference.document_type,
+        priority: (index + 1) * 10,
+        max_bytes: 800_000,
+      })),
+      maxUntrustedBytes: 2_400_000,
+      maxInputTokens: 3_000_000,
+    });
+    let thirdElementReads = 0;
+    const thirdBytesTarget = new Uint8Array(Buffer.from(sourceTexts[2], "utf8"));
+    const observedThirdBytes = new Proxy(thirdBytesTarget, {
+      get(target, property) {
+        if (property === "byteLength") return target.byteLength;
+        if (property === "length") return target.length;
+        if (typeof property === "string" && /^[0-9]+$/u.test(property)) {
+          thirdElementReads += 1;
+          return target[Number(property)];
+        }
+        return undefined;
+      },
+    });
+    const artifacts: ResolvedArtifactFixture[] = [
+      ...trustedArtifacts(actualFixture),
+      textArtifact(references[0], sourceTexts[0]),
+      textArtifact(references[1], sourceTexts[1]),
+      { ...textArtifact(references[2], sourceTexts[2]), bytes: observedThirdBytes },
+      textArtifact(references[3], sourceTexts[3]),
+    ];
+    const calls: ArtifactReference[] = [];
+
+    await expectContextError(
+      compileAgentContext(compileInput(actualFixture, artifacts, calls)),
+      "RUNTIME_CONTEXT_UNSUPPORTED",
+    );
+
+    expect(thirdElementReads).toBe(0);
+    expect(calls.map(referenceKey)).toEqual([
+      referenceKey(actualFixture.taskReference),
+      referenceKey(actualFixture.outputReference),
+      referenceKey(references[0]),
+      referenceKey(references[1]),
+      referenceKey(references[2]),
+    ]);
   });
 
   it("rejects duplicate exact references before calling the resolver", async () => {
@@ -1183,7 +1321,7 @@ describe("provenance-aware agent context compilation", () => {
     });
   });
 
-  it("uses bytewise tuple order independent of caller input order", async () => {
+  it("uses one canonical request identity and compiled output independent of caller input order", async () => {
     const contents = ["upper", "lower", "revision-one", "revision-two", "later-type"] as const;
     const references = [
       ref("source-a", "Zeta", 1, sha256(contents[0])),
@@ -1215,6 +1353,8 @@ describe("provenance-aware agent context compilation", () => {
       ...trustedArtifacts(secondFixture),
       ...artifacts,
     ]);
+    expect(firstInput.request_hash).toBe(canonicalSemanticRequestHash(firstFixture.request));
+    expect(secondInput.request_hash).toBe(firstInput.request_hash);
     const first = await compileAgentContext(firstInput);
     const second = await compileAgentContext(secondInput);
 
@@ -1227,9 +1367,10 @@ describe("provenance-aware agent context compilation", () => {
     expect(second.segments.map((segment) => segment.segment_id)).toEqual(
       first.segments.map((segment) => segment.segment_id),
     );
-    expect(second.request_hash).not.toBe(first.request_hash);
-    expect(second.document_hash).not.toBe(first.document_hash);
+    expect(second.request_hash).toBe(first.request_hash);
+    expect(second.document_hash).toBe(first.document_hash);
     expect(second.segments).toEqual(first.segments);
+    expect(canonicalJson(second)).toBe(canonicalJson(first));
   });
 
   it("rejects unknown input document types before resolving any source", async () => {

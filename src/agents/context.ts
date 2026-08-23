@@ -112,11 +112,12 @@ interface CompileProjection {
 }
 
 interface ResolvedProjection {
-  readonly reference: ArtifactReference;
+  readonly reference: unknown;
   readonly media_type: ResolvedContextArtifact["media_type"];
   readonly sensitivity: ResolvedContextArtifact["sensitivity"];
   readonly origin: ResolvedContextArtifact["origin"];
   readonly bytes: Uint8Array;
+  readonly byte_length: number;
 }
 
 interface NormalizedArtifact {
@@ -128,6 +129,13 @@ interface NormalizedArtifact {
 interface SortedInputReference {
   readonly reference: ArtifactReference;
   readonly priority: number;
+}
+
+interface CompiledRepresentationState {
+  readonly segments: CompiledContextSegmentV1[];
+  segmentJsonBytes: number;
+  inputBytes: number;
+  untrustedBytes: number;
 }
 
 function contextError(code: ConstructorParameters<typeof RuntimeAgentError>[0]): never {
@@ -274,10 +282,18 @@ function projectCompileInput(input: CompileAgentContextInput): CompileProjection
   } catch {
     return integrityError();
   }
-  if (!requestResult.ok || hashExecutionRequest(requestResult.value) !== requestHash) {
-    integrityError();
-  }
-  const request = requestResult.value;
+  if (!requestResult.ok) integrityError();
+  // Context compilation treats input artifacts as a semantic set, so its local
+  // request identity projects away resolver-only locations and sorts exact refs.
+  const request = Object.freeze({
+    ...requestResult.value,
+    input_artifacts: Object.freeze(
+      requestResult.value.input_artifacts
+        .map((reference) => projectReference(reference))
+        .sort(compareArtifactReferences),
+    ),
+  });
+  if (hashExecutionRequest(request) !== requestHash) integrityError();
   const bundle = snapshotJson(descriptors.bundle?.value) as ResolvedAgentBundle;
 
   const resolver = descriptors.resolver?.value as unknown;
@@ -358,6 +374,15 @@ function bytewiseCompare(left: string, right: string): number {
 
 function compareSafeIntegers(left: number, right: number): number {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function compareArtifactReferences(left: ArtifactReference, right: ArtifactReference): number {
+  return (
+    bytewiseCompare(left.document_type, right.document_type) ||
+    bytewiseCompare(left.artifact_id, right.artifact_id) ||
+    compareSafeIntegers(left.revision, right.revision) ||
+    bytewiseCompare(left.hash, right.hash)
+  );
 }
 
 function compareSortedInputs(left: SortedInputReference, right: SortedInputReference): number {
@@ -460,7 +485,7 @@ function sortedInputReferences(
   );
 }
 
-function snapshotResolvedArtifact(value: unknown): ResolvedProjection {
+function inspectResolvedArtifact(value: unknown): ResolvedProjection {
   const descriptors = exactDataDescriptors(value, RESOLVED_ARTIFACT_KEYS);
   const bytesValue = descriptors.bytes?.value as unknown;
   let byteLength: number;
@@ -475,15 +500,6 @@ function snapshotResolvedArtifact(value: unknown): ResolvedProjection {
   if (!Number.isSafeInteger(byteLength) || byteLength < 0) integrityError();
   if (byteLength > MAX_COMPILED_SEGMENT_BYTES) unsupportedError();
 
-  let bytes: Uint8Array;
-  try {
-    bytes = new Uint8Array(byteLength);
-    bytes.set(byteArray);
-  } catch {
-    return integrityError();
-  }
-
-  const reference = projectReference(descriptors.reference?.value);
   const mediaType = descriptors.media_type?.value as unknown;
   const sensitivity = descriptors.sensitivity?.value as unknown;
   const origin = descriptors.origin?.value as unknown;
@@ -493,11 +509,12 @@ function snapshotResolvedArtifact(value: unknown): ResolvedProjection {
   if (typeof origin !== "string" || !ORIGINS.has(origin)) unsupportedError();
 
   return {
-    reference,
+    reference: descriptors.reference?.value,
     media_type: mediaType as ResolvedContextArtifact["media_type"],
     sensitivity: sensitivity as ResolvedContextArtifact["sensitivity"],
     origin: origin as ResolvedContextArtifact["origin"],
-    bytes,
+    bytes: byteArray,
+    byte_length: byteLength,
   };
 }
 
@@ -505,6 +522,7 @@ async function resolveExactArtifact(
   projection: CompileProjection,
   requestedReference: ArtifactReference,
   trustedControl: boolean,
+  beforeCopy?: (resolved: ResolvedProjection) => void,
 ): Promise<NormalizedArtifact> {
   let rawArtifact: unknown;
   try {
@@ -515,17 +533,27 @@ async function resolveExactArtifact(
     return integrityError();
   }
 
-  const resolved = snapshotResolvedArtifact(rawArtifact);
-  if (!exactReference(resolved.reference, requestedReference)) referenceMismatchError();
+  const resolved = inspectResolvedArtifact(rawArtifact);
   if (trustedControl && resolved.origin !== "control-plane") unsupportedError();
   if (trustedControl && resolved.media_type !== "application/json") unsupportedError();
+  beforeCopy?.(resolved);
+
+  let bytes: Uint8Array;
+  try {
+    bytes = new Uint8Array(resolved.byte_length);
+    bytes.set(resolved.bytes);
+  } catch {
+    return integrityError();
+  }
+  const resolvedReference = projectReference(resolved.reference);
+  if (!exactReference(resolvedReference, requestedReference)) referenceMismatchError();
 
   let content: string;
   let contentHash: `sha256:${string}`;
   if (resolved.media_type === "application/json") {
     let parsed: JsonValue;
     try {
-      parsed = parseJsonBytes(resolved.bytes, AGENT_DOCUMENT_LIMITS);
+      parsed = parseJsonBytes(bytes, AGENT_DOCUMENT_LIMITS);
       content = canonicalJson(parsed, AGENT_DOCUMENT_LIMITS);
       contentHash = sha256(parsed, AGENT_DOCUMENT_LIMITS);
     } catch {
@@ -533,7 +561,7 @@ async function resolveExactArtifact(
     }
   } else {
     try {
-      content = new TextDecoder("utf-8", { fatal: true }).decode(resolved.bytes);
+      content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     } catch {
       return unsupportedError();
     }
@@ -585,11 +613,10 @@ function segmentBase(
   } as const;
 }
 
-function buildSegments(
+function buildTrustedSegments(
   bundle: ResolvedAgentBundle,
   task: NormalizedArtifact,
   output: NormalizedArtifact,
-  inputs: readonly NormalizedArtifact[],
 ): readonly CompiledContextSegmentV1[] {
   const promptReference = projectReference(
     bundle.definition.prompt_template,
@@ -634,36 +661,88 @@ function buildSegments(
     trust: "trusted-control",
     source: output.reference as OutputSchemaReference,
   });
-  for (const input of inputs) {
-    const segment: InputArtifactSegmentV1 = {
-      ...segmentBase("input-artifact", input.reference, input.reference.hash, input.content),
-      kind: "input-artifact",
-      trust: "untrusted-content",
-      source: input.reference,
-    };
-    segments.push(segment);
-  }
   return Object.freeze(segments);
 }
 
-function buildCompiledContext(
+function buildInputSegment(input: NormalizedArtifact): InputArtifactSegmentV1 {
+  return {
+    ...segmentBase("input-artifact", input.reference, input.reference.hash, input.content),
+    kind: "input-artifact",
+    trust: "untrusted-content",
+    source: input.reference,
+  };
+}
+
+function boundedJsonStringByteLength(value: string): number {
+  const limit = AGENT_DOCUMENT_LIMITS.maxBytes;
+  let bytes = 2;
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    let increment: number;
+    if (codeUnit === 0x22 || codeUnit === 0x5c) {
+      increment = 2;
+    } else if (codeUnit <= 0x1f) {
+      increment =
+        codeUnit === 0x08 ||
+        codeUnit === 0x09 ||
+        codeUnit === 0x0a ||
+        codeUnit === 0x0c ||
+        codeUnit === 0x0d
+          ? 2
+          : 6;
+    } else if (codeUnit <= 0x7f) {
+      increment = 1;
+    } else if (codeUnit <= 0x7ff) {
+      increment = 2;
+    } else if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        increment = 4;
+        index += 1;
+      } else {
+        increment = 6;
+      }
+    } else {
+      increment = codeUnit >= 0xdc00 && codeUnit <= 0xdfff ? 6 : 3;
+    }
+    if (bytes > limit - increment) return limit + 1;
+    bytes += increment;
+  }
+  return bytes;
+}
+
+function safeSum(...values: readonly number[]): number {
+  const total = values.reduce((sum, value) => sum + value, 0);
+  if (!Number.isSafeInteger(total) || total < 0) integrityError();
+  return total;
+}
+
+function segmentJsonByteLengthForContent(
+  segment: CompiledContextSegmentV1,
+  encodedContentBytes: number,
+): number {
+  let baseBytes: number;
+  try {
+    baseBytes = Buffer.byteLength(canonicalJson({ ...segment, content: "" }), "utf8");
+  } catch {
+    return integrityError();
+  }
+  return safeSum(baseBytes, encodedContentBytes - 2);
+}
+
+function segmentJsonByteLength(segment: CompiledContextSegmentV1): number {
+  return segmentJsonByteLengthForContent(segment, boundedJsonStringByteLength(segment.content));
+}
+
+function buildHashableContext(
   requestHash: `sha256:${string}`,
   authority: EffectiveAgentAuthority,
   bundle: ResolvedAgentBundle,
   segments: readonly CompiledContextSegmentV1[],
-): CompiledContextV1 {
-  const inputBytes = segments.reduce((total, segment) => total + segment.included_bytes, 0);
-  const untrustedBytes = segments.reduce(
-    (total, segment) =>
-      total + (segment.trust === "untrusted-content" ? segment.included_bytes : 0),
-    0,
-  );
-  if (!Number.isSafeInteger(inputBytes) || !Number.isSafeInteger(untrustedBytes)) integrityError();
-  if (inputBytes > authority.budget.max_input_tokens) {
-    contextError("RUNTIME_CONTEXT_OVERFLOW");
-  }
-
-  const unsigned: HashableCompiledContextV1 = {
+  inputBytes: number,
+  untrustedBytes: number,
+): HashableCompiledContextV1 {
+  return {
     protocol_version: "runtime-contract.v1",
     schema_version: "compiled-context.v1",
     document_type: "compiled-context",
@@ -694,27 +773,162 @@ function buildCompiledContext(
     },
     truncations: [],
   };
+}
 
-  let representableDocument: string;
+function compiledDocumentByteLength(
+  requestHash: `sha256:${string}`,
+  authority: EffectiveAgentAuthority,
+  bundle: ResolvedAgentBundle,
+  segmentJsonBytes: number,
+  segmentCount: number,
+  inputBytes: number,
+  untrustedBytes: number,
+): number {
+  let skeletonBytes: number;
   try {
-    representableDocument = canonicalJson(
-      { ...unsigned, document_hash: ZERO_HASH },
-      AGENT_DOCUMENT_LIMITS,
-    );
+    const skeleton = {
+      ...buildHashableContext(
+        requestHash,
+        authority,
+        bundle,
+        Object.freeze([]),
+        inputBytes,
+        untrustedBytes,
+      ),
+      document_hash: ZERO_HASH,
+    };
+    skeletonBytes = Buffer.byteLength(canonicalJson(skeleton, AGENT_DOCUMENT_LIMITS), "utf8");
   } catch {
     return unsupportedError();
   }
-  if (Buffer.byteLength(representableDocument, "utf8") > AGENT_DOCUMENT_LIMITS.maxBytes) {
+  return safeSum(skeletonBytes, segmentJsonBytes, Math.max(0, segmentCount - 1));
+}
+
+function projectedRepresentation(
+  requestHash: `sha256:${string}`,
+  authority: EffectiveAgentAuthority,
+  bundle: ResolvedAgentBundle,
+  state: CompiledRepresentationState,
+  segment: CompiledContextSegmentV1,
+  candidateJsonBytes: number,
+): Readonly<{
+  inputBytes: number;
+  untrustedBytes: number;
+  segmentJsonBytes: number;
+}> {
+  const inputBytes = safeSum(state.inputBytes, segment.included_bytes);
+  const untrustedBytes = safeSum(
+    state.untrustedBytes,
+    segment.trust === "untrusted-content" ? segment.included_bytes : 0,
+  );
+  if (inputBytes > authority.budget.max_input_tokens) {
+    contextError("RUNTIME_CONTEXT_OVERFLOW");
+  }
+  const segmentJsonBytes = safeSum(state.segmentJsonBytes, candidateJsonBytes);
+  const documentBytes = compiledDocumentByteLength(
+    requestHash,
+    authority,
+    bundle,
+    segmentJsonBytes,
+    state.segments.length + 1,
+    inputBytes,
+    untrustedBytes,
+  );
+  if (documentBytes > AGENT_DOCUMENT_LIMITS.maxBytes) unsupportedError();
+  return { inputBytes, untrustedBytes, segmentJsonBytes };
+}
+
+function appendRepresentableSegment(
+  requestHash: `sha256:${string}`,
+  authority: EffectiveAgentAuthority,
+  bundle: ResolvedAgentBundle,
+  state: CompiledRepresentationState,
+  segment: CompiledContextSegmentV1,
+): void {
+  const projected = projectedRepresentation(
+    requestHash,
+    authority,
+    bundle,
+    state,
+    segment,
+    segmentJsonByteLength(segment),
+  );
+  state.inputBytes = projected.inputBytes;
+  state.untrustedBytes = projected.untrustedBytes;
+  state.segmentJsonBytes = projected.segmentJsonBytes;
+  state.segments.push(segment);
+}
+
+function assertRawInputCanFit(
+  requestHash: `sha256:${string}`,
+  authority: EffectiveAgentAuthority,
+  bundle: ResolvedAgentBundle,
+  state: CompiledRepresentationState,
+  requestedReference: ArtifactReference,
+  resolved: ResolvedProjection,
+): void {
+  const minimumContentBytes = resolved.media_type === "text/plain" ? resolved.byte_length : 1;
+  const minimumSegment: InputArtifactSegmentV1 = {
+    segment_id: `ctx-${"0".repeat(64)}`,
+    kind: "input-artifact",
+    trust: "untrusted-content",
+    source: requestedReference,
+    original_hash: requestedReference.hash,
+    included_hash: ZERO_HASH,
+    original_bytes: minimumContentBytes,
+    included_bytes: minimumContentBytes,
+    tokens: minimumContentBytes,
+    content: "",
+  };
+  projectedRepresentation(
+    requestHash,
+    authority,
+    bundle,
+    state,
+    minimumSegment,
+    segmentJsonByteLengthForContent(minimumSegment, minimumContentBytes + 2),
+  );
+}
+
+function buildCompiledContext(
+  requestHash: `sha256:${string}`,
+  authority: EffectiveAgentAuthority,
+  bundle: ResolvedAgentBundle,
+  state: CompiledRepresentationState,
+): CompiledContextV1 {
+  const segments = Object.freeze([...state.segments]);
+  const unsigned = buildHashableContext(
+    requestHash,
+    authority,
+    bundle,
+    segments,
+    state.inputBytes,
+    state.untrustedBytes,
+  );
+
+  if (
+    compiledDocumentByteLength(
+      requestHash,
+      authority,
+      bundle,
+      state.segmentJsonBytes,
+      segments.length,
+      state.inputBytes,
+      state.untrustedBytes,
+    ) > AGENT_DOCUMENT_LIMITS.maxBytes
+  ) {
     unsupportedError();
   }
 
   let document: CompiledContextV1;
+  let encoded: string;
   try {
     document = { ...unsigned, document_hash: hashCompiledContext(unsigned) };
+    encoded = canonicalJson(document, AGENT_DOCUMENT_LIMITS);
   } catch {
     return integrityError();
   }
-  const parsed = parseCompiledContext(canonicalJson(document, AGENT_DOCUMENT_LIMITS));
+  const parsed = parseCompiledContext(encoded);
   if (!parsed.ok) integrityError();
   return parsed.value;
 }
@@ -736,11 +950,27 @@ export async function compileAgentContext(
 
   const task = await resolveExactArtifact(projection, taskReference, true);
   const output = await resolveExactArtifact(projection, outputReference, true);
-  const resolvedInputs: NormalizedArtifact[] = [];
+  const state: CompiledRepresentationState = {
+    segments: [],
+    segmentJsonBytes: 0,
+    inputBytes: 0,
+    untrustedBytes: 0,
+  };
+  for (const segment of buildTrustedSegments(bundle, task, output)) {
+    appendRepresentableSegment(projection.request_hash, authority, bundle, state, segment);
+  }
   for (const { reference } of inputReferences) {
-    resolvedInputs.push(await resolveExactArtifact(projection, reference, false));
+    const resolved = await resolveExactArtifact(projection, reference, false, (artifact) => {
+      assertRawInputCanFit(projection.request_hash, authority, bundle, state, reference, artifact);
+    });
+    appendRepresentableSegment(
+      projection.request_hash,
+      authority,
+      bundle,
+      state,
+      buildInputSegment(resolved),
+    );
   }
 
-  const segments = buildSegments(bundle, task, output, resolvedInputs);
-  return buildCompiledContext(projection.request_hash, authority, bundle, segments);
+  return buildCompiledContext(projection.request_hash, authority, bundle, state);
 }
