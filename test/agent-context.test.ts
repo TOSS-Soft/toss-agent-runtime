@@ -1910,40 +1910,166 @@ describe("provenance-aware agent context compilation", () => {
     expect(accessorError.message).toBe("Context integrity check failed");
   });
 
-  it("does not copy byte elements from a definition-omitted source", async () => {
-    const sourceText = "z".repeat(500_000);
-    const sourceReference = ref("source-text", "SOURCE-OMITTED-NO-COPY", 1, sha256(sourceText));
+  it("snapshots each omitted source before resolving the next without retaining its content", async () => {
+    const firstText = "a".repeat(500_000);
+    const secondText = "b".repeat(500_000);
+    const firstReference = ref("source-text", "SOURCE-OMITTED-A", 1, sha256(firstText));
+    const secondReference = ref("source-text", "SOURCE-OMITTED-B", 1, sha256(secondText));
     const actualFixture = fixture({
-      inputReferences: [sourceReference],
+      inputReferences: [secondReference, firstReference],
       inputPolicies: [{ document_type: "source-text", priority: 10, max_bytes: 0 }],
-      maxUntrustedBytes: 500_000,
+      maxUntrustedBytes: 0,
     });
-    const target = new Uint8Array(Buffer.from(sourceText, "utf8"));
-    let elementReads = 0;
-    const observedBytes = new Proxy(target, {
+    const firstTarget = new Uint8Array(Buffer.from(firstText, "utf8"));
+    let firstElementReads = 0;
+    let readsWhenSecondResolved = -1;
+    const observedFirstBytes = new Proxy(firstTarget, {
       get(value, property) {
         if (property === "byteLength") return value.byteLength;
         if (property === "length") return value.length;
         if (typeof property === "string" && /^[0-9]+$/u.test(property)) {
-          elementReads += 1;
+          firstElementReads += 1;
           return value[Number(property)];
         }
         return undefined;
       },
     });
-    const source = { ...textArtifact(sourceReference, sourceText), bytes: observedBytes };
-
-    const compiled = await compileAgentContext(
-      compileInput(actualFixture, [...trustedArtifacts(actualFixture), source]),
+    const artifacts = [
+      ...trustedArtifacts(actualFixture),
+      { ...textArtifact(firstReference, firstText), bytes: observedFirstBytes },
+      textArtifact(secondReference, secondText),
+    ];
+    const byReference = new Map(
+      artifacts.map((artifact) => [referenceKey(artifact.reference), artifact]),
     );
 
-    expect(elementReads).toBe(0);
-    expect(contentSegment(compiled.segments, sourceReference)).toMatchObject({
+    const compiled = await compileAgentContext({
+      request_hash: canonicalSemanticRequestHash(actualFixture.request),
+      request: actualFixture.request,
+      bundle: actualFixture.bundle,
+      resolver: {
+        resolve(reference) {
+          if (referenceKey(reference) === referenceKey(secondReference)) {
+            readsWhenSecondResolved = firstElementReads;
+          }
+          const artifact = byReference.get(referenceKey(reference));
+          return artifact === undefined
+            ? Promise.reject(new Error("fixture artifact missing"))
+            : Promise.resolve(artifact);
+        },
+      },
+    });
+
+    expect(readsWhenSecondResolved).toBe(500_000);
+    expect(firstElementReads).toBe(500_000);
+    expect(contentSegment(compiled.segments, firstReference)).toMatchObject({
       original_bytes: 500_000,
       included_bytes: 0,
       content: "",
     });
-    expect(compiled.truncations[0]?.reason).toBe("definition-ceiling");
+    expect(contentSegment(compiled.segments, secondReference)).toMatchObject({
+      original_bytes: 500_000,
+      included_bytes: 0,
+      content: "",
+    });
+    expect(canonicalJson(compiled)).not.toContain(firstText);
+    expect(canonicalJson(compiled)).not.toContain(secondText);
+  });
+
+  it("rejects a wrong semantic hash for a fully omitted text source", async () => {
+    const sourceReference = ref("source-text", "SOURCE-OMITTED-HASH", 1, sha256("expected"));
+    const actualFixture = fixture({
+      inputReferences: [sourceReference],
+      inputPolicies: [{ document_type: "source-text", priority: 10, max_bytes: 0 }],
+      maxUntrustedBytes: 0,
+    });
+
+    await expectContextError(
+      compileAgentContext(
+        compileInput(actualFixture, [
+          ...trustedArtifacts(actualFixture),
+          textArtifact(sourceReference, "TAMPERED"),
+        ]),
+      ),
+      "RUNTIME_CONTEXT_REFERENCE_MISMATCH",
+    );
+  });
+
+  it("rejects malformed UTF-8 for a fully omitted text source", async () => {
+    const sourceReference = ref("source-text", "SOURCE-OMITTED-UTF8", 1, sha256("valid"));
+    const actualFixture = fixture({
+      inputReferences: [sourceReference],
+      inputPolicies: [{ document_type: "source-text", priority: 10, max_bytes: 0 }],
+      maxUntrustedBytes: 0,
+    });
+    const malformed = {
+      ...textArtifact(sourceReference, "valid"),
+      bytes: Uint8Array.of(0xc3, 0x28),
+    };
+
+    await expectContextError(
+      compileAgentContext(
+        compileInput(actualFixture, [...trustedArtifacts(actualFixture), malformed]),
+      ),
+      "RUNTIME_CONTEXT_UNSUPPORTED",
+    );
+  });
+
+  it("rejects malformed JSON for a fully omitted JSON source", async () => {
+    const sourceValue = { valid: true };
+    const sourceReference = ref("source-json", "SOURCE-OMITTED-JSON", 1, sha256(sourceValue));
+    const actualFixture = fixture({
+      inputReferences: [sourceReference],
+      inputPolicies: [{ document_type: "source-json", priority: 10, max_bytes: 0 }],
+      maxUntrustedBytes: 0,
+    });
+    const malformed = {
+      ...jsonArtifact(sourceReference, sourceValue, { origin: "repository" }),
+      bytes: Buffer.from('{"valid":', "utf8"),
+    };
+
+    await expectContextError(
+      compileAgentContext(
+        compileInput(actualFixture, [...trustedArtifacts(actualFixture), malformed]),
+      ),
+      "RUNTIME_CONTEXT_REFERENCE_MISMATCH",
+    );
+  });
+
+  it("records canonical original bytes for fully omitted noncanonical JSON", async () => {
+    const sourceValue = { z: 2, a: 1 };
+    const sourceReference = ref(
+      "source-json",
+      "SOURCE-OMITTED-NONCANONICAL",
+      1,
+      sha256(sourceValue),
+    );
+    const actualFixture = fixture({
+      inputReferences: [sourceReference],
+      inputPolicies: [{ document_type: "source-json", priority: 10, max_bytes: 0 }],
+      maxUntrustedBytes: 0,
+    });
+    const source = jsonArtifact(sourceReference, sourceValue, { origin: "repository" });
+    expect(source.bytes.byteLength).toBeGreaterThan(Buffer.byteLength(canonicalJson(sourceValue)));
+
+    const compiled = await compileAgentContext(
+      compileInput(actualFixture, [...trustedArtifacts(actualFixture), source]),
+    );
+    const expectedOriginalBytes = Buffer.byteLength(canonicalJson(sourceValue), "utf8");
+
+    expect(contentSegment(compiled.segments, sourceReference)).toMatchObject({
+      original_bytes: expectedOriginalBytes,
+      included_bytes: 0,
+      content: "",
+    });
+    expect(compiled.truncations).toEqual([
+      {
+        source: sourceReference,
+        reason: "definition-ceiling",
+        original_bytes: expectedOriginalBytes,
+        included_bytes: 0,
+      },
+    ]);
   });
 
   it("keeps an empty source whole at zero definition ceilings", async () => {
