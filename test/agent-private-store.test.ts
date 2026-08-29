@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   chmod,
+  chown,
   link,
   lstat,
   mkdir,
@@ -14,7 +15,7 @@ import {
   truncate,
   writeFile,
 } from "node:fs/promises";
-import { renameSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, lstatSync, renameSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server } from "node:net";
 import path from "node:path";
 
@@ -30,9 +31,50 @@ import {
 
 const roots: string[] = [];
 const servers: Server[] = [];
+const SPECIAL_0600_MODES = [
+  ["sticky", 0o1600],
+  ["setgid", 0o2600],
+  ["setuid", 0o4600],
+] as const;
+const SPECIAL_0700_MODES = [
+  ["sticky", 0o1700],
+  ["setgid", 0o2700],
+  ["setuid", 0o4700],
+] as const;
+const PRIVATE_DIRECTORY_PATHS = [
+  ["state root", "statePath"],
+  ["agents directory", "agentsPath"],
+  ["objects directory", "objectsPath"],
+  ["registry directory", "registryPath"],
+  ["quarantine directory", "quarantinePath"],
+] as const;
 
 function contentHash(bytes: Uint8Array): `sha256:${string}` {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+async function setExactMode(candidate: string, mode: number): Promise<void> {
+  if (
+    (mode & 0o2000) !== 0 &&
+    typeof process.getuid === "function" &&
+    typeof process.getgid === "function"
+  ) {
+    await chown(candidate, process.getuid(), process.getgid());
+  }
+  await chmod(candidate, mode);
+  expect((await lstat(candidate)).mode & 0o7777).toBe(mode);
+}
+
+function setExactModeSync(candidate: string, mode: number): void {
+  if (
+    (mode & 0o2000) !== 0 &&
+    typeof process.getuid === "function" &&
+    typeof process.getgid === "function"
+  ) {
+    chownSync(candidate, process.getuid(), process.getgid());
+  }
+  chmodSync(candidate, mode);
+  expect(lstatSync(candidate).mode & 0o7777).toBe(mode);
 }
 
 async function fixture(): Promise<{ readonly root: string; readonly statePath: string }> {
@@ -139,12 +181,12 @@ describe.sequential("private agent object store", () => {
     ]) {
       const metadata = await lstat(directory);
       expect(metadata.isDirectory()).toBe(true);
-      expect(metadata.mode & 0o777).toBe(0o700);
+      expect(metadata.mode & 0o7777).toBe(0o700);
       if (typeof process.getuid === "function") expect(metadata.uid).toBe(process.getuid());
     }
     const metadata = await lstat(objectPath);
     expect(metadata.isFile()).toBe(true);
-    expect(metadata.mode & 0o777).toBe(0o600);
+    expect(metadata.mode & 0o7777).toBe(0o600);
     expect(metadata.nlink).toBe(1);
     if (typeof process.getuid === "function") expect(metadata.uid).toBe(process.getuid());
     expect(snapshot.bytes).toEqual(bytes);
@@ -164,16 +206,84 @@ describe.sequential("private agent object store", () => {
         const bytes = Buffer.from(`umask-${mask}`, "utf8");
         const store = createPrivateAgentStore(options(statePath));
         await store.publishObject(contentHash(bytes), bytes);
-        expect((await lstat(statePath)).mode & 0o777).toBe(0o700);
-        expect((await lstat(store.objectsPath)).mode & 0o777).toBe(0o700);
+        expect((await lstat(statePath)).mode & 0o7777).toBe(0o700);
+        expect((await lstat(store.objectsPath)).mode & 0o7777).toBe(0o700);
         expect(
-          (await lstat(path.join(store.objectsPath, contentHash(bytes).slice(7)))).mode & 0o777,
+          (await lstat(path.join(store.objectsPath, contentHash(bytes).slice(7)))).mode & 0o7777,
         ).toBe(0o600);
       } finally {
         process.umask(previous);
       }
     }
   });
+
+  describe.each(PRIVATE_DIRECTORY_PATHS)("private %s", (_description, directoryPath) => {
+    it.each(SPECIAL_0700_MODES)("rejects %s special mode bits", async (_name, mode) => {
+      const { statePath } = await fixture();
+      const store = createPrivateAgentStore(options(statePath));
+      await store.ensureRoots();
+      const candidate = store[directoryPath];
+      await setExactMode(candidate, mode);
+
+      await expectAgentError(store.ensureRoots(), "RUNTIME_AGENT_PATH_UNSAFE");
+    });
+  });
+
+  it.each(SPECIAL_0600_MODES)(
+    "rejects an object with %s special mode bits",
+    async (_name, mode) => {
+      const published = await publishedFixture();
+      await setExactMode(published.objectPath, mode);
+
+      await expectAgentError(
+        createPrivateAgentStore(options(published.statePath)).readObject(published.hash),
+        "RUNTIME_AGENT_PATH_UNSAFE",
+      );
+    },
+  );
+
+  it.each(SPECIAL_0600_MODES)("rejects a stage with %s special mode bits", async (_name, mode) => {
+    const { statePath } = await fixture();
+    const bytes = Buffer.from(`special-stage-${mode}`, "utf8");
+    const store = createPrivateAgentStore(
+      options(statePath, {
+        operationHooks: {
+          beforeFileSync: async (stagePath) => {
+            await setExactMode(stagePath, mode);
+          },
+        },
+      }),
+    );
+
+    await expectAgentError(
+      store.publishObject(contentHash(bytes), bytes),
+      "RUNTIME_AGENT_PATH_UNSAFE",
+    );
+  });
+
+  it.each(SPECIAL_0600_MODES)(
+    "rejects a tombstone with %s special mode bits",
+    async (_name, mode) => {
+      const { statePath } = await fixture();
+      const bytes = Buffer.from(`special-tombstone-${mode}`, "utf8");
+      let tombstonePath = "";
+      const operationHooks = {
+        afterTombstoneRename: (kind: string, _candidate: string, tombstone: string) => {
+          if (kind !== "stage") return;
+          tombstonePath = tombstone;
+          setExactModeSync(tombstone, mode);
+        },
+      } as unknown as PrivateAgentStoreOperationHooks;
+      const store = createPrivateAgentStore(options(statePath, { operationHooks }));
+
+      await expectAgentError(
+        store.publishObject(contentHash(bytes), bytes),
+        "RUNTIME_AGENT_PATH_UNSAFE",
+      );
+      expect(tombstonePath).not.toBe("");
+      expect((await lstat(tombstonePath)).mode & 0o7777).toBe(mode);
+    },
+  );
 
   it("replays exact existing bytes without overwriting and rejects changed bytes for the hash", async () => {
     const { statePath } = await fixture();
@@ -613,7 +723,7 @@ describe.sequential("private agent mutation claim", () => {
     const metadata = await lstat(store.mutationClaimPath);
 
     expect(metadata.isFile()).toBe(true);
-    expect(metadata.mode & 0o777).toBe(0o700);
+    expect(metadata.mode & 0o7777).toBe(0o700);
     expect(metadata.nlink).toBe(1);
     if (typeof process.getuid === "function") expect(metadata.uid).toBe(process.getuid());
     expect(claim.ownerPid).toBe(process.pid);
@@ -642,6 +752,22 @@ describe.sequential("private agent mutation claim", () => {
       await expectAgentError(contender.acquireMutationClaim(), "RUNTIME_AGENT_REGISTRY_CORRUPT");
       expect((await lstat(first.mutationClaimPath)).isFile()).toBe(true);
       await held.release();
+    },
+  );
+
+  it.each(SPECIAL_0700_MODES)(
+    "rejects a mutation claim with %s special mode bits",
+    async (_name, mode) => {
+      const { statePath } = await fixture();
+      const store = createPrivateAgentStore(options(statePath));
+      await store.ensureRoots();
+      await writeFile(store.mutationClaimPath, JSON.stringify({ pid: process.pid }), {
+        mode: 0o700,
+      });
+      await setExactMode(store.mutationClaimPath, mode);
+
+      await expectAgentError(store.acquireMutationClaim(), "RUNTIME_AGENT_PATH_UNSAFE");
+      expect((await lstat(store.mutationClaimPath)).mode & 0o7777).toBe(mode);
     },
   );
 

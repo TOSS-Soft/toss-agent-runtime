@@ -184,7 +184,7 @@ function assertPrivateDirectory(
   const mode = Number(metadata.mode & 0o7777n);
   const owned = isCurrentUser(metadata.uid, candidate);
   if (exactPrivate) {
-    if (!owned || (mode & 0o777) !== 0o700) pathUnsafe();
+    if (!owned || mode !== 0o700) pathUnsafe();
     return true;
   }
   if (owned) {
@@ -371,7 +371,7 @@ function assertPrivateFile(
     metadata.isSymbolicLink() ||
     !metadata.isFile() ||
     !isCurrentUser(metadata.uid, candidate) ||
-    Number(metadata.mode & 0o777n) !== mode ||
+    Number(metadata.mode & 0o7777n) !== mode ||
     metadata.nlink !== BigInt(links) ||
     (expected !== undefined && !identitiesMatch(actual, expected))
   ) {
