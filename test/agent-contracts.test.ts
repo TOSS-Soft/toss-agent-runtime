@@ -11,7 +11,7 @@ import {
   parseCompiledContext,
   parsePromptTemplate,
 } from "../src/agents/contracts.js";
-import { sha256 } from "../src/protocol/json.js";
+import { canonicalJson, sha256 } from "../src/protocol/json.js";
 import type { ArtifactReference } from "../src/protocol/types.js";
 import type {
   AgentDefinitionV1,
@@ -25,9 +25,13 @@ import type {
 } from "../src/agents/types.js";
 
 const ZERO_HASH = `sha256:${"0".repeat(64)}` as const;
-const TASK_HASH = `sha256:${"1".repeat(64)}` as const;
+const TASK_VALUE = { authority: "task-contract" } as const;
+const TASK_CONTENT = canonicalJson(TASK_VALUE);
+const TASK_HASH = sha256(TASK_VALUE);
 const MCP_HASH = `sha256:${"2".repeat(64)}` as const;
-const OUTPUT_HASH = `sha256:${"3".repeat(64)}` as const;
+const OUTPUT_VALUE = { type: "object" } as const;
+const OUTPUT_CONTENT = canonicalJson(OUTPUT_VALUE);
+const OUTPUT_HASH = sha256(OUTPUT_VALUE);
 const INPUT_HASH = sha256("untrusted source artifact");
 const TEMPLATE_ID = "template-implementation";
 const AGENT_ID = "agent-implementation";
@@ -203,21 +207,22 @@ function fixtureContext(
         "trusted-control",
         ref("task-contract", TASK_ID, 3, TASK_HASH),
         TASK_HASH,
-        "task contract",
+        TASK_CONTENT,
       ),
       segment(
         "prompt-template",
         "trusted-control",
         ref("prompt-template", TEMPLATE_ID, 1, promptHash),
         promptHash,
-        "prompt template",
+        "Act within the task contract.",
+        "role",
       ),
       segment(
         "output-schema",
         "trusted-control",
         ref("output-schema", OUTPUT_ID, 4, OUTPUT_HASH),
         OUTPUT_HASH,
-        "output schema",
+        OUTPUT_CONTENT,
       ),
       segment(
         "input-artifact",
@@ -227,6 +232,12 @@ function fixtureContext(
         "untrusted source artifact",
       ),
     ],
+    allocation_policy: {
+      definition_max_input_tokens: 8000,
+      truncation: "utf8-prefix.v1",
+      max_untrusted_bytes: 4096,
+      inputs: [{ document_type: "source-artifact", priority: 10, max_bytes: 2048 }],
+    },
     accounting: { input_tokens: 0, input_bytes: 0, untrusted_bytes: 0, remaining_input_tokens: 0 },
     truncations: [],
     document_hash: ZERO_HASH,
@@ -240,19 +251,37 @@ function segment(
   source: ReturnType<typeof ref> | null,
   original_hash: `sha256:${string}`,
   content: string,
+  block_id?: string,
+  original_bytes = Buffer.byteLength(content, "utf8"),
 ): CompiledContextV1["segments"][number] {
   const included_bytes = Buffer.byteLength(content, "utf8");
+  const included_hash =
+    original_bytes === included_bytes &&
+    (kind === "task-contract" || kind === "output-schema" || kind === "input-artifact")
+      ? original_hash
+      : sha256(content);
+  const discriminator =
+    kind === "runtime-safety"
+      ? RUNTIME_POLICY_HASH
+      : kind === "prompt-template"
+        ? block_id
+        : undefined;
+  const preimage =
+    discriminator === undefined
+      ? { kind, source, included_hash }
+      : { kind, source, included_hash, discriminator };
   return {
-    segment_id: `${kind}-segment`,
+    segment_id: `ctx-${sha256(preimage).slice("sha256:".length)}`,
     kind,
     trust,
     source,
     original_hash,
-    included_hash: sha256(content),
-    original_bytes: included_bytes,
+    included_hash,
+    original_bytes,
     included_bytes,
     tokens: included_bytes,
     content,
+    ...(block_id === undefined ? {} : { block_id }),
   } as unknown as CompiledContextV1["segments"][number];
 }
 
@@ -275,6 +304,7 @@ interface ContextSegmentForHash {
   readonly included_bytes: number;
   readonly tokens: number;
   readonly content: string;
+  readonly block_id?: string;
 }
 
 type ContextForHash = Omit<CompiledContextV1, "authority" | "segments"> & {
@@ -285,14 +315,33 @@ type ContextForHash = Omit<CompiledContextV1, "authority" | "segments"> & {
 };
 
 function resignedContext(value: ContextForHash): CompiledContextV1 {
-  const input_tokens = value.segments.reduce((total, item) => total + item.tokens, 0);
-  const input_bytes = value.segments.reduce((total, item) => total + item.included_bytes, 0);
-  const untrusted_bytes = value.segments.reduce(
+  const segments = value.segments.map((item) => {
+    const discriminator =
+      item.kind === "runtime-safety"
+        ? RUNTIME_POLICY_HASH
+        : item.kind === "prompt-template"
+          ? item.block_id
+          : undefined;
+    const preimage =
+      discriminator === undefined
+        ? { kind: item.kind, source: item.source, included_hash: item.included_hash }
+        : {
+            kind: item.kind,
+            source: item.source,
+            included_hash: item.included_hash,
+            discriminator,
+          };
+    return { ...item, segment_id: `ctx-${sha256(preimage).slice("sha256:".length)}` };
+  });
+  const input_tokens = segments.reduce((total, item) => total + item.tokens, 0);
+  const input_bytes = segments.reduce((total, item) => total + item.included_bytes, 0);
+  const untrusted_bytes = segments.reduce(
     (total, item) => total + (item.trust === "untrusted-content" ? item.included_bytes : 0),
     0,
   );
   const unsigned = {
     ...value,
+    segments,
     accounting: {
       input_tokens,
       input_bytes,
@@ -337,17 +386,32 @@ function fixtureTruncatedContext(
   const firstSource = ref("source-artifact", "source-first", 1, sha256(firstOriginal));
   const secondSource = ref("source-artifact", "source-second", 1, sha256(secondOriginal));
   const first = {
-    ...segment("input-artifact", "untrusted-content", firstSource, firstSource.hash, "a"),
+    ...segment(
+      "input-artifact",
+      "untrusted-content",
+      firstSource,
+      firstSource.hash,
+      "a",
+      undefined,
+      Buffer.byteLength(firstOriginal, "utf8"),
+    ),
     segment_id: "input-first-segment",
-    original_bytes: Buffer.byteLength(firstOriginal, "utf8"),
   };
   const second = {
-    ...segment("input-artifact", "untrusted-content", secondSource, secondSource.hash, ""),
+    ...segment(
+      "input-artifact",
+      "untrusted-content",
+      secondSource,
+      secondSource.hash,
+      "",
+      undefined,
+      Buffer.byteLength(secondOriginal, "utf8"),
+    ),
     segment_id: "input-second-segment",
-    original_bytes: Buffer.byteLength(secondOriginal, "utf8"),
   };
   return resignedContext({
     ...context,
+    allocation_policy: { ...context.allocation_policy, max_untrusted_bytes: 1 },
     segments: [
       ...replaceRuntimeContent(context, RUNTIME_SAFETY_TEXT + TRUNCATION_NOTICE_FRAMING).filter(
         (entry) => entry.kind !== "input-artifact",
@@ -358,13 +422,13 @@ function fixtureTruncatedContext(
     truncations: [
       {
         source: firstSource,
-        reason: "input-budget",
+        reason: "definition-ceiling",
         original_bytes: first.original_bytes,
         included_bytes: first.included_bytes,
       },
       {
         source: secondSource,
-        reason: "input-budget",
+        reason: "definition-ceiling",
         original_bytes: second.original_bytes,
         included_bytes: second.included_bytes,
       },
@@ -707,7 +771,7 @@ describe("agent contract documents", () => {
               content: "untrusted",
               included_bytes: 9,
               tokens: 9,
-              original_bytes: 24,
+              original_bytes: entry.original_bytes,
               included_hash: sha256("untrusted"),
             }
           : entry,
@@ -725,6 +789,7 @@ describe("agent contract documents", () => {
     if (input === undefined || input.source === null) throw new Error("input fixture is invalid");
     const shortened = resignedContext({
       ...context,
+      allocation_policy: { ...context.allocation_policy, max_untrusted_bytes: 9 },
       segments: replaceRuntimeContent(context, RUNTIME_SAFETY_TEXT + TRUNCATION_NOTICE_FRAMING).map(
         (entry) =>
           entry.kind === "input-artifact"
@@ -733,7 +798,7 @@ describe("agent contract documents", () => {
                 content: "untrusted",
                 included_bytes: 9,
                 tokens: 9,
-                original_bytes: 24,
+                original_bytes: entry.original_bytes,
                 included_hash: sha256("untrusted"),
               }
             : entry,
@@ -741,8 +806,8 @@ describe("agent contract documents", () => {
       truncations: [
         {
           source: input.source,
-          reason: "input-budget",
-          original_bytes: 24,
+          reason: "definition-ceiling",
+          original_bytes: input.original_bytes,
           included_bytes: 9,
         },
       ],
@@ -756,8 +821,8 @@ describe("agent contract documents", () => {
       truncations: [
         {
           source: ref("source-artifact", "unrelated-source", 1, INPUT_HASH),
-          reason: "input-budget",
-          original_bytes: 24,
+          reason: "definition-ceiling",
+          original_bytes: input.original_bytes,
           included_bytes: 9,
         },
       ],

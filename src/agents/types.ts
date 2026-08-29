@@ -135,6 +135,7 @@ export interface PromptTemplateSegmentV1 extends CompiledContextSegmentBaseV1 {
   readonly kind: "prompt-template";
   readonly trust: "trusted-control";
   readonly source: PromptTemplateReference;
+  readonly block_id: string;
 }
 
 export interface OutputSchemaSegmentV1 extends CompiledContextSegmentBaseV1 {
@@ -171,6 +172,13 @@ export interface CompiledContextAccountingV1 {
   readonly remaining_input_tokens: number;
 }
 
+export interface CompiledContextAllocationPolicyV1 {
+  readonly definition_max_input_tokens: number;
+  readonly truncation: "utf8-prefix.v1";
+  readonly max_untrusted_bytes: number;
+  readonly inputs: readonly ContextInputPolicyV1[];
+}
+
 export interface ContextTruncationV1 {
   readonly source: ArtifactReference;
   readonly reason: "input-budget" | "definition-ceiling";
@@ -189,6 +197,7 @@ export interface HashableCompiledContextV1 extends RuntimeDocument {
   readonly output_schema: OutputSchemaReference;
   readonly authority: CompiledContextAuthorityV1;
   readonly runtime_policy: Readonly<{ revision: number; hash: `sha256:${string}` }>;
+  readonly allocation_policy: CompiledContextAllocationPolicyV1;
   readonly segments: readonly CompiledContextSegmentV1[];
   readonly accounting: CompiledContextAccountingV1;
   readonly truncations: readonly ContextTruncationV1[];

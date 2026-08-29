@@ -288,7 +288,7 @@ describe("published protocol artifacts", () => {
         "sha256:3c13d4027e25aa78a1df9a042b78635ed8c212a4838b500d07b47e25837f1a58",
       );
       expect(context.value.document_hash).toBe(
-        "sha256:b37ad6d2e9b6447129707442c7b4a8f9ce491ad71e41a9464059e5c9e59cfde5",
+        "sha256:cf59f980a71a31958daf9d386c5d26b6536d87de3e87aead121c4c8e9f22b5ef",
       );
       expect(definition.value.prompt_template).toEqual(promptReference);
       expect(registryEntry.value.definition).toEqual(definitionReference);

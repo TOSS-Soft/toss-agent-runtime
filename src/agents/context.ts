@@ -15,6 +15,7 @@ import { matchAgentAuthority, type EffectiveAgentAuthority } from "./authority.j
 import {
   AGENT_DOCUMENT_LIMITS,
   COMPILED_CONTEXT_RUNTIME_POLICY_V1,
+  compiledContextSegmentId,
   hashCompiledContext,
   parseAgentDefinition,
   parseCompiledContext,
@@ -368,6 +369,17 @@ function compareSortedInputs(left: SortedInputReference, right: SortedInputRefer
   );
 }
 
+function compareContextPolicies(
+  left: AgentDefinitionV1["context_policy"]["inputs"][number],
+  right: AgentDefinitionV1["context_policy"]["inputs"][number],
+): number {
+  return (
+    compareSafeIntegers(left.priority, right.priority) ||
+    bytewiseCompare(left.document_type, right.document_type) ||
+    compareSafeIntegers(left.max_bytes, right.max_bytes)
+  );
+}
+
 function validatedBundle(bundle: ResolvedAgentBundle): ResolvedAgentBundle {
   let definitionResult: ReturnType<typeof parseAgentDefinition>;
   let promptResult: ReturnType<typeof parsePromptTemplate>;
@@ -555,32 +567,18 @@ async function resolveExactArtifact(
   });
 }
 
-function segmentId(
-  kind: CompiledContextSegmentV1["kind"],
-  source: ArtifactReference | null,
-  includedHash: `sha256:${string}`,
-  discriminator?: string,
-): string {
-  const hash = sha256(
-    discriminator === undefined
-      ? { kind, source, included_hash: includedHash }
-      : { kind, source, included_hash: includedHash, discriminator },
-    AGENT_DOCUMENT_LIMITS,
-  );
-  return `ctx-${hash.slice("sha256:".length)}`;
-}
-
 function segmentBase(
   kind: CompiledContextSegmentV1["kind"],
   source: ArtifactReference | null,
   originalHash: `sha256:${string}`,
   content: string,
   discriminator?: string,
+  fullSourceHash?: `sha256:${string}`,
 ) {
-  const includedHash = sha256(content, AGENT_DOCUMENT_LIMITS);
+  const includedHash = fullSourceHash ?? sha256(content, AGENT_DOCUMENT_LIMITS);
   const includedBytes = Buffer.byteLength(content, "utf8");
   return {
-    segment_id: segmentId(kind, source, includedHash, discriminator),
+    segment_id: compiledContextSegmentId(kind, source, includedHash, discriminator),
     original_hash: originalHash,
     included_hash: includedHash,
     original_bytes: includedBytes,
@@ -617,7 +615,14 @@ function buildTrustedSegments(
       source: noticePolicy.target.source,
     },
     {
-      ...segmentBase("task-contract", task.reference, task.reference.hash, task.content),
+      ...segmentBase(
+        "task-contract",
+        task.reference,
+        task.reference.hash,
+        task.content,
+        undefined,
+        task.reference.hash,
+      ),
       kind: "task-contract",
       trust: "trusted-control",
       source: task.reference as TaskContractReference,
@@ -635,10 +640,18 @@ function buildTrustedSegments(
       kind: "prompt-template",
       trust: "trusted-control",
       source: promptReference,
+      block_id: block.block_id,
     });
   }
   segments.push({
-    ...segmentBase("output-schema", output.reference, output.reference.hash, output.content),
+    ...segmentBase(
+      "output-schema",
+      output.reference,
+      output.reference.hash,
+      output.content,
+      undefined,
+      output.reference.hash,
+    ),
     kind: "output-schema",
     trust: "trusted-control",
     source: output.reference as OutputSchemaReference,
@@ -650,8 +663,16 @@ function buildInputSegment(
   input: NormalizedArtifact,
   includedContent = input.content,
 ): InputArtifactSegmentV1 {
+  const includedBytes = Buffer.byteLength(includedContent, "utf8");
   return {
-    ...segmentBase("input-artifact", input.reference, input.reference.hash, includedContent),
+    ...segmentBase(
+      "input-artifact",
+      input.reference,
+      input.reference.hash,
+      includedContent,
+      undefined,
+      includedBytes === input.original_bytes ? input.reference.hash : undefined,
+    ),
     kind: "input-artifact",
     trust: "untrusted-content",
     source: input.reference,
@@ -775,6 +796,18 @@ function buildHashableContext(
     runtime_policy: {
       revision: COMPILED_CONTEXT_RUNTIME_POLICY_V1.reference.revision,
       hash: COMPILED_CONTEXT_RUNTIME_POLICY_V1.reference.hash,
+    },
+    allocation_policy: {
+      definition_max_input_tokens: bundle.definition.budget_ceiling.max_input_tokens,
+      truncation: bundle.definition.context_policy.truncation,
+      max_untrusted_bytes: bundle.definition.context_policy.max_untrusted_bytes,
+      inputs: [...bundle.definition.context_policy.inputs]
+        .sort(compareContextPolicies)
+        .map((policy) => ({
+          document_type: policy.document_type,
+          priority: policy.priority,
+          max_bytes: policy.max_bytes,
+        })),
     },
     segments,
     accounting: {

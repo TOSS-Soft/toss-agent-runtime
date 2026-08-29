@@ -54,6 +54,7 @@ function segment(
   kind: string,
   trust: string,
   source: typeof TASK_REFERENCE | typeof PROMPT_REFERENCE | typeof OUTPUT_REFERENCE | null,
+  blockId?: string,
 ) {
   return {
     segment_id,
@@ -66,6 +67,7 @@ function segment(
     included_bytes: 1,
     tokens: 1,
     content: "x",
+    ...(blockId === undefined ? {} : { block_id: blockId }),
   };
 }
 
@@ -140,10 +142,16 @@ const AGENT_SCHEMA_DOCUMENTS = [
       budget: BUDGET,
     },
     runtime_policy: { revision: 1, hash: ZERO_HASH },
+    allocation_policy: {
+      definition_max_input_tokens: 1000,
+      truncation: "utf8-prefix.v1",
+      max_untrusted_bytes: 256,
+      inputs: [{ document_type: "source-artifact", priority: 1, max_bytes: 256 }],
+    },
     segments: [
       segment("runtime-safety", "runtime-safety", "trusted-runtime", null),
       segment("task-contract", "task-contract", "trusted-control", TASK_REFERENCE),
-      segment("prompt-template", "prompt-template", "trusted-control", PROMPT_REFERENCE),
+      segment("prompt-template", "prompt-template", "trusted-control", PROMPT_REFERENCE, "role"),
       segment("output-schema", "output-schema", "trusted-control", OUTPUT_REFERENCE),
     ],
     accounting: {

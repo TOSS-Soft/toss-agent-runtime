@@ -20,6 +20,7 @@ import type {
   AgentDefinitionV1,
   AgentRegistryEntryV1,
   CompiledContextV1,
+  ContextTruncationV1,
   HashableAgentDefinitionV1,
   HashableAgentRegistryEntryV1,
   HashableCompiledContextV1,
@@ -341,6 +342,82 @@ function exactReference(
   return artifactKey(left) === artifactKey(right);
 }
 
+export function compiledContextSegmentId(
+  kind: CompiledContextV1["segments"][number]["kind"],
+  source: CompiledContextV1["segments"][number]["source"],
+  includedHash: `sha256:${string}`,
+  discriminator?: string,
+): string {
+  const hash = sha256(
+    discriminator === undefined
+      ? { kind, source, included_hash: includedHash }
+      : { kind, source, included_hash: includedHash, discriminator },
+    AGENT_DOCUMENT_LIMITS,
+  );
+  return `ctx-${hash.slice("sha256:".length)}`;
+}
+
+function compareSafeIntegers(left: number, right: number): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function compareContextPolicies(
+  left: CompiledContextV1["allocation_policy"]["inputs"][number],
+  right: CompiledContextV1["allocation_policy"]["inputs"][number],
+): number {
+  return (
+    compareSafeIntegers(left.priority, right.priority) ||
+    bytewiseCompare(left.document_type, right.document_type) ||
+    compareSafeIntegers(left.max_bytes, right.max_bytes)
+  );
+}
+
+function compareInputSegments(
+  left: Extract<CompiledContextV1["segments"][number], { readonly kind: "input-artifact" }>,
+  right: Extract<CompiledContextV1["segments"][number], { readonly kind: "input-artifact" }>,
+  policies: ReadonlyMap<string, CompiledContextV1["allocation_policy"]["inputs"][number]>,
+): number {
+  const leftPolicy = policies.get(left.source.document_type);
+  const rightPolicy = policies.get(right.source.document_type);
+  if (leftPolicy === undefined || rightPolicy === undefined) return 0;
+  return (
+    compareSafeIntegers(leftPolicy.priority, rightPolicy.priority) ||
+    bytewiseCompare(left.source.document_type, right.source.document_type) ||
+    bytewiseCompare(left.source.artifact_id, right.source.artifact_id) ||
+    compareSafeIntegers(left.source.revision, right.source.revision) ||
+    bytewiseCompare(left.source.hash, right.source.hash)
+  );
+}
+
+function canonicalJsonContentHash(content: string): `sha256:${string}` | undefined {
+  try {
+    const parsed = parseJsonBytes(content, AGENT_DOCUMENT_LIMITS);
+    if (canonicalJson(parsed, AGENT_DOCUMENT_LIMITS) !== content) return undefined;
+    return sha256(parsed, AGENT_DOCUMENT_LIMITS);
+  } catch {
+    return undefined;
+  }
+}
+
+function directSourceContentMatches(
+  segment: Extract<
+    CompiledContextV1["segments"][number],
+    { readonly kind: "task-contract" | "output-schema" | "input-artifact" }
+  >,
+): boolean {
+  if (segment.kind === "task-contract" || segment.kind === "output-schema") {
+    return canonicalJsonContentHash(segment.content) === segment.included_hash;
+  }
+  return (
+    sha256(segment.content, AGENT_DOCUMENT_LIMITS) === segment.included_hash ||
+    canonicalJsonContentHash(segment.content) === segment.included_hash
+  );
+}
+
+function remaining(ceiling: number, used: number): number {
+  return used >= ceiling ? 0 : ceiling - used;
+}
+
 function validateContextSemantics(value: CompiledContextV1): readonly ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   const segmentIds = value.segments.map((segment) => segment.segment_id);
@@ -366,6 +443,59 @@ function validateContextSemantics(value: CompiledContextV1): readonly Validation
       issue("/authority/mcp_profile/document_type", "const", "MCP profile must be exact"),
     );
   }
+
+  const allocationPolicies = value.allocation_policy.inputs;
+  const policyDocumentTypes = new Set<string>();
+  const policyPriorities = new Set<number>();
+  for (const [index, policy] of allocationPolicies.entries()) {
+    if (policyDocumentTypes.has(policy.document_type)) {
+      issues.push(
+        issue(
+          `/allocation_policy/inputs/${index}/document_type`,
+          "uniqueDocumentType",
+          "allocation policy document types must be unique",
+        ),
+      );
+    }
+    if (policyPriorities.has(policy.priority)) {
+      issues.push(
+        issue(
+          `/allocation_policy/inputs/${index}/priority`,
+          "uniquePriority",
+          "allocation policy priorities must be unique",
+        ),
+      );
+    }
+    if (index > 0 && compareContextPolicies(allocationPolicies[index - 1]!, policy) >= 0) {
+      issues.push(
+        issue(
+          "/allocation_policy/inputs",
+          "order",
+          "allocation policies must be in canonical producer order",
+        ),
+      );
+    }
+    policyDocumentTypes.add(policy.document_type);
+    policyPriorities.add(policy.priority);
+  }
+  if (
+    value.authority.budget.max_input_tokens > value.allocation_policy.definition_max_input_tokens
+  ) {
+    issues.push(
+      issue(
+        "/allocation_policy/definition_max_input_tokens",
+        "authority",
+        "request input ceiling must not exceed the definition ceiling",
+      ),
+    );
+  }
+  const policyByDocumentType = new Map(
+    allocationPolicies.map((policy) => [policy.document_type, policy]),
+  );
+  const effectiveInputCeiling = Math.min(
+    value.authority.budget.max_input_tokens,
+    value.allocation_policy.definition_max_input_tokens,
+  );
 
   const noticePolicy = COMPILED_CONTEXT_RUNTIME_POLICY_V1.truncation_notice;
   const runtime = value.segments[noticePolicy.target.segment_index];
@@ -412,15 +542,62 @@ function validateContextSemantics(value: CompiledContextV1): readonly Validation
     issues.push(issue("/segments", "precedence", "only input artifacts may follow output schema"));
   }
 
+  const promptSegments = value.segments
+    .slice(2, promptEnd)
+    .filter(
+      (
+        segment,
+      ): segment is Extract<
+        CompiledContextV1["segments"][number],
+        { readonly kind: "prompt-template" }
+      > => segment.kind === "prompt-template",
+    );
+  const promptBlockIds = promptSegments.map((segment) => segment.block_id);
+  if (new Set(promptBlockIds).size !== promptBlockIds.length) {
+    issues.push(
+      issue("/segments", "uniquePromptBlock", "prompt template block IDs must be unique"),
+    );
+  }
+  try {
+    const promptProjection: HashablePromptTemplateV1 = {
+      protocol_version: "runtime-contract.v1",
+      schema_version: "prompt-template.v1",
+      document_type: "prompt-template",
+      template_id: value.prompt_template.artifact_id,
+      revision: value.prompt_template.revision,
+      instruction_blocks: promptSegments.map((segment) => ({
+        block_id: segment.block_id,
+        content: segment.content,
+      })),
+    };
+    if (hashPromptTemplate(promptProjection) !== value.prompt_template.hash) {
+      issues.push(
+        issue(
+          "/segments",
+          "promptTemplateHash",
+          "ordered prompt blocks must reconstruct the exact prompt template",
+        ),
+      );
+    }
+  } catch {
+    issues.push(issue("/segments", "promptTemplateHash", "prompt template projection is invalid"));
+  }
+
   let inputTokens = 0;
   let inputBytes = 0;
   let untrustedBytes = 0;
-  const shortenedInputs = new Map<
-    string,
-    { readonly original_bytes: number; readonly included_bytes: number }
-  >();
+  const shortenedInputs: {
+    readonly segment: Extract<
+      CompiledContextV1["segments"][number],
+      { readonly kind: "input-artifact" }
+    >;
+    readonly reason: ContextTruncationV1["reason"];
+  }[] = [];
   const inputSources = new Set<string>();
   let firstShortenedInputIndex: number | undefined;
+  let stopReason: ContextTruncationV1["reason"] | undefined;
+  let previousInput:
+    Extract<CompiledContextV1["segments"][number], { readonly kind: "input-artifact" }> | undefined;
   for (const [index, segment] of value.segments.entries()) {
     const bytes = Buffer.byteLength(segment.content, "utf8");
     if (segment.included_bytes !== bytes || segment.original_bytes < segment.included_bytes) {
@@ -429,16 +606,6 @@ function validateContextSemantics(value: CompiledContextV1): readonly Validation
     if (segment.tokens !== segment.included_bytes) {
       issues.push(
         issue(`/segments/${index}/tokens`, "tokenCount", "tokens must equal included bytes"),
-      );
-    }
-    const expectedIncludedHash = sha256(segment.content, AGENT_DOCUMENT_LIMITS);
-    if (segment.included_hash !== expectedIncludedHash) {
-      issues.push(
-        issue(
-          `/segments/${index}/included_hash`,
-          "contentHash",
-          "included hash must match content",
-        ),
       );
     }
     if (segment.source === null) {
@@ -479,6 +646,57 @@ function validateContextSemantics(value: CompiledContextV1): readonly Validation
         issue(`/segments/${index}`, "truncation", "trusted segments must not be truncated"),
       );
     }
+    const unshortenedDirectSource =
+      (segment.kind === "task-contract" ||
+        segment.kind === "output-schema" ||
+        segment.kind === "input-artifact") &&
+      segment.original_bytes === segment.included_bytes;
+    if (unshortenedDirectSource) {
+      if (segment.original_hash !== segment.included_hash) {
+        issues.push(
+          issue(
+            `/segments/${index}/included_hash`,
+            "sourceContentHash",
+            "unshortened direct-source content must retain the exact source hash",
+          ),
+        );
+      }
+      if (!directSourceContentMatches(segment)) {
+        issues.push(
+          issue(
+            `/segments/${index}/included_hash`,
+            "contentHash",
+            "direct-source hash must match canonical JSON or UTF-8 text content",
+          ),
+        );
+      }
+    } else if (segment.included_hash !== sha256(segment.content, AGENT_DOCUMENT_LIMITS)) {
+      issues.push(
+        issue(
+          `/segments/${index}/included_hash`,
+          "contentHash",
+          "included hash must match content",
+        ),
+      );
+    }
+    const discriminator =
+      segment.kind === "runtime-safety"
+        ? COMPILED_CONTEXT_RUNTIME_POLICY_V1.reference.hash
+        : segment.kind === "prompt-template"
+          ? segment.block_id
+          : undefined;
+    if (
+      segment.segment_id !==
+      compiledContextSegmentId(segment.kind, segment.source, segment.included_hash, discriminator)
+    ) {
+      issues.push(
+        issue(
+          `/segments/${index}/segment_id`,
+          "segmentId",
+          "segment ID must match the canonical producer preimage",
+        ),
+      );
+    }
     if (segment.kind === "input-artifact") {
       const sourceKey = artifactKey(segment.source);
       if (inputSources.has(sourceKey)) {
@@ -487,6 +705,25 @@ function validateContextSemantics(value: CompiledContextV1): readonly Validation
         );
       }
       inputSources.add(sourceKey);
+      const policy = policyByDocumentType.get(segment.source.document_type);
+      if (policy === undefined) {
+        issues.push(
+          issue(
+            `/segments/${index}/source/document_type`,
+            "allocationPolicy",
+            "input source requires an exact allocation policy",
+          ),
+        );
+      }
+      if (
+        previousInput !== undefined &&
+        compareInputSegments(previousInput, segment, policyByDocumentType) >= 0
+      ) {
+        issues.push(
+          issue("/segments", "inputOrder", "input artifacts must be in canonical producer order"),
+        );
+      }
+      previousInput = segment;
       if (
         firstShortenedInputIndex !== undefined &&
         index > firstShortenedInputIndex &&
@@ -502,33 +739,80 @@ function validateContextSemantics(value: CompiledContextV1): readonly Validation
       }
       if (segment.original_bytes > segment.included_bytes) {
         firstShortenedInputIndex ??= index;
-        shortenedInputs.set(sourceKey, {
-          original_bytes: segment.original_bytes,
-          included_bytes: segment.included_bytes,
-        });
+        if (policy !== undefined) {
+          if (stopReason === undefined) {
+            const requestAllowance = remaining(effectiveInputCeiling, inputBytes);
+            const definitionAllowance = Math.min(
+              policy.max_bytes,
+              remaining(value.allocation_policy.max_untrusted_bytes, untrustedBytes),
+            );
+            const allowed = Math.min(requestAllowance, definitionAllowance);
+            if (
+              allowed >= segment.original_bytes ||
+              segment.included_bytes > allowed ||
+              allowed - segment.included_bytes > 3
+            ) {
+              issues.push(
+                issue(
+                  `/segments/${index}`,
+                  "allocation",
+                  "shortened input must consume the exact UTF-8-safe producer allowance",
+                ),
+              );
+            }
+            stopReason =
+              definitionAllowance <= requestAllowance ? "definition-ceiling" : "input-budget";
+          } else if (segment.included_bytes !== 0 || segment.content !== "") {
+            issues.push(
+              issue(
+                `/segments/${index}`,
+                "allocation",
+                "every input after the producer cut must be fully omitted",
+              ),
+            );
+          }
+          shortenedInputs.push({ segment, reason: stopReason });
+        }
+      } else if (policy !== undefined) {
+        const requestAllowance = remaining(effectiveInputCeiling, inputBytes);
+        const definitionAllowance = Math.min(
+          policy.max_bytes,
+          remaining(value.allocation_policy.max_untrusted_bytes, untrustedBytes),
+        );
+        if (segment.original_bytes > Math.min(requestAllowance, definitionAllowance)) {
+          issues.push(
+            issue(
+              `/segments/${index}`,
+              "allocation",
+              "unshortened input exceeds the producer allowance",
+            ),
+          );
+        }
       }
     }
     inputTokens += segment.tokens;
     inputBytes += segment.included_bytes;
     if (segment.trust === "untrusted-content") untrustedBytes += segment.included_bytes;
   }
-  const truncationSources = new Set<string>();
   for (const [index, truncation] of value.truncations.entries()) {
-    const sourceKey = artifactKey(truncation.source);
-    const shortened = shortenedInputs.get(sourceKey);
+    const shortened = shortenedInputs[index];
     if (
       shortened === undefined ||
-      truncationSources.has(sourceKey) ||
-      truncation.original_bytes !== shortened.original_bytes ||
-      truncation.included_bytes !== shortened.included_bytes
+      !exactReference(truncation.source, shortened.segment.source) ||
+      truncation.original_bytes !== shortened.segment.original_bytes ||
+      truncation.included_bytes !== shortened.segment.included_bytes ||
+      truncation.reason !== shortened.reason
     ) {
       issues.push(
-        issue(`/truncations/${index}`, "truncation", "truncation must bind one shortened input"),
+        issue(
+          `/truncations/${index}`,
+          "truncation",
+          "truncation must bind the canonical shortened suffix and stop reason",
+        ),
       );
     }
-    truncationSources.add(sourceKey);
   }
-  if (truncationSources.size !== shortenedInputs.size) {
+  if (value.truncations.length !== shortenedInputs.length) {
     issues.push(issue("/truncations", "truncation", "every shortened input requires one record"));
   }
   if (

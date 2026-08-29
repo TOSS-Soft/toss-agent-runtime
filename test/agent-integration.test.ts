@@ -55,9 +55,9 @@ const REVISION_V1_PROMPT_SEGMENT_ID =
 const REVISION_V2_PROMPT_SEGMENT_ID =
   "ctx-7f304e33dfa51618a8700261d9ee2e3ae1a6fcf01c147d5b310da9f2dc5eea99";
 const REVISION_V1_DOCUMENT_HASH =
-  "sha256:b37ad6d2e9b6447129707442c7b4a8f9ce491ad71e41a9464059e5c9e59cfde5";
+  "sha256:cf59f980a71a31958daf9d386c5d26b6536d87de3e87aead121c4c8e9f22b5ef";
 const REVISION_V2_DOCUMENT_HASH =
-  "sha256:2d8cad70e21b74068c97101adc5a02aff8f80c10c64a9fb4f9cd3f2ad97a7920";
+  "sha256:cd477730808050aca5ffaca6fe89f7ea2ed4ffac23218eb02a3dffcfa546fcfe";
 const SOURCE_ONE_HASH = "sha256:b73e73471433d1c2262f913cbc7eef547cfe3bd191fbb5f1a90382bd2f611863";
 const SOURCE_TWO_HASH = "sha256:d1051d2b34615a0756d304a9e0744f9021c59196c446795503210321d172bd3c";
 const TASK_REFERENCE_HASH =
@@ -85,13 +85,13 @@ const REVIEWER_MCP_HASH = "sha256:3f3c6a1992ac7deb29d5844689992ced5b3630b2a4a614
 const MALICIOUS_SOURCE_HASH =
   "sha256:a7f12d3bf189f57944065710921ff5eed28e17ebd17c11ea86e27ac2ee6247d9";
 const WORKER_PRISTINE_DOCUMENT_HASH =
-  "sha256:c227510e7887e30c6b9446fc1e9549b3533481f33d0f57fe5c57fc6854fa16c9";
+  "sha256:e52fc9349f65c27ac1426e71468aabb13d7c43f3b2fa431e95582833ad3815ad";
 const REVIEWER_PRISTINE_DOCUMENT_HASH =
-  "sha256:4eb8bb0a163f7f5953cb35c95b831c7235e6d718f2c854a5479f1092cf063437";
+  "sha256:f484d54b0b6c78e75141bae581b6eeb8b9ac8d375f527ade892dd1c9f954bdd2";
 const WORKER_MALICIOUS_DOCUMENT_HASH =
-  "sha256:d4816330f9e0cb6fdd4a71a907fd3cc5040d8d455260b594b760f3f939d8c69f";
+  "sha256:1f2d69c963f2757907a8b4b81a56a0c34cf077e3ad8a9ffea3e923bc6d3ac36e";
 const REVIEWER_MALICIOUS_DOCUMENT_HASH =
-  "sha256:43f102648952f9a85e4a288344975fa130d856ae2cd3cef02e1892de0e89431a";
+  "sha256:218e6792e4356a4c7648f36332711b72e945c225c0f64fc22c76e92afc82390e";
 const temporaryRoots: string[] = [];
 
 type ArtifactFixture = Omit<ResolvedContextArtifact, "bytes"> & {
@@ -534,6 +534,7 @@ describe("agent revision and context integration", () => {
       hash: REVISION_V2_TEMPLATE_HASH,
     });
     expect(promptSegment(firstV1)).toEqual({
+      block_id: "role",
       segment_id: REVISION_V1_PROMPT_SEGMENT_ID,
       kind: "prompt-template",
       trust: "trusted-control",
@@ -551,6 +552,7 @@ describe("agent revision and context integration", () => {
       content: "Role prompt version one.",
     });
     expect(promptSegment(firstV2)).toEqual({
+      block_id: "role",
       segment_id: REVISION_V2_PROMPT_SEGMENT_ID,
       kind: "prompt-template",
       trust: "trusted-control",
@@ -599,8 +601,10 @@ describe("agent revision and context integration", () => {
     expect(firstV2.segments.filter((segment) => segment.kind === "input-artifact")).toEqual(
       expectedInputSegments,
     );
-    expect(firstV1.document_hash).toBe(REVISION_V1_DOCUMENT_HASH);
-    expect(firstV2.document_hash).toBe(REVISION_V2_DOCUMENT_HASH);
+    expect([firstV1.document_hash, firstV2.document_hash]).toEqual([
+      REVISION_V1_DOCUMENT_HASH,
+      REVISION_V2_DOCUMENT_HASH,
+    ]);
     expect(firstV2.accounting).toEqual(firstV1.accounting);
     expect(firstV2.authority).toEqual(firstV1.authority);
     expect(normalizedRevisionContext(firstV2)).toEqual(normalizedRevisionContext(firstV1));
@@ -892,6 +896,7 @@ describe("agent revision and context integration", () => {
       reviewerPristine.segments.filter((segment) => segment.kind !== "prompt-template"),
     );
     expect(promptSegment(workerContext)).toEqual({
+      block_id: "role",
       segment_id: WORKER_PROMPT_SEGMENT_ID,
       kind: "prompt-template",
       trust: "trusted-control",
@@ -909,6 +914,7 @@ describe("agent revision and context integration", () => {
       content: "Implement within the Task Contract.",
     });
     expect(promptSegment(reviewerContext)).toEqual({
+      block_id: "role",
       segment_id: REVIEWER_PROMPT_SEGMENT_ID,
       kind: "prompt-template",
       trust: "trusted-control",
@@ -925,10 +931,17 @@ describe("agent revision and context integration", () => {
       tokens: 39,
       content: "Review independently; do not implement.",
     });
-    expect(workerPristine.document_hash).toBe(WORKER_PRISTINE_DOCUMENT_HASH);
-    expect(reviewerPristine.document_hash).toBe(REVIEWER_PRISTINE_DOCUMENT_HASH);
-    expect(workerContext.document_hash).toBe(WORKER_MALICIOUS_DOCUMENT_HASH);
-    expect(reviewerContext.document_hash).toBe(REVIEWER_MALICIOUS_DOCUMENT_HASH);
+    expect([
+      workerPristine.document_hash,
+      reviewerPristine.document_hash,
+      workerContext.document_hash,
+      reviewerContext.document_hash,
+    ]).toEqual([
+      WORKER_PRISTINE_DOCUMENT_HASH,
+      REVIEWER_PRISTINE_DOCUMENT_HASH,
+      WORKER_MALICIOUS_DOCUMENT_HASH,
+      REVIEWER_MALICIOUS_DOCUMENT_HASH,
+    ]);
     expect(workerPristine.document_hash).not.toBe(reviewerPristine.document_hash);
     expect(workerContext.document_hash).not.toBe(reviewerContext.document_hash);
     expect(reviewerUntrusted).toEqual(workerUntrusted);

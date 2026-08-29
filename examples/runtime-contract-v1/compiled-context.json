@@ -5,6 +5,18 @@
     "remaining_input_tokens": 23017,
     "untrusted_bytes": 66
   },
+  "allocation_policy": {
+    "definition_max_input_tokens": 32000,
+    "inputs": [
+      {
+        "document_type": "source-artifact",
+        "max_bytes": 8192,
+        "priority": 10
+      }
+    ],
+    "max_untrusted_bytes": 8192,
+    "truncation": "utf8-prefix.v1"
+  },
   "authority": {
     "budget": {
       "max_cost_microusd": 400000,
@@ -29,7 +41,7 @@
     "hash": "sha256:dcbb6bf855f06ab5e183773287e71565b26305bfdf646649a3fec92be1854f7c",
     "revision": 1
   },
-  "document_hash": "sha256:b37ad6d2e9b6447129707442c7b4a8f9ce491ad71e41a9464059e5c9e59cfde5",
+  "document_hash": "sha256:cf59f980a71a31958daf9d386c5d26b6536d87de3e87aead121c4c8e9f22b5ef",
   "document_type": "compiled-context",
   "output_schema": {
     "artifact_id": "OUTPUT-INTEGRATION",
@@ -66,11 +78,11 @@
     {
       "content": "{\"document_type\":\"task-contract\",\"objective\":\"Perform only the assigned integration task.\",\"protocol_version\":\"runtime-contract.v1\",\"revision\":1,\"schema_version\":\"task-contract.v1\",\"task_id\":\"TASK-INTEGRATION\"}",
       "included_bytes": 210,
-      "included_hash": "sha256:88e113129ca9b37ef257fc2ad1da306b7e1e2aed7596b66f730d206142f650db",
+      "included_hash": "sha256:dd88cb1dd66adcfa4263af92b28a92501d4c3cf9118bb0fabccb1e4e751029ff",
       "kind": "task-contract",
       "original_bytes": 210,
       "original_hash": "sha256:dd88cb1dd66adcfa4263af92b28a92501d4c3cf9118bb0fabccb1e4e751029ff",
-      "segment_id": "ctx-b6f931edaef8f59cc61ab472d19abaa4ce968196e877914786759a88d23262b3",
+      "segment_id": "ctx-d5e3e9d61f5c221157103e9f90645df3b5792b11ed5b0ff8c915941fd48f4443",
       "source": {
         "artifact_id": "TASK-INTEGRATION",
         "document_type": "task-contract",
@@ -81,6 +93,7 @@
       "trust": "trusted-control"
     },
     {
+      "block_id": "role",
       "content": "Role prompt version one.",
       "included_bytes": 24,
       "included_hash": "sha256:44267af2b2d4bb3055149676a3c5f9a998a39aca39789a8dc1f4447a8ada15a3",
@@ -100,11 +113,11 @@
     {
       "content": "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"additionalProperties\":false,\"properties\":{\"status\":{\"enum\":[\"complete\",\"blocked\"]}},\"required\":[\"status\"],\"title\":\"Integration result\",\"type\":\"object\"}",
       "included_bytes": 210,
-      "included_hash": "sha256:7a6cda12a0ac723fccffc3563735c66e56ac9a6732f7339b130efb9c494a4c6b",
+      "included_hash": "sha256:a0cce6474e92534c39c3be685c272e4cf29a22f1170180d2c316f4c32834eef2",
       "kind": "output-schema",
       "original_bytes": 210,
       "original_hash": "sha256:a0cce6474e92534c39c3be685c272e4cf29a22f1170180d2c316f4c32834eef2",
-      "segment_id": "ctx-7b825d67d7a414176fbc67f2bf3f3e85e199b18900dc2c8320e7af2636fa5a30",
+      "segment_id": "ctx-56ae7026041caa873cbf07c37660e850298928939db9f33897708df04156f1cc",
       "source": {
         "artifact_id": "OUTPUT-INTEGRATION",
         "document_type": "output-schema",
