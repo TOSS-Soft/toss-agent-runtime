@@ -799,6 +799,85 @@ interface ExpectedDirectory {
   readonly files: Map<string, number>;
 }
 
+interface RetainedConfiguredDirectorySnapshot {
+  readonly absolutePath: string;
+  readonly identity: CatalogFileIdentity;
+  readonly expectedEntries: readonly string[];
+  readonly directories: RetainedConfiguredDirectorySnapshot[];
+  readonly members: RetainedConfiguredMemberSnapshot[];
+}
+
+interface RetainedConfiguredMemberSnapshot {
+  readonly absolutePath: string;
+  readonly identity: CatalogFileIdentity;
+}
+
+interface RetainedConfiguredSnapshotContainer {
+  readonly directories: RetainedConfiguredDirectorySnapshot[];
+  readonly members: RetainedConfiguredMemberSnapshot[];
+}
+
+interface RetainedConfiguredClosure extends RetainedConfiguredSnapshotContainer {
+  count: number;
+}
+
+const MAX_CONFIGURED_CLOSURE_SNAPSHOTS =
+  SKILL_LIMITS.resourcesPerPackage * SKILL_LIMITS.nestingDepth + 1;
+
+function retainConfiguredSnapshot(
+  closure: RetainedConfiguredClosure,
+  container: RetainedConfiguredSnapshotContainer,
+  snapshot: RetainedConfiguredDirectorySnapshot | RetainedConfiguredMemberSnapshot,
+): void {
+  if (closure.count >= MAX_CONFIGURED_CLOSURE_SNAPSHOTS) limitExceeded();
+  closure.count += 1;
+  if ("expectedEntries" in snapshot) container.directories.push(snapshot);
+  else container.members.push(snapshot);
+}
+
+function revalidateConfiguredSnapshots(
+  closure: RetainedConfiguredClosure,
+  packageChain: readonly HeldDirectory[],
+  hooks: CatalogTestHooks,
+): void {
+  if (closure.count > MAX_CONFIGURED_CLOSURE_SNAPSHOTS) limitExceeded();
+
+  const revalidateContainer = (
+    container: RetainedConfiguredSnapshotContainer,
+    chain: readonly HeldDirectory[],
+  ): void => {
+    for (const snapshot of container.directories) {
+      const opened = openHeldDirectorySync(snapshot.absolutePath, chain, hooks);
+      try {
+        if (!sameIdentity(snapshot.identity, opened.identity)) integrity();
+        const currentEntries = readDirectoryNamesSync(
+          snapshot.absolutePath,
+          [...chain, opened],
+          hooks,
+          SKILL_LIMITS.resourcesPerPackage + 2,
+        );
+        if (!sameNames(snapshot.expectedEntries, currentEntries)) integrity();
+        const exactAfter = syncSandwich([...chain, opened], hooks, () =>
+          syncPathIdentity(snapshot.absolutePath, hooks),
+        );
+        if (!sameIdentity(snapshot.identity, exactAfter)) integrity();
+        revalidateContainer(snapshot, [...chain, opened]);
+      } finally {
+        closeSync(opened.descriptor);
+      }
+    }
+
+    for (const snapshot of container.members) {
+      const current = syncSandwich(chain, hooks, () =>
+        syncPathIdentity(snapshot.absolutePath, hooks),
+      );
+      if (!sameIdentity(snapshot.identity, current)) integrity();
+    }
+  };
+
+  revalidateContainer(closure, packageChain);
+}
+
 function expectedPackageTree(manifest: SkillPackageManifest): ExpectedDirectory {
   const root: ExpectedDirectory = { directories: new Map(), files: new Map() };
   root.files.set("skill.json", -1);
@@ -833,6 +912,8 @@ async function validateConfiguredClosure(
   currentUid: number,
   hooks: CatalogTestHooks,
   identities: Set<string>,
+  retainedClosure: RetainedConfiguredClosure,
+  retainedContainer: RetainedConfiguredSnapshotContainer,
   revalidatePackageGuard: () => void,
   rootSnapshot?: readonly string[],
 ): Promise<void> {
@@ -863,6 +944,14 @@ async function validateConfiguredClosure(
       const identityKey = `${held.identity.dev}:${held.identity.ino}`;
       if (identities.has(identityKey)) integrity();
       identities.add(identityKey);
+      const retainedDirectory: RetainedConfiguredDirectorySnapshot = {
+        absolutePath: childPath,
+        identity: held.identity,
+        expectedEntries: expectedDirectoryNames(child),
+        directories: [],
+        members: [],
+      };
+      retainConfiguredSnapshot(retainedClosure, retainedContainer, retainedDirectory);
       await validateConfiguredClosure(
         childPath,
         [...chain, held],
@@ -870,6 +959,8 @@ async function validateConfiguredClosure(
         currentUid,
         hooks,
         identities,
+        retainedClosure,
+        retainedDirectory,
         revalidatePackageGuard,
       );
     } finally {
@@ -896,6 +987,10 @@ async function validateConfiguredClosure(
     const identityKey = `${identity.dev}:${identity.ino}`;
     if (identities.has(identityKey)) integrity();
     identities.add(identityKey);
+    retainConfiguredSnapshot(retainedClosure, retainedContainer, {
+      absolutePath: memberPath,
+      identity,
+    });
   }
 }
 
@@ -982,6 +1077,11 @@ async function configuredEntries(
             options.hooks,
             revalidateRootSnapshot,
           );
+          const retainedClosure: RetainedConfiguredClosure = {
+            count: 0,
+            directories: [],
+            members: [],
+          };
           try {
             const revalidatePackageGuard = (): void => {
               revalidateRootSnapshot();
@@ -993,6 +1093,7 @@ async function configuredEntries(
                 SKILL_LIMITS.resourcesPerPackage + 2,
               );
               if (!sameNames(packageSnapshot, current)) integrity();
+              revalidateConfiguredSnapshots(retainedClosure, packageChain, options.hooks);
             };
             const manifestBytes = await configuredBoundary(
               "manifest-read",
@@ -1028,6 +1129,8 @@ async function configuredEntries(
               options.currentUid,
               options.hooks,
               identities,
+              retainedClosure,
+              retainedClosure,
               revalidatePackageGuard,
               packageSnapshot,
             );

@@ -487,6 +487,95 @@ describe("skill catalog metadata discovery", () => {
     }
   });
 
+  it("revalidates an earlier configured member during a later member boundary", async () => {
+    const resource = {
+      path: "references/guide.md",
+      role: "reference" as const,
+      media_type: "text/markdown",
+      bytes: 4,
+      hash: rawHash(Buffer.alloc(4)),
+    };
+    const root = await privateTemporaryDirectory("toss-skill-root-");
+    await writeConfiguredPackage(root, "testing", {
+      capabilities: ["testing"],
+      resources: [resource],
+    });
+    const skill = path.join(root, "testing", "SKILL.md");
+    const guide = path.join(root, "testing", resource.path);
+    const preserved = path.join(path.dirname(root), `${path.basename(root)}-guide-preserved`);
+    let replaced = false;
+    const catalog = createSkillCatalogForTest({
+      configuredRoots: [root],
+      includeBundled: false,
+      hooks: {
+        async beforeConfiguredBoundary(boundary, target) {
+          if (boundary !== "member-stat" || target !== skill || replaced) return;
+          await rename(guide, preserved);
+          replaced = true;
+          await writeFile(guide, Buffer.alloc(4), { mode: 0o640 });
+        },
+      },
+    });
+    try {
+      await expect(
+        catalog.discover({ query: null, allowed_capabilities: ["testing"] }),
+      ).rejects.toEqual(skillError("RUNTIME_SKILL_INTEGRITY"));
+      expect(replaced).toBe(true);
+      await expect(lstat(guide)).resolves.toBeDefined();
+      await expect(lstat(preserved)).resolves.toBeDefined();
+    } finally {
+      if (replaced) {
+        await rm(guide, { force: true });
+        await rename(preserved, guide);
+      }
+    }
+  });
+
+  it("revalidates an earlier configured subtree during a later member boundary", async () => {
+    const resource = {
+      path: "references/guide.md",
+      role: "reference" as const,
+      media_type: "text/markdown",
+      bytes: 4,
+      hash: rawHash(Buffer.alloc(4)),
+    };
+    const root = await privateTemporaryDirectory("toss-skill-root-");
+    await writeConfiguredPackage(root, "testing", {
+      capabilities: ["testing"],
+      resources: [resource],
+    });
+    const skill = path.join(root, "testing", "SKILL.md");
+    const references = path.join(root, "testing", "references");
+    const preserved = path.join(path.dirname(root), `${path.basename(root)}-references-preserved`);
+    let replaced = false;
+    const catalog = createSkillCatalogForTest({
+      configuredRoots: [root],
+      includeBundled: false,
+      hooks: {
+        async beforeConfiguredBoundary(boundary, target) {
+          if (boundary !== "member-stat" || target !== skill || replaced) return;
+          await rename(references, preserved);
+          replaced = true;
+          await mkdir(references, { mode: 0o700 });
+          await writeFile(path.join(references, "guide.md"), Buffer.alloc(4), { mode: 0o600 });
+        },
+      },
+    });
+    try {
+      await expect(
+        catalog.discover({ query: null, allowed_capabilities: ["testing"] }),
+      ).rejects.toEqual(skillError("RUNTIME_SKILL_INTEGRITY"));
+      expect(replaced).toBe(true);
+      await expect(lstat(references)).resolves.toBeDefined();
+      await expect(lstat(preserved)).resolves.toBeDefined();
+    } finally {
+      if (replaced) {
+        await rm(references, { force: true, recursive: true });
+        await rename(preserved, references);
+      }
+    }
+  });
+
   it.each(["missing", "extra", "symlink", "directory", "mode", "size"] as const)(
     "rejects configured package closure with a %s member mutation without reading bodies",
     async (mutation) => {
