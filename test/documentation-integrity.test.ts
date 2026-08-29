@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   createBaselineCapabilities,
+  createProtocolValidator,
   createRunJournalStore,
   hashModelCatalog,
   hashModelSelectionPlan,
@@ -23,11 +24,37 @@ import {
 
 interface ContractManifest {
   readonly schema_version: "runtime-contract-manifest.v1";
+  readonly protocol_version: "runtime-contract.v1";
   readonly schemas: readonly {
     readonly schema_version: string;
     readonly path: string;
     readonly id: string;
   }[];
+}
+
+interface ContractSchema {
+  readonly $schema?: string;
+  readonly $id?: string;
+  readonly type?: string;
+  readonly additionalProperties?: boolean;
+  readonly oneOf?: readonly {
+    readonly type?: string;
+    readonly unevaluatedProperties?: boolean;
+  }[];
+  readonly $defs?: Readonly<Record<string, unknown>>;
+}
+
+const AGENT_SCHEMA_VERSIONS = [
+  "agent-definition.v1",
+  "agent-registry-entry.v1",
+  "compiled-context.v1",
+  "prompt-template.v1",
+] as const;
+
+async function readContractManifest(): Promise<ContractManifest> {
+  return JSON.parse(
+    await readFile("docs/contracts/runtime-contract-v1.manifest.json", "utf8"),
+  ) as ContractManifest;
 }
 
 async function readExample(name: string): Promise<Uint8Array> {
@@ -79,17 +106,53 @@ describe("published protocol artifacts", () => {
     }
   });
 
+  it("keeps every advertised and registered agent schema coherent with the manifest", async () => {
+    const manifest = await readContractManifest();
+    const advertised = createBaselineCapabilities({
+      os: "linux",
+      arch: "x64",
+      node: "22.23.1",
+    }).supported_schemas;
+    const advertisedManifestVersions = manifest.schemas
+      .filter((entry) => advertised.includes(entry.schema_version))
+      .map((entry) => entry.schema_version);
+
+    expect(advertisedManifestVersions).toEqual(advertised);
+    expect(new Set(advertisedManifestVersions).size).toBe(advertised.length);
+
+    const validator = createProtocolValidator();
+    for (const schemaVersion of AGENT_SCHEMA_VERSIONS) {
+      expect(advertised).toContain(schemaVersion);
+      const matches = manifest.schemas.filter((entry) => entry.schema_version === schemaVersion);
+      const expectedPath = `contracts/runtime/${schemaVersion}.schema.json`;
+      const expectedId = `https://toss.software/schemas/runtime/v1/${schemaVersion}.schema.json`;
+      expect(matches).toEqual([
+        { schema_version: schemaVersion, path: expectedPath, id: expectedId },
+      ]);
+
+      expect(
+        validator.parse(
+          JSON.stringify({ schema_version: schemaVersion, document_type: "manifest-probe" }),
+          "manifest-probe",
+        ),
+      ).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
+    }
+  });
+
   it("maps every published schema version to its exact file and identifier", async () => {
-    const manifest = JSON.parse(
-      await readFile("docs/contracts/runtime-contract-v1.manifest.json", "utf8"),
-    ) as ContractManifest;
+    const manifest = await readContractManifest();
     expect(manifest.schema_version).toBe("runtime-contract-manifest.v1");
+    expect(manifest.protocol_version).toBe("runtime-contract.v1");
     const versions = manifest.schemas.map((entry) => entry.schema_version);
     expect(versions).toEqual([...versions].sort());
+    expect(new Set(versions).size).toBe(versions.length);
     expect(versions).toEqual([
+      "agent-definition.v1",
+      "agent-registry-entry.v1",
       "agentgateway-capabilities.v1",
       "candidate-job-intent.v1",
       "command-result.v1",
+      "compiled-context.v1",
       "execution-event.v1",
       "execution-request.v1",
       "execution-result.v1",
@@ -98,6 +161,7 @@ describe("published protocol artifacts", () => {
       "operational-event.v1",
       "project-registry-entry.v1",
       "project-watch-manifest.v1",
+      "prompt-template.v1",
       "provider-event.v1",
       "routing-policy.v1",
       "routing-state.v1",
@@ -114,8 +178,21 @@ describe("published protocol artifacts", () => {
       const expectedId = `https://toss.software/schemas/runtime/v1/${entry.schema_version}.schema.json`;
       expect(entry.path).toBe(expectedPath);
       expect(entry.id).toBe(expectedId);
-      const schema = JSON.parse(await readFile(entry.path, "utf8")) as { readonly $id?: string };
+      const schema = JSON.parse(await readFile(entry.path, "utf8")) as ContractSchema;
+      expect(schema.$schema).toBe("https://json-schema.org/draft/2020-12/schema");
       expect(schema.$id).toBe(expectedId);
+      if (entry.schema_version === "runtime-common.v1") {
+        expect(schema.$defs).toBeTypeOf("object");
+      } else if (schema.type === "object") {
+        expect(schema.additionalProperties).toBe(false);
+      } else if (schema.oneOf !== undefined) {
+        expect(schema.oneOf.length).toBeGreaterThan(0);
+        for (const branch of schema.oneOf) {
+          expect(branch).toMatchObject({ type: "object", unevaluatedProperties: false });
+        }
+      } else {
+        throw new Error(`Manifest schema is not closed: ${entry.schema_version}`);
+      }
     }
   });
 

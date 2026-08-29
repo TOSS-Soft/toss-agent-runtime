@@ -3,6 +3,16 @@
   "protocol_version": "runtime-contract.v1",
   "schemas": [
     {
+      "schema_version": "agent-definition.v1",
+      "path": "contracts/runtime/agent-definition.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/agent-definition.v1.schema.json"
+    },
+    {
+      "schema_version": "agent-registry-entry.v1",
+      "path": "contracts/runtime/agent-registry-entry.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/agent-registry-entry.v1.schema.json"
+    },
+    {
       "schema_version": "agentgateway-capabilities.v1",
       "path": "contracts/runtime/agentgateway-capabilities.v1.schema.json",
       "id": "https://toss.software/schemas/runtime/v1/agentgateway-capabilities.v1.schema.json"
@@ -16,6 +26,11 @@
       "schema_version": "command-result.v1",
       "path": "contracts/runtime/command-result.v1.schema.json",
       "id": "https://toss.software/schemas/runtime/v1/command-result.v1.schema.json"
+    },
+    {
+      "schema_version": "compiled-context.v1",
+      "path": "contracts/runtime/compiled-context.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/compiled-context.v1.schema.json"
     },
     {
       "schema_version": "execution-event.v1",
@@ -56,6 +71,11 @@
       "schema_version": "project-watch-manifest.v1",
       "path": "contracts/runtime/project-watch-manifest.v1.schema.json",
       "id": "https://toss.software/schemas/runtime/v1/project-watch-manifest.v1.schema.json"
+    },
+    {
+      "schema_version": "prompt-template.v1",
+      "path": "contracts/runtime/prompt-template.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/prompt-template.v1.schema.json"
     },
     {
       "schema_version": "provider-event.v1",
