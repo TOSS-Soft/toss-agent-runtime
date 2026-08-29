@@ -140,6 +140,7 @@ interface RegistryCandidateOptions {
 
 interface RegistryLoadOptions extends RegistryCandidateOptions {
   readonly recoverPartials: boolean;
+  readonly nonCreatingObjectReads: boolean;
 }
 
 interface DirectoryContentToken {
@@ -867,6 +868,7 @@ function completeRecoveryStage(options: {
   const stagePath = path.join(options.registryPath, options.stage.name);
   const quarantineName = quarantineArtifactName(options.stage.kind, options.stage.operationId);
   const quarantinePath = path.join(options.quarantinePath, quarantineName);
+  let quarantineDescriptor: number | undefined;
   let stageDescriptor: number | undefined;
   let currentDescriptor: number | undefined;
   try {
@@ -899,6 +901,8 @@ function completeRecoveryStage(options: {
     ) {
       registryCorrupt();
     }
+    quarantineDescriptor = openSync(quarantinePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    exactFile(quarantinePath, quarantineDescriptor, quarantineSnapshot.identity, options.fragment);
 
     const stageBefore = lstatSync(stagePath, { bigint: true });
     assertPrivateFile(stageBefore, options.stage.identity);
@@ -930,6 +934,14 @@ function completeRecoveryStage(options: {
       registryPath: options.registryPath,
       scans: options.scans,
     });
+    options.assertRegistryIdentity();
+    exactFile(quarantinePath, quarantineDescriptor, quarantineSnapshot.identity, options.fragment);
+    exactFile(
+      options.candidate,
+      currentDescriptor,
+      options.expected.identity,
+      options.expected.bytes,
+    );
     renameSync(stagePath, options.candidate);
     exactFile(options.candidate, stageDescriptor, options.stage.identity, options.prefix);
     options.hooks?.afterRecoveryRename?.(options.stage.kind, options.candidate);
@@ -940,12 +952,14 @@ function completeRecoveryStage(options: {
     syncPrivateDirectory(options.registryPath, options.hooks?.beforeHistoryDirectorySync);
     exactFile(options.candidate, stageDescriptor, options.stage.identity, options.prefix);
     options.assertRegistryIdentity();
+    exactFile(quarantinePath, quarantineDescriptor, quarantineSnapshot.identity, options.fragment);
   } catch (error) {
     if (error instanceof RuntimeAgentError) throw error;
     registryCorrupt();
   } finally {
     if (currentDescriptor !== undefined) closeSync(currentDescriptor);
     if (stageDescriptor !== undefined) closeSync(stageDescriptor);
+    if (quarantineDescriptor !== undefined) closeSync(quarantineDescriptor);
   }
 }
 
@@ -1116,6 +1130,9 @@ function recoverPartial(options: {
       registryPath: options.registryPath,
       scans: options.scans,
     });
+    options.assertRegistryIdentity();
+    exactFile(quarantineFile, quarantine, quarantineIdentity, options.fragment);
+    exactFile(options.candidate, current, options.expected.identity, options.expected.bytes);
     renameSync(stagePath, options.candidate);
     renamed = true;
     exactFile(options.candidate, stage, stageIdentity, options.prefix);
@@ -1126,6 +1143,8 @@ function recoverPartial(options: {
     });
     syncPrivateDirectory(options.registryPath, options.hooks?.beforeHistoryDirectorySync);
     exactFile(options.candidate, stage, stageIdentity, options.prefix);
+    options.assertRegistryIdentity();
+    exactFile(quarantineFile, quarantine, quarantineIdentity, options.fragment);
   } catch (error) {
     failure = error;
   } finally {
@@ -1571,31 +1590,72 @@ function createAgentRegistryImplementation(
   const pendingMutations = new Set<Promise<unknown>>();
   let intakeStopped = false;
 
+  const bindContext = (
+    canonical: string,
+    directories: readonly PinnedDirectory[],
+  ): RegistryContext => {
+    pinnedDirectories = directories;
+    const stateIdentity = directories[0]?.identity;
+    if (stateIdentity === undefined) registryCorrupt();
+    const key = `${canonical}\u0000${String(stateIdentity.device)}:${String(stateIdentity.inode)}`;
+    let shared = coordinators.get(key)?.deref();
+    if (shared === undefined) {
+      shared = { tail: Promise.resolve() };
+      coordinators.set(key, new WeakRef(shared));
+    }
+    assertPinnedDirectories(directories);
+    return Object.freeze({ shared, directories });
+  };
+
   const context = (): Promise<RegistryContext> => {
     contextPromise ??= (async () => {
       await store.ensureRoots();
       const canonical = realpathSync(statePath);
       if (canonical !== statePath) pathUnsafe();
-      const directories = pinPrivateDirectories([
-        statePath,
-        store.agentsPath,
-        store.objectsPath,
-        store.registryPath,
-        store.quarantinePath,
-      ]);
-      pinnedDirectories = directories;
-      const stateIdentity = directories[0]?.identity;
-      if (stateIdentity === undefined) registryCorrupt();
-      const key = `${canonical}\u0000${String(stateIdentity.device)}:${String(stateIdentity.inode)}`;
-      let shared = coordinators.get(key)?.deref();
-      if (shared === undefined) {
-        shared = { tail: Promise.resolve() };
-        coordinators.set(key, new WeakRef(shared));
-      }
-      assertPinnedDirectories(directories);
-      return Object.freeze({ shared, directories });
+      return bindContext(
+        canonical,
+        pinPrivateDirectories([
+          statePath,
+          store.agentsPath,
+          store.objectsPath,
+          store.registryPath,
+          store.quarantinePath,
+        ]),
+      );
     })();
     return contextPromise;
+  };
+
+  const existingContext = (): Promise<RegistryContext | null> => {
+    if (contextPromise !== undefined) return contextPromise;
+    return Promise.resolve().then(() => {
+      if (contextPromise !== undefined) return contextPromise;
+      try {
+        lstatSync(statePath, { bigint: true });
+      } catch (error) {
+        if (errorCode(error) === "ENOENT") return null;
+        return pathUnsafe();
+      }
+      try {
+        const canonical = realpathSync(statePath);
+        if (canonical !== statePath) pathUnsafe();
+        const bound = bindContext(
+          canonical,
+          pinPrivateDirectories([
+            statePath,
+            store.agentsPath,
+            store.objectsPath,
+            store.registryPath,
+            store.quarantinePath,
+          ]),
+        );
+        contextPromise = Promise.resolve(bound);
+        return bound;
+      } catch (error) {
+        if (error instanceof RuntimeAgentError) throw error;
+        return pathUnsafe();
+      }
+    });
   };
 
   const assertRegistryIdentity = (): void => {
@@ -1603,27 +1663,34 @@ function createAgentRegistryImplementation(
     assertPinnedDirectories(pinnedDirectories);
   };
 
-  const enqueue = <T>(operation: () => Promise<T>, mutation: boolean): Promise<T> => {
-    const scheduled = context().then(async ({ shared }) => {
-      const current = shared.tail
-        .catch(() => undefined)
-        .then(async () => {
+  const schedule = <T>(shared: Coordinator, operation: () => Promise<T>): Promise<T> => {
+    const current = shared.tail
+      .catch(() => undefined)
+      .then(async () => {
+        assertRegistryIdentity();
+        try {
+          return await operation();
+        } finally {
           assertRegistryIdentity();
-          try {
-            return await operation();
-          } finally {
-            assertRegistryIdentity();
-          }
-        });
-      shared.tail = current;
-      return current;
-    });
+        }
+      });
+    shared.tail = current;
+    return current;
+  };
+
+  const enqueue = <T>(operation: () => Promise<T>, mutation: boolean): Promise<T> => {
+    const scheduled = context().then(({ shared }) => schedule(shared, operation));
     if (mutation) {
       pendingMutations.add(scheduled);
       void scheduled.finally(() => pendingMutations.delete(scheduled)).catch(() => undefined);
     }
     return scheduled;
   };
+
+  const enqueueExisting = <T>(operation: () => Promise<T>, absent: () => T): Promise<T> =>
+    existingContext().then((existing) =>
+      existing === null ? absent() : schedule(existing.shared, operation),
+    );
 
   const withClaim = async <T>(operation: () => Promise<T>): Promise<T> => {
     assertRegistryIdentity();
@@ -1646,6 +1713,7 @@ function createAgentRegistryImplementation(
     definition: ArtifactReference,
     promptTemplate: ArtifactReference,
     cache: Map<string, ResolvedAgentBundle>,
+    nonCreatingObjectReads: boolean,
   ): Promise<ResolvedAgentBundle> => {
     const key = referenceKey(definition);
     const cached = cache.get(key);
@@ -1653,10 +1721,23 @@ function createAgentRegistryImplementation(
       if (!exactReference(cached.definition.prompt_template, promptTemplate)) registryCorrupt();
       return cached;
     }
-    const [definitionObject, promptObject] = await Promise.all([
-      store.readObject(definition.hash),
-      store.readObject(promptTemplate.hash),
-    ]);
+    const [definitionObject, promptObject] = nonCreatingObjectReads
+      ? [
+          readExactPrivateFile({
+            candidate: path.join(store.objectsPath, definition.hash.slice("sha256:".length)),
+            parentPath: store.objectsPath,
+            maximumBytes: MAX_PRIVATE_OBJECT_BYTES,
+          }),
+          readExactPrivateFile({
+            candidate: path.join(store.objectsPath, promptTemplate.hash.slice("sha256:".length)),
+            parentPath: store.objectsPath,
+            maximumBytes: MAX_PRIVATE_OBJECT_BYTES,
+          }),
+        ]
+      : await Promise.all([
+          store.readObject(definition.hash),
+          store.readObject(promptTemplate.hash),
+        ]);
     if (definitionObject === null || promptObject === null) return registryCorrupt();
     let storedDefinition: JsonValue;
     let storedPrompt: JsonValue;
@@ -1703,6 +1784,7 @@ function createAgentRegistryImplementation(
 
   const validateLifecycle = async (
     entries: readonly AgentRegistryEntryV1[],
+    nonCreatingObjectReads: boolean,
   ): Promise<{
     readonly active: ReadonlyMap<string, AgentRegistration>;
     readonly bundles: ReadonlyMap<string, ResolvedAgentBundle>;
@@ -1726,7 +1808,12 @@ function createAgentRegistryImplementation(
       ) {
         registryCorrupt();
       }
-      const resolved = await readBundle(entry.definition, entry.prompt_template, bundles);
+      const resolved = await readBundle(
+        entry.definition,
+        entry.prompt_template,
+        bundles,
+        nonCreatingObjectReads,
+      );
       const agentId = resolved.definition.agent_id;
       if (entry.definition.artifact_id !== agentId) registryCorrupt();
       const result = registration(entry);
@@ -1861,7 +1948,7 @@ function createAgentRegistryImplementation(
     let lifecycle = parseJsonl(lifecycleFile.bytes, parseLifecycleLine);
     if (lifecycle.fragment.byteLength > 0) {
       if (lifecycle.records.length === 0) registryCorrupt();
-      await validateLifecycle(lifecycle.records);
+      await validateLifecycle(lifecycle.records, loadOptions.nonCreatingObjectReads);
       if (!loadOptions.recoverPartials) registryCorrupt();
       assertRegistryIdentity();
       if (recoveryStage !== undefined) {
@@ -1906,7 +1993,10 @@ function createAgentRegistryImplementation(
     } else if (recoveryStage?.kind === "lifecycle") {
       registryCorrupt();
     }
-    const lifecycleState = await validateLifecycle(lifecycle.records);
+    const lifecycleState = await validateLifecycle(
+      lifecycle.records,
+      loadOptions.nonCreatingObjectReads,
+    );
 
     let operationFile = readHistoryFile(operationPath, store.registryPath, scans, loadOptions);
     let operationRecords: readonly AgentOperationRecordV1[] = Object.freeze([]);
@@ -2003,28 +2093,36 @@ function createAgentRegistryImplementation(
 
   const readValidated = <T>(
     operation: (history: RegistryHistory) => Promise<T> | T,
+    absent: () => T,
   ): Promise<T> => {
     const claimAcceptedBeforeStop = !intakeStopped;
-    return enqueue(
-      async () =>
-        claimAcceptedBeforeStop
-          ? await withClaim(async () =>
-              operation(
-                await load({
-                  recoverPartials: false,
-                  allowMutationClaim: true,
-                  allowRecoveryStage: false,
-                }),
-              ),
-            )
-          : await operation(
+    if (claimAcceptedBeforeStop) {
+      return enqueue(
+        () =>
+          withClaim(async () =>
+            operation(
               await load({
                 recoverPartials: false,
-                allowMutationClaim: false,
+                nonCreatingObjectReads: false,
+                allowMutationClaim: true,
                 allowRecoveryStage: false,
               }),
             ),
-      claimAcceptedBeforeStop,
+          ),
+        true,
+      );
+    }
+    return enqueueExisting(
+      async () =>
+        operation(
+          await load({
+            recoverPartials: false,
+            nonCreatingObjectReads: true,
+            allowMutationClaim: false,
+            allowRecoveryStage: false,
+          }),
+        ),
+      absent,
     );
   };
 
@@ -2065,6 +2163,7 @@ function createAgentRegistryImplementation(
             async () =>
               void (await load({
                 recoverPartials: true,
+                nonCreatingObjectReads: false,
                 allowMutationClaim: true,
                 allowRecoveryStage: true,
               })),
@@ -2084,6 +2183,7 @@ function createAgentRegistryImplementation(
           withClaim(async () => {
             const history = await load({
               recoverPartials: false,
+              nonCreatingObjectReads: false,
               allowMutationClaim: true,
               allowRecoveryStage: false,
             });
@@ -2153,6 +2253,7 @@ function createAgentRegistryImplementation(
           withClaim(async () => {
             const history = await load({
               recoverPartials: false,
+              nonCreatingObjectReads: false,
               allowMutationClaim: true,
               allowRecoveryStage: false,
             });
@@ -2181,39 +2282,47 @@ function createAgentRegistryImplementation(
     },
     async resolveForExecution(candidate) {
       const definitionRef = normalizeDefinitionReference(candidate);
-      return readValidated((history) => {
-        const resolved = history.bundles.get(referenceKey(definitionRef));
-        if (resolved === undefined) return agentError("RUNTIME_AGENT_NOT_FOUND");
-        const active = history.active.get(definitionRef.artifact_id);
-        if (active === undefined || !exactReference(active.definition, definitionRef)) {
-          return agentError("RUNTIME_AGENT_STALE_REVISION");
-        }
-        return resolved;
-      });
+      return readValidated(
+        (history) => {
+          const resolved = history.bundles.get(referenceKey(definitionRef));
+          if (resolved === undefined) return agentError("RUNTIME_AGENT_NOT_FOUND");
+          const active = history.active.get(definitionRef.artifact_id);
+          if (active === undefined || !exactReference(active.definition, definitionRef)) {
+            return agentError("RUNTIME_AGENT_STALE_REVISION");
+          }
+          return resolved;
+        },
+        () => agentError("RUNTIME_AGENT_NOT_FOUND"),
+      );
     },
     async resolveForResume(candidate) {
       const definitionRef = normalizeDefinitionReference(candidate);
-      return readValidated((history) => {
-        const resolved = history.bundles.get(referenceKey(definitionRef));
-        if (resolved === undefined) return agentError("RUNTIME_AGENT_NOT_FOUND");
-        return resolved;
-      });
+      return readValidated(
+        (history) => {
+          const resolved = history.bundles.get(referenceKey(definitionRef));
+          if (resolved === undefined) return agentError("RUNTIME_AGENT_NOT_FOUND");
+          return resolved;
+        },
+        () => agentError("RUNTIME_AGENT_NOT_FOUND"),
+      );
     },
     list: () =>
-      readValidated((history) =>
-        Object.freeze(
-          [...history.active.values()].sort((left, right) =>
-            Buffer.from(
-              `${left.definition.artifact_id}\u0000${String(left.definition.revision)}`,
-              "utf8",
-            ).compare(
+      readValidated(
+        (history) =>
+          Object.freeze(
+            [...history.active.values()].sort((left, right) =>
               Buffer.from(
-                `${right.definition.artifact_id}\u0000${String(right.definition.revision)}`,
+                `${left.definition.artifact_id}\u0000${String(left.definition.revision)}`,
                 "utf8",
+              ).compare(
+                Buffer.from(
+                  `${right.definition.artifact_id}\u0000${String(right.definition.revision)}`,
+                  "utf8",
+                ),
               ),
             ),
           ),
-        ),
+        () => Object.freeze([]),
       ),
     stopIntake() {
       intakeStopped = true;

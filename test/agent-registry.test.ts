@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, opendirSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, opendirSync, renameSync, writeFileSync } from "node:fs";
 import {
   appendFile,
   chmod,
+  lstat,
   mkdtemp,
   readFile,
   readdir,
@@ -278,8 +279,118 @@ function quarantineArtifactPath(
   return path.join(statePath, "agents", "quarantine", `${prefix}-${operationId}.bin`);
 }
 
+interface PathIdentitySnapshot {
+  readonly device: string;
+  readonly inode: string;
+  readonly mode: number;
+  readonly links: string;
+  readonly size: string;
+}
+
+function pathIdentitySnapshot(candidate: string): PathIdentitySnapshot {
+  const metadata = lstatSync(candidate, { bigint: true });
+  return {
+    device: String(metadata.dev),
+    inode: String(metadata.ino),
+    mode: Number(metadata.mode & 0o7777n),
+    links: String(metadata.nlink),
+    size: String(metadata.size),
+  };
+}
+
+interface PartialRecoveryFixture {
+  readonly root: string;
+  readonly statePath: string;
+  readonly historyPath: string;
+  readonly prefix: Buffer;
+  readonly fragment: Buffer;
+  readonly partial: Buffer;
+  readonly stagePath: string;
+  readonly quarantinePath: string;
+}
+
+async function partialRecoveryFixture(
+  kind: "lifecycle" | "operations",
+  origin: "new" | "restart",
+): Promise<PartialRecoveryFixture> {
+  const { root, statePath } = await fixture();
+  const agents = registry(statePath);
+  const v1 = bundle(1);
+  await agents.publish(v1, OPERATION_1);
+  if (kind === "operations") await agents.publish(v1, OPERATION_2);
+  const historyPath = kind === "lifecycle" ? entriesPath(statePath) : operationsPath(statePath);
+  const prefix = await readFile(historyPath);
+  const fragment = Buffer.from(kind === "lifecycle" ? '{"partial":' : "{", "utf8");
+  const partial = Buffer.concat([prefix, fragment]);
+  await appendFile(historyPath, fragment);
+  const stagePath = recoveryStagePath(statePath, kind, OPERATION_4);
+  const quarantinePath = quarantineArtifactPath(statePath, kind, OPERATION_4);
+  if (origin === "restart") {
+    await writeFile(quarantinePath, fragment, { mode: 0o600 });
+    await writeFile(stagePath, prefix, { mode: 0o600 });
+  }
+  return {
+    root,
+    statePath,
+    historyPath,
+    prefix,
+    fragment,
+    partial,
+    stagePath,
+    quarantinePath,
+  };
+}
+
 async function lines(candidate: string): Promise<string[]> {
   return (await readFile(candidate, "utf8")).trimEnd().split("\n");
+}
+
+interface FilesystemSnapshotEntry {
+  readonly relativePath: string;
+  readonly type: "directory" | "file" | "other" | "symlink";
+  readonly mode: number;
+  readonly device: string;
+  readonly inode: string;
+  readonly links: string;
+  readonly size: string;
+  readonly modifiedNanoseconds: string;
+  readonly changedNanoseconds: string;
+  readonly contentHash?: `sha256:${string}`;
+}
+
+async function filesystemSnapshot(candidate: string): Promise<readonly FilesystemSnapshotEntry[]> {
+  const snapshot: FilesystemSnapshotEntry[] = [];
+  const visit = async (absolutePath: string, relativePath: string): Promise<void> => {
+    const metadata = await lstat(absolutePath, { bigint: true });
+    const type = metadata.isDirectory()
+      ? "directory"
+      : metadata.isFile()
+        ? "file"
+        : metadata.isSymbolicLink()
+          ? "symlink"
+          : "other";
+    snapshot.push({
+      relativePath,
+      type,
+      mode: Number(metadata.mode & 0o7777n),
+      device: String(metadata.dev),
+      inode: String(metadata.ino),
+      links: String(metadata.nlink),
+      size: String(metadata.size),
+      modifiedNanoseconds: String(metadata.mtimeNs),
+      changedNanoseconds: String(metadata.ctimeNs),
+      ...(metadata.isFile() ? { contentHash: rawSha256(await readFile(absolutePath)) } : {}),
+    });
+    if (!metadata.isDirectory()) return;
+    for (const name of (await readdir(absolutePath)).sort()) {
+      await visit(
+        path.join(absolutePath, name),
+        relativePath === "." ? name : `${relativePath}/${name}`,
+      );
+    }
+  };
+  await visit(candidate, ".");
+  return Object.freeze(snapshot);
 }
 
 function rehashEntry(value: Record<string, unknown>): AgentRegistryEntryV1 {
@@ -1172,6 +1283,66 @@ describe("agent registry recovery and fail-closed history validation", () => {
 });
 
 describe("agent registry durability and coordination", () => {
+  it.each(["list", "resolveForExecution", "resolveForResume"] as const)(
+    "does not create an absent post-stop registry tree through %s",
+    async (method) => {
+      const { root, statePath } = await fixture();
+      const expectedTree = await filesystemSnapshot(root);
+      const agents = registry(statePath);
+      const definitionRef = definitionReference(bundle(1).definition);
+      agents.stopIntake();
+      await agents.flush(new AbortController().signal);
+
+      if (method === "list") {
+        const registrations = await agents.list();
+        expect(registrations).toEqual([]);
+        expect(Object.isFrozen(registrations)).toBe(true);
+      } else {
+        await expect(agents[method](definitionRef)).rejects.toMatchObject({
+          code: "RUNTIME_AGENT_NOT_FOUND",
+        });
+      }
+      expect(await filesystemSnapshot(root)).toEqual(expectedTree);
+      expect(existsSync(statePath)).toBe(false);
+    },
+  );
+
+  it.each([
+    ["list", "agents"],
+    ["list", "objects"],
+    ["list", "registry"],
+    ["list", "quarantine"],
+    ["resolveForExecution", "agents"],
+    ["resolveForExecution", "objects"],
+    ["resolveForExecution", "registry"],
+    ["resolveForExecution", "quarantine"],
+    ["resolveForResume", "agents"],
+    ["resolveForResume", "objects"],
+    ["resolveForResume", "registry"],
+    ["resolveForResume", "quarantine"],
+  ] as const)(
+    "fails closed through %s without recreating a missing %s tree",
+    async (method, missing) => {
+      const { root, statePath } = await fixture();
+      await registry(statePath).recover();
+      const missingPath =
+        missing === "agents"
+          ? path.join(statePath, "agents")
+          : path.join(statePath, "agents", missing);
+      await rm(missingPath, { recursive: true });
+      const expectedTree = await filesystemSnapshot(root);
+      const agents = registry(statePath);
+      const definitionRef = definitionReference(bundle(1).definition);
+      agents.stopIntake();
+      await agents.flush(new AbortController().signal);
+
+      const operation = method === "list" ? agents.list() : agents[method](definitionRef);
+      await expect(operation).rejects.toMatchObject({ code: "RUNTIME_AGENT_PATH_UNSAFE" });
+      expect(await filesystemSnapshot(root)).toEqual(expectedTree);
+      expect(existsSync(missingPath)).toBe(false);
+    },
+  );
+
   it.each([
     "recovery-file-sync",
     "stage-directory-sync",
@@ -1356,6 +1527,117 @@ describe("agent registry durability and coordination", () => {
     expect(await readFile(replacementPath, "utf8")).toBe("replacement");
     expect(await readFile(entriesPath(statePath))).toEqual(Buffer.concat([prefix, fragment]));
   });
+
+  it.each([
+    ["lifecycle", "new", "history"],
+    ["lifecycle", "new", "quarantine"],
+    ["lifecycle", "restart", "history"],
+    ["lifecycle", "restart", "quarantine"],
+    ["operations", "new", "history"],
+    ["operations", "new", "quarantine"],
+    ["operations", "restart", "history"],
+    ["operations", "restart", "quarantine"],
+  ] as const)(
+    "fails closed when the %s %s recovery %s participant is replaced before rename",
+    async (kind, origin, participant) => {
+      const actual = await partialRecoveryFixture(kind, origin);
+      const participantPath =
+        participant === "history" ? actual.historyPath : actual.quarantinePath;
+      const displacedPath = path.join(actual.root, `displaced-${kind}-${origin}-${participant}`);
+      const replacement = Buffer.from(participant === "history" ? actual.partial : actual.fragment);
+      const restartStageIdentity =
+        origin === "restart" ? pathIdentitySnapshot(actual.stagePath) : undefined;
+      let originalIdentity: PathIdentitySnapshot | undefined;
+      let replacementIdentity: PathIdentitySnapshot | undefined;
+
+      await expect(
+        registry(actual.statePath, {
+          randomId: () => OPERATION_4,
+          operationHooks: {
+            beforeRecoveryRename: () => {
+              originalIdentity = pathIdentitySnapshot(participantPath);
+              renameSync(participantPath, displacedPath);
+              writeFileSync(participantPath, replacement, { mode: 0o600 });
+              replacementIdentity = pathIdentitySnapshot(participantPath);
+            },
+          },
+        }).recover(),
+      ).rejects.toMatchObject({ code: "RUNTIME_AGENT_REGISTRY_CORRUPT" });
+
+      expect(originalIdentity).toBeDefined();
+      expect(replacementIdentity).toBeDefined();
+      expect(pathIdentitySnapshot(displacedPath)).toEqual(originalIdentity);
+      expect(pathIdentitySnapshot(participantPath)).toEqual(replacementIdentity);
+      expect(await readFile(displacedPath)).toEqual(
+        participant === "history" ? actual.partial : actual.fragment,
+      );
+      expect(await readFile(participantPath)).toEqual(replacement);
+      if (participant === "history") {
+        expect(await readFile(actual.quarantinePath)).toEqual(actual.fragment);
+      } else {
+        expect(await readFile(actual.historyPath)).toEqual(actual.partial);
+      }
+      expect(await readdir(path.dirname(actual.quarantinePath))).toEqual([
+        path.basename(actual.quarantinePath),
+      ]);
+      const stages = (await readdir(registryDirectory(actual.statePath))).filter((name) =>
+        name.endsWith(".stage"),
+      );
+      if (origin === "restart") {
+        expect(stages).toEqual([path.basename(actual.stagePath)]);
+        expect(await readFile(actual.stagePath)).toEqual(actual.prefix);
+        expect(pathIdentitySnapshot(actual.stagePath)).toEqual(restartStageIdentity);
+      } else {
+        expect(stages).toEqual([]);
+      }
+    },
+  );
+
+  it.each([
+    ["lifecycle", "new"],
+    ["lifecycle", "restart"],
+    ["operations", "new"],
+    ["operations", "restart"],
+  ] as const)(
+    "fails closed when the %s %s recovery quarantine is replaced after rename",
+    async (kind, origin) => {
+      const actual = await partialRecoveryFixture(kind, origin);
+      const displacedPath = path.join(actual.root, `displaced-${kind}-${origin}-quarantine`);
+      const replacement = Buffer.from(actual.fragment);
+      let originalIdentity: PathIdentitySnapshot | undefined;
+      let replacementIdentity: PathIdentitySnapshot | undefined;
+
+      await expect(
+        registry(actual.statePath, {
+          randomId: () => OPERATION_4,
+          operationHooks: {
+            afterRecoveryRename: () => {
+              originalIdentity = pathIdentitySnapshot(actual.quarantinePath);
+              renameSync(actual.quarantinePath, displacedPath);
+              writeFileSync(actual.quarantinePath, replacement, { mode: 0o600 });
+              replacementIdentity = pathIdentitySnapshot(actual.quarantinePath);
+            },
+          },
+        }).recover(),
+      ).rejects.toMatchObject({ code: "RUNTIME_AGENT_REGISTRY_CORRUPT" });
+
+      expect(originalIdentity).toBeDefined();
+      expect(replacementIdentity).toBeDefined();
+      expect(pathIdentitySnapshot(displacedPath)).toEqual(originalIdentity);
+      expect(pathIdentitySnapshot(actual.quarantinePath)).toEqual(replacementIdentity);
+      expect(await readFile(displacedPath)).toEqual(actual.fragment);
+      expect(await readFile(actual.quarantinePath)).toEqual(replacement);
+      expect(await readFile(actual.historyPath)).toEqual(actual.prefix);
+      expect(await readdir(path.dirname(actual.quarantinePath))).toEqual([
+        path.basename(actual.quarantinePath),
+      ]);
+      expect(
+        (await readdir(registryDirectory(actual.statePath))).filter((name) =>
+          name.endsWith(".stage"),
+        ),
+      ).toEqual([]);
+    },
+  );
 
   it.each(["file", "directory"] as const)(
     "replays after an initial %s sync failure",
