@@ -1,4 +1,6 @@
+import { execFile as execFileCallback } from "node:child_process";
 import { readFile } from "node:fs/promises";
+import { promisify } from "node:util";
 
 import { describe, expect, expectTypeOf, it } from "vitest";
 
@@ -34,6 +36,27 @@ import {
   type ProviderWireResponse,
   type ProviderWireStream,
 } from "../src/index.js";
+
+const execFile = promisify(execFileCallback);
+const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+
+interface NpmPackReport {
+  readonly files: readonly { readonly path: string }[];
+}
+
+async function realDryPackPaths(): Promise<readonly string[]> {
+  await execFile(npmCommand, ["run", "build"], {
+    encoding: "utf8",
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  const packed = await execFile(npmCommand, ["pack", "--dry-run", "--json", "--ignore-scripts"], {
+    encoding: "utf8",
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  const report = JSON.parse(packed.stdout) as readonly NpmPackReport[];
+  expect(report).toHaveLength(1);
+  return report[0]!.files.map((entry) => entry.path).sort();
+}
 
 describe("package metadata", () => {
   it("exports the frozen development identity", () => {
@@ -188,4 +211,94 @@ describe("package metadata", () => {
       ]),
     );
   });
+
+  it("emits a self-contained public agent registry factory declaration", async () => {
+    await execFile(npmCommand, ["run", "build"], {
+      encoding: "utf8",
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    const declaration = await readFile("dist/src/agents/index.d.ts", "utf8");
+
+    expect(packageApi.createAgentRegistry).toBeTypeOf("function");
+    expect(declaration).toContain("export interface CreateAgentRegistryOptions");
+    expect(declaration).toMatch(/export declare function createAgentRegistry\(/u);
+    expect(declaration).not.toMatch(/from "\.\/registry\.js"/u);
+    expect(declaration).not.toMatch(
+      /createAgentRegistryForTest|operationHooks|PrivateAgentStore/iu,
+    );
+  });
+
+  it("matches the exact real dry-pack allowlist and keeps agent internals private", async () => {
+    const expectedFiles = JSON.parse(
+      await readFile("scripts/package-files.json", "utf8"),
+    ) as readonly string[];
+    const packedFiles = await realDryPackPaths();
+
+    expect(packedFiles).toEqual(expectedFiles);
+    expect(expectedFiles).toEqual([...expectedFiles].sort());
+
+    for (const schema of [
+      "agent-definition.v1",
+      "agent-registry-entry.v1",
+      "compiled-context.v1",
+      "prompt-template.v1",
+    ]) {
+      expect(packedFiles).toContain(`contracts/runtime/${schema}.schema.json`);
+      expect(packedFiles).toContain(`dist/contracts/runtime/${schema}.schema.json`);
+    }
+    for (const example of [
+      "agent-definition",
+      "agent-registry-entry",
+      "compiled-context",
+      "prompt-template",
+    ]) {
+      expect(packedFiles).toContain(`examples/runtime-contract-v1/${example}.json`);
+    }
+    for (const publicModule of ["authority", "context", "contracts", "errors", "index", "types"]) {
+      expect(packedFiles).toContain(`dist/src/agents/${publicModule}.js`);
+      expect(packedFiles).toContain(`dist/src/agents/${publicModule}.d.ts`);
+    }
+    expect(packedFiles).toEqual(
+      expect.arrayContaining([
+        "docs/contracts/runtime-contract-protocol-v1.md",
+        "dist/src/index.d.ts",
+        "dist/src/index.js",
+        "dist/src/agents/registry.js",
+        "dist/src/agents/private-store.js",
+        "dist/src/agents/context.d.ts.map",
+        "dist/src/agents/context.js.map",
+      ]),
+    );
+
+    expect(packedFiles).not.toEqual(
+      expect.arrayContaining([
+        "dist/src/agents/private-store.d.ts",
+        "dist/src/agents/private-store.d.ts.map",
+        "dist/src/agents/private-store.js.map",
+        "dist/src/agents/registry.d.ts",
+        "dist/src/agents/registry.d.ts.map",
+        "dist/src/agents/registry.js.map",
+      ]),
+    );
+    for (const packedPath of packedFiles) {
+      expect(packedPath).not.toMatch(/(?:^|\/)(?:test|tests|fixtures)(?:\/|$)/iu);
+      expect(packedPath).not.toMatch(/(?:^|\/)(?:tmp|temp|staging|claims?|objects?)(?:\/|$)/iu);
+      expect(packedPath).not.toMatch(/(?:^|\/)(?:history|operations|registry)\.jsonl$/iu);
+      if (/prompt/iu.test(packedPath) && !/\.schema\.json$/u.test(packedPath)) {
+        expect(packedPath).toBe("examples/runtime-contract-v1/prompt-template.json");
+      }
+    }
+
+    const publishedDeclarationsAndMaps = packedFiles.filter(
+      (packedPath) =>
+        packedPath.startsWith("dist/src/agents/") &&
+        /(?:\.d\.ts|\.d\.ts\.map|\.js\.map)$/u.test(packedPath),
+    );
+    for (const packedPath of publishedDeclarationsAndMaps) {
+      const contents = await readFile(packedPath, "utf8");
+      expect(contents).not.toMatch(
+        /createAgentRegistryForTest|operationHooks|PrivateAgentStore|mutation claim/iu,
+      );
+    }
+  }, 30_000);
 });

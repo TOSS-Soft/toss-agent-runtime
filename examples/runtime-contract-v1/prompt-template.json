@@ -1,0 +1,14 @@
+{
+  "document_hash": "sha256:be559a32cd3dc45c9652b9c2f6505842f757067d67de26a7f192d429628f1f3b",
+  "document_type": "prompt-template",
+  "instruction_blocks": [
+    {
+      "block_id": "role",
+      "content": "Role prompt version one."
+    }
+  ],
+  "protocol_version": "runtime-contract.v1",
+  "revision": 1,
+  "schema_version": "prompt-template.v1",
+  "template_id": "prompt-revision"
+}

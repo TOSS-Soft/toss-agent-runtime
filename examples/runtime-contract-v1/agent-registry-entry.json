@@ -1,0 +1,24 @@
+{
+  "definition": {
+    "artifact_id": "agent-revision",
+    "document_type": "agent-definition",
+    "hash": "sha256:dcbb6bf855f06ab5e183773287e71565b26305bfdf646649a3fec92be1854f7c",
+    "revision": 1
+  },
+  "document_type": "agent-registry-entry",
+  "entry_hash": "sha256:3c13d4027e25aa78a1df9a042b78635ed8c212a4838b500d07b47e25837f1a58",
+  "occurred_at": "2026-08-21T12:00:00.000Z",
+  "operation_hash": "sha256:9ba54eca453b59fe64bae7a4fe5857ebf8429806021909ec0380a0a79c107108",
+  "operation_id": "70000000-0000-4000-8000-000000000001",
+  "previous_entry_hash": null,
+  "prompt_template": {
+    "artifact_id": "prompt-revision",
+    "document_type": "prompt-template",
+    "hash": "sha256:be559a32cd3dc45c9652b9c2f6505842f757067d67de26a7f192d429628f1f3b",
+    "revision": 1
+  },
+  "protocol_version": "runtime-contract.v1",
+  "registry_revision": 1,
+  "schema_version": "agent-registry-entry.v1",
+  "state": "ACTIVE"
+}

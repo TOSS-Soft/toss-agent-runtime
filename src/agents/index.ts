@@ -1,3 +1,6 @@
+import { createAgentRegistry as createAgentRegistryInternal } from "./registry.js";
+import type { AgentRegistry } from "./types.js";
+
 export {
   hashAgentDefinition,
   hashAgentRegistryEntry,
@@ -10,8 +13,19 @@ export {
 } from "./contracts.js";
 export { matchAgentAuthority, type EffectiveAgentAuthority } from "./authority.js";
 export { compileAgentContext } from "./context.js";
-export { createAgentRegistry, type CreateAgentRegistryOptions } from "./registry.js";
 export { RuntimeAgentError, type RuntimeAgentErrorCode } from "./errors.js";
+
+export interface CreateAgentRegistryOptions {
+  readonly statePath: string;
+  readonly now: () => Date;
+  readonly randomId: () => string;
+  readonly hasServiceListener: () => Promise<"present" | "absent" | "unknown">;
+}
+
+export function createAgentRegistry(options: CreateAgentRegistryOptions): AgentRegistry {
+  return createAgentRegistryInternal(options);
+}
+
 export type {
   AgentBudgetClass,
   AgentArtifactReference,

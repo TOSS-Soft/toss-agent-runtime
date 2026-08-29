@@ -314,12 +314,102 @@ Prompts, provider bodies, endpoints, headers, tokens, credentials, diagnostics, 
 
 Issue #13 remains pending for full secret, egress, prompt-injection, and sandbox hardening. Issue #15 remains pending for protected live-provider routing smoke and release guidance. Ordinary CI validates the pure contract without claiming either gate.
 
-## 12. Stable failures
+## 12. Agent definition registry and compiled context
+
+### 12.1 Control-plane authority and immutable lifecycle
+
+The TOSS control plane is the sole authority for agent identity, role, Task
+Contract, approval, policy, and acceptance. The runtime MUST accept only exact,
+hash-bound control-plane artifacts. It MUST NOT create a role, broaden an
+allowlist or budget, reinterpret repository content as authority, or accept its
+own output. Agent definitions remain provider-independent: they name a logical
+model class and closed capabilities, never a provider, endpoint, route, or
+concrete model.
+
+`prompt-template.v1` and `agent-definition.v1` are immutable canonical objects.
+`agent-registry-entry.v1` forms an append-only hash-linked lifecycle with
+`ACTIVE` and `RETIRED` states. Publishing a new revision makes the prior active
+revision stale for new execution without deleting its objects. A new execution
+MUST resolve the exact `ACTIVE` definition requested by the control plane.
+`resolveForExecution()` MUST reject every non-active revision. A retained
+retired revision MAY resolve through `resolveForResume()` only to resume a run
+already bound to that exact definition and prompt; retirement never silently
+reactivates it. Repeated operation IDs replay only their exact durable result,
+and reuse with different canonical semantics is a conflict.
+
+Registry storage is private runtime state, not a writable configuration
+surface. Object names are derived from verified hashes rather than caller
+paths. Registry projections omit prompt bodies, while recovery verifies the
+complete history, operation binding, referenced object bytes, hash links, and
+the single-active-revision invariant before intake.
+
+### 12.2 Trust classes and fixed precedence
+
+`compiled-context.v1` binds the exact execution-request hash, definition,
+prompt, Task Contract, output schema, effective authority, runtime-policy
+revision, ordered segments, accounting, truncation records, and final document
+hash. Its three trust classes have closed meanings:
+
+- `trusted-runtime` is the fixed, hash-bound runtime safety policy.
+- `trusted-control` is exact control-plane content that passed its owning
+  validator and reference checks.
+- `untrusted-content` is repository, web, model, skill, and tool content,
+  regardless of text that claims to be policy, approval, authority, or a system
+  instruction.
+
+The compiler MUST emit fixed precedence in this order: runtime safety, exact
+Task Contract, prompt-template blocks, exact output contract, then input
+artifacts. Task and runtime constraints cannot be overridden by a prompt, and a
+prompt cannot broaden the Task Contract. Untrusted segments remain structurally
+separate and MUST NOT be concatenated into trusted instruction blocks. Caller
+input order has no authority: inputs are normalized and ASCII-sorted by policy
+priority, document type, artifact ID, revision, and hash.
+
+### 12.3 Conservative accounting and truncation
+
+For v1, one UTF-8 byte counts as one conservative input token. The effective
+input ceiling is the minimum of the execution request and definition ceilings.
+All `trusted-runtime` and `trusted-control` segments are non-truncatable; trusted
+content is never truncated, and compilation MUST fail before a provider effect
+when it does not fit.
+
+Untrusted inputs consume only the remaining budget and the definition's
+per-document and total-untrusted byte ceilings. Whole content is preferred.
+Only the final eligible untrusted segment may be prefix-truncated at a Unicode
+scalar boundary; every later segment is omitted. Truncation is not semantic
+summarization and performs no model call. The output records original and
+included hashes and byte counts with reason `input-budget` or
+`definition-ceiling`; omitted bytes MUST NOT be represented as included or
+trusted.
+
+### 12.4 Schema support and downstream ownership
+
+Issue #7 advertises the four agent/context schemas only; Issue #7 does not
+execute Agent Skills, Superpowers, MCP tools, providers, or the agent loop.
+Schema support therefore MUST NOT make skills, MCP, agent-loop, review, or
+evidence availability true. Issue #8 owns Agent Skills loading, Superpowers
+phases, approval pauses, and skill evidence. Issue #9 owns MCP tool brokering,
+approvals, and side-effect idempotency. Issue #10 owns provider calls and the
+agent loop, including provider-neutral turns, structured output, pause/resume,
+and terminal status.
+
+## 13. Stable failures
 
 Library validation returns `RUNTIME_DOCUMENT_INVALID` for malformed content and `RUNTIME_DOCUMENT_UNSUPPORTED` for a recognized envelope requiring an unimplemented version or capability. Issues contain a JSON Pointer-like path, stable keyword, and safe message in deterministic order.
 
 CLI JSON mode returns one `command-result.v1` document. Exit codes are `0` success, `2` usage, `3` invalid input, `4` policy/blocked, `5` validation, `6` conflict/stale revision, `69` unavailable, and `70` internal. Failure output MUST be safe to persist and MUST NOT echo secret-shaped option values.
 
-## 13. Reference artifacts
+## 14. Reference artifacts
 
-The schema manifest maps every exact version to a stable `$id`. The `examples/runtime-contract-v1` directory contains a complete request, event, result, baseline capabilities, model catalog, routing policy, prior routing state, and model-selection plan set. Package verification loads the examples through the public API, validates the full execution chain, and recomputes all governed routing hashes. The planned example binds its exact next-state hash without embedding a cyclic plan hash in the state reservation.
+The schema manifest maps every exact version to a stable `$id`. The
+`examples/runtime-contract-v1` directory contains a complete request, event,
+result, baseline capabilities, model catalog, routing policy, prior routing
+state, model-selection plan, prompt template, agent definition, registry entry,
+and compiled context set. The four agent/context examples are illustrative
+control-plane artifacts, not writable local configuration. They are secret-free
+and bind one exact accepted integration fixture across definition, prompt,
+registry, Task Contract, output schema, request, and compiled-context hashes.
+Package verification loads examples through the public package API, validates
+the execution chain, and recomputes every governed routing and agent/context
+hash. The planned routing example binds its exact next-state hash without
+embedding a cyclic plan hash in the state reservation.

@@ -6,16 +6,24 @@ import {
   createBaselineCapabilities,
   createProtocolValidator,
   createRunJournalStore,
+  hashAgentDefinition,
+  hashAgentRegistryEntry,
+  hashCompiledContext,
   hashModelCatalog,
   hashModelSelectionPlan,
+  hashPromptTemplate,
   hashRoutingPolicy,
   hashRoutingState,
+  parseAgentDefinition,
+  parseAgentRegistryEntry,
+  parseCompiledContext,
   parseExecutionEvent,
   parseExecutionRequest,
   parseExecutionResult,
   parseModelCatalog,
   parseModelSelectionPlan,
   parseProviderEvent,
+  parsePromptTemplate,
   parseRoutingPolicy,
   parseRoutingState,
   parseRuntimeCapabilities,
@@ -237,6 +245,98 @@ describe("published protocol artifacts", () => {
       expect(plan.value.prior_state_hash).toBe(state.value.document_hash);
       expect(plan.value.status).toBe("planned");
     }
+  });
+
+  it("loads the accepted agent-context examples through the package-root parsers with exact bindings", async () => {
+    const prompt = parsePromptTemplate(await readExample("prompt-template"));
+    const definition = parseAgentDefinition(await readExample("agent-definition"));
+    const registryEntry = parseAgentRegistryEntry(await readExample("agent-registry-entry"));
+    const context = parseCompiledContext(await readExample("compiled-context"));
+
+    expect(prompt.ok && definition.ok && registryEntry.ok && context.ok).toBe(true);
+    if (prompt.ok && definition.ok && registryEntry.ok && context.ok) {
+      expect(hashPromptTemplate(prompt.value)).toBe(prompt.value.document_hash);
+      expect(hashAgentDefinition(definition.value)).toBe(definition.value.document_hash);
+      expect(hashAgentRegistryEntry(registryEntry.value)).toBe(registryEntry.value.entry_hash);
+      expect(hashCompiledContext(context.value)).toBe(context.value.document_hash);
+
+      const promptReference = {
+        document_type: "prompt-template",
+        artifact_id: prompt.value.template_id,
+        revision: prompt.value.revision,
+        hash: prompt.value.document_hash,
+      } as const;
+      const definitionReference = {
+        document_type: "agent-definition",
+        artifact_id: definition.value.agent_id,
+        revision: definition.value.revision,
+        hash: definition.value.document_hash,
+      } as const;
+
+      expect(prompt.value.document_hash).toBe(
+        "sha256:be559a32cd3dc45c9652b9c2f6505842f757067d67de26a7f192d429628f1f3b",
+      );
+      expect(definition.value.document_hash).toBe(
+        "sha256:dcbb6bf855f06ab5e183773287e71565b26305bfdf646649a3fec92be1854f7c",
+      );
+      expect(registryEntry.value.entry_hash).toBe(
+        "sha256:3c13d4027e25aa78a1df9a042b78635ed8c212a4838b500d07b47e25837f1a58",
+      );
+      expect(context.value.document_hash).toBe(
+        "sha256:b37ad6d2e9b6447129707442c7b4a8f9ce491ad71e41a9464059e5c9e59cfde5",
+      );
+      expect(definition.value.prompt_template).toEqual(promptReference);
+      expect(registryEntry.value.definition).toEqual(definitionReference);
+      expect(registryEntry.value.prompt_template).toEqual(promptReference);
+      expect(context.value.definition).toEqual(definitionReference);
+      expect(context.value.prompt_template).toEqual(promptReference);
+      expect(context.value.task_contract).toEqual(definition.value.task_contracts[0]);
+      expect(context.value.output_schema).toEqual(definition.value.output_schemas[0]);
+      expect(context.value.authority.logical_class).toBe(definition.value.model.logical_class);
+      expect(context.value.authority.mcp_profile).toEqual(definition.value.mcp_profiles[0]);
+    }
+  });
+
+  it("documents the normative agent authority, lifecycle, compiler, and downstream boundaries", async () => {
+    const readme = await readFile("README.md", "utf8");
+    const protocolContract = await readFile(
+      "docs/contracts/runtime-contract-protocol-v1.md",
+      "utf8",
+    );
+    const changelog = await readFile("CHANGELOG.md", "utf8");
+    const combined = `${readme}\n${protocolContract}\n${changelog}`;
+    const protocolProse = protocolContract.replaceAll(/\s+/gu, " ");
+    const combinedProse = combined.replaceAll(/\s+/gu, " ");
+
+    expect(protocolContract).toContain("Agent definition registry and compiled context");
+    expect(combinedProse).toMatch(/TOSS control plane.*?(?:sole|only).*?authority/iu);
+    expect(protocolProse).toMatch(/ACTIVE.*?new execution/iu);
+    expect(protocolProse).toMatch(/retained.*?(?:retired )?revision.*?resume/iu);
+    expect(protocolContract).toContain("`trusted-runtime`");
+    expect(protocolContract).toContain("`trusted-control`");
+    expect(protocolContract).toContain("`untrusted-content`");
+    expect(protocolProse).toMatch(
+      /runtime safety.*?Task Contract.*?prompt-template.*?output contract.*?input artifacts/iu,
+    );
+    expect(protocolProse).toMatch(/one UTF-8 byte.*?one conservative input token/iu);
+    expect(protocolProse).toMatch(/trusted.*?never truncated/iu);
+    expect(protocolProse).toMatch(/final eligible untrusted segment.*?Unicode scalar boundary/iu);
+    expect(combinedProse).toMatch(/illustrative.*?not writable (?:local )?configuration/iu);
+    expect(combinedProse).toMatch(/Issue #7.*?advertises.*?schemas only/iu);
+    for (const boundary of [
+      "Agent Skills",
+      "Superpowers",
+      "MCP tools",
+      "providers",
+      "agent loop",
+    ]) {
+      expect(combinedProse).toMatch(
+        new RegExp(`Issue #7.*?(?:does not|MUST NOT).*?${boundary}`, "iu"),
+      );
+    }
+    expect(combinedProse).toMatch(/Issue #8.*?owns.*?(?:Agent Skills|skill)/iu);
+    expect(combinedProse).toMatch(/Issue #9.*?owns.*?(?:MCP|tool)/iu);
+    expect(combinedProse).toMatch(/Issue #10.*?owns.*?(?:provider|agent loop)/iu);
   });
 
   it("documents the complete governed routing boundary without claiming later execution", async () => {
