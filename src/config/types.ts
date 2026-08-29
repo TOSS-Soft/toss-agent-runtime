@@ -26,6 +26,7 @@ export interface RuntimeConfigV1 {
   readonly gateway_profiles: Readonly<Record<string, AgentgatewayProfileV1>>;
   readonly provider_profiles: readonly string[];
   readonly mcp_profiles: readonly string[];
+  readonly skill_roots: readonly string[];
   readonly secret_references: Readonly<Record<string, SecretReference>>;
 }
 

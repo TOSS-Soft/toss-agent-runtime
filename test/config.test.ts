@@ -90,6 +90,7 @@ gateway_profile: ${mode === "production" ? "gateway-production" : "null"}
 ${gatewayProfiles}
 provider_profiles: []
 mcp_profiles: []
+skill_roots: []
 ${secretReferences}
 `;
 }
@@ -117,6 +118,13 @@ function developmentGatewayYaml(root: string, endpoint: string): string {
 
 function validYamlWithSocket(root: string, socket: string): string {
   return validYaml(root).replace(`socket: ${root}/runtime.sock`, `socket: ${socket}`);
+}
+
+function validYamlWithSkillRoots(root: string, skillRoots: readonly string[]): string {
+  return validYaml(root).replace(
+    "skill_roots: []",
+    `skill_roots:\n${skillRoots.map((skillRoot) => `  - ${skillRoot}`).join("\n")}`,
+  );
 }
 
 function linuxConfigRoot(home: string): string {
@@ -156,6 +164,47 @@ afterEach(async () => {
 });
 
 describe("runtime configuration", () => {
+  it("defaults to bundled skills without scanning a user or project root", () => {
+    expect(defaultConfig("darwin", "/Users/test").skill_roots).toEqual([]);
+  });
+
+  it("accepts ASCII-sorted unique configured skill roots", async () => {
+    const root = await temporaryDirectory();
+    const configPath = path.join(root, "config.yaml");
+    await writeFile(
+      configPath,
+      validYamlWithSkillRoots(root, ["/opt/toss/skills-a", "/opt/toss/skills-b"]),
+      { mode: 0o600 },
+    );
+
+    await expect(
+      loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home: root }),
+    ).resolves.toMatchObject({
+      config: { skill_roots: ["/opt/toss/skills-a", "/opt/toss/skills-b"] },
+    });
+  });
+
+  it.each([
+    [
+      "more than sixteen roots",
+      Array.from({ length: 17 }, (_, index) => `/opt/skills-${String(index).padStart(2, "0")}`),
+    ],
+    ["relative root", ["relative/skills"]],
+    ["control character", ["/opt/unsafe\u0000skills"]],
+    ["normalization alias", ["/opt/toss/../skills"]],
+    ["duplicate root", ["/opt/toss/skills", "/opt/toss/skills"]],
+    ["unsorted roots", ["/opt/toss/skills-b", "/opt/toss/skills-a"]],
+    ["ancestor overlap", ["/opt/toss/skills", "/opt/toss/skills/references"]],
+  ] as const)("rejects %s in configured skill roots", async (_name, skillRoots) => {
+    const root = await temporaryDirectory();
+    const configPath = path.join(root, "config.yaml");
+    await writeFile(configPath, validYamlWithSkillRoots(root, skillRoots), { mode: 0o600 });
+
+    await expect(
+      loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home: root }),
+    ).rejects.toMatchObject({ code: "RUNTIME_CONFIG_INVALID" });
+  });
+
   it("keeps the shared control-artifact registry and scanner predicates in exact parity", () => {
     const pathsModule = servicePaths as typeof servicePaths & {
       readonly SERVICE_CONTROL_ARTIFACT_PATTERNS?: Readonly<Record<string, RegExp>>;
