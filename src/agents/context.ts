@@ -596,30 +596,25 @@ function buildTrustedSegments(
   output: NormalizedArtifact,
   includeTruncationNotice = false,
 ): readonly CompiledContextSegmentV1[] {
+  const noticePolicy = COMPILED_CONTEXT_RUNTIME_POLICY_V1.truncation_notice;
+  const runtimeContent =
+    COMPILED_CONTEXT_RUNTIME_POLICY_V1.safety_text +
+    (includeTruncationNotice ? noticePolicy.framing + noticePolicy.content : "");
   const promptReference = projectReference(
     bundle.definition.prompt_template,
   ) as PromptTemplateReference;
   const segments: CompiledContextSegmentV1[] = [
     {
       ...segmentBase(
-        "runtime-safety",
-        null,
-        sha256(
-          includeTruncationNotice
-            ? COMPILED_CONTEXT_RUNTIME_POLICY_V1.safety_text +
-                COMPILED_CONTEXT_RUNTIME_POLICY_V1.truncation_notice_framing
-            : COMPILED_CONTEXT_RUNTIME_POLICY_V1.safety_text,
-          AGENT_DOCUMENT_LIMITS,
-        ),
-        includeTruncationNotice
-          ? COMPILED_CONTEXT_RUNTIME_POLICY_V1.safety_text +
-              COMPILED_CONTEXT_RUNTIME_POLICY_V1.truncation_notice_framing
-          : COMPILED_CONTEXT_RUNTIME_POLICY_V1.safety_text,
+        noticePolicy.target.kind,
+        noticePolicy.target.source,
+        sha256(runtimeContent, AGENT_DOCUMENT_LIMITS),
+        runtimeContent,
         COMPILED_CONTEXT_RUNTIME_POLICY_V1.reference.hash,
       ),
-      kind: "runtime-safety",
+      kind: noticePolicy.target.kind,
       trust: "trusted-runtime",
-      source: null,
+      source: noticePolicy.target.source,
     },
     {
       ...segmentBase("task-contract", task.reference, task.reference.hash, task.content),

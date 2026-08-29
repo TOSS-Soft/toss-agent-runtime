@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  COMPILED_CONTEXT_RUNTIME_POLICY_V1,
   hashAgentDefinition,
   hashAgentRegistryEntry,
   hashCompiledContext,
@@ -44,8 +45,7 @@ const TRUNCATION_NOTICE_TEXT = [
   "TOSS Runtime Context Truncation Notice v1.",
   "Untrusted content was truncated or omitted to satisfy deterministic context limits.",
 ].join("\n");
-const TRUNCATION_NOTICE_FRAMING = `\n\n${TRUNCATION_NOTICE_TEXT}`;
-const RUNTIME_POLICY_HASH = sha256({
+const RUNTIME_POLICY_DOCUMENT = {
   protocol_version: "runtime-contract.v1",
   schema_version: "runtime-context-policy.v1",
   document_type: "runtime-context-policy",
@@ -63,7 +63,20 @@ const RUNTIME_POLICY_HASH = sha256({
     trusted_instruction_classes: ["trusted-runtime", "trusted-control"],
     untrusted_interpretation: "quoted-data-only",
   },
-});
+  truncation_notice: {
+    target: { segment_index: 0, kind: "runtime-safety", source: null },
+    presence: "iff-truncations-nonempty",
+    placement: "content-suffix",
+    framing: "\n\n",
+    content: TRUNCATION_NOTICE_TEXT,
+  },
+} as const;
+const TRUNCATION_NOTICE_FRAMING =
+  RUNTIME_POLICY_DOCUMENT.truncation_notice.framing +
+  RUNTIME_POLICY_DOCUMENT.truncation_notice.content;
+const RUNTIME_POLICY_HASH = sha256(RUNTIME_POLICY_DOCUMENT);
+const LEGACY_RUNTIME_POLICY_HASH =
+  "sha256:e30d7d8e0d6e62665f0460ae86d72c80e7a8655a3af18a36930d79473adc5e91" as const;
 
 function ref<T extends string>(
   document_type: T,
@@ -805,6 +818,72 @@ describe("agent contract documents", () => {
     });
 
     expect(parseCompiledContext(JSON.stringify(wrongPolicy)).ok).toBe(false);
+  });
+
+  it("hashes the full canonical runtime policy including notice semantics", () => {
+    expect(COMPILED_CONTEXT_RUNTIME_POLICY_V1.reference.hash).toBe(sha256(RUNTIME_POLICY_DOCUMENT));
+    expect(COMPILED_CONTEXT_RUNTIME_POLICY_V1.reference.hash).not.toBe(LEGACY_RUNTIME_POLICY_HASH);
+  });
+
+  it("binds every notice and framing byte plus target and placement semantics", () => {
+    const expectedHash = sha256(RUNTIME_POLICY_DOCUMENT);
+    for (const field of ["content", "framing"] as const) {
+      const original = RUNTIME_POLICY_DOCUMENT.truncation_notice[field];
+      expect(Buffer.byteLength(original, "utf8")).toBe(original.length);
+      for (let index = 0; index < original.length; index += 1) {
+        const replacement = String.fromCharCode(original.charCodeAt(index) ^ 1);
+        const changed = original.slice(0, index) + replacement + original.slice(index + 1);
+        expect(
+          sha256({
+            ...RUNTIME_POLICY_DOCUMENT,
+            truncation_notice: {
+              ...RUNTIME_POLICY_DOCUMENT.truncation_notice,
+              [field]: changed,
+            },
+          }),
+        ).not.toBe(expectedHash);
+      }
+    }
+
+    for (const truncation_notice of [
+      {
+        ...RUNTIME_POLICY_DOCUMENT.truncation_notice,
+        target: { ...RUNTIME_POLICY_DOCUMENT.truncation_notice.target, segment_index: 1 },
+      },
+      {
+        ...RUNTIME_POLICY_DOCUMENT.truncation_notice,
+        target: { ...RUNTIME_POLICY_DOCUMENT.truncation_notice.target, kind: "input-artifact" },
+      },
+      {
+        ...RUNTIME_POLICY_DOCUMENT.truncation_notice,
+        target: {
+          ...RUNTIME_POLICY_DOCUMENT.truncation_notice.target,
+          source: {
+            document_type: "runtime-context-policy",
+            artifact_id: "runtime-context-policy-v1",
+            revision: 1,
+            hash: expectedHash,
+          },
+        },
+      },
+      { ...RUNTIME_POLICY_DOCUMENT.truncation_notice, presence: "always" },
+      { ...RUNTIME_POLICY_DOCUMENT.truncation_notice, placement: "content-prefix" },
+    ]) {
+      expect(sha256({ ...RUNTIME_POLICY_DOCUMENT, truncation_notice })).not.toBe(expectedHash);
+    }
+  });
+
+  it("rejects a re-signed context carrying the legacy notice-free policy hash", () => {
+    const prompt = fixturePrompt();
+    const definition = fixtureDefinition(prompt.document_hash);
+    const context = fixtureContext(prompt.document_hash, definition.document_hash);
+    const legacyPolicy = resignedContext({
+      ...context,
+      runtime_policy: { revision: 1, hash: LEGACY_RUNTIME_POLICY_HASH },
+    });
+
+    expect(parseCompiledContext(JSON.stringify(context)).ok).toBe(true);
+    expect(parseCompiledContext(JSON.stringify(legacyPolicy)).ok).toBe(false);
   });
 
   it("rejects hash-valid unsorted authority sets and noncanonical operation UUID aliases", () => {

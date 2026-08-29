@@ -65,6 +65,13 @@ const RUNTIME_CONTEXT_POLICY_DOCUMENT_V1 = deepFreezeJson({
     trusted_instruction_classes: ["trusted-runtime", "trusted-control"],
     untrusted_interpretation: "quoted-data-only",
   },
+  truncation_notice: {
+    target: { segment_index: 0, kind: "runtime-safety", source: null },
+    presence: "iff-truncations-nonempty",
+    placement: "content-suffix",
+    framing: "\n\n",
+    content: TRUNCATION_NOTICE_TEXT,
+  },
 } as const);
 
 // Shared by the compiler and semantic validator, but intentionally omitted from
@@ -77,7 +84,7 @@ export const COMPILED_CONTEXT_RUNTIME_POLICY_V1 = deepFreezeJson({
     hash: sha256(RUNTIME_CONTEXT_POLICY_DOCUMENT_V1),
   },
   safety_text: RUNTIME_CONTEXT_POLICY_DOCUMENT_V1.safety_text,
-  truncation_notice_framing: `\n\n${TRUNCATION_NOTICE_TEXT}`,
+  truncation_notice: RUNTIME_CONTEXT_POLICY_DOCUMENT_V1.truncation_notice,
   framing_rules: RUNTIME_CONTEXT_POLICY_DOCUMENT_V1.framing_rules,
 } as const);
 
@@ -360,7 +367,8 @@ function validateContextSemantics(value: CompiledContextV1): readonly Validation
     );
   }
 
-  const runtime = value.segments[0];
+  const noticePolicy = COMPILED_CONTEXT_RUNTIME_POLICY_V1.truncation_notice;
+  const runtime = value.segments[noticePolicy.target.segment_index];
   const task = value.segments[1];
   if (runtime?.kind !== "runtime-safety" || task?.kind !== "task-contract") {
     issues.push(
@@ -375,10 +383,12 @@ function validateContextSemantics(value: CompiledContextV1): readonly Validation
   }
   const expectedRuntimeContent =
     COMPILED_CONTEXT_RUNTIME_POLICY_V1.safety_text +
-    (value.truncations.length === 0
-      ? ""
-      : COMPILED_CONTEXT_RUNTIME_POLICY_V1.truncation_notice_framing);
-  if (runtime?.kind === "runtime-safety" && runtime.content !== expectedRuntimeContent) {
+    (value.truncations.length === 0 ? "" : noticePolicy.framing + noticePolicy.content);
+  if (
+    runtime?.kind === noticePolicy.target.kind &&
+    runtime.source === noticePolicy.target.source &&
+    runtime.content !== expectedRuntimeContent
+  ) {
     issues.push(
       issue(
         "/segments/0/content",
