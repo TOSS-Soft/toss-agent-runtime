@@ -499,7 +499,7 @@ their separate availability states.
 - public API includes only safe parsers, hashes, pure operations, and types;
 - schema manifest, capability example, routing examples, README, protocol
   docs, changelog, and exact package allowlist agree;
-- Node 22.23.1 and Node 24 macOS format, lint, typecheck, full tests, build,
+- latest Node.js LTS macOS format, lint, typecheck, full tests, build,
   installed-package acceptance, and production audit pass;
 - protected live-provider routing smoke remains explicitly pending Issue #15.
 
@@ -507,6 +507,6 @@ their separate availability states.
 
 Issue #6 uses branch `issue/6-governed-model-router` and one dedicated PR
 against `release/v1.0.0`. The issue and PR project items become Done and the
-issue closes when the exact PR head passes both required macOS CI jobs and all
+issue closes when the exact PR head passes the required macOS CI job and all
 Issue #6 acceptance criteria. Merge into the version branch is recorded
 separately in Epic #16.
