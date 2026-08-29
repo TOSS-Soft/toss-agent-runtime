@@ -343,12 +343,33 @@ paths. Registry projections omit prompt bodies, while recovery verifies the
 complete history, operation binding, referenced object bytes, hash links, and
 the single-active-revision invariant before intake.
 
+Registry reads are validation-only. A read accepted before shutdown holds a
+mutation claim and participates in the shutdown flush cut, but it MUST NOT
+repair a partial history. After intake stops, list and exact-resolution reads
+MAY inspect fully valid durable state without a claim or any durable mutation;
+a partial tail fails closed without truncation, quarantine, or history changes.
+Only an explicitly awaited `recover()` owns repair, and that repair is tracked
+as a mutation.
+
+Recovery uses at most one private regular stage file with the exact name
+`.(lifecycle|operations)-recovery.<canonical-uuid>.stage`. Before a rename, the
+stage contains exactly the validated complete history prefix and its UUID names
+exactly one private quarantine file containing the rejected tail. Fresh
+recovery revalidates bounded directory membership, owner, mode, link count,
+size, file identity, stage content, quarantine content, and their relationship
+to the current partial history before completing the rename. An unsafe,
+additional, live, replaced, or unrelated stage fails closed and is preserved.
+A failed pre-rename attempt removes only the exact stage identity it created
+and synchronizes the parent directory when possible; retry reuses an existing
+exact quarantine fragment rather than creating a duplicate.
+
 ### 12.2 Trust classes and fixed precedence
 
 `compiled-context.v1` binds the exact execution-request hash, definition,
 prompt, Task Contract, output schema, effective authority, runtime-policy
-revision, ordered segments, accounting, truncation records, and final document
-hash. Its three trust classes have closed meanings:
+revision, closed allocation-policy projection, ordered segments, accounting,
+truncation records, and final document hash. Its three trust classes have
+closed meanings:
 
 - `trusted-runtime` is the fixed, hash-bound runtime safety policy.
 - `trusted-control` is exact control-plane content that passed its owning
@@ -365,6 +386,28 @@ separate and MUST NOT be concatenated into trusted instruction blocks. Caller
 input order has no authority: inputs are normalized and ASCII-sorted by policy
 priority, document type, artifact ID, revision, and hash.
 
+Every segment ID is recomputed from the producer's exact canonical preimage.
+Prompt segments additionally carry their canonical `block_id`. A parser MUST
+take every contiguous prompt segment in order, exclude runtime safety and its
+truncation notice, reconstruct the complete `prompt-template.v1` document from
+the top-level template reference plus those block IDs and contents, and require
+its hash to equal `prompt_template.hash`. Missing, duplicate, reordered, or
+altered prompt blocks are invalid. For an unshortened Task Contract, output
+schema, or input artifact, `included_hash`, `original_hash`, and `source.hash`
+are identical; the included bytes MUST recompute that source hash using the
+source's canonical JSON or text representation.
+
+The hash-bound allocation projection contains the definition input ceiling,
+truncation algorithm, total-untrusted ceiling, and the complete canonically
+ordered per-document policies. Together with the request ceiling already in
+effective authority, it lets a parser independently enforce the compiler's
+input comparator, ceiling choice, and truncation reason without a caller
+override. This projection proves the compiled document's internal canonical
+semantics. Its correspondence to the separately hash-bound full agent
+definition remains the resolver/compiler trust boundary: registry resolution
+validates and supplies that definition before compilation; a standalone parser
+does not fetch the definition object.
+
 ### 12.3 Conservative accounting and truncation
 
 For v1, one UTF-8 byte counts as one conservative input token. The effective
@@ -380,7 +423,10 @@ scalar boundary; every later segment is omitted. Truncation is not semantic
 summarization and performs no model call. The output records original and
 included hashes and byte counts with reason `input-budget` or
 `definition-ceiling`; omitted bytes MUST NOT be represented as included or
-trusted.
+trusted. The first shortened input fixes the exact reason implied by the
+effective request/definition, per-document, and total-untrusted ceilings (ties
+resolve to `definition-ceiling`); every later shortened or omitted input MUST
+propagate that one reason.
 
 ### 12.4 Schema support and downstream ownership
 

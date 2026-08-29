@@ -123,10 +123,21 @@ change authority.
 `compileAgentContext()` emits one deterministic, provider-neutral,
 hash-bound `compiled-context.v1` document. Segment precedence is fixed as
 `trusted-runtime` safety, `trusted-control` Task Contract, prompt template and
-output contract, then `untrusted-content` input artifacts. V1 counts one UTF-8
-byte as one conservative token. Trusted segments are never truncated; only the
-final eligible untrusted segment can be prefix-truncated at a Unicode scalar
-boundary, with exact original/included hashes and byte counts recorded.
+output contract, then `untrusted-content` input artifacts. Prompt block IDs and
+the closed allocation policy are hash-bound so the parser can reconstruct the
+exact prompt, recompute every segment ID, and enforce canonical input ordering
+and truncation reasons. Unshortened direct-source content retains its exact
+source hash. V1 counts one UTF-8 byte as one conservative token. Trusted
+segments are never truncated; only the final eligible untrusted segment can be
+prefix-truncated at a Unicode scalar boundary, with exact original/included
+hashes and byte counts recorded.
+
+Registry list and resolution calls validate but never repair durable history.
+Reads accepted before shutdown participate in the flush cut; reads after
+shutdown may inspect fully valid state without writing. An explicitly awaited
+`recover()` is the only operation that repairs a partial tail, using a bounded,
+identity-checked recovery stage and reusing an exact quarantine fragment on
+retry.
 
 Issue #7 advertises the four agent/context schemas only; Issue #7 does not
 execute Agent Skills, Superpowers, MCP tools, providers, or the agent loop.
