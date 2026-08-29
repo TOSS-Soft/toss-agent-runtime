@@ -9,6 +9,7 @@ import {
   hashAgentDefinition,
   hashAgentRegistryEntry,
   hashCompiledContext,
+  hashExecutionRequest,
   hashModelCatalog,
   hashModelSelectionPlan,
   hashPromptTemplate,
@@ -248,13 +249,17 @@ describe("published protocol artifacts", () => {
   });
 
   it("loads the accepted agent-context examples through the package-root parsers with exact bindings", async () => {
+    const request = parseExecutionRequest(await readExample("agent-context-execution-request"));
     const prompt = parsePromptTemplate(await readExample("prompt-template"));
     const definition = parseAgentDefinition(await readExample("agent-definition"));
     const registryEntry = parseAgentRegistryEntry(await readExample("agent-registry-entry"));
     const context = parseCompiledContext(await readExample("compiled-context"));
 
-    expect(prompt.ok && definition.ok && registryEntry.ok && context.ok).toBe(true);
-    if (prompt.ok && definition.ok && registryEntry.ok && context.ok) {
+    expect(request.ok && prompt.ok && definition.ok && registryEntry.ok && context.ok).toBe(true);
+    if (request.ok && prompt.ok && definition.ok && registryEntry.ok && context.ok) {
+      expect(hashExecutionRequest(request.value)).toBe(
+        "sha256:1b36f5f38a4f2ac2b89381a1847ded1e3ebc5d9539e6f11d190bfe0568f5de30",
+      );
       expect(hashPromptTemplate(prompt.value)).toBe(prompt.value.document_hash);
       expect(hashAgentDefinition(definition.value)).toBe(definition.value.document_hash);
       expect(hashAgentRegistryEntry(registryEntry.value)).toBe(registryEntry.value.entry_hash);
@@ -290,10 +295,75 @@ describe("published protocol artifacts", () => {
       expect(registryEntry.value.prompt_template).toEqual(promptReference);
       expect(context.value.definition).toEqual(definitionReference);
       expect(context.value.prompt_template).toEqual(promptReference);
+      expect(context.value.request_hash).toBe(hashExecutionRequest(request.value));
+      expect(request.value.agent.definition).toEqual(definitionReference);
+      expect(request.value.agent.definition).toEqual(context.value.definition);
+      expect(request.value.agent.role).toBe(definition.value.role);
+      expect(request.value.task_contract).toEqual(definition.value.task_contracts[0]);
       expect(context.value.task_contract).toEqual(definition.value.task_contracts[0]);
+      expect(request.value.task_contract).toEqual(context.value.task_contract);
+      expect(request.value.output.schema).toEqual(definition.value.output_schemas[0]);
       expect(context.value.output_schema).toEqual(definition.value.output_schemas[0]);
+      expect(request.value.output.schema).toEqual(context.value.output_schema);
+      expect(request.value.model.logical_class).toBe(definition.value.model.logical_class);
       expect(context.value.authority.logical_class).toBe(definition.value.model.logical_class);
+      expect(context.value.authority.logical_class).toBe(request.value.model.logical_class);
+      expect(request.value.model.required_capabilities).toEqual(["text", "tools"]);
+      expect(context.value.authority.model_capabilities).toEqual(
+        request.value.model.required_capabilities,
+      );
+      for (const capability of definition.value.model.required_capabilities) {
+        expect(request.value.model.required_capabilities).toContain(capability);
+      }
+      for (const capability of request.value.model.required_capabilities) {
+        expect(definition.value.model.allowed_capabilities).toContain(capability);
+      }
+      expect(request.value.superpowers.required).toEqual(definition.value.superpowers.required);
+      expect(context.value.authority.superpowers).toEqual(request.value.superpowers.required);
+      expect(request.value.mcp.profile).toEqual(definition.value.mcp_profiles[0]);
       expect(context.value.authority.mcp_profile).toEqual(definition.value.mcp_profiles[0]);
+      expect(context.value.authority.mcp_profile).toEqual(request.value.mcp.profile);
+      expect(request.value.budget).toEqual({
+        max_input_tokens: 24_000,
+        max_output_tokens: 3_000,
+        max_cost_microusd: 400_000,
+        max_duration_ms: 500_000,
+        max_turns: 7,
+      });
+      expect(definition.value.budget_ceiling).toEqual({
+        max_input_tokens: 32_000,
+        max_output_tokens: 4_000,
+        max_cost_microusd: 500_000,
+        max_duration_ms: 600_000,
+        max_turns: 8,
+      });
+      expect(context.value.authority.budget).toEqual(request.value.budget);
+      for (const budgetKey of Object.keys(
+        request.value.budget,
+      ) as readonly (keyof typeof request.value.budget)[]) {
+        expect(request.value.budget[budgetKey]).toBeLessThanOrEqual(
+          definition.value.budget_ceiling[budgetKey],
+        );
+      }
+      expect(request.value.input_artifacts).toEqual([
+        {
+          document_type: "source-artifact",
+          artifact_id: "SOURCE-ONE",
+          revision: 1,
+          hash: "sha256:b73e73471433d1c2262f913cbc7eef547cfe3bd191fbb5f1a90382bd2f611863",
+        },
+        {
+          document_type: "source-artifact",
+          artifact_id: "SOURCE-TWO",
+          revision: 2,
+          hash: "sha256:d1051d2b34615a0756d304a9e0744f9021c59196c446795503210321d172bd3c",
+        },
+      ]);
+      expect(
+        context.value.segments
+          .filter((segment) => segment.kind === "input-artifact")
+          .map((segment) => segment.source),
+      ).toEqual(request.value.input_artifacts);
     }
   });
 

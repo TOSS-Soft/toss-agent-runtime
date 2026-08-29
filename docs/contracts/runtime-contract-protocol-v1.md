@@ -402,14 +402,18 @@ CLI JSON mode returns one `command-result.v1` document. Exit codes are `0` succe
 ## 14. Reference artifacts
 
 The schema manifest maps every exact version to a stable `$id`. The
-`examples/runtime-contract-v1` directory contains a complete request, event,
-result, baseline capabilities, model catalog, routing policy, prior routing
-state, model-selection plan, prompt template, agent definition, registry entry,
-and compiled context set. The four agent/context examples are illustrative
-control-plane artifacts, not writable local configuration. They are secret-free
-and bind one exact accepted integration fixture across definition, prompt,
-registry, Task Contract, output schema, request, and compiled-context hashes.
-Package verification loads examples through the public package API, validates
-the execution chain, and recomputes every governed routing and agent/context
-hash. The planned routing example binds its exact next-state hash without
-embedding a cyclic plan hash in the state reservation.
+`examples/runtime-contract-v1` directory groups three distinct reference sets.
+`execution-request.json`, `execution-event.json`, and `execution-result.json`
+form the legacy execution chain. The model catalog, routing policy, prior
+routing state, and model-selection plan form the governed routing set. The
+`agent-context-execution-request.json` request, prompt template, agent
+definition, registry entry, and compiled context form the accepted
+agent-context fixture. The agent-context examples are illustrative control-plane
+artifacts, not writable local configuration. They are secret-free and bind one
+exact accepted integration fixture across definition, role, prompt, registry,
+Task Contract, output schema, model and Superpowers capabilities, MCP profile,
+all budget dimensions, input references, request hash, and compiled-context
+hash. Package verification loads examples through the public package API,
+validates the legacy execution chain, and recomputes every governed routing and
+agent/context hash. The planned routing example binds its exact next-state hash
+without embedding a cyclic plan hash in the state reservation.

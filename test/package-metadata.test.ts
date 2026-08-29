@@ -247,6 +247,7 @@ describe("package metadata", () => {
       expect(packedFiles).toContain(`dist/contracts/runtime/${schema}.schema.json`);
     }
     for (const example of [
+      "agent-context-execution-request",
       "agent-definition",
       "agent-registry-entry",
       "compiled-context",

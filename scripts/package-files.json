@@ -375,6 +375,7 @@
   "docs/contracts/runtime-contract-v1.manifest.json",
   "docs/contracts/toss-cli-v2.2-compatibility.md",
   "examples/config/runtime.development.yaml",
+  "examples/runtime-contract-v1/agent-context-execution-request.json",
   "examples/runtime-contract-v1/agent-definition.json",
   "examples/runtime-contract-v1/agent-registry-entry.json",
   "examples/runtime-contract-v1/compiled-context.json",
