@@ -1,0 +1,120 @@
+{
+  "schema_version": "bundled-skill-manifest.v1",
+  "packages": [
+    {
+      "directory": "brainstorming",
+      "manifest": {
+        "name": "brainstorming",
+        "description": "Clarifies TOSS outcomes, constraints, approvals, and design intent before implementation.",
+        "version": "1.0.0",
+        "required_runtime_capabilities": ["brainstorming"],
+        "skill_markdown": {
+          "path": "SKILL.md",
+          "media_type": "text/markdown",
+          "bytes": 440,
+          "hash": "sha256:56eb80ed9bdb15a851f110b1c05277f5ac3b8c1bbe263cd6e4bd6e666563f3e0"
+        },
+        "resources": [],
+        "resource_count": 0,
+        "total_bytes": 440,
+        "package_hash": "sha256:3cdb20401b362d728ea3706a5cfea59621a3aff4bdc4dbffb22918364ed3dd73"
+      },
+      "handler": {
+        "capability": "brainstorming",
+        "policy_version": "toss-superpowers.v1"
+      }
+    },
+    {
+      "directory": "requesting-code-review",
+      "manifest": {
+        "name": "requesting-code-review",
+        "description": "Prepares a governed TOSS change and its verification evidence for exact-diff review.",
+        "version": "1.0.0",
+        "required_runtime_capabilities": ["requesting-code-review"],
+        "skill_markdown": {
+          "path": "SKILL.md",
+          "media_type": "text/markdown",
+          "bytes": 454,
+          "hash": "sha256:a296816d3a03063579c7c52e4ff22db75cdccd2402c80037b8bff1649bda92de"
+        },
+        "resources": [],
+        "resource_count": 0,
+        "total_bytes": 454,
+        "package_hash": "sha256:7346755b7232e65ee7a931fb7bd97f178e5244b26f7a5f2c541445d6a9808b78"
+      },
+      "handler": {
+        "capability": "requesting-code-review",
+        "policy_version": "toss-superpowers.v1"
+      }
+    },
+    {
+      "directory": "systematic-debugging",
+      "manifest": {
+        "name": "systematic-debugging",
+        "description": "Traces reproducible TOSS runtime failures to a tested root cause.",
+        "version": "1.0.0",
+        "required_runtime_capabilities": ["systematic-debugging"],
+        "skill_markdown": {
+          "path": "SKILL.md",
+          "media_type": "text/markdown",
+          "bytes": 475,
+          "hash": "sha256:68854b1ee428d468dc6184f0531847335d5fa160cc4b46a52526cf9f21fb343f"
+        },
+        "resources": [],
+        "resource_count": 0,
+        "total_bytes": 475,
+        "package_hash": "sha256:e65a6e47411c61667351908fa24ccb1461c4c474703988083b4862d4a9aadf18"
+      },
+      "handler": {
+        "capability": "systematic-debugging",
+        "policy_version": "toss-superpowers.v1"
+      }
+    },
+    {
+      "directory": "test-driven-development",
+      "manifest": {
+        "name": "test-driven-development",
+        "description": "Guides test-first RED, GREEN, and refactoring evidence for TOSS runtime changes.",
+        "version": "1.0.0",
+        "required_runtime_capabilities": ["test-driven-development"],
+        "skill_markdown": {
+          "path": "SKILL.md",
+          "media_type": "text/markdown",
+          "bytes": 467,
+          "hash": "sha256:ebbe76626e1677f1873a13f87001d2d4171ad1e292bbe4e2df14e558d942910d"
+        },
+        "resources": [],
+        "resource_count": 0,
+        "total_bytes": 467,
+        "package_hash": "sha256:cc07f50ea5136dccbd3484238607f4c4578d38b05bb37c8605e40910f35dcbe3"
+      },
+      "handler": {
+        "capability": "test-driven-development",
+        "policy_version": "toss-superpowers.v1"
+      }
+    },
+    {
+      "directory": "verification-before-completion",
+      "manifest": {
+        "name": "verification-before-completion",
+        "description": "Requires fresh evidence for every TOSS completion claim.",
+        "version": "1.0.0",
+        "required_runtime_capabilities": ["verification-before-completion"],
+        "skill_markdown": {
+          "path": "SKILL.md",
+          "media_type": "text/markdown",
+          "bytes": 472,
+          "hash": "sha256:3a7d644cd053b918940a7a16ca001f6839d5ac7fb1e6c3ffeb4ddd79d83a27f3"
+        },
+        "resources": [],
+        "resource_count": 0,
+        "total_bytes": 472,
+        "package_hash": "sha256:d0c53a60355f23d1cbec011506df6c653da27d297ffc01d4cd8fdb124621863d"
+      },
+      "handler": {
+        "capability": "verification-before-completion",
+        "policy_version": "toss-superpowers.v1"
+      }
+    }
+  ]
+}
