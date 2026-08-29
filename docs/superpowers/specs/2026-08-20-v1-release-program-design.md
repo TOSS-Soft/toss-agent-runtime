@@ -17,7 +17,8 @@ acceptance authority; those decisions remain with TOSS CLI.
 ## Approved release boundary
 
 - v1.0.0 supports macOS only.
-- Supported Node lines are Node.js 22 with a floor of 22.23.0 and Node.js 24.
+- Verification and release validation use only the latest Node.js LTS release,
+  selected automatically through `lts/*`.
 - Linux, Windows, Kubernetes, authenticated remote control, parallel local
   scheduling, distributed workers, durable memory, operator UI, and agent mesh
   execution are outside v1.0.0.
@@ -84,7 +85,7 @@ required predecessor.
 
 - Integrate PR #33 for issues #2 and #4.
 - Integrate PR #34 as the existing #28 service-foundation PR.
-- Re-run the complete macOS Node 22/24 version-branch gate.
+- Re-run the complete macOS latest Node.js LTS version-branch gate.
 - Keep #28 `In progress` until durable `INTERRUPTED` state and the remaining
   macOS login/service acceptance are proven.
 
@@ -206,7 +207,7 @@ Every issue follows test-driven development:
 2. Implement the smallest coherent behavior.
 3. Pass focused tests and regression tests for adjacent boundaries.
 4. Pass formatting, lint, strict type checking, and package build.
-5. Pass the full macOS matrix on Node 22.23.1 and Node 24.
+5. Pass the single macOS gate on the latest Node.js LTS.
 6. Pass installed-package smoke and production dependency audit.
 7. Map every issue acceptance criterion to code, test, documentation, or an
    explicit protected integration gate.
@@ -238,7 +239,7 @@ SBOM/provenance configuration, and release evidence references.
 
 The release sequence is:
 
-1. Run the full hermetic macOS Node 22/24 gate on `release/v1.0.0`.
+1. Run the full hermetic macOS latest Node.js LTS gate on `release/v1.0.0`.
 2. Run the protected live-provider gate.
 3. Build one npm tarball from the exact clean commit and record contents,
    integrity, SHA-256, and SBOM.

@@ -504,7 +504,7 @@ and Responses SSE. Tests prove:
 - focused gateway/provider/config/docs tests;
 - format, lint, strict typecheck, complete test suite, build, exact package
   contents, installed package lifecycle, and production audit;
-- full macOS Node 22.23.1 and Node 24 CI;
+- full macOS verification on the latest Node.js LTS;
 - no live credential or external network requirement in ordinary CI.
 
 Protected live-provider and agentgateway smoke remains an explicit Issue #15
@@ -514,6 +514,6 @@ release gate and is not claimed by Issue #3.
 
 Issue #3 uses branch `issue/3-agentgateway-transport` and one dedicated PR
 against `release/v1.0.0`. The issue and PR project items become Done and the
-issue closes when the exact PR head passes both required macOS CI jobs and all
+issue closes when the exact PR head passes the required macOS CI job and all
 Issue #3 acceptance criteria. Merge into the version branch is recorded
 separately in Epic #16.
