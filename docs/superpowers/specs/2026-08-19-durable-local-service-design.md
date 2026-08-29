@@ -375,10 +375,11 @@ handles. Required coverage includes:
   concurrent callers, rotation, retention scope, follow across rotation,
   partial/corrupt lines, disk-full degradation, and safe doctor/status output.
 
-Normal CI remains credential-free on Node `22.23.1` and Node `24`, Ubuntu and
-macOS. Tests never install definitions into the real user's service-manager
-directories; manager integrations render into temporary roots and validate
-with native syntax tools. Package smoke tests execute the installed supervisor
+Normal CI remains credential-free on macOS and uses only the latest Node.js LTS,
+selected automatically through `lts/*`. Tests never install definitions into
+the real user's service-manager directories; manager integrations render into
+temporary roots and validate with native syntax tools. Package smoke tests
+execute the installed supervisor
 and private socket but do not leave a background service behind. Deterministic
 definitions, native syntax lint, exact manager command arrays, status/backoff
 parsing, doctor remediation, and direct supervisor smoke are distinct from

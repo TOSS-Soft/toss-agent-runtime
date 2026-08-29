@@ -6,7 +6,7 @@
 
 ## Requirements
 
-- Node.js 22.23.0 or newer in the Node 22 line, or Node.js 24
+- The latest Node.js LTS release (selected automatically in CI and release validation)
 - macOS
 - npm
 
