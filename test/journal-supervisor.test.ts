@@ -1,7 +1,7 @@
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import { createMainServices } from "../src/cli/main.js";
 import { defaultConfig } from "../src/config/load.js";
@@ -65,7 +65,10 @@ describe("production journal supervisor integration", () => {
     expect((await seed.load("run-active"))?.state).toBe("RUNNING");
 
     const signals = new FakeSignals();
-    let ready = 0;
+    let resolveReady: (() => void) | undefined;
+    const ready = new Promise<void>((resolve) => {
+      resolveReady = resolve;
+    });
     const services = createMainServices({
       platform: { os: "darwin", arch: process.arch, node: "22.23.1" },
       env: {},
@@ -75,23 +78,33 @@ describe("production journal supervisor integration", () => {
       now: () => new Date("2026-08-20T12:01:00.000Z"),
       createServiceInstanceId: () => "00000000-0000-4000-8000-000000000100",
       resolveExecutableHash: () => Promise.resolve("a".repeat(64)),
-      sendReady: () => {
-        ready += 1;
-      },
+      sendReady: () => resolveReady?.(),
       loadConfig: () => Promise.resolve({ config, source: "explicit" }),
     });
 
     const running = services.serve?.({});
     if (running === undefined) throw new Error("serve service is unavailable");
-    await vi.waitFor(() => expect(ready).toBe(1));
-    signals.emit("SIGTERM");
+    let readinessObserved = false;
+    try {
+      await Promise.race([
+        ready,
+        running.then(() => {
+          throw new Error("serve completed before readiness");
+        }),
+      ]);
+      readinessObserved = true;
+      signals.emit("SIGTERM");
 
-    await expect(running).resolves.toMatchObject({ reason: "SIGTERM", forced: false });
-    const recovered = createRunJournalStore({
-      statePath,
-      now: () => new Date("2026-08-20T12:02:00.000Z"),
-      randomId: () => "00000000-0000-4000-8000-000000000200",
-    });
-    expect((await recovered.load("run-active"))?.state).toBe("INTERRUPTED");
+      await expect(running).resolves.toMatchObject({ reason: "SIGTERM", forced: false });
+      const recovered = createRunJournalStore({
+        statePath,
+        now: () => new Date("2026-08-20T12:02:00.000Z"),
+        randomId: () => "00000000-0000-4000-8000-000000000200",
+      });
+      expect((await recovered.load("run-active"))?.state).toBe("INTERRUPTED");
+    } finally {
+      if (readinessObserved) signals.emit("SIGTERM");
+      await running.catch(() => undefined);
+    }
   });
 });
