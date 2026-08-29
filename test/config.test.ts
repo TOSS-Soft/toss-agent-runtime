@@ -184,6 +184,18 @@ describe("runtime configuration", () => {
     });
   });
 
+  it("accepts configured skill roots in bytewise UTF-8 order", async () => {
+    const root = await temporaryDirectory();
+    const configPath = path.join(root, "config.yaml");
+    await writeFile(configPath, validYamlWithSkillRoots(root, ["/opt/\uE000", "/opt/😀"]), {
+      mode: 0o600,
+    });
+
+    await expect(
+      loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home: root }),
+    ).resolves.toMatchObject({ config: { skill_roots: ["/opt/\uE000", "/opt/😀"] } });
+  });
+
   it.each([
     [
       "more than sixteen roots",
@@ -193,7 +205,9 @@ describe("runtime configuration", () => {
     ["control character", ["/opt/unsafe\u0000skills"]],
     ["normalization alias", ["/opt/toss/../skills"]],
     ["duplicate root", ["/opt/toss/skills", "/opt/toss/skills"]],
+    ["trailing-separator root alias", ["/opt/toss/skills", "/opt/toss/skills/"]],
     ["unsorted roots", ["/opt/toss/skills-b", "/opt/toss/skills-a"]],
+    ["reverse bytewise UTF-8 order", ["/opt/😀", "/opt/\uE000"]],
     ["ancestor overlap", ["/opt/toss/skills", "/opt/toss/skills/references"]],
   ] as const)("rejects %s in configured skill roots", async (_name, skillRoots) => {
     const root = await temporaryDirectory();

@@ -234,6 +234,10 @@ function isAncestorPath(ancestor: string, descendant: string): boolean {
   return relative !== "" && !path.isAbsolute(relative) && !relative.startsWith(`..${path.sep}`);
 }
 
+function bytewiseCompare(left: string, right: string): number {
+  return Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8"));
+}
+
 function assertSkillRoots(skillRoots: readonly string[]): void {
   if (skillRoots.length > SKILL_LIMITS.roots) invalidSkillRoots();
 
@@ -250,7 +254,7 @@ function assertSkillRoots(skillRoots: readonly string[]): void {
   }
 
   for (let index = 1; index < skillRoots.length; index += 1) {
-    if (skillRoots[index - 1]! >= skillRoots[index]!) invalidSkillRoots();
+    if (bytewiseCompare(skillRoots[index - 1]!, skillRoots[index]!) >= 0) invalidSkillRoots();
   }
   for (let index = 0; index < skillRoots.length; index += 1) {
     for (let nested = index + 1; nested < skillRoots.length; nested += 1) {

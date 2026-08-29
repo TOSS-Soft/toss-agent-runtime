@@ -14,6 +14,7 @@ export function assertConfiguredSkillRootPath(candidate: string): string {
   if (
     CONTROL_CHARACTER.test(candidate) ||
     !path.isAbsolute(candidate) ||
+    (candidate !== path.parse(candidate).root && candidate.endsWith(path.sep)) ||
     path.normalize(candidate) !== candidate
   ) {
     unsafePath();
