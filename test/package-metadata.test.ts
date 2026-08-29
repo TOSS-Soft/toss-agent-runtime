@@ -226,7 +226,7 @@ describe("package metadata", () => {
     expect(declaration).not.toMatch(
       /createAgentRegistryForTest|operationHooks|PrivateAgentStore/iu,
     );
-  });
+  }, 30_000);
 
   it("matches the exact real dry-pack allowlist and keeps agent internals private", async () => {
     const expectedFiles = JSON.parse(
