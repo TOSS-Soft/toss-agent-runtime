@@ -580,6 +580,24 @@ describe("agent contract documents", () => {
     ).toBe(false);
   });
 
+  it("rejects provider, route, endpoint, and concrete-model identity in agent definitions", () => {
+    const prompt = fixturePrompt();
+    const definition = fixtureDefinition(prompt.document_hash);
+    for (const [field, value] of [
+      ["provider", "example-provider"],
+      ["route", "primary"],
+      ["endpoint", "https://provider.invalid/v1"],
+      ["model_id", "concrete-model-1"],
+    ] as const) {
+      const candidate = resignedDefinition({
+        ...definition,
+        model: { ...definition.model, [field]: value },
+      });
+
+      expect(parseAgentDefinition(JSON.stringify(candidate)).ok, field).toBe(false);
+    }
+  });
+
   it("rejects a hash-valid context without all fixed trusted segments", () => {
     const prompt = fixturePrompt();
     const definition = fixtureDefinition(prompt.document_hash);

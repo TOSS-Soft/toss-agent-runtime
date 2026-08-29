@@ -109,6 +109,39 @@ function authorityMismatch(
   }
 }
 
+type AuthorityReferenceTarget = "definition" | "Task Contract" | "MCP profile" | "output schema";
+
+function replaceAuthorityReference(
+  target: AuthorityReferenceTarget,
+  reference: ArtifactReference,
+): ExecutionRequestV1 {
+  const actual = request();
+  switch (target) {
+    case "definition":
+      return request({ agent: { definition: reference, role: actual.agent.role } });
+    case "Task Contract":
+      return request({ task_contract: reference });
+    case "MCP profile":
+      return request({ mcp: { profile: reference } });
+    case "output schema":
+      return request({ output: { schema: reference } });
+  }
+}
+
+function authorityReference(target: AuthorityReferenceTarget): ArtifactReference {
+  const actual = request();
+  switch (target) {
+    case "definition":
+      return actual.agent.definition;
+    case "Task Contract":
+      return actual.task_contract;
+    case "MCP profile":
+      return actual.mcp.profile;
+    case "output schema":
+      return actual.output.schema;
+  }
+}
+
 describe("execution request authority matching", () => {
   it.each([
     [
@@ -178,6 +211,59 @@ describe("execution request authority matching", () => {
     ],
   ] as const)("rejects %s before any resolver can be called", (_name, makeRequest) => {
     authorityMismatch(makeRequest());
+  });
+
+  it.each(
+    (["definition", "Task Contract", "MCP profile", "output schema"] as const).flatMap((target) => {
+      const reference = authorityReference(target);
+      return [
+        [
+          target,
+          "document type",
+          { ...reference, document_type: `${reference.document_type}-other` },
+        ],
+        [target, "artifact ID", { ...reference, artifact_id: `${reference.artifact_id}-other` }],
+        [target, "revision", { ...reference, revision: reference.revision + 1 }],
+        [target, "hash", { ...reference, hash: reference.hash === HASH_A ? HASH_B : HASH_A }],
+      ] as const;
+    }),
+  )("rejects %s reference %s mismatch", (target, _component, reference) => {
+    authorityMismatch(replaceAuthorityReference(target, reference));
+  });
+
+  it("ignores location hints for every exact authority reference", () => {
+    const actual = request();
+    const withLocations = request({
+      agent: {
+        definition: { ...actual.agent.definition, location: "governance/agent.json" },
+        role: actual.agent.role,
+      },
+      task_contract: { ...actual.task_contract, location: "governance/task.json" },
+      mcp: { profile: { ...actual.mcp.profile, location: "governance/mcp.json" } },
+      output: { schema: { ...actual.output.schema, location: "governance/output.json" } },
+    });
+
+    expect(matchAgentAuthority(withLocations, definition())).toMatchObject({
+      definition: withLocations.agent.definition,
+      task_contract: withLocations.task_contract,
+      mcp_profile: withLocations.mcp.profile,
+      output_schema: withLocations.output.schema,
+    });
+  });
+
+  it("rejects duplicate requested model and Superpowers capabilities", () => {
+    authorityMismatch(
+      request({
+        model: { logical_class: "balanced-code", required_capabilities: ["text", "text"] },
+      }),
+    );
+    authorityMismatch(
+      request({
+        superpowers: {
+          required: ["test-driven-development", "test-driven-development"],
+        },
+      }),
+    );
   });
 
   it("returns only sorted, narrowed authority as independent deeply frozen values", () => {
