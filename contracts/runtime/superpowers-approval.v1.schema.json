@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toss.software/schemas/runtime/v1/superpowers-approval.v1.schema.json",
+  "title": "TOSS Superpowers approval v1",
+  "oneOf": [
+    { "type": "object", "unevaluatedProperties": false, "allOf": [{ "$ref": "#/$defs/base" }, { "$ref": "#/$defs/request" }] },
+    { "type": "object", "unevaluatedProperties": false, "allOf": [{ "$ref": "#/$defs/base" }, { "$ref": "#/$defs/decision" }] }
+  ],
+  "$defs": {
+    "base": {
+      "type": "object",
+      "required": ["protocol_version", "schema_version", "document_type", "kind", "run_id", "pending_journal_head", "phase_document_hash", "phase", "skill_name", "skill_version", "skill_snapshot_hash", "phase_operation_id", "trace", "document_hash"],
+      "properties": {
+        "protocol_version": { "const": "runtime-contract.v1" }, "schema_version": { "const": "superpowers-approval.v1" }, "document_type": { "const": "superpowers-approval" }, "kind": { "enum": ["REQUEST", "DECISION"] }, "run_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" }, "pending_journal_head": { "$ref": "#/$defs/journal_head" }, "phase_document_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }, "phase": { "$ref": "#/$defs/phase" }, "skill_name": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" }, "skill_version": { "type": "string", "minLength": 1, "maxLength": 128 }, "skill_snapshot_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }, "phase_operation_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" }, "decision": {}, "approval_request_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }, "operation_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" }, "trace": { "$ref": "runtime-common.v1.schema.json#/$defs/trace_context" }, "document_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
+      }
+    },
+    "request": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        { "type": "object", "required": ["protocol_version", "schema_version", "document_type", "kind", "run_id", "pending_journal_head", "phase_document_hash", "phase", "skill_name", "skill_version", "skill_snapshot_hash", "phase_operation_id", "decision", "trace", "document_hash"], "properties": { "protocol_version": { "const": "runtime-contract.v1" }, "schema_version": { "const": "superpowers-approval.v1" }, "document_type": { "const": "superpowers-approval" }, "kind": { "const": "REQUEST" }, "run_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" }, "pending_journal_head": { "$ref": "#/$defs/journal_head" }, "phase_document_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }, "phase": { "$ref": "#/$defs/phase" }, "skill_name": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" }, "skill_version": { "type": "string", "minLength": 1, "maxLength": 128 }, "skill_snapshot_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }, "phase_operation_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" }, "decision": { "type": "null" }, "trace": { "$ref": "runtime-common.v1.schema.json#/$defs/trace_context" }, "document_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" } } }
+      ]
+    },
+    "decision": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        { "type": "object", "required": ["protocol_version", "schema_version", "document_type", "kind", "run_id", "pending_journal_head", "phase_document_hash", "phase", "skill_name", "skill_version", "skill_snapshot_hash", "phase_operation_id", "approval_request_hash", "operation_id", "decision", "trace", "document_hash"], "properties": { "protocol_version": { "const": "runtime-contract.v1" }, "schema_version": { "const": "superpowers-approval.v1" }, "document_type": { "const": "superpowers-approval" }, "kind": { "const": "DECISION" }, "run_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" }, "pending_journal_head": { "$ref": "#/$defs/journal_head" }, "phase_document_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }, "phase": { "$ref": "#/$defs/phase" }, "skill_name": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" }, "skill_version": { "type": "string", "minLength": 1, "maxLength": 128 }, "skill_snapshot_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }, "phase_operation_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" }, "approval_request_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }, "operation_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" }, "decision": { "enum": ["APPROVE", "REJECT"] }, "trace": { "$ref": "runtime-common.v1.schema.json#/$defs/trace_context" }, "document_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" } } }
+      ]
+    },
+    "positive_integer": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "journal_head": { "type": "object", "additionalProperties": false, "required": ["journal_revision", "sequence", "entry_hash"], "properties": { "journal_revision": { "$ref": "#/$defs/positive_integer" }, "sequence": { "$ref": "#/$defs/positive_integer" }, "entry_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" } } },
+    "phase": { "enum": ["BRAINSTORMING", "TEST_DESIGN", "RED", "GREEN", "DEBUGGING", "REVIEW", "VERIFICATION"] }
+  }
+}

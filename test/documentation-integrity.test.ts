@@ -205,6 +205,11 @@ describe("published protocol artifacts", () => {
       "service-control-request.v1",
       "service-control-response.v1",
       "service-lock.v1",
+      "skill-descriptor.v1",
+      "skill-execution-evidence.v1",
+      "skill-snapshot.v1",
+      "superpowers-approval.v1",
+      "superpowers-phase.v1",
     ]);
     for (const entry of manifest.schemas) {
       const expectedPath = `contracts/runtime/${entry.schema_version}.schema.json`;

@@ -126,6 +126,31 @@
       "schema_version": "service-lock.v1",
       "path": "contracts/runtime/service-lock.v1.schema.json",
       "id": "https://toss.software/schemas/runtime/v1/service-lock.v1.schema.json"
+    },
+    {
+      "schema_version": "skill-descriptor.v1",
+      "path": "contracts/runtime/skill-descriptor.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/skill-descriptor.v1.schema.json"
+    },
+    {
+      "schema_version": "skill-execution-evidence.v1",
+      "path": "contracts/runtime/skill-execution-evidence.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/skill-execution-evidence.v1.schema.json"
+    },
+    {
+      "schema_version": "skill-snapshot.v1",
+      "path": "contracts/runtime/skill-snapshot.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/skill-snapshot.v1.schema.json"
+    },
+    {
+      "schema_version": "superpowers-approval.v1",
+      "path": "contracts/runtime/superpowers-approval.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/superpowers-approval.v1.schema.json"
+    },
+    {
+      "schema_version": "superpowers-phase.v1",
+      "path": "contracts/runtime/superpowers-phase.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/superpowers-phase.v1.schema.json"
     }
   ]
 }

@@ -18,6 +18,11 @@ import promptTemplateSchema from "../../contracts/runtime/prompt-template.v1.sch
 import providerEventSchema from "../../contracts/runtime/provider-event.v1.schema.json" with { type: "json" };
 import runJournalEntrySchema from "../../contracts/runtime/run-journal-entry.v1.schema.json" with { type: "json" };
 import runtimeCapabilitiesSchema from "../../contracts/runtime/runtime-capabilities.v1.schema.json" with { type: "json" };
+import skillDescriptorSchema from "../../contracts/runtime/skill-descriptor.v1.schema.json" with { type: "json" };
+import skillExecutionEvidenceSchema from "../../contracts/runtime/skill-execution-evidence.v1.schema.json" with { type: "json" };
+import skillSnapshotSchema from "../../contracts/runtime/skill-snapshot.v1.schema.json" with { type: "json" };
+import superpowersApprovalSchema from "../../contracts/runtime/superpowers-approval.v1.schema.json" with { type: "json" };
+import superpowersPhaseSchema from "../../contracts/runtime/superpowers-phase.v1.schema.json" with { type: "json" };
 import {
   canonicalJson,
   deepFreezeJson,
@@ -63,6 +68,14 @@ const REGISTERED_SCHEMAS: Readonly<Record<string, string>> = {
     "https://toss.software/schemas/runtime/v1/run-journal-entry.v1.schema.json",
   "runtime-capabilities.v1":
     "https://toss.software/schemas/runtime/v1/runtime-capabilities.v1.schema.json",
+  "skill-descriptor.v1": "https://toss.software/schemas/runtime/v1/skill-descriptor.v1.schema.json",
+  "skill-execution-evidence.v1":
+    "https://toss.software/schemas/runtime/v1/skill-execution-evidence.v1.schema.json",
+  "skill-snapshot.v1": "https://toss.software/schemas/runtime/v1/skill-snapshot.v1.schema.json",
+  "superpowers-approval.v1":
+    "https://toss.software/schemas/runtime/v1/superpowers-approval.v1.schema.json",
+  "superpowers-phase.v1":
+    "https://toss.software/schemas/runtime/v1/superpowers-phase.v1.schema.json",
 };
 
 const FRAGMENTS = {
@@ -141,6 +154,11 @@ export function createProtocolValidator(): ProtocolValidator {
   ajv.addSchema(providerEventSchema);
   ajv.addSchema(runJournalEntrySchema);
   ajv.addSchema(runtimeCapabilitiesSchema);
+  ajv.addSchema(skillDescriptorSchema);
+  ajv.addSchema(skillSnapshotSchema);
+  ajv.addSchema(superpowersPhaseSchema);
+  ajv.addSchema(superpowersApprovalSchema);
+  ajv.addSchema(skillExecutionEvidenceSchema);
 
   const fragmentValidators = Object.fromEntries(
     Object.entries(FRAGMENTS).map(([name, schemaReference]) => {
