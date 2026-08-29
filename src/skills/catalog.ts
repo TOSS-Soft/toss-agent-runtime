@@ -1,6 +1,14 @@
 import { createHash } from "node:crypto";
-import { constants } from "node:fs";
-import { lstat, open, opendir, type FileHandle } from "node:fs/promises";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  opendirSync,
+  readSync,
+  type BigIntStats,
+} from "node:fs";
 import path from "node:path";
 
 import {
@@ -89,11 +97,27 @@ export interface CatalogFileIdentity {
   readonly ctimeNs: bigint;
 }
 
+export type ConfiguredCatalogBoundary =
+  | "root-open"
+  | "root-enumerate"
+  | "package-open"
+  | "package-enumerate"
+  | "manifest-open"
+  | "manifest-read"
+  | "member-stat"
+  | "package-final-revalidate";
+
 export interface CatalogTestHooks {
   readonly onFileRead?: ((absolutePath: string) => void) | undefined;
   readonly afterManifestRead?: ((absolutePath: string) => void | Promise<void>) | undefined;
   readonly mapIdentity?:
     ((absolutePath: string, identity: CatalogFileIdentity) => CatalogFileIdentity) | undefined;
+  readonly beforeConfiguredBoundary?:
+    | ((boundary: ConfiguredCatalogBoundary, absolutePath: string) => void | Promise<void>)
+    | undefined;
+  readonly afterConfiguredBoundary?:
+    | ((boundary: ConfiguredCatalogBoundary, absolutePath: string) => void | Promise<void>)
+    | undefined;
 }
 
 export interface CreateSkillCatalogOptions {
@@ -115,8 +139,15 @@ interface PrivateCatalogEntry {
   readonly sourceKind: SkillSourceKind;
 }
 
-interface OpenedDirectory {
-  readonly handle: FileHandle;
+interface HeldDirectory {
+  readonly descriptor: number;
+  readonly absolutePath: string;
+  readonly identity: CatalogFileIdentity;
+}
+
+interface HeldManifest {
+  readonly descriptor: number;
+  readonly absolutePath: string;
   readonly identity: CatalogFileIdentity;
 }
 
@@ -354,17 +385,7 @@ export function parseSkillPackageManifest(value: JsonValue): SkillPackageManifes
   return deepFreezeJson(manifest as unknown as JsonValue) as unknown as SkillPackageManifest;
 }
 
-function identityFromStats(stats: Awaited<ReturnType<FileHandle["stat"]>>): CatalogFileIdentity {
-  const value = stats as unknown as {
-    readonly dev: bigint;
-    readonly ino: bigint;
-    readonly mode: bigint;
-    readonly uid: bigint;
-    readonly nlink: bigint;
-    readonly size: bigint;
-    readonly mtimeNs: bigint;
-    readonly ctimeNs: bigint;
-  };
+function identityFromStats(value: BigIntStats): CatalogFileIdentity {
   return {
     dev: value.dev,
     ino: value.ino,
@@ -377,21 +398,17 @@ function identityFromStats(stats: Awaited<ReturnType<FileHandle["stat"]>>): Cata
   };
 }
 
-async function pathIdentity(
-  absolutePath: string,
-  hooks: CatalogTestHooks,
-): Promise<CatalogFileIdentity> {
-  const stats = await lstat(absolutePath, { bigint: true });
-  const identity = identityFromStats(stats);
+function syncPathIdentity(absolutePath: string, hooks: CatalogTestHooks): CatalogFileIdentity {
+  const identity = identityFromStats(lstatSync(absolutePath, { bigint: true }));
   return hooks.mapIdentity?.(absolutePath, identity) ?? identity;
 }
 
-async function handleIdentity(
-  handle: FileHandle,
+function syncDescriptorIdentity(
+  descriptor: number,
   absolutePath: string,
   hooks: CatalogTestHooks,
-): Promise<CatalogFileIdentity> {
-  const identity = identityFromStats(await handle.stat({ bigint: true }));
+): CatalogFileIdentity {
+  const identity = identityFromStats(fstatSync(descriptor, { bigint: true }));
   return hooks.mapIdentity?.(absolutePath, identity) ?? identity;
 }
 
@@ -405,6 +422,15 @@ function sameIdentity(left: CatalogFileIdentity, right: CatalogFileIdentity): bo
     left.size === right.size &&
     left.mtimeNs === right.mtimeNs &&
     left.ctimeNs === right.ctimeNs
+  );
+}
+
+function sameDirectoryIdentity(left: CatalogFileIdentity, right: CatalogFileIdentity): boolean {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.mode === right.mode &&
+    left.uid === right.uid
   );
 }
 
@@ -438,93 +464,186 @@ function assertPrivateManifest(identity: CatalogFileIdentity, currentUid: number
   }
 }
 
-async function assertNoSymlinkAncestry(absolutePath: string): Promise<void> {
+function assertPrivateMember(
+  identity: CatalogFileIdentity,
+  currentUid: number,
+  expectedBytes: number,
+): void {
+  if (
+    !isFileMode(identity.mode) ||
+    identity.uid !== currentUid ||
+    (identity.mode & 0o7777) !== PRIVATE_FILE_MODE ||
+    identity.nlink !== 1n ||
+    identity.size !== BigInt(expectedBytes)
+  ) {
+    integrity();
+  }
+}
+
+function configuredAncestorPaths(absolutePath: string): readonly string[] {
   const parsed = path.parse(absolutePath);
+  const result = [parsed.root];
   let current = parsed.root;
   for (const component of absolutePath.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
     current = path.join(current, component);
-    const identity = await lstat(current, { bigint: true });
-    if ((Number(identity.mode) & constants.S_IFMT) === constants.S_IFLNK) integrity();
+    result.push(current);
+  }
+  return result;
+}
+
+function revalidateHeldChain(chain: readonly HeldDirectory[], hooks: CatalogTestHooks): void {
+  for (const held of chain) {
+    const descriptorIdentity = syncDescriptorIdentity(held.descriptor, held.absolutePath, hooks);
+    const pathIdentity = syncPathIdentity(held.absolutePath, hooks);
+    if (
+      !sameDirectoryIdentity(held.identity, descriptorIdentity) ||
+      !sameDirectoryIdentity(held.identity, pathIdentity)
+    ) {
+      integrity();
+    }
   }
 }
 
-async function openPrivateDirectory(
+function revalidateHeldManifest(
+  manifest: HeldManifest,
+  chain: readonly HeldDirectory[],
+  hooks: CatalogTestHooks,
+): void {
+  const descriptorBefore = syncDescriptorIdentity(
+    manifest.descriptor,
+    manifest.absolutePath,
+    hooks,
+  );
+  const pathIdentity = syncSandwich(chain, hooks, () =>
+    syncPathIdentity(manifest.absolutePath, hooks),
+  );
+  const descriptorAfter = syncDescriptorIdentity(manifest.descriptor, manifest.absolutePath, hooks);
+  if (
+    !sameIdentity(manifest.identity, descriptorBefore) ||
+    !sameIdentity(manifest.identity, descriptorAfter) ||
+    !sameIdentity(manifest.identity, pathIdentity)
+  ) {
+    integrity();
+  }
+}
+
+/*
+ * Node does not expose openat(2)/fdopendir(3). Each pathname syscall is therefore
+ * enclosed in a synchronous held-chain validation sandwich. A same-UID external
+ * actor could theoretically switch and restore a name entirely inside that
+ * non-yielding syscall interval; the controller accepts this Node platform limit.
+ */
+function syncSandwich<T>(
+  chain: readonly HeldDirectory[],
+  hooks: CatalogTestHooks,
+  operation: () => T,
+): T {
+  revalidateHeldChain(chain, hooks);
+  const result = operation();
+  revalidateHeldChain(chain, hooks);
+  return result;
+}
+
+function openHeldDirectorySync(
   absolutePath: string,
+  parentChain: readonly HeldDirectory[],
+  hooks: CatalogTestHooks,
+): HeldDirectory {
+  const before = syncSandwich(parentChain, hooks, () => syncPathIdentity(absolutePath, hooks));
+  if (!isDirectoryMode(before.mode)) integrity();
+  const descriptor = syncSandwich(parentChain, hooks, () =>
+    openSync(absolutePath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW),
+  );
+  try {
+    const held = syncDescriptorIdentity(descriptor, absolutePath, hooks);
+    const namedAfter = syncSandwich(parentChain, hooks, () =>
+      syncPathIdentity(absolutePath, hooks),
+    );
+    if (!sameDirectoryIdentity(before, held) || !sameDirectoryIdentity(before, namedAfter)) {
+      integrity();
+    }
+    return { descriptor, absolutePath, identity: held };
+  } catch (error) {
+    closeSync(descriptor);
+    throw error;
+  }
+}
+
+function openHeldManifestSync(
+  absolutePath: string,
+  chain: readonly HeldDirectory[],
   currentUid: number,
   hooks: CatalogTestHooks,
-): Promise<OpenedDirectory> {
-  await assertNoSymlinkAncestry(absolutePath);
-  const before = await pathIdentity(absolutePath, hooks);
-  assertPrivateDirectory(before, currentUid);
-  let handle: FileHandle;
+): HeldManifest {
+  const before = syncSandwich(chain, hooks, () => syncPathIdentity(absolutePath, hooks));
+  assertPrivateManifest(before, currentUid);
+  const descriptor = syncSandwich(chain, hooks, () =>
+    openSync(absolutePath, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW),
+  );
   try {
-    handle = await open(
-      absolutePath,
-      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-    );
-  } catch {
-    integrity();
+    const held = syncDescriptorIdentity(descriptor, absolutePath, hooks);
+    const namedAfter = syncSandwich(chain, hooks, () => syncPathIdentity(absolutePath, hooks));
+    assertPrivateManifest(held, currentUid);
+    if (!sameIdentity(before, held) || !sameIdentity(before, namedAfter)) integrity();
+    return { descriptor, absolutePath, identity: held };
+  } catch (error) {
+    closeSync(descriptor);
+    throw error;
   }
-  const held = await handleIdentity(handle, absolutePath, hooks);
-  if (!sameIdentity(before, held)) {
-    await handle.close();
-    integrity();
-  }
-  return { handle, identity: held };
 }
 
-async function revalidateDirectory(
-  opened: OpenedDirectory,
-  absolutePath: string,
-  hooks: CatalogTestHooks,
-): Promise<void> {
-  const held = await handleIdentity(opened.handle, absolutePath, hooks);
-  const named = await pathIdentity(absolutePath, hooks);
-  if (!sameIdentity(opened.identity, held) || !sameIdentity(opened.identity, named)) integrity();
+function closeHeldDirectories(chain: readonly HeldDirectory[]): void {
+  for (const held of [...chain].reverse()) closeSync(held.descriptor);
 }
 
-async function readBoundedPrivateManifest(
+function readDirectoryNamesSync(
   absolutePath: string,
-  currentUid: number,
+  chain: readonly HeldDirectory[],
   hooks: CatalogTestHooks,
-): Promise<{ readonly bytes: Uint8Array; readonly identity: CatalogFileIdentity }> {
-  let namedBefore: CatalogFileIdentity;
-  try {
-    namedBefore = await pathIdentity(absolutePath, hooks);
-  } catch {
-    integrity();
-  }
-  assertPrivateManifest(namedBefore, currentUid);
-  let handle: FileHandle;
-  try {
-    handle = await open(
-      absolutePath,
-      constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW,
-    );
-  } catch {
-    integrity();
-  }
-  try {
-    const before = await handleIdentity(handle, absolutePath, hooks);
-    assertPrivateManifest(before, currentUid);
-    if (!sameIdentity(before, namedBefore)) integrity();
-    const buffer = Buffer.alloc(Number(before.size) + 1);
-    hooks.onFileRead?.(absolutePath);
+  maximumEntries: number,
+): readonly string[] {
+  return syncSandwich(chain, hooks, () => {
+    const directory = opendirSync(absolutePath);
+    const names: string[] = [];
+    try {
+      for (;;) {
+        const entry = directory.readSync();
+        if (entry === null) break;
+        names.push(entry.name);
+        if (names.length > maximumEntries) limitExceeded();
+      }
+    } finally {
+      directory.closeSync();
+    }
+    return names.sort(bytewiseCompare);
+  });
+}
+
+function readHeldManifestSync(
+  manifest: HeldManifest,
+  chain: readonly HeldDirectory[],
+  hooks: CatalogTestHooks,
+): Uint8Array {
+  const bytes = syncSandwich(chain, hooks, () => {
+    const buffer = Buffer.alloc(Number(manifest.identity.size) + 1);
+    hooks.onFileRead?.(manifest.absolutePath);
     let offset = 0;
     while (offset < buffer.length) {
-      const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+      const bytesRead = readSync(
+        manifest.descriptor,
+        buffer,
+        offset,
+        buffer.length - offset,
+        offset,
+      );
       if (bytesRead === 0) break;
       offset += bytesRead;
     }
-    if (offset !== Number(before.size)) integrity();
-    await hooks.afterManifestRead?.(absolutePath);
-    const after = await handleIdentity(handle, absolutePath, hooks);
-    const namedAfter = await pathIdentity(absolutePath, hooks);
-    if (!sameIdentity(before, after) || !sameIdentity(before, namedAfter)) integrity();
-    return { bytes: buffer.subarray(0, offset), identity: before };
-  } finally {
-    await handle.close();
-  }
+    if (offset !== Number(manifest.identity.size)) integrity();
+    return buffer.subarray(0, offset);
+  });
+  revalidateHeldManifest(manifest, chain, hooks);
+  return bytes;
 }
 
 function rawHash(bytes: Uint8Array): `sha256:${string}` {
@@ -565,70 +684,385 @@ function configuredSourceIdentity(
   });
 }
 
+function sameNames(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((name, index) => name === right[index]);
+}
+
+async function configuredBoundary<T>(
+  boundary: ConfiguredCatalogBoundary,
+  absolutePath: string,
+  chain: readonly HeldDirectory[],
+  hooks: CatalogTestHooks,
+  operation: () => T,
+  postHookValidation: (result: T) => void,
+): Promise<T> {
+  await hooks.beforeConfiguredBoundary?.(boundary, absolutePath);
+  const result = operation();
+  await hooks.afterConfiguredBoundary?.(boundary, absolutePath);
+  revalidateHeldChain(chain, hooks);
+  postHookValidation(result);
+  return result;
+}
+
+async function openConfiguredDirectoryBoundary(
+  boundary: "root-open" | "package-open" | "member-stat",
+  absolutePath: string,
+  parentChain: readonly HeldDirectory[],
+  hooks: CatalogTestHooks,
+  additionalPostHookValidation: () => void = () => undefined,
+): Promise<HeldDirectory> {
+  let opened: HeldDirectory | undefined;
+  try {
+    opened = await configuredBoundary(
+      boundary,
+      absolutePath,
+      parentChain,
+      hooks,
+      () => {
+        opened = openHeldDirectorySync(absolutePath, parentChain, hooks);
+        return opened;
+      },
+      (result) => {
+        revalidateHeldChain([...parentChain, result], hooks);
+        additionalPostHookValidation();
+      },
+    );
+    return opened;
+  } catch (error) {
+    if (opened !== undefined) closeSync(opened.descriptor);
+    throw error;
+  }
+}
+
+async function enumerateConfiguredDirectoryBoundary(
+  boundary: "root-enumerate" | "package-enumerate" | "member-stat",
+  absolutePath: string,
+  chain: readonly HeldDirectory[],
+  hooks: CatalogTestHooks,
+  maximumEntries: number,
+  additionalPostHookValidation: () => void = () => undefined,
+): Promise<readonly string[]> {
+  return configuredBoundary(
+    boundary,
+    absolutePath,
+    chain,
+    hooks,
+    () => readDirectoryNamesSync(absolutePath, chain, hooks, maximumEntries),
+    (result) => {
+      const current = readDirectoryNamesSync(absolutePath, chain, hooks, maximumEntries);
+      if (!sameNames(result, current)) integrity();
+      additionalPostHookValidation();
+    },
+  );
+}
+
+async function openConfiguredManifestBoundary(
+  absolutePath: string,
+  chain: readonly HeldDirectory[],
+  currentUid: number,
+  packageEntries: readonly string[],
+  hooks: CatalogTestHooks,
+  additionalPostHookValidation: () => void,
+): Promise<HeldManifest> {
+  let opened: HeldManifest | undefined;
+  try {
+    opened = await configuredBoundary(
+      "manifest-open",
+      absolutePath,
+      chain,
+      hooks,
+      () => {
+        opened = openHeldManifestSync(absolutePath, chain, currentUid, hooks);
+        return opened;
+      },
+      (result) => {
+        revalidateHeldManifest(result, chain, hooks);
+        const current = readDirectoryNamesSync(
+          path.dirname(absolutePath),
+          chain,
+          hooks,
+          SKILL_LIMITS.resourcesPerPackage + 2,
+        );
+        if (!sameNames(packageEntries, current)) integrity();
+        additionalPostHookValidation();
+      },
+    );
+    return opened;
+  } catch (error) {
+    if (opened !== undefined) closeSync(opened.descriptor);
+    throw error;
+  }
+}
+
+interface ExpectedDirectory {
+  readonly directories: Map<string, ExpectedDirectory>;
+  readonly files: Map<string, number>;
+}
+
+function expectedPackageTree(manifest: SkillPackageManifest): ExpectedDirectory {
+  const root: ExpectedDirectory = { directories: new Map(), files: new Map() };
+  root.files.set("skill.json", -1);
+  root.files.set("SKILL.md", manifest.skill_markdown.bytes);
+  for (const resource of manifest.resources) {
+    const components = resource.path.split("/");
+    const basename = components.pop();
+    if (basename === undefined) integrity();
+    let directory = root;
+    for (const component of components) {
+      let child = directory.directories.get(component);
+      if (child === undefined) {
+        child = { directories: new Map(), files: new Map() };
+        directory.directories.set(component, child);
+      }
+      directory = child;
+    }
+    if (directory.files.has(basename) || directory.directories.has(basename)) integrity();
+    directory.files.set(basename, resource.bytes);
+  }
+  return root;
+}
+
+function expectedDirectoryNames(directory: ExpectedDirectory): readonly string[] {
+  return [...directory.directories.keys(), ...directory.files.keys()].sort(bytewiseCompare);
+}
+
+async function validateConfiguredClosure(
+  absoluteDirectory: string,
+  chain: readonly HeldDirectory[],
+  expected: ExpectedDirectory,
+  currentUid: number,
+  hooks: CatalogTestHooks,
+  identities: Set<string>,
+  revalidatePackageGuard: () => void,
+  rootSnapshot?: readonly string[],
+): Promise<void> {
+  const expectedNames = expectedDirectoryNames(expected);
+  const actualNames =
+    rootSnapshot ??
+    (await enumerateConfiguredDirectoryBoundary(
+      "member-stat",
+      absoluteDirectory,
+      chain,
+      hooks,
+      SKILL_LIMITS.resourcesPerPackage + 2,
+      revalidatePackageGuard,
+    ));
+  if (!sameNames(expectedNames, actualNames)) integrity();
+
+  for (const [name, child] of expected.directories) {
+    const childPath = path.join(absoluteDirectory, name);
+    const held = await openConfiguredDirectoryBoundary(
+      "member-stat",
+      childPath,
+      chain,
+      hooks,
+      revalidatePackageGuard,
+    );
+    try {
+      assertPrivateDirectory(held.identity, currentUid);
+      const identityKey = `${held.identity.dev}:${held.identity.ino}`;
+      if (identities.has(identityKey)) integrity();
+      identities.add(identityKey);
+      await validateConfiguredClosure(
+        childPath,
+        [...chain, held],
+        child,
+        currentUid,
+        hooks,
+        identities,
+        revalidatePackageGuard,
+      );
+    } finally {
+      closeSync(held.descriptor);
+    }
+  }
+
+  for (const [name, expectedBytes] of expected.files) {
+    if (name === "skill.json") continue;
+    const memberPath = path.join(absoluteDirectory, name);
+    const identity = await configuredBoundary(
+      "member-stat",
+      memberPath,
+      chain,
+      hooks,
+      () => syncSandwich(chain, hooks, () => syncPathIdentity(memberPath, hooks)),
+      (result) => {
+        const current = syncSandwich(chain, hooks, () => syncPathIdentity(memberPath, hooks));
+        if (!sameIdentity(result, current)) integrity();
+        revalidatePackageGuard();
+      },
+    );
+    assertPrivateMember(identity, currentUid, expectedBytes);
+    const identityKey = `${identity.dev}:${identity.ino}`;
+    if (identities.has(identityKey)) integrity();
+    identities.add(identityKey);
+  }
+}
+
+function openConfiguredAncestorChain(
+  configuredRoot: string,
+  hooks: CatalogTestHooks,
+): HeldDirectory[] {
+  const chain: HeldDirectory[] = [];
+  const ancestors = configuredAncestorPaths(configuredRoot).slice(0, -1);
+  try {
+    for (const ancestor of ancestors) {
+      chain.push(openHeldDirectorySync(ancestor, chain, hooks));
+    }
+    return chain;
+  } catch (error) {
+    closeHeldDirectories(chain);
+    throw error;
+  }
+}
+
 async function configuredEntries(
   options: CatalogImplementationOptions,
 ): Promise<readonly PrivateCatalogEntry[]> {
   const entries: PrivateCatalogEntry[] = [];
   for (const root of validatedConfiguredRoots(options.configuredRoots)) {
-    const openedRoot = await openPrivateDirectory(root, options.currentUid, options.hooks);
+    const ancestorChain = openConfiguredAncestorChain(root, options.hooks);
+    let openedRoot: HeldDirectory | undefined;
     try {
-      const packageNames: string[] = [];
-      const directory = await opendir(root);
-      for await (const entry of directory) {
-        packageNames.push(entry.name);
-        if (packageNames.length > SKILL_LIMITS.packagesPerRoot) limitExceeded();
-      }
-      packageNames.sort(bytewiseCompare);
+      openedRoot = await openConfiguredDirectoryBoundary(
+        "root-open",
+        root,
+        ancestorChain,
+        options.hooks,
+      );
+      assertPrivateDirectory(openedRoot.identity, options.currentUid);
+      const rootChain = [...ancestorChain, openedRoot];
+      const packageNames = await enumerateConfiguredDirectoryBoundary(
+        "root-enumerate",
+        root,
+        rootChain,
+        options.hooks,
+        SKILL_LIMITS.packagesPerRoot,
+      );
+      const revalidateRootSnapshot = (): void => {
+        const current = readDirectoryNamesSync(
+          root,
+          rootChain,
+          options.hooks,
+          SKILL_LIMITS.packagesPerRoot,
+        );
+        if (!sameNames(packageNames, current)) integrity();
+      };
       const packageIdentities = new Set<string>();
       for (const packageName of packageNames) {
         if (!NAME_PATTERN.test(packageName)) integrity();
         const packagePath = path.join(root, packageName);
-        const openedPackage = await openPrivateDirectory(
+        const openedPackage = await openConfiguredDirectoryBoundary(
+          "package-open",
           packagePath,
-          options.currentUid,
+          rootChain,
           options.hooks,
+          revalidateRootSnapshot,
         );
         try {
+          assertPrivateDirectory(openedPackage.identity, options.currentUid);
+          const packageChain = [...rootChain, openedPackage];
           const aliasKey = `${openedPackage.identity.dev}:${openedPackage.identity.ino}`;
           if (packageIdentities.has(aliasKey)) integrity();
           packageIdentities.add(aliasKey);
-          const manifestPath = path.join(packagePath, "skill.json");
-          const read = await readBoundedPrivateManifest(
-            manifestPath,
-            options.currentUid,
+          const packageSnapshot = await enumerateConfiguredDirectoryBoundary(
+            "package-enumerate",
+            packagePath,
+            packageChain,
             options.hooks,
+            SKILL_LIMITS.resourcesPerPackage + 2,
+            revalidateRootSnapshot,
           );
-          let parsed: JsonValue;
+          const manifestPath = path.join(packagePath, "skill.json");
+          const heldManifest = await openConfiguredManifestBoundary(
+            manifestPath,
+            packageChain,
+            options.currentUid,
+            packageSnapshot,
+            options.hooks,
+            revalidateRootSnapshot,
+          );
           try {
-            parsed = parseJsonBytes(read.bytes, {
-              maxBytes: SKILL_LIMITS.descriptorBytes,
-              maxDepth: SKILL_LIMITS.nestingDepth,
-              maxMembers: 4096,
+            const revalidatePackageGuard = (): void => {
+              revalidateRootSnapshot();
+              revalidateHeldManifest(heldManifest, packageChain, options.hooks);
+              const current = readDirectoryNamesSync(
+                packagePath,
+                packageChain,
+                options.hooks,
+                SKILL_LIMITS.resourcesPerPackage + 2,
+              );
+              if (!sameNames(packageSnapshot, current)) integrity();
+            };
+            const manifestBytes = await configuredBoundary(
+              "manifest-read",
+              manifestPath,
+              packageChain,
+              options.hooks,
+              () => readHeldManifestSync(heldManifest, packageChain, options.hooks),
+              revalidatePackageGuard,
+            );
+            await options.hooks.afterManifestRead?.(manifestPath);
+            revalidatePackageGuard();
+
+            let parsed: JsonValue;
+            try {
+              parsed = parseJsonBytes(manifestBytes, {
+                maxBytes: SKILL_LIMITS.descriptorBytes,
+                maxDepth: SKILL_LIMITS.nestingDepth,
+                maxMembers: 4096,
+              });
+            } catch {
+              integrity();
+            }
+            const manifest = parseSkillPackageManifest(parsed);
+            if (manifest.name !== packageName) integrity();
+            const identities = new Set<string>([
+              `${heldManifest.identity.dev}:${heldManifest.identity.ino}`,
+              `${openedPackage.identity.dev}:${openedPackage.identity.ino}`,
+            ]);
+            await validateConfiguredClosure(
+              packagePath,
+              packageChain,
+              expectedPackageTree(manifest),
+              options.currentUid,
+              options.hooks,
+              identities,
+              revalidatePackageGuard,
+              packageSnapshot,
+            );
+            await configuredBoundary(
+              "package-final-revalidate",
+              packagePath,
+              packageChain,
+              options.hooks,
+              revalidatePackageGuard,
+              revalidatePackageGuard,
+            );
+            const sourceIdentity = configuredSourceIdentity(
+              openedRoot.identity,
+              openedPackage.identity,
+            );
+            entries.push({
+              descriptor: descriptorFor(manifest, {
+                kind: "configured",
+                identity: sourceIdentity,
+              }),
+              manifest,
+              manifestIdentity: rawHash(manifestBytes),
+              absoluteDirectory: packagePath,
+              sourceKind: "configured",
             });
-          } catch {
-            integrity();
+          } finally {
+            closeSync(heldManifest.descriptor);
           }
-          const manifest = parseSkillPackageManifest(parsed);
-          if (manifest.name !== packageName) integrity();
-          const sourceIdentity = configuredSourceIdentity(
-            openedRoot.identity,
-            openedPackage.identity,
-          );
-          entries.push({
-            descriptor: descriptorFor(manifest, { kind: "configured", identity: sourceIdentity }),
-            manifest,
-            manifestIdentity: rawHash(read.bytes),
-            absoluteDirectory: packagePath,
-            sourceKind: "configured",
-          });
-          await revalidateDirectory(openedPackage, packagePath, options.hooks);
         } finally {
-          await openedPackage.handle.close();
+          closeSync(openedPackage.descriptor);
         }
       }
-      await revalidateDirectory(openedRoot, root, options.hooks);
     } finally {
-      await openedRoot.handle.close();
+      if (openedRoot !== undefined) closeSync(openedRoot.descriptor);
+      closeHeldDirectories(ancestorChain);
     }
   }
   return entries;
@@ -822,7 +1256,6 @@ class FileSystemSkillCatalog implements SkillCatalog {
   select(snapshot: SkillCatalogSnapshot, request: SkillSelectionRequest): SkillSelection {
     const entries = this.snapshots.get(snapshot);
     if (entries === undefined) invalid();
-    const query = validateQuery(request.query);
     const allowed = capabilitySet(request.allowed_capabilities);
     if (!NAME_PATTERN.test(request.capability)) invalid();
 
@@ -837,12 +1270,12 @@ class FileSystemSkillCatalog implements SkillCatalog {
           allowed.has(request.capability) &&
           entry.descriptor.required_runtime_capabilities.every((capability) =>
             allowed.has(capability),
-          ) &&
-          metadataMatches(entry.descriptor, query),
+          ),
       );
       if (candidates.length !== 1) blocked();
     } else if (request.mode === "implicit") {
       if (request.descriptor !== null) invalid();
+      const query = validateQuery(request.query);
       candidates = [...entries.values()].filter(
         (entry) =>
           allowed.has(request.capability) &&

@@ -3,6 +3,7 @@ import {
   chmod,
   copyFile,
   link,
+  lstat,
   mkdir,
   mkdtemp,
   realpath,
@@ -99,6 +100,23 @@ async function writeConfiguredPackage(
   const manifest = packageManifest(name, options);
   await mkdir(directory, { mode: 0o700 });
   await writeFile(manifestPath, canonicalJson(manifest), { mode: 0o600 });
+  await writeFile(path.join(directory, "SKILL.md"), options.skillMarkdown ?? `# ${name}\n`, {
+    mode: 0o600,
+  });
+  for (const resource of manifest.resources) {
+    const components = resource.path.split("/").slice(0, -1);
+    let parent = directory;
+    for (const component of components) {
+      parent = path.join(parent, component);
+      await mkdir(parent, { mode: 0o700 }).catch((error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      });
+      await chmod(parent, 0o700);
+    }
+    await writeFile(path.join(directory, resource.path), Buffer.alloc(resource.bytes), {
+      mode: 0o600,
+    });
+  }
   return { directory, manifestPath, manifest };
 }
 
@@ -198,7 +216,7 @@ describe("skill catalog metadata discovery", () => {
       ],
       { hooks: { onFileRead: (name) => reads.push(name) } },
     );
-    await writeFile(path.join(root, "testing", "SKILL.md"), "must not be read", { mode: 0o600 });
+    await writeFile(path.join(root, "testing", "SKILL.md"), "x".repeat(10), { mode: 0o600 });
     const snapshot = await catalog.discover({
       query: "test first",
       allowed_capabilities: ["testing"],
@@ -362,6 +380,197 @@ describe("skill catalog metadata discovery", () => {
               { mode: 0o600 },
             );
             await rename(replacement, name);
+          },
+        },
+      },
+    );
+    expect(root).toBeTruthy();
+    await expect(
+      catalog.discover({ query: null, allowed_capabilities: ["testing"] }),
+    ).rejects.toEqual(skillError("RUNTIME_SKILL_INTEGRITY"));
+  });
+
+  it.each(
+    (
+      [
+        "root-open",
+        "root-enumerate",
+        "package-open",
+        "package-enumerate",
+        "manifest-open",
+        "manifest-read",
+        "member-stat",
+        "package-final-revalidate",
+      ] as const
+    ).flatMap((boundary) => ["before", "after"].map((phase) => [boundary, phase] as const)),
+  )(
+    "rejects ancestor replacement at the %s boundary during %s validation",
+    async (boundary, phase) => {
+      const base = await privateTemporaryDirectory("toss-skill-race-");
+      const trusted = path.join(base, "trusted");
+      const preserved = path.join(base, "trusted-preserved");
+      const replacement = path.join(base, "replacement");
+      const root = path.join(trusted, "root");
+      const replacementRoot = path.join(replacement, "root");
+      await mkdir(root, { recursive: true, mode: 0o700 });
+      await chmod(trusted, 0o700);
+      await chmod(root, 0o700);
+      await mkdir(replacementRoot, { recursive: true, mode: 0o700 });
+      await chmod(replacement, 0o700);
+      await chmod(replacementRoot, 0o700);
+      await writeConfiguredPackage(root, "testing", { capabilities: ["testing"] });
+      await writeConfiguredPackage(replacementRoot, "testing", { capabilities: ["testing"] });
+      let swapped = false;
+      const catalog = createSkillCatalogForTest({
+        configuredRoots: [root],
+        includeBundled: false,
+        hooks: {
+          async beforeConfiguredBoundary(observedBoundary) {
+            if (phase !== "before" || observedBoundary !== boundary || swapped) return;
+            await rename(trusted, preserved);
+            await rename(replacement, trusted);
+            swapped = true;
+          },
+          async afterConfiguredBoundary(observedBoundary) {
+            if (phase !== "after" || observedBoundary !== boundary || swapped) return;
+            await rename(trusted, preserved);
+            await rename(replacement, trusted);
+            swapped = true;
+          },
+        },
+      });
+      try {
+        await expect(
+          catalog.discover({ query: null, allowed_capabilities: ["testing"] }),
+        ).rejects.toEqual(skillError("RUNTIME_SKILL_INTEGRITY"));
+        expect(swapped).toBe(true);
+        await expect(lstat(preserved)).resolves.toBeDefined();
+        await expect(lstat(trusted)).resolves.toBeDefined();
+      } finally {
+        if (swapped) {
+          await rename(trusted, replacement);
+          await rename(preserved, trusted);
+        }
+      }
+    },
+  );
+
+  it("rejects same-size configured member replacement after metadata stat", async () => {
+    const root = await privateTemporaryDirectory("toss-skill-root-");
+    await writeConfiguredPackage(root, "testing", { capabilities: ["testing"] });
+    const skill = path.join(root, "testing", "SKILL.md");
+    const preserved = path.join(root, "testing", "SKILL.preserved");
+    let replaced = false;
+    const catalog = createSkillCatalogForTest({
+      configuredRoots: [root],
+      includeBundled: false,
+      hooks: {
+        async afterConfiguredBoundary(boundary, target) {
+          if (boundary !== "member-stat" || target !== skill || replaced) return;
+          await rename(skill, preserved);
+          await writeFile(skill, "z".repeat(10), { mode: 0o600 });
+          replaced = true;
+        },
+      },
+    });
+    try {
+      await expect(
+        catalog.discover({ query: null, allowed_capabilities: ["testing"] }),
+      ).rejects.toEqual(skillError("RUNTIME_SKILL_INTEGRITY"));
+      await expect(lstat(skill)).resolves.toBeDefined();
+      await expect(lstat(preserved)).resolves.toBeDefined();
+    } finally {
+      if (replaced) {
+        await rm(skill);
+        await rename(preserved, skill);
+      }
+    }
+  });
+
+  it.each(["missing", "extra", "symlink", "directory", "mode", "size"] as const)(
+    "rejects configured package closure with a %s member mutation without reading bodies",
+    async (mutation) => {
+      const reads: string[] = [];
+      const { root, catalog } = await configuredCatalog(
+        [{ name: "testing", capabilities: ["testing"] }],
+        { hooks: { onFileRead: (name) => reads.push(name) } },
+      );
+      const skill = path.join(root, "testing", "SKILL.md");
+      if (mutation === "missing") await rm(skill);
+      if (mutation === "extra") {
+        await writeFile(path.join(root, "testing", "undeclared.txt"), "x", { mode: 0o600 });
+      }
+      if (mutation === "symlink") {
+        await rm(skill);
+        await symlink(path.join(root, "testing", "skill.json"), skill);
+      }
+      if (mutation === "directory") {
+        await rm(skill);
+        await mkdir(skill, { mode: 0o700 });
+      }
+      if (mutation === "mode") await chmod(skill, 0o640);
+      if (mutation === "size") await writeFile(skill, "wrong", { mode: 0o600 });
+      await expect(
+        catalog.discover({ query: null, allowed_capabilities: ["testing"] }),
+      ).rejects.toEqual(skillError("RUNTIME_SKILL_INTEGRITY"));
+      expect(reads.every((name) => path.basename(name) === "skill.json")).toBe(true);
+    },
+  );
+
+  it.each(["owner", "fifo", "device"] as const)(
+    "rejects configured package closure with modeled %s metadata",
+    async (mutation) => {
+      const { catalog } = await configuredCatalog(
+        [{ name: "testing", capabilities: ["testing"] }],
+        {
+          hooks: {
+            mapIdentity(name, identity) {
+              if (path.basename(name) !== "SKILL.md") return identity;
+              if (mutation === "owner") return { ...identity, uid: identity.uid + 1 };
+              if (mutation === "fifo") return { ...identity, mode: 0o010600 };
+              return { ...identity, mode: 0o060600 };
+            },
+          },
+        },
+      );
+      await expect(
+        catalog.discover({ query: null, allowed_capabilities: ["testing"] }),
+      ).rejects.toEqual(skillError("RUNTIME_SKILL_INTEGRITY"));
+    },
+  );
+
+  it("rejects configured member inode aliases and accepts complete declared resource metadata", async () => {
+    const resource = {
+      path: "references/guide.md",
+      role: "reference" as const,
+      media_type: "text/markdown",
+      bytes: 4,
+      hash: rawHash(Buffer.alloc(4)),
+    };
+    const root = await privateTemporaryDirectory("toss-skill-root-");
+    await writeConfiguredPackage(root, "testing", {
+      capabilities: ["testing"],
+      resources: [resource],
+    });
+    const catalog = createSkillCatalogForTest({ configuredRoots: [root], includeBundled: false });
+    await expect(
+      catalog.discover({ query: null, allowed_capabilities: ["testing"] }),
+    ).resolves.toMatchObject({ descriptors: [{ name: "testing", resource_count: 1 }] });
+
+    await rm(path.join(root, "testing", resource.path));
+    await link(path.join(root, "testing", "SKILL.md"), path.join(root, "testing", resource.path));
+    await expect(
+      catalog.discover({ query: null, allowed_capabilities: ["testing"] }),
+    ).rejects.toEqual(skillError("RUNTIME_SKILL_INTEGRITY"));
+  });
+
+  it("revalidates exact package entries after the asynchronous manifest hook", async () => {
+    const { root, catalog } = await configuredCatalog(
+      [{ name: "testing", capabilities: ["testing"] }],
+      {
+        hooks: {
+          async afterManifestRead(name) {
+            await writeFile(path.join(path.dirname(name), "late-extra"), "x", { mode: 0o600 });
           },
         },
       },
@@ -537,6 +746,39 @@ describe("skill selection", () => {
         allowed_capabilities: ["testing"],
         query: null,
         descriptor: { ...exact, package_hash: rawHash("different") },
+      }),
+    ).toThrowError(skillError("BLOCKED_SUPERPOWERS_MISSING"));
+  });
+
+  it("ignores query for exact explicit selection but still enforces allowed capabilities", async () => {
+    const { catalog } = await configuredCatalog([
+      {
+        name: "testing",
+        description: "TOSS test first discipline",
+        capabilities: ["shell", "testing"],
+      },
+    ]);
+    const snapshot = await catalog.discover({
+      query: null,
+      allowed_capabilities: ["shell", "testing"],
+    });
+    const descriptor = reference(snapshot, "testing");
+    expect(
+      catalog.select(snapshot, {
+        mode: "explicit",
+        capability: "testing",
+        allowed_capabilities: ["shell", "testing"],
+        query: "does not match this descriptor",
+        descriptor,
+      }).descriptor.name,
+    ).toBe("testing");
+    expect(() =>
+      catalog.select(snapshot, {
+        mode: "explicit",
+        capability: "testing",
+        allowed_capabilities: ["testing"],
+        query: null,
+        descriptor,
       }),
     ).toThrowError(skillError("BLOCKED_SUPERPOWERS_MISSING"));
   });
