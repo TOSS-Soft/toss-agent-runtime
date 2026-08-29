@@ -11,11 +11,6 @@ export {
 export { matchAgentAuthority, type EffectiveAgentAuthority } from "./authority.js";
 export { compileAgentContext } from "./context.js";
 export { createAgentRegistry, type CreateAgentRegistryOptions } from "./registry.js";
-import { UnavailableCapabilityError } from "../version.js";
-
-export function requireAgentRegistry(): never {
-  throw new UnavailableCapabilityError("agents");
-}
 export { RuntimeAgentError, type RuntimeAgentErrorCode } from "./errors.js";
 export type {
   AgentBudgetClass,

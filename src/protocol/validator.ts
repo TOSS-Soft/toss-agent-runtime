@@ -1,7 +1,10 @@
 import Ajv2020Module, { type ErrorObject, type ValidateFunction } from "ajv/dist/2020.js";
 import addFormatsModule from "ajv-formats";
 
+import agentDefinitionSchema from "../../contracts/runtime/agent-definition.v1.schema.json" with { type: "json" };
+import agentRegistryEntrySchema from "../../contracts/runtime/agent-registry-entry.v1.schema.json" with { type: "json" };
 import agentgatewayCapabilitiesSchema from "../../contracts/runtime/agentgateway-capabilities.v1.schema.json" with { type: "json" };
+import compiledContextSchema from "../../contracts/runtime/compiled-context.v1.schema.json" with { type: "json" };
 import modelCatalogSchema from "../../contracts/runtime/model-catalog.v1.schema.json" with { type: "json" };
 import modelSelectionPlanSchema from "../../contracts/runtime/model-selection-plan.v1.schema.json" with { type: "json" };
 import routingPolicySchema from "../../contracts/runtime/routing-policy.v1.schema.json" with { type: "json" };
@@ -11,6 +14,7 @@ import executionEventSchema from "../../contracts/runtime/execution-event.v1.sch
 import executionRequestSchema from "../../contracts/runtime/execution-request.v1.schema.json" with { type: "json" };
 import executionResultSchema from "../../contracts/runtime/execution-result.v1.schema.json" with { type: "json" };
 import operationalEventSchema from "../../contracts/runtime/operational-event.v1.schema.json" with { type: "json" };
+import promptTemplateSchema from "../../contracts/runtime/prompt-template.v1.schema.json" with { type: "json" };
 import providerEventSchema from "../../contracts/runtime/provider-event.v1.schema.json" with { type: "json" };
 import runJournalEntrySchema from "../../contracts/runtime/run-journal-entry.v1.schema.json" with { type: "json" };
 import runtimeCapabilitiesSchema from "../../contracts/runtime/runtime-capabilities.v1.schema.json" with { type: "json" };
@@ -36,20 +40,25 @@ const Ajv2020 = Ajv2020Module.default;
 const addFormats = addFormatsModule.default;
 
 const REGISTERED_SCHEMAS: Readonly<Record<string, string>> = {
+  "agent-definition.v1": "https://toss.software/schemas/runtime/v1/agent-definition.v1.schema.json",
+  "agent-registry-entry.v1":
+    "https://toss.software/schemas/runtime/v1/agent-registry-entry.v1.schema.json",
   "agentgateway-capabilities.v1":
     "https://toss.software/schemas/runtime/v1/agentgateway-capabilities.v1.schema.json",
+  "compiled-context.v1": "https://toss.software/schemas/runtime/v1/compiled-context.v1.schema.json",
+  "execution-event.v1": "https://toss.software/schemas/runtime/v1/execution-event.v1.schema.json",
+  "execution-request.v1":
+    "https://toss.software/schemas/runtime/v1/execution-request.v1.schema.json",
+  "execution-result.v1": "https://toss.software/schemas/runtime/v1/execution-result.v1.schema.json",
   "model-catalog.v1": "https://toss.software/schemas/runtime/v1/model-catalog.v1.schema.json",
   "model-selection-plan.v1":
     "https://toss.software/schemas/runtime/v1/model-selection-plan.v1.schema.json",
-  "routing-policy.v1": ROUTING_POLICY_SCHEMA_ID,
-  "routing-state.v1": "https://toss.software/schemas/runtime/v1/routing-state.v1.schema.json",
-  "execution-request.v1":
-    "https://toss.software/schemas/runtime/v1/execution-request.v1.schema.json",
-  "execution-event.v1": "https://toss.software/schemas/runtime/v1/execution-event.v1.schema.json",
-  "execution-result.v1": "https://toss.software/schemas/runtime/v1/execution-result.v1.schema.json",
   "operational-event.v1":
     "https://toss.software/schemas/runtime/v1/operational-event.v1.schema.json",
+  "prompt-template.v1": "https://toss.software/schemas/runtime/v1/prompt-template.v1.schema.json",
   "provider-event.v1": "https://toss.software/schemas/runtime/v1/provider-event.v1.schema.json",
+  "routing-policy.v1": ROUTING_POLICY_SCHEMA_ID,
+  "routing-state.v1": "https://toss.software/schemas/runtime/v1/routing-state.v1.schema.json",
   "run-journal-entry.v1":
     "https://toss.software/schemas/runtime/v1/run-journal-entry.v1.schema.json",
   "runtime-capabilities.v1":
@@ -116,7 +125,10 @@ export function createProtocolValidator(): ProtocolValidator {
   });
   addFormats(ajv);
   ajv.addSchema(commonSchema);
+  ajv.addSchema(agentDefinitionSchema);
+  ajv.addSchema(agentRegistryEntrySchema);
   ajv.addSchema(agentgatewayCapabilitiesSchema);
+  ajv.addSchema(compiledContextSchema);
   ajv.addSchema(modelCatalogSchema);
   ajv.addSchema(modelSelectionPlanSchema);
   ajv.addSchema(routingPolicySchema);
@@ -125,6 +137,7 @@ export function createProtocolValidator(): ProtocolValidator {
   ajv.addSchema(executionRequestSchema);
   ajv.addSchema(executionResultSchema);
   ajv.addSchema(operationalEventSchema);
+  ajv.addSchema(promptTemplateSchema);
   ajv.addSchema(providerEventSchema);
   ajv.addSchema(runJournalEntrySchema);
   ajv.addSchema(runtimeCapabilitiesSchema);

@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 
-import { requireAgentRegistry } from "../src/agents/index.js";
 import { requireEvidenceEmitter } from "../src/evidence/index.js";
 import { requireAgentLoop } from "../src/orchestration/index.js";
 import * as routingApi from "../src/routing/index.js";
@@ -28,7 +27,6 @@ describe("future subsystem boundaries", () => {
   });
 
   it.each([
-    ["agents", requireAgentRegistry],
     ["skills", requireSkillsHost],
     ["tools", requireToolBroker],
     ["orchestration", requireAgentLoop],
