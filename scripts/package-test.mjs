@@ -103,6 +103,7 @@ const REQUIRED_FILES = Object.freeze([
   "docs/contracts/runtime-contract-v1.manifest.json",
   "docs/contracts/toss-cli-v2.2-compatibility.md",
   "examples/config/runtime.development.yaml",
+  "examples/runtime-contract-v1/agent-context-execution-request.json",
   "examples/runtime-contract-v1/execution-event.json",
   "examples/runtime-contract-v1/execution-request.json",
   "examples/runtime-contract-v1/execution-result.json",
@@ -261,6 +262,136 @@ function parseCanonicalDocument(output, canonicalJson, label) {
   const document = JSON.parse(lines[0]);
   assert(output === `${canonicalJson(document)}\n`, `${label} was not canonical JSON`);
   return document;
+}
+
+async function assertInstalledAgentContextExample(temporaryDirectory) {
+  await execFile(
+    process.execPath,
+    [
+      "--input-type=module",
+      "--eval",
+      `
+        import assert from "node:assert/strict";
+        import { readFile } from "node:fs/promises";
+        import path from "node:path";
+        import {
+          hashAgentDefinition,
+          hashCompiledContext,
+          hashExecutionRequest,
+          parseAgentDefinition,
+          parseCompiledContext,
+          parseExecutionRequest,
+        } from "@toss-software/agent-runtime";
+
+        const exampleDirectory = path.join(
+          process.cwd(),
+          "node_modules",
+          "@toss-software",
+          "agent-runtime",
+          "examples",
+          "runtime-contract-v1",
+        );
+        const readExample = (name) => readFile(path.join(exampleDirectory, name));
+        const requireParsed = (result, label) => {
+          assert.equal(result.ok, true, label + " did not parse through the package root");
+          return result.value;
+        };
+
+        const request = requireParsed(
+          parseExecutionRequest(await readExample("agent-context-execution-request.json")),
+          "Agent-context execution request",
+        );
+        const definition = requireParsed(
+          parseAgentDefinition(await readExample("agent-definition.json")),
+          "Agent definition",
+        );
+        const context = requireParsed(
+          parseCompiledContext(await readExample("compiled-context.json")),
+          "Compiled context",
+        );
+
+        assert.equal(
+          hashExecutionRequest(request),
+          "sha256:1b36f5f38a4f2ac2b89381a1847ded1e3ebc5d9539e6f11d190bfe0568f5de30",
+        );
+        assert.equal(hashExecutionRequest(request), context.request_hash);
+        assert.equal(hashAgentDefinition(definition), definition.document_hash);
+        assert.equal(hashCompiledContext(context), context.document_hash);
+        assert.deepEqual(request.agent.definition, context.definition);
+        assert.deepEqual(request.agent.definition, {
+          document_type: "agent-definition",
+          artifact_id: definition.agent_id,
+          revision: definition.revision,
+          hash: definition.document_hash,
+        });
+        assert.equal(request.agent.role, definition.role);
+        assert.deepEqual(request.task_contract, definition.task_contracts[0]);
+        assert.deepEqual(request.task_contract, context.task_contract);
+        assert.deepEqual(request.output.schema, definition.output_schemas[0]);
+        assert.deepEqual(request.output.schema, context.output_schema);
+        assert.equal(request.model.logical_class, definition.model.logical_class);
+        assert.equal(request.model.logical_class, context.authority.logical_class);
+        assert.deepEqual(request.model.required_capabilities, ["text", "tools"]);
+        assert.deepEqual(
+          request.model.required_capabilities,
+          context.authority.model_capabilities,
+        );
+        assert.ok(
+          definition.model.required_capabilities.every((capability) =>
+            request.model.required_capabilities.includes(capability),
+          ),
+        );
+        assert.ok(
+          request.model.required_capabilities.every((capability) =>
+            definition.model.allowed_capabilities.includes(capability),
+          ),
+        );
+        assert.deepEqual(request.superpowers.required, definition.superpowers.required);
+        assert.deepEqual(request.superpowers.required, context.authority.superpowers);
+        assert.deepEqual(request.mcp.profile, definition.mcp_profiles[0]);
+        assert.deepEqual(request.mcp.profile, context.authority.mcp_profile);
+        assert.deepEqual(request.budget, {
+          max_input_tokens: 24000,
+          max_output_tokens: 3000,
+          max_cost_microusd: 400000,
+          max_duration_ms: 500000,
+          max_turns: 7,
+        });
+        assert.deepEqual(definition.budget_ceiling, {
+          max_input_tokens: 32000,
+          max_output_tokens: 4000,
+          max_cost_microusd: 500000,
+          max_duration_ms: 600000,
+          max_turns: 8,
+        });
+        assert.deepEqual(request.budget, context.authority.budget);
+        for (const budgetKey of Object.keys(request.budget)) {
+          assert.ok(request.budget[budgetKey] <= definition.budget_ceiling[budgetKey]);
+        }
+        assert.deepEqual(request.input_artifacts, [
+          {
+            document_type: "source-artifact",
+            artifact_id: "SOURCE-ONE",
+            revision: 1,
+            hash: "sha256:b73e73471433d1c2262f913cbc7eef547cfe3bd191fbb5f1a90382bd2f611863",
+          },
+          {
+            document_type: "source-artifact",
+            artifact_id: "SOURCE-TWO",
+            revision: 2,
+            hash: "sha256:d1051d2b34615a0756d304a9e0744f9021c59196c446795503210321d172bd3c",
+          },
+        ]);
+        assert.deepEqual(
+          context.segments
+            .filter((segment) => segment.kind === "input-artifact")
+            .map((segment) => segment.source),
+          request.input_artifacts,
+        );
+      `,
+    ],
+    { cwd: temporaryDirectory, encoding: "utf8", maxBuffer: 4 * 1024 * 1024 },
+  );
 }
 
 function startInstalledServe(executable, configPath) {
@@ -781,9 +912,13 @@ try {
     env: isolatedPackEnvironment(inheritedPackDestination, prepackProbe),
   });
   if (prepackProbe !== undefined) {
+    const prepackProbeLine = `Prepack contents-only probe ${prepackProbe}`;
+    const prepackProbeOccurrences = `${packed.stdout}\n${packed.stderr}`
+      .split("\n")
+      .filter((line) => line.trim() === prepackProbeLine);
     assert(
-      `${packed.stdout}\n${packed.stderr}`.includes(`Prepack contents-only probe ${prepackProbe}`),
-      "The real npm pack path did not complete contents-only prepack acceptance",
+      prepackProbeOccurrences.length === 1,
+      "The real npm pack path did not complete exactly one contents-only prepack acceptance",
     );
   }
   const report = parsePackReport(packed.stdout);
@@ -828,6 +963,7 @@ try {
     ],
     { cwd: temporaryDirectory, encoding: "utf8" },
   );
+  await assertInstalledAgentContextExample(temporaryDirectory);
 
   const executable = path.join(
     temporaryDirectory,

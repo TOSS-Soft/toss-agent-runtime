@@ -1,0 +1,68 @@
+{
+  "agent_id": "agent-revision",
+  "budget_ceiling": {
+    "max_cost_microusd": 500000,
+    "max_duration_ms": 600000,
+    "max_input_tokens": 32000,
+    "max_output_tokens": 4000,
+    "max_turns": 8
+  },
+  "budget_class": "standard",
+  "context_policy": {
+    "inputs": [
+      {
+        "document_type": "source-artifact",
+        "max_bytes": 8192,
+        "priority": 10
+      }
+    ],
+    "max_untrusted_bytes": 8192,
+    "truncation": "utf8-prefix.v1"
+  },
+  "document_hash": "sha256:dcbb6bf855f06ab5e183773287e71565b26305bfdf646649a3fec92be1854f7c",
+  "document_type": "agent-definition",
+  "mcp_profiles": [
+    {
+      "artifact_id": "MCP-WORKER",
+      "document_type": "mcp-profile",
+      "hash": "sha256:91b63c372bd64c80953271cb3103412ae75f241964571f5425f96ea11cc4e4eb",
+      "revision": 1
+    }
+  ],
+  "model": {
+    "allowed_capabilities": ["json-schema", "text", "tools"],
+    "logical_class": "balanced-code",
+    "required_capabilities": ["text"]
+  },
+  "name": "worker-1",
+  "output_schemas": [
+    {
+      "artifact_id": "OUTPUT-INTEGRATION",
+      "document_type": "output-schema",
+      "hash": "sha256:a0cce6474e92534c39c3be685c272e4cf29a22f1170180d2c316f4c32834eef2",
+      "revision": 1
+    }
+  ],
+  "prompt_template": {
+    "artifact_id": "prompt-revision",
+    "document_type": "prompt-template",
+    "hash": "sha256:be559a32cd3dc45c9652b9c2f6505842f757067d67de26a7f192d429628f1f3b",
+    "revision": 1
+  },
+  "protocol_version": "runtime-contract.v1",
+  "revision": 1,
+  "role": "worker",
+  "schema_version": "agent-definition.v1",
+  "superpowers": {
+    "allowed": ["test-driven-development", "verification-before-completion"],
+    "required": ["test-driven-development"]
+  },
+  "task_contracts": [
+    {
+      "artifact_id": "TASK-INTEGRATION",
+      "document_type": "task-contract",
+      "hash": "sha256:dd88cb1dd66adcfa4263af92b28a92501d4c3cf9118bb0fabccb1e4e751029ff",
+      "revision": 1
+    }
+  ]
+}

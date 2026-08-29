@@ -41,6 +41,9 @@ describe("Runtime Contract Protocol v1 chain", () => {
   it("reports the delivered provider and routing planning subsystems in the baseline", () => {
     const document = createBaselineCapabilities({ os: "linux", arch: "x64", node: "22.23.1" });
     expect(document.execution_topologies).toEqual([]);
+    expect(document.skill_host_versions).toEqual([]);
+    expect(document.superpowers_capabilities).toEqual([]);
+    expect(document.mcp_transports).toEqual([]);
     expect(document.model_classes.map((entry) => entry.logical_class)).toEqual([
       "economy",
       "balanced-code",
@@ -51,7 +54,30 @@ describe("Runtime Contract Protocol v1 chain", () => {
     ]);
     expect(document.mcp_profiles).toEqual([]);
     expect(document.provider_transports).toEqual(["agentgateway", "openai", "anthropic", "gemini"]);
-    expect(document.supported_schemas).toContain("agentgateway-capabilities.v1");
+    expect(document.supported_schemas).toEqual([
+      "agent-definition.v1",
+      "agent-registry-entry.v1",
+      "agentgateway-capabilities.v1",
+      "candidate-job-intent.v1",
+      "compiled-context.v1",
+      "execution-event.v1",
+      "execution-request.v1",
+      "execution-result.v1",
+      "model-catalog.v1",
+      "model-selection-plan.v1",
+      "operational-event.v1",
+      "project-registry-entry.v1",
+      "project-watch-manifest.v1",
+      "prompt-template.v1",
+      "provider-event.v1",
+      "routing-policy.v1",
+      "routing-state.v1",
+      "run-journal-entry.v1",
+      "runtime-capabilities.v1",
+      "service-control-request.v1",
+      "service-control-response.v1",
+      "service-lock.v1",
+    ]);
     expect(document.features).toEqual({
       providers: "available",
       routing: "available",
@@ -66,6 +92,26 @@ describe("Runtime Contract Protocol v1 chain", () => {
 
   it("fails request negotiation before execution when capabilities are unavailable", async () => {
     const chain = await loadValidChain();
+    expect(chain.capabilities.supported_schemas).toEqual(
+      expect.arrayContaining([
+        "agent-definition.v1",
+        "agent-registry-entry.v1",
+        "compiled-context.v1",
+        "prompt-template.v1",
+      ]),
+    );
+    expect(chain.capabilities.skill_host_versions).toEqual([]);
+    expect(chain.capabilities.superpowers_capabilities).toEqual([]);
+    expect(chain.capabilities.mcp_transports).toEqual([]);
+    expect(chain.capabilities.mcp_profiles).toEqual([]);
+    expect(chain.capabilities.execution_topologies).toEqual([]);
+    expect(chain.capabilities.features).toMatchObject({
+      skills: "unavailable",
+      mcp: "unavailable",
+      agent_loop: "unavailable",
+      review: "unavailable",
+      evidence: "unavailable",
+    });
     const result = negotiateRequest(chain.request, chain.capabilities);
     expect(result).toMatchObject({
       ok: false,

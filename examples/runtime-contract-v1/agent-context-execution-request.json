@@ -1,0 +1,79 @@
+{
+  "agent": {
+    "definition": {
+      "artifact_id": "agent-revision",
+      "document_type": "agent-definition",
+      "hash": "sha256:dcbb6bf855f06ab5e183773287e71565b26305bfdf646649a3fec92be1854f7c",
+      "revision": 1
+    },
+    "role": "worker"
+  },
+  "budget": {
+    "max_cost_microusd": 400000,
+    "max_duration_ms": 500000,
+    "max_input_tokens": 24000,
+    "max_output_tokens": 3000,
+    "max_turns": 7
+  },
+  "created_at": "2026-08-21T12:00:00.000Z",
+  "deadline": "2026-08-21T12:10:00.000Z",
+  "document_type": "execution-request",
+  "input_artifacts": [
+    {
+      "artifact_id": "SOURCE-ONE",
+      "document_type": "source-artifact",
+      "hash": "sha256:b73e73471433d1c2262f913cbc7eef547cfe3bd191fbb5f1a90382bd2f611863",
+      "revision": 1
+    },
+    {
+      "artifact_id": "SOURCE-TWO",
+      "document_type": "source-artifact",
+      "hash": "sha256:d1051d2b34615a0756d304a9e0744f9021c59196c446795503210321d172bd3c",
+      "revision": 2
+    }
+  ],
+  "mcp": {
+    "profile": {
+      "artifact_id": "MCP-WORKER",
+      "document_type": "mcp-profile",
+      "hash": "sha256:91b63c372bd64c80953271cb3103412ae75f241964571f5425f96ea11cc4e4eb",
+      "revision": 1
+    }
+  },
+  "model": {
+    "logical_class": "balanced-code",
+    "required_capabilities": ["text", "tools"]
+  },
+  "output": {
+    "schema": {
+      "artifact_id": "OUTPUT-INTEGRATION",
+      "document_type": "output-schema",
+      "hash": "sha256:a0cce6474e92534c39c3be685c272e4cf29a22f1170180d2c316f4c32834eef2",
+      "revision": 1
+    }
+  },
+  "protocol_version": "runtime-contract.v1",
+  "request_id": "REQ-REVISION",
+  "review_policy": {
+    "artifact_id": "REVIEW-INTEGRATION",
+    "document_type": "review-policy",
+    "hash": "sha256:c808c4daebda67b143b2d07f01e5c12900ff8f9a2fcdab5b8ccd9b820abd6b45",
+    "revision": 1
+  },
+  "run_id": "RUN-REQ-REVISION",
+  "schema_version": "execution-request.v1",
+  "superpowers": {
+    "required": ["test-driven-development"]
+  },
+  "task_contract": {
+    "artifact_id": "TASK-INTEGRATION",
+    "document_type": "task-contract",
+    "hash": "sha256:dd88cb1dd66adcfa4263af92b28a92501d4c3cf9118bb0fabccb1e4e751029ff",
+    "revision": 1
+  },
+  "trace": {
+    "span_id": "0123456789abcdef",
+    "trace_flags": 1,
+    "trace_id": "0123456789abcdef0123456789abcdef"
+  }
+}

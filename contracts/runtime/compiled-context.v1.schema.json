@@ -1,0 +1,295 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toss.software/schemas/runtime/v1/compiled-context.v1.schema.json",
+  "title": "TOSS compiled context v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "schema_version",
+    "document_type",
+    "request_hash",
+    "definition",
+    "prompt_template",
+    "task_contract",
+    "output_schema",
+    "authority",
+    "runtime_policy",
+    "allocation_policy",
+    "segments",
+    "accounting",
+    "truncations",
+    "document_hash"
+  ],
+  "properties": {
+    "protocol_version": { "const": "runtime-contract.v1" },
+    "schema_version": { "const": "compiled-context.v1" },
+    "document_type": { "const": "compiled-context" },
+    "request_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+    "definition": { "$ref": "#/$defs/definition_reference" },
+    "prompt_template": { "$ref": "#/$defs/prompt_template_reference" },
+    "task_contract": { "$ref": "#/$defs/task_contract_reference" },
+    "output_schema": { "$ref": "#/$defs/output_schema_reference" },
+    "authority": { "$ref": "#/$defs/authority" },
+    "runtime_policy": { "$ref": "#/$defs/runtime_policy" },
+    "allocation_policy": { "$ref": "#/$defs/allocation_policy" },
+    "segments": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4096,
+      "items": { "$ref": "#/$defs/segment" }
+    },
+    "accounting": { "$ref": "#/$defs/accounting" },
+    "truncations": { "type": "array", "maxItems": 4096, "items": { "$ref": "#/$defs/truncation" } },
+    "document_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
+  },
+  "$defs": {
+    "nonnegative_safe_integer": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "positive_safe_integer": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "definition_reference": {
+      "allOf": [
+        { "$ref": "runtime-common.v1.schema.json#/$defs/artifact_reference" },
+        { "type": "object", "properties": { "document_type": { "const": "agent-definition" } } }
+      ]
+    },
+    "prompt_template_reference": {
+      "allOf": [
+        { "$ref": "runtime-common.v1.schema.json#/$defs/artifact_reference" },
+        { "type": "object", "properties": { "document_type": { "const": "prompt-template" } } }
+      ]
+    },
+    "task_contract_reference": {
+      "allOf": [
+        { "$ref": "runtime-common.v1.schema.json#/$defs/artifact_reference" },
+        { "type": "object", "properties": { "document_type": { "const": "task-contract" } } }
+      ]
+    },
+    "output_schema_reference": {
+      "allOf": [
+        { "$ref": "runtime-common.v1.schema.json#/$defs/artifact_reference" },
+        { "type": "object", "properties": { "document_type": { "const": "output-schema" } } }
+      ]
+    },
+    "mcp_profile_reference": {
+      "allOf": [
+        { "$ref": "runtime-common.v1.schema.json#/$defs/artifact_reference" },
+        { "type": "object", "properties": { "document_type": { "const": "mcp-profile" } } }
+      ]
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["logical_class", "model_capabilities", "superpowers", "mcp_profile", "budget"],
+      "properties": {
+        "logical_class": {
+          "enum": [
+            "economy",
+            "balanced-code",
+            "deep-reasoning",
+            "long-context",
+            "vision",
+            "independent-review"
+          ]
+        },
+        "model_capabilities": { "$ref": "#/$defs/model_capabilities" },
+        "superpowers": { "$ref": "#/$defs/names" },
+        "mcp_profile": { "$ref": "#/$defs/mcp_profile_reference" },
+        "budget": { "$ref": "runtime-common.v1.schema.json#/$defs/budget" }
+      }
+    },
+    "model_capabilities": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "items": {
+        "enum": [
+          "independent-review",
+          "json-schema",
+          "long-context",
+          "reasoning",
+          "streaming",
+          "text",
+          "tools",
+          "vision"
+        ]
+      }
+    },
+    "names": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 256,
+      "items": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" }
+    },
+    "runtime_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "hash"],
+      "properties": {
+        "revision": { "$ref": "#/$defs/positive_safe_integer" },
+        "hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
+      }
+    },
+    "allocation_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["definition_max_input_tokens", "truncation", "max_untrusted_bytes", "inputs"],
+      "properties": {
+        "definition_max_input_tokens": { "$ref": "#/$defs/positive_safe_integer" },
+        "truncation": { "const": "utf8-prefix.v1" },
+        "max_untrusted_bytes": { "$ref": "#/$defs/nonnegative_safe_integer" },
+        "inputs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/context_input_policy" }
+        }
+      }
+    },
+    "context_input_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["document_type", "priority", "max_bytes"],
+      "properties": {
+        "document_type": { "$ref": "runtime-common.v1.schema.json#/$defs/document_type" },
+        "priority": { "$ref": "#/$defs/nonnegative_safe_integer" },
+        "max_bytes": { "$ref": "#/$defs/nonnegative_safe_integer" }
+      }
+    },
+    "segment_common": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "segment_id",
+        "kind",
+        "trust",
+        "source",
+        "original_hash",
+        "included_hash",
+        "original_bytes",
+        "included_bytes",
+        "tokens",
+        "content"
+      ],
+      "properties": {
+        "segment_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+        "kind": { "type": "string" },
+        "trust": { "type": "string" },
+        "source": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "runtime-common.v1.schema.json#/$defs/artifact_reference" }
+          ]
+        },
+        "original_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+        "included_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+        "original_bytes": { "$ref": "#/$defs/nonnegative_safe_integer" },
+        "included_bytes": { "$ref": "#/$defs/nonnegative_safe_integer" },
+        "tokens": { "$ref": "#/$defs/nonnegative_safe_integer" },
+        "content": { "type": "string", "maxLength": 1048576 },
+        "block_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" }
+      }
+    },
+    "segment": {
+      "oneOf": [
+        { "$ref": "#/$defs/runtime_safety_segment" },
+        { "$ref": "#/$defs/task_contract_segment" },
+        { "$ref": "#/$defs/prompt_template_segment" },
+        { "$ref": "#/$defs/output_schema_segment" },
+        { "$ref": "#/$defs/input_artifact_segment" }
+      ]
+    },
+    "runtime_safety_segment": {
+      "allOf": [
+        { "$ref": "#/$defs/segment_common" },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "runtime-safety" },
+            "trust": { "const": "trusted-runtime" },
+            "source": { "type": "null" }
+          },
+          "not": { "properties": { "block_id": {} }, "required": ["block_id"] }
+        }
+      ]
+    },
+    "task_contract_segment": {
+      "allOf": [
+        { "$ref": "#/$defs/segment_common" },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "task-contract" },
+            "trust": { "const": "trusted-control" },
+            "source": { "$ref": "#/$defs/task_contract_reference" }
+          },
+          "not": { "properties": { "block_id": {} }, "required": ["block_id"] }
+        }
+      ]
+    },
+    "prompt_template_segment": {
+      "allOf": [
+        { "$ref": "#/$defs/segment_common" },
+        {
+          "type": "object",
+          "required": ["block_id"],
+          "properties": {
+            "kind": { "const": "prompt-template" },
+            "trust": { "const": "trusted-control" },
+            "source": { "$ref": "#/$defs/prompt_template_reference" },
+            "block_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" }
+          }
+        }
+      ]
+    },
+    "output_schema_segment": {
+      "allOf": [
+        { "$ref": "#/$defs/segment_common" },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "output-schema" },
+            "trust": { "const": "trusted-control" },
+            "source": { "$ref": "#/$defs/output_schema_reference" }
+          },
+          "not": { "properties": { "block_id": {} }, "required": ["block_id"] }
+        }
+      ]
+    },
+    "input_artifact_segment": {
+      "allOf": [
+        { "$ref": "#/$defs/segment_common" },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "input-artifact" },
+            "trust": { "const": "untrusted-content" },
+            "source": { "$ref": "runtime-common.v1.schema.json#/$defs/artifact_reference" }
+          },
+          "not": { "properties": { "block_id": {} }, "required": ["block_id"] }
+        }
+      ]
+    },
+    "accounting": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input_tokens", "input_bytes", "untrusted_bytes", "remaining_input_tokens"],
+      "properties": {
+        "input_tokens": { "$ref": "#/$defs/nonnegative_safe_integer" },
+        "input_bytes": { "$ref": "#/$defs/nonnegative_safe_integer" },
+        "untrusted_bytes": { "$ref": "#/$defs/nonnegative_safe_integer" },
+        "remaining_input_tokens": { "$ref": "#/$defs/nonnegative_safe_integer" }
+      }
+    },
+    "truncation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "reason", "original_bytes", "included_bytes"],
+      "properties": {
+        "source": { "$ref": "runtime-common.v1.schema.json#/$defs/artifact_reference" },
+        "reason": { "enum": ["input-budget", "definition-ceiling"] },
+        "original_bytes": { "$ref": "#/$defs/nonnegative_safe_integer" },
+        "included_bytes": { "$ref": "#/$defs/nonnegative_safe_integer" }
+      }
+    }
+  }
+}

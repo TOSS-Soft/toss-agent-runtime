@@ -1,8 +1,8 @@
 # TOSS Agent Runtime
 
-`@toss-software/agent-runtime` is the governed, provider-neutral execution runtime for TOSS. This development baseline publishes Runtime Contract Protocol v1, strict configuration loading, a truthful capability handshake, authenticated agentgateway transport, deterministic governed model-routing and budget planning, immutable append-only run journals, private structured operational logs, and the explicit per-user `toss-runtime` service-supervision foundation.
+`@toss-software/agent-runtime` is the governed, provider-neutral execution runtime for TOSS. This development baseline publishes Runtime Contract Protocol v1, strict configuration loading, a truthful capability handshake, an immutable agent-definition registry and provenance-aware context compiler, authenticated agentgateway transport, deterministic governed model-routing and budget planning, immutable append-only run journals, private structured operational logs, and the explicit per-user `toss-runtime` service-supervision foundation.
 
-> Status: the package remains `0.0.0-development` until all v1 release waves and protected live-provider gates pass. Immutable run-journal persistence, explicit project intake, structured operational logging, authenticated agentgateway transport, and the pure governed routing boundary are implemented; issue #28 still requires its separate real macOS login/native crash-loop acceptance, and protected live-provider/agentgateway smoke remains issue #15. npm `1.0.0` remains incomplete. The supervised runtime does not yet execute agents, run tools, or expose remote control.
+> Status: the package remains `0.0.0-development` until all v1 release waves and protected live-provider gates pass. Immutable run-journal persistence, explicit project intake, structured operational logging, the immutable agent registry/context compiler, authenticated agentgateway transport, and the pure governed routing boundary are implemented; issue #28 still requires its separate real macOS login/native crash-loop acceptance, and protected live-provider/agentgateway smoke remains issue #15. npm `1.0.0` remains incomplete. The supervised runtime does not yet execute agents, run tools, or expose remote control.
 
 ## Requirements
 
@@ -110,6 +110,42 @@ Exact route verification runs against the initially reserved state before any ou
 
 Issue #10 remains pending for worker-turn execution and consumption of the explicit fallback plan. Issue #11 remains pending for independent review orchestration and execution proof. Issue #12 remains pending for ACP execution evidence and authoritative gateway usage reconciliation. Issue #13 remains pending for full secret, egress, prompt-injection, and sandbox hardening. Issue #15 remains pending for protected live-provider routing smoke and release guidance. The Issue #6 surface itself performs no network call, provider invocation, filesystem write, persistence, clock read, sleep, or automatic retry.
 
+## Agent definition registry and compiled context
+
+The TOSS control plane is the only authority for agent roles, exact Task
+Contracts, capability and budget ceilings, approval, and acceptance. The public
+library can publish immutable prompt/definition revisions, resolve an exact
+`ACTIVE` revision for new execution, and retain an old active or `RETIRED`
+revision only for resume of a run already bound to it. Repository files and all
+other non-control-plane inputs remain `untrusted-content`; they cannot mint or
+change authority.
+
+`compileAgentContext()` emits one deterministic, provider-neutral,
+hash-bound `compiled-context.v1` document. Segment precedence is fixed as
+`trusted-runtime` safety, `trusted-control` Task Contract, prompt template and
+output contract, then `untrusted-content` input artifacts. Prompt block IDs and
+the closed allocation policy are hash-bound so the parser can reconstruct the
+exact prompt, recompute every segment ID, and enforce canonical input ordering
+and truncation reasons. Unshortened direct-source content retains its exact
+source hash. V1 counts one UTF-8 byte as one conservative token. Trusted
+segments are never truncated; only the final eligible untrusted segment can be
+prefix-truncated at a Unicode scalar boundary, with exact original/included
+hashes and byte counts recorded.
+
+Registry list and resolution calls validate but never repair durable history.
+Reads accepted before shutdown participate in the flush cut; reads after
+shutdown may inspect fully valid state without writing. An explicitly awaited
+`recover()` is the only operation that repairs a partial tail, using a bounded,
+identity-checked recovery stage and reusing an exact quarantine fragment on
+retry.
+
+Issue #7 advertises the four agent/context schemas only; Issue #7 does not
+execute Agent Skills, Superpowers, MCP tools, providers, or the agent loop.
+Issue #8 owns Agent Skills and Superpowers execution, Issue #9 owns MCP tools,
+and Issue #10 owns providers and the agent loop. The packaged examples are
+illustrative control-plane artifacts, not writable local configuration, and
+contain no credentials or local paths.
+
 `doctor` checks package, platform, Node, configuration, native manager state, restart backoff, and private socket health. A healthy active service with a matching socket identity passes the service check. Missing or stopped service state warns in development and fails in production; backoff, unsafe state, unavailable/degraded control, or identity mismatch fails. See the [Local Service Control v1 contract](docs/contracts/local-service-control-v1.md) for exact native commands, permissions, protocol bounds, stable failures, and shutdown ordering.
 
 `capabilities` advertises the delivered agentgateway and OpenAI, Anthropic, and Gemini normalized adapter transports plus the available pure routing-planning boundary. Skills, MCP, the agent loop, review execution, and evidence remain unavailable. An empty or unavailable capability is not an implementation promise. The supervised `serve` process owns the single-instance lock, private local status socket, and private append-only run-journal store. Active runs are durably recorded as `INTERRUPTED` before graceful shutdown removes the socket or lock. Agent execution remains unavailable until its later v1 waves.
@@ -141,7 +177,7 @@ const journal = createRunJournalStore({
 
 The public parser returns either a validated, deeply frozen domain value or a normalized failure. Input is bounded JSON; duplicate keys, unknown properties, unsupported schema versions, and unsafe JavaScript values are rejected.
 
-The same top-level API exports the closed project manifest, registry-entry, candidate-intent, provider-event, and agentgateway-capability parsers; safe registry/intake, gateway profile/capability/route/health/credential-provider/observation types; the authenticated agentgateway factory; provider-neutral request/event/completion types; and the three adapter factories. Filesystem constructors, native SDK handles, raw fetch/SSE/header parsers, gateway wire clients, credential caches, and operation hooks remain outside the public package surface.
+The same top-level API exports the closed project manifest, project registry-entry, candidate-intent, agent-definition, prompt-template, agent-registry-entry, compiled-context, provider-event, and agentgateway-capability parsers; the corresponding public agent hashes, registry factory/interface and pure compiler; safe project registry/intake, gateway profile/capability/route/health/credential-provider/observation types; the authenticated agentgateway factory; provider-neutral request/event/completion types; and the three adapter factories. Private agent object-store helpers, mutation claims, test factories, filesystem constructors, native SDK handles, raw fetch/SSE/header parsers, gateway wire clients, credential caches, and operation hooks remain outside the public package surface.
 
 ## Contracts and examples
 

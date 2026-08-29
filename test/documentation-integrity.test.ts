@@ -1,20 +1,30 @@
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 
 import { describe, expect, it } from "vitest";
 
 import {
   createBaselineCapabilities,
+  createProtocolValidator,
   createRunJournalStore,
+  hashAgentDefinition,
+  hashAgentRegistryEntry,
+  hashCompiledContext,
+  hashExecutionRequest,
   hashModelCatalog,
   hashModelSelectionPlan,
+  hashPromptTemplate,
   hashRoutingPolicy,
   hashRoutingState,
+  parseAgentDefinition,
+  parseAgentRegistryEntry,
+  parseCompiledContext,
   parseExecutionEvent,
   parseExecutionRequest,
   parseExecutionResult,
   parseModelCatalog,
   parseModelSelectionPlan,
   parseProviderEvent,
+  parsePromptTemplate,
   parseRoutingPolicy,
   parseRoutingState,
   parseRuntimeCapabilities,
@@ -23,11 +33,58 @@ import {
 
 interface ContractManifest {
   readonly schema_version: "runtime-contract-manifest.v1";
+  readonly protocol_version: "runtime-contract.v1";
   readonly schemas: readonly {
     readonly schema_version: string;
     readonly path: string;
     readonly id: string;
   }[];
+}
+
+interface ContractSchema {
+  readonly $schema?: string;
+  readonly $id?: string;
+  readonly type?: string;
+  readonly additionalProperties?: boolean;
+  readonly oneOf?: readonly {
+    readonly type?: string;
+    readonly unevaluatedProperties?: boolean;
+  }[];
+  readonly $defs?: Readonly<Record<string, unknown>>;
+}
+
+interface ContractSchemaCandidate {
+  readonly schema_version: string;
+  readonly path: string;
+  readonly id: string;
+}
+
+async function readContractManifest(): Promise<ContractManifest> {
+  return JSON.parse(
+    await readFile("docs/contracts/runtime-contract-v1.manifest.json", "utf8"),
+  ) as ContractManifest;
+}
+
+async function readContractSchemaCandidates(): Promise<readonly ContractSchemaCandidate[]> {
+  const suffix = ".schema.json";
+  const filenames = (await readdir("contracts/runtime"))
+    .filter((filename) => filename.endsWith(suffix))
+    .sort();
+
+  return Promise.all(
+    filenames.map(async (filename) => {
+      const path = `contracts/runtime/${filename}`;
+      const schema = JSON.parse(await readFile(path, "utf8")) as ContractSchema;
+      if (schema.$id === undefined) {
+        throw new Error(`Contract schema has no identifier: ${path}`);
+      }
+      return {
+        schema_version: filename.slice(0, -suffix.length),
+        path,
+        id: schema.$id,
+      };
+    }),
+  );
 }
 
 async function readExample(name: string): Promise<Uint8Array> {
@@ -79,17 +136,56 @@ describe("published protocol artifacts", () => {
     }
   });
 
+  it("keeps every advertised and generically registered schema coherent with the manifest", async () => {
+    const manifest = await readContractManifest();
+    const validator = createProtocolValidator();
+    const candidates = await readContractSchemaCandidates();
+
+    for (const candidate of candidates) {
+      const probe = validator.parse(
+        JSON.stringify({
+          schema_version: candidate.schema_version,
+          document_type: "manifest-probe",
+        }),
+        "manifest-probe",
+      );
+      if (!probe.ok && probe.code === "RUNTIME_DOCUMENT_UNSUPPORTED") {
+        continue;
+      }
+
+      const matches = manifest.schemas.filter(
+        (entry) => entry.schema_version === candidate.schema_version,
+      );
+      expect(matches, candidate.schema_version).toEqual([candidate]);
+    }
+
+    const advertised = createBaselineCapabilities({
+      os: "linux",
+      arch: "x64",
+      node: "22.23.1",
+    }).supported_schemas;
+    const advertisedManifestVersions = manifest.schemas
+      .filter((entry) => advertised.includes(entry.schema_version))
+      .map((entry) => entry.schema_version);
+
+    expect(advertisedManifestVersions).toEqual(advertised);
+    expect(new Set(advertisedManifestVersions).size).toBe(advertised.length);
+  });
+
   it("maps every published schema version to its exact file and identifier", async () => {
-    const manifest = JSON.parse(
-      await readFile("docs/contracts/runtime-contract-v1.manifest.json", "utf8"),
-    ) as ContractManifest;
+    const manifest = await readContractManifest();
     expect(manifest.schema_version).toBe("runtime-contract-manifest.v1");
+    expect(manifest.protocol_version).toBe("runtime-contract.v1");
     const versions = manifest.schemas.map((entry) => entry.schema_version);
     expect(versions).toEqual([...versions].sort());
+    expect(new Set(versions).size).toBe(versions.length);
     expect(versions).toEqual([
+      "agent-definition.v1",
+      "agent-registry-entry.v1",
       "agentgateway-capabilities.v1",
       "candidate-job-intent.v1",
       "command-result.v1",
+      "compiled-context.v1",
       "execution-event.v1",
       "execution-request.v1",
       "execution-result.v1",
@@ -98,6 +194,7 @@ describe("published protocol artifacts", () => {
       "operational-event.v1",
       "project-registry-entry.v1",
       "project-watch-manifest.v1",
+      "prompt-template.v1",
       "provider-event.v1",
       "routing-policy.v1",
       "routing-state.v1",
@@ -114,8 +211,21 @@ describe("published protocol artifacts", () => {
       const expectedId = `https://toss.software/schemas/runtime/v1/${entry.schema_version}.schema.json`;
       expect(entry.path).toBe(expectedPath);
       expect(entry.id).toBe(expectedId);
-      const schema = JSON.parse(await readFile(entry.path, "utf8")) as { readonly $id?: string };
+      const schema = JSON.parse(await readFile(entry.path, "utf8")) as ContractSchema;
+      expect(schema.$schema).toBe("https://json-schema.org/draft/2020-12/schema");
       expect(schema.$id).toBe(expectedId);
+      if (entry.schema_version === "runtime-common.v1") {
+        expect(schema.$defs).toBeTypeOf("object");
+      } else if (schema.type === "object") {
+        expect(schema.additionalProperties).toBe(false);
+      } else if (schema.oneOf !== undefined) {
+        expect(schema.oneOf.length).toBeGreaterThan(0);
+        for (const branch of schema.oneOf) {
+          expect(branch).toMatchObject({ type: "object", unevaluatedProperties: false });
+        }
+      } else {
+        throw new Error(`Manifest schema is not closed: ${entry.schema_version}`);
+      }
     }
   });
 
@@ -136,6 +246,167 @@ describe("published protocol artifacts", () => {
       expect(plan.value.prior_state_hash).toBe(state.value.document_hash);
       expect(plan.value.status).toBe("planned");
     }
+  });
+
+  it("loads the accepted agent-context examples through the package-root parsers with exact bindings", async () => {
+    const request = parseExecutionRequest(await readExample("agent-context-execution-request"));
+    const prompt = parsePromptTemplate(await readExample("prompt-template"));
+    const definition = parseAgentDefinition(await readExample("agent-definition"));
+    const registryEntry = parseAgentRegistryEntry(await readExample("agent-registry-entry"));
+    const context = parseCompiledContext(await readExample("compiled-context"));
+
+    expect(request.ok && prompt.ok && definition.ok && registryEntry.ok && context.ok).toBe(true);
+    if (request.ok && prompt.ok && definition.ok && registryEntry.ok && context.ok) {
+      expect(hashExecutionRequest(request.value)).toBe(
+        "sha256:1b36f5f38a4f2ac2b89381a1847ded1e3ebc5d9539e6f11d190bfe0568f5de30",
+      );
+      expect(hashPromptTemplate(prompt.value)).toBe(prompt.value.document_hash);
+      expect(hashAgentDefinition(definition.value)).toBe(definition.value.document_hash);
+      expect(hashAgentRegistryEntry(registryEntry.value)).toBe(registryEntry.value.entry_hash);
+      expect(hashCompiledContext(context.value)).toBe(context.value.document_hash);
+
+      const promptReference = {
+        document_type: "prompt-template",
+        artifact_id: prompt.value.template_id,
+        revision: prompt.value.revision,
+        hash: prompt.value.document_hash,
+      } as const;
+      const definitionReference = {
+        document_type: "agent-definition",
+        artifact_id: definition.value.agent_id,
+        revision: definition.value.revision,
+        hash: definition.value.document_hash,
+      } as const;
+
+      expect(prompt.value.document_hash).toBe(
+        "sha256:be559a32cd3dc45c9652b9c2f6505842f757067d67de26a7f192d429628f1f3b",
+      );
+      expect(definition.value.document_hash).toBe(
+        "sha256:dcbb6bf855f06ab5e183773287e71565b26305bfdf646649a3fec92be1854f7c",
+      );
+      expect(registryEntry.value.entry_hash).toBe(
+        "sha256:3c13d4027e25aa78a1df9a042b78635ed8c212a4838b500d07b47e25837f1a58",
+      );
+      expect(context.value.document_hash).toBe(
+        "sha256:cf59f980a71a31958daf9d386c5d26b6536d87de3e87aead121c4c8e9f22b5ef",
+      );
+      expect(definition.value.prompt_template).toEqual(promptReference);
+      expect(registryEntry.value.definition).toEqual(definitionReference);
+      expect(registryEntry.value.prompt_template).toEqual(promptReference);
+      expect(context.value.definition).toEqual(definitionReference);
+      expect(context.value.prompt_template).toEqual(promptReference);
+      expect(context.value.request_hash).toBe(hashExecutionRequest(request.value));
+      expect(request.value.agent.definition).toEqual(definitionReference);
+      expect(request.value.agent.definition).toEqual(context.value.definition);
+      expect(request.value.agent.role).toBe(definition.value.role);
+      expect(request.value.task_contract).toEqual(definition.value.task_contracts[0]);
+      expect(context.value.task_contract).toEqual(definition.value.task_contracts[0]);
+      expect(request.value.task_contract).toEqual(context.value.task_contract);
+      expect(request.value.output.schema).toEqual(definition.value.output_schemas[0]);
+      expect(context.value.output_schema).toEqual(definition.value.output_schemas[0]);
+      expect(request.value.output.schema).toEqual(context.value.output_schema);
+      expect(request.value.model.logical_class).toBe(definition.value.model.logical_class);
+      expect(context.value.authority.logical_class).toBe(definition.value.model.logical_class);
+      expect(context.value.authority.logical_class).toBe(request.value.model.logical_class);
+      expect(request.value.model.required_capabilities).toEqual(["text", "tools"]);
+      expect(context.value.authority.model_capabilities).toEqual(
+        request.value.model.required_capabilities,
+      );
+      for (const capability of definition.value.model.required_capabilities) {
+        expect(request.value.model.required_capabilities).toContain(capability);
+      }
+      for (const capability of request.value.model.required_capabilities) {
+        expect(definition.value.model.allowed_capabilities).toContain(capability);
+      }
+      expect(request.value.superpowers.required).toEqual(definition.value.superpowers.required);
+      expect(context.value.authority.superpowers).toEqual(request.value.superpowers.required);
+      expect(request.value.mcp.profile).toEqual(definition.value.mcp_profiles[0]);
+      expect(context.value.authority.mcp_profile).toEqual(definition.value.mcp_profiles[0]);
+      expect(context.value.authority.mcp_profile).toEqual(request.value.mcp.profile);
+      expect(request.value.budget).toEqual({
+        max_input_tokens: 24_000,
+        max_output_tokens: 3_000,
+        max_cost_microusd: 400_000,
+        max_duration_ms: 500_000,
+        max_turns: 7,
+      });
+      expect(definition.value.budget_ceiling).toEqual({
+        max_input_tokens: 32_000,
+        max_output_tokens: 4_000,
+        max_cost_microusd: 500_000,
+        max_duration_ms: 600_000,
+        max_turns: 8,
+      });
+      expect(context.value.authority.budget).toEqual(request.value.budget);
+      for (const budgetKey of Object.keys(
+        request.value.budget,
+      ) as readonly (keyof typeof request.value.budget)[]) {
+        expect(request.value.budget[budgetKey]).toBeLessThanOrEqual(
+          definition.value.budget_ceiling[budgetKey],
+        );
+      }
+      expect(request.value.input_artifacts).toEqual([
+        {
+          document_type: "source-artifact",
+          artifact_id: "SOURCE-ONE",
+          revision: 1,
+          hash: "sha256:b73e73471433d1c2262f913cbc7eef547cfe3bd191fbb5f1a90382bd2f611863",
+        },
+        {
+          document_type: "source-artifact",
+          artifact_id: "SOURCE-TWO",
+          revision: 2,
+          hash: "sha256:d1051d2b34615a0756d304a9e0744f9021c59196c446795503210321d172bd3c",
+        },
+      ]);
+      expect(
+        context.value.segments
+          .filter((segment) => segment.kind === "input-artifact")
+          .map((segment) => segment.source),
+      ).toEqual(request.value.input_artifacts);
+    }
+  });
+
+  it("documents the normative agent authority, lifecycle, compiler, and downstream boundaries", async () => {
+    const readme = await readFile("README.md", "utf8");
+    const protocolContract = await readFile(
+      "docs/contracts/runtime-contract-protocol-v1.md",
+      "utf8",
+    );
+    const changelog = await readFile("CHANGELOG.md", "utf8");
+    const combined = `${readme}\n${protocolContract}\n${changelog}`;
+    const protocolProse = protocolContract.replaceAll(/\s+/gu, " ");
+    const combinedProse = combined.replaceAll(/\s+/gu, " ");
+
+    expect(protocolContract).toContain("Agent definition registry and compiled context");
+    expect(combinedProse).toMatch(/TOSS control plane.*?(?:sole|only).*?authority/iu);
+    expect(protocolProse).toMatch(/ACTIVE.*?new execution/iu);
+    expect(protocolProse).toMatch(/retained.*?(?:retired )?revision.*?resume/iu);
+    expect(protocolContract).toContain("`trusted-runtime`");
+    expect(protocolContract).toContain("`trusted-control`");
+    expect(protocolContract).toContain("`untrusted-content`");
+    expect(protocolProse).toMatch(
+      /runtime safety.*?Task Contract.*?prompt-template.*?output contract.*?input artifacts/iu,
+    );
+    expect(protocolProse).toMatch(/one UTF-8 byte.*?one conservative input token/iu);
+    expect(protocolProse).toMatch(/trusted.*?never truncated/iu);
+    expect(protocolProse).toMatch(/final eligible untrusted segment.*?Unicode scalar boundary/iu);
+    expect(combinedProse).toMatch(/illustrative.*?not writable (?:local )?configuration/iu);
+    expect(combinedProse).toMatch(/Issue #7.*?advertises.*?schemas only/iu);
+    for (const boundary of [
+      "Agent Skills",
+      "Superpowers",
+      "MCP tools",
+      "providers",
+      "agent loop",
+    ]) {
+      expect(combinedProse).toMatch(
+        new RegExp(`Issue #7.*?(?:does not|MUST NOT).*?${boundary}`, "iu"),
+      );
+    }
+    expect(combinedProse).toMatch(/Issue #8.*?owns.*?(?:Agent Skills|skill)/iu);
+    expect(combinedProse).toMatch(/Issue #9.*?owns.*?(?:MCP|tool)/iu);
+    expect(combinedProse).toMatch(/Issue #10.*?owns.*?(?:provider|agent loop)/iu);
   });
 
   it("documents the complete governed routing boundary without claiming later execution", async () => {

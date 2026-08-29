@@ -10,7 +10,173 @@ const VALID_ARTIFACT_REFERENCE = {
   location: "project-management/tasks/TASK-001.json",
 } as const;
 
+const ZERO_HASH = `sha256:${"0".repeat(64)}` as const;
+const PROMPT_REFERENCE = {
+  document_type: "prompt-template",
+  artifact_id: "prompt-template-public-api",
+  revision: 1,
+  hash: ZERO_HASH,
+} as const;
+const DEFINITION_REFERENCE = {
+  document_type: "agent-definition",
+  artifact_id: "agent-definition-public-api",
+  revision: 1,
+  hash: ZERO_HASH,
+} as const;
+const TASK_REFERENCE = {
+  document_type: "task-contract",
+  artifact_id: "task-contract-public-api",
+  revision: 1,
+  hash: ZERO_HASH,
+} as const;
+const MCP_REFERENCE = {
+  document_type: "mcp-profile",
+  artifact_id: "mcp-profile-public-api",
+  revision: 1,
+  hash: ZERO_HASH,
+} as const;
+const OUTPUT_REFERENCE = {
+  document_type: "output-schema",
+  artifact_id: "output-schema-public-api",
+  revision: 1,
+  hash: ZERO_HASH,
+} as const;
+const BUDGET = {
+  max_input_tokens: 1000,
+  max_output_tokens: 500,
+  max_cost_microusd: 100_000,
+  max_duration_ms: 60_000,
+  max_turns: 4,
+} as const;
+
+function segment(
+  segment_id: string,
+  kind: string,
+  trust: string,
+  source: typeof TASK_REFERENCE | typeof PROMPT_REFERENCE | typeof OUTPUT_REFERENCE | null,
+  blockId?: string,
+) {
+  return {
+    segment_id,
+    kind,
+    trust,
+    source,
+    original_hash: ZERO_HASH,
+    included_hash: ZERO_HASH,
+    original_bytes: 1,
+    included_bytes: 1,
+    tokens: 1,
+    content: "x",
+    ...(blockId === undefined ? {} : { block_id: blockId }),
+  };
+}
+
+const AGENT_SCHEMA_DOCUMENTS = [
+  {
+    protocol_version: "runtime-contract.v1",
+    schema_version: "prompt-template.v1",
+    document_type: "prompt-template",
+    template_id: "prompt-template-public-api",
+    revision: 1,
+    instruction_blocks: [{ block_id: "role", content: "Stay within task authority." }],
+    document_hash: ZERO_HASH,
+  },
+  {
+    protocol_version: "runtime-contract.v1",
+    schema_version: "agent-definition.v1",
+    document_type: "agent-definition",
+    agent_id: "agent-definition-public-api",
+    revision: 1,
+    name: "public-api-worker",
+    role: "worker",
+    prompt_template: PROMPT_REFERENCE,
+    task_contracts: [TASK_REFERENCE],
+    model: {
+      logical_class: "balanced-code",
+      required_capabilities: ["text"],
+      allowed_capabilities: ["text"],
+    },
+    superpowers: {
+      required: ["test-driven-development"],
+      allowed: ["test-driven-development"],
+    },
+    mcp_profiles: [MCP_REFERENCE],
+    budget_class: "standard",
+    budget_ceiling: BUDGET,
+    output_schemas: [OUTPUT_REFERENCE],
+    context_policy: {
+      truncation: "utf8-prefix.v1",
+      max_untrusted_bytes: 256,
+      inputs: [{ document_type: "source-artifact", priority: 1, max_bytes: 256 }],
+    },
+    document_hash: ZERO_HASH,
+  },
+  {
+    protocol_version: "runtime-contract.v1",
+    schema_version: "agent-registry-entry.v1",
+    document_type: "agent-registry-entry",
+    registry_revision: 1,
+    previous_entry_hash: null,
+    operation_id: "048e6b57-9448-4b11-b2f9-1bcf3b20c806",
+    operation_hash: ZERO_HASH,
+    definition: DEFINITION_REFERENCE,
+    prompt_template: PROMPT_REFERENCE,
+    state: "ACTIVE",
+    occurred_at: "2026-08-21T12:00:00.000Z",
+    entry_hash: ZERO_HASH,
+  },
+  {
+    protocol_version: "runtime-contract.v1",
+    schema_version: "compiled-context.v1",
+    document_type: "compiled-context",
+    request_hash: ZERO_HASH,
+    definition: DEFINITION_REFERENCE,
+    prompt_template: PROMPT_REFERENCE,
+    task_contract: TASK_REFERENCE,
+    output_schema: OUTPUT_REFERENCE,
+    authority: {
+      logical_class: "balanced-code",
+      model_capabilities: ["text"],
+      superpowers: ["test-driven-development"],
+      mcp_profile: MCP_REFERENCE,
+      budget: BUDGET,
+    },
+    runtime_policy: { revision: 1, hash: ZERO_HASH },
+    allocation_policy: {
+      definition_max_input_tokens: 1000,
+      truncation: "utf8-prefix.v1",
+      max_untrusted_bytes: 256,
+      inputs: [{ document_type: "source-artifact", priority: 1, max_bytes: 256 }],
+    },
+    segments: [
+      segment("runtime-safety", "runtime-safety", "trusted-runtime", null),
+      segment("task-contract", "task-contract", "trusted-control", TASK_REFERENCE),
+      segment("prompt-template", "prompt-template", "trusted-control", PROMPT_REFERENCE, "role"),
+      segment("output-schema", "output-schema", "trusted-control", OUTPUT_REFERENCE),
+    ],
+    accounting: {
+      input_tokens: 4,
+      input_bytes: 4,
+      untrusted_bytes: 0,
+      remaining_input_tokens: 996,
+    },
+    truncations: [],
+    document_hash: ZERO_HASH,
+  },
+] as const;
+
 describe("runtime common schema", () => {
+  it("registers exactly the four agent document schemas", () => {
+    const validator = createProtocolValidator();
+
+    for (const document of AGENT_SCHEMA_DOCUMENTS) {
+      expect(
+        validator.parse(JSON.stringify(document), document.document_type),
+        document.schema_version,
+      ).toMatchObject({ ok: true, value: document });
+    }
+  });
+
   it("accepts and freezes an exact artifact reference", () => {
     const result = createProtocolValidator().validateFragment(
       "artifact-reference",
