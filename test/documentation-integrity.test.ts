@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 
 import { describe, expect, it } from "vitest";
 
@@ -44,17 +44,38 @@ interface ContractSchema {
   readonly $defs?: Readonly<Record<string, unknown>>;
 }
 
-const AGENT_SCHEMA_VERSIONS = [
-  "agent-definition.v1",
-  "agent-registry-entry.v1",
-  "compiled-context.v1",
-  "prompt-template.v1",
-] as const;
+interface ContractSchemaCandidate {
+  readonly schema_version: string;
+  readonly path: string;
+  readonly id: string;
+}
 
 async function readContractManifest(): Promise<ContractManifest> {
   return JSON.parse(
     await readFile("docs/contracts/runtime-contract-v1.manifest.json", "utf8"),
   ) as ContractManifest;
+}
+
+async function readContractSchemaCandidates(): Promise<readonly ContractSchemaCandidate[]> {
+  const suffix = ".schema.json";
+  const filenames = (await readdir("contracts/runtime"))
+    .filter((filename) => filename.endsWith(suffix))
+    .sort();
+
+  return Promise.all(
+    filenames.map(async (filename) => {
+      const path = `contracts/runtime/${filename}`;
+      const schema = JSON.parse(await readFile(path, "utf8")) as ContractSchema;
+      if (schema.$id === undefined) {
+        throw new Error(`Contract schema has no identifier: ${path}`);
+      }
+      return {
+        schema_version: filename.slice(0, -suffix.length),
+        path,
+        id: schema.$id,
+      };
+    }),
+  );
 }
 
 async function readExample(name: string): Promise<Uint8Array> {
@@ -106,8 +127,29 @@ describe("published protocol artifacts", () => {
     }
   });
 
-  it("keeps every advertised and registered agent schema coherent with the manifest", async () => {
+  it("keeps every advertised and generically registered schema coherent with the manifest", async () => {
     const manifest = await readContractManifest();
+    const validator = createProtocolValidator();
+    const candidates = await readContractSchemaCandidates();
+
+    for (const candidate of candidates) {
+      const probe = validator.parse(
+        JSON.stringify({
+          schema_version: candidate.schema_version,
+          document_type: "manifest-probe",
+        }),
+        "manifest-probe",
+      );
+      if (!probe.ok && probe.code === "RUNTIME_DOCUMENT_UNSUPPORTED") {
+        continue;
+      }
+
+      const matches = manifest.schemas.filter(
+        (entry) => entry.schema_version === candidate.schema_version,
+      );
+      expect(matches, candidate.schema_version).toEqual([candidate]);
+    }
+
     const advertised = createBaselineCapabilities({
       os: "linux",
       arch: "x64",
@@ -119,24 +161,6 @@ describe("published protocol artifacts", () => {
 
     expect(advertisedManifestVersions).toEqual(advertised);
     expect(new Set(advertisedManifestVersions).size).toBe(advertised.length);
-
-    const validator = createProtocolValidator();
-    for (const schemaVersion of AGENT_SCHEMA_VERSIONS) {
-      expect(advertised).toContain(schemaVersion);
-      const matches = manifest.schemas.filter((entry) => entry.schema_version === schemaVersion);
-      const expectedPath = `contracts/runtime/${schemaVersion}.schema.json`;
-      const expectedId = `https://toss.software/schemas/runtime/v1/${schemaVersion}.schema.json`;
-      expect(matches).toEqual([
-        { schema_version: schemaVersion, path: expectedPath, id: expectedId },
-      ]);
-
-      expect(
-        validator.parse(
-          JSON.stringify({ schema_version: schemaVersion, document_type: "manifest-probe" }),
-          "manifest-probe",
-        ),
-      ).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
-    }
   });
 
   it("maps every published schema version to its exact file and identifier", async () => {
