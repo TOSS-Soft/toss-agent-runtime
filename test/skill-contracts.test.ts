@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { canonicalJson } from "../src/protocol/json.js";
+import { canonicalJson, sha256 } from "../src/protocol/json.js";
 import {
   parseSkillDescriptor,
   parseSkillExecutionEvidence,
@@ -21,6 +21,12 @@ function expectDeepFrozen(value: unknown): void {
   if (typeof value !== "object" || value === null) return;
   expect(Object.isFrozen(value)).toBe(true);
   for (const child of Object.values(value)) expectDeepFrozen(child);
+}
+
+function resignDocument<T extends Record<string, unknown>>(value: T): T {
+  const hashable = { ...value };
+  delete hashable.document_hash;
+  return { ...hashable, document_hash: sha256(hashable) };
 }
 
 describe("skill runtime contracts", () => {
@@ -78,10 +84,14 @@ describe("skill runtime contracts", () => {
     expect(parseSkillSnapshot(canonicalJson({ ...fixture, total_bytes: fixture.total_bytes + 1 }))).toMatchObject({ ok: false });
   });
 
-  it("rejects unbound approval fields", () => {
+  it.each(["approval_request_hash", "operation_id"] as const)(
+    "rejects re-signed REQUEST documents with unbound %s",
+    (field) => {
     const fixture = validSuperpowersApproval();
-    expect(parseSuperpowersApproval(canonicalJson({ ...fixture, approval_request_hash: fixture.phase_document_hash }))).toMatchObject({ ok: false });
-  });
+      const mutated = resignDocument({ ...fixture, [field]: fixture.phase_document_hash });
+      expect(parseSuperpowersApproval(canonicalJson(mutated))).toMatchObject({ ok: false });
+    },
+  );
 
   it("parses a closed approval decision", () => {
     expect(parseSuperpowersApproval(canonicalJson(validSuperpowersApprovalDecision()))).toMatchObject({
