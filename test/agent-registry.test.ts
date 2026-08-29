@@ -75,6 +75,16 @@ interface RegistryTestDependencies {
     readonly beforeHistoryDirectorySync?: (directoryPath: string) => void;
     readonly afterQuarantinePublished?: (filePath: string) => void;
     readonly afterObjectsPublished?: () => Promise<void>;
+    readonly beforeRecoveryStageDirectorySync?: (
+      kind: "lifecycle" | "operations",
+      stagePath: string,
+    ) => void;
+    readonly beforeRecoveryRename?: (
+      kind: "lifecycle" | "operations",
+      stagePath: string,
+      historyPath: string,
+    ) => void;
+    readonly afterRecoveryRename?: (kind: "lifecycle" | "operations", historyPath: string) => void;
   };
   readonly openCandidateDirectory?: (candidate: string) => CandidateDirectoryReader | undefined;
   readonly candidateLimits?: {
@@ -249,6 +259,23 @@ function operationsPath(statePath: string): string {
 
 function objectPath(statePath: string, hash: `sha256:${string}`): string {
   return path.join(statePath, "agents", "objects", hash.slice("sha256:".length));
+}
+
+function recoveryStagePath(
+  statePath: string,
+  kind: "lifecycle" | "operations",
+  operationId: string,
+): string {
+  return path.join(registryDirectory(statePath), `.${kind}-recovery.${operationId}.stage`);
+}
+
+function quarantineArtifactPath(
+  statePath: string,
+  kind: "lifecycle" | "operations",
+  operationId: string,
+): string {
+  const prefix = kind === "lifecycle" ? "agent-registry" : "agent-registry-operations";
+  return path.join(statePath, "agents", "quarantine", `${prefix}-${operationId}.bin`);
 }
 
 async function lines(candidate: string): Promise<string[]> {
@@ -1145,6 +1172,191 @@ describe("agent registry recovery and fail-closed history validation", () => {
 });
 
 describe("agent registry durability and coordination", () => {
+  it.each([
+    "recovery-file-sync",
+    "stage-directory-sync",
+    "before-rename",
+    "after-rename",
+    "post-rename-directory-sync",
+  ] as const)(
+    "retries a partial lifecycle recovery after the %s barrier without quarantine growth",
+    async (barrier) => {
+      const { statePath } = await fixture();
+      await registry(statePath).publish(bundle(1), OPERATION_1);
+      const historyPath = entriesPath(statePath);
+      const prefix = await readFile(historyPath);
+      const fragment = Buffer.from('{"partial":', "utf8");
+      await appendFile(historyPath, fragment);
+      let injected = false;
+      let renamed = false;
+      const failOnce = (): void => {
+        if (injected) return;
+        injected = true;
+        throw new Error(`simulated ${barrier} failure`);
+      };
+      const failing = registry(statePath, {
+        randomId: () => OPERATION_4,
+        operationHooks: {
+          beforeHistoryFileSync: (kind) => {
+            if (barrier === "recovery-file-sync" && kind === "recovery") failOnce();
+          },
+          beforeRecoveryStageDirectorySync: () => {
+            if (barrier === "stage-directory-sync") failOnce();
+          },
+          beforeRecoveryRename: () => {
+            if (barrier === "before-rename") failOnce();
+          },
+          afterRecoveryRename: () => {
+            renamed = true;
+            if (barrier === "after-rename") failOnce();
+          },
+          beforeHistoryDirectorySync: (directoryPath) => {
+            if (
+              barrier === "post-rename-directory-sync" &&
+              renamed &&
+              directoryPath === registryDirectory(statePath)
+            ) {
+              failOnce();
+            }
+          },
+        },
+      });
+
+      await expect(failing.recover()).rejects.toMatchObject({
+        code: "RUNTIME_AGENT_REGISTRY_CORRUPT",
+      });
+      expect(injected).toBe(true);
+
+      const fresh = registry(statePath);
+      await expect(fresh.recover()).resolves.toBeUndefined();
+      expect(await readFile(historyPath)).toEqual(prefix);
+      const quarantine = await readdir(path.join(statePath, "agents", "quarantine"));
+      expect(quarantine).toHaveLength(1);
+      expect(await readFile(path.join(statePath, "agents", "quarantine", quarantine[0]!))).toEqual(
+        fragment,
+      );
+      expect(
+        (await readdir(registryDirectory(statePath))).some((name) => name.endsWith(".stage")),
+      ).toBe(false);
+    },
+  );
+
+  it.each(["lifecycle", "operations"] as const)(
+    "completes an exact restart-owned %s recovery stage without duplicate quarantine",
+    async (kind) => {
+      const { statePath } = await fixture();
+      const agents = registry(statePath);
+      const v1 = bundle(1);
+      await agents.publish(v1, OPERATION_1);
+      if (kind === "operations") await agents.publish(v1, OPERATION_2);
+      const historyPath = kind === "lifecycle" ? entriesPath(statePath) : operationsPath(statePath);
+      const prefix = await readFile(historyPath);
+      const fragment = Buffer.from(kind === "lifecycle" ? '{"partial":' : "{", "utf8");
+      await appendFile(historyPath, fragment);
+      const stagePath = recoveryStagePath(statePath, kind, OPERATION_3);
+      const quarantinePath = quarantineArtifactPath(statePath, kind, OPERATION_3);
+      await writeFile(quarantinePath, fragment, { mode: 0o600 });
+      await writeFile(stagePath, prefix, { mode: 0o600 });
+
+      await expect(registry(statePath).recover()).resolves.toBeUndefined();
+      expect(await readFile(historyPath)).toEqual(prefix);
+      expect(await readFile(quarantinePath)).toEqual(fragment);
+      expect(existsSync(stagePath)).toBe(false);
+      expect(await readdir(path.join(statePath, "agents", "quarantine"))).toEqual([
+        path.basename(quarantinePath),
+      ]);
+    },
+  );
+
+  it.each(["wrong-content", "unsafe-mode", "extra-stage"] as const)(
+    "fails closed and preserves an unsafe recovery stage state: %s",
+    async (shape) => {
+      const { statePath } = await fixture();
+      await registry(statePath).publish(bundle(1), OPERATION_1);
+      const historyPath = entriesPath(statePath);
+      const prefix = await readFile(historyPath);
+      const fragment = Buffer.from("{", "utf8");
+      await appendFile(historyPath, fragment);
+      const stagePath = recoveryStagePath(statePath, "lifecycle", OPERATION_3);
+      const quarantinePath = quarantineArtifactPath(statePath, "lifecycle", OPERATION_3);
+      await writeFile(quarantinePath, fragment, { mode: 0o600 });
+      await writeFile(stagePath, shape === "wrong-content" ? "wrong" : prefix, { mode: 0o600 });
+      if (shape === "unsafe-mode") await chmod(stagePath, 0o644);
+      const extraStage = recoveryStagePath(statePath, "lifecycle", OPERATION_4);
+      if (shape === "extra-stage") {
+        await writeFile(quarantineArtifactPath(statePath, "lifecycle", OPERATION_4), fragment, {
+          mode: 0o600,
+        });
+        await writeFile(extraStage, prefix, { mode: 0o600 });
+      }
+      const before = new Map<string, Buffer>();
+      for (const candidate of await readdir(registryDirectory(statePath))) {
+        if (candidate.endsWith(".stage")) {
+          before.set(candidate, await readFile(path.join(registryDirectory(statePath), candidate)));
+        }
+      }
+
+      await expect(registry(statePath).recover()).rejects.toMatchObject({
+        code: "RUNTIME_AGENT_REGISTRY_CORRUPT",
+      });
+      for (const [candidate, bytes] of before) {
+        expect(await readFile(path.join(registryDirectory(statePath), candidate))).toEqual(bytes);
+      }
+      expect(await readFile(historyPath)).toEqual(Buffer.concat([prefix, fragment]));
+    },
+  );
+
+  it("preserves an exact recovery stage while a live mutation claim blocks ownership", async () => {
+    const { statePath } = await fixture();
+    await registry(statePath).publish(bundle(1), OPERATION_1);
+    const prefix = await readFile(entriesPath(statePath));
+    const fragment = Buffer.from("{", "utf8");
+    await appendFile(entriesPath(statePath), fragment);
+    const stagePath = recoveryStagePath(statePath, "lifecycle", OPERATION_3);
+    const quarantinePath = quarantineArtifactPath(statePath, "lifecycle", OPERATION_3);
+    await writeFile(quarantinePath, fragment, { mode: 0o600 });
+    await writeFile(stagePath, prefix, { mode: 0o600 });
+    const claimPath = path.join(registryDirectory(statePath), "mutation.claim");
+    await writeFile(claimPath, JSON.stringify({ pid: process.pid }), { mode: 0o700 });
+
+    await expect(
+      registry(statePath, {
+        isProcessAlive: () => "alive",
+        hasServiceListener: () => Promise.resolve("absent"),
+      }).recover(),
+    ).rejects.toMatchObject({ code: "RUNTIME_AGENT_REGISTRY_CORRUPT" });
+    expect(await readFile(stagePath)).toEqual(prefix);
+    expect(await readFile(quarantinePath)).toEqual(fragment);
+    expect(existsSync(claimPath)).toBe(true);
+  });
+
+  it("detects a pre-rename stage replacement and preserves the replacement", async () => {
+    const { root, statePath } = await fixture();
+    await registry(statePath).publish(bundle(1), OPERATION_1);
+    const prefix = await readFile(entriesPath(statePath));
+    const fragment = Buffer.from("{", "utf8");
+    await appendFile(entriesPath(statePath), fragment);
+    const displaced = path.join(root, "displaced-recovery-stage");
+    let replacementPath = "";
+
+    await expect(
+      registry(statePath, {
+        randomId: () => OPERATION_4,
+        operationHooks: {
+          beforeRecoveryRename: (_kind, stagePath) => {
+            replacementPath = stagePath;
+            renameSync(stagePath, displaced);
+            writeFileSync(stagePath, "replacement", { mode: 0o600 });
+          },
+        },
+      }).recover(),
+    ).rejects.toMatchObject({ code: "RUNTIME_AGENT_REGISTRY_CORRUPT" });
+
+    expect(await readFile(displaced)).toEqual(prefix);
+    expect(await readFile(replacementPath, "utf8")).toBe("replacement");
+    expect(await readFile(entriesPath(statePath))).toEqual(Buffer.concat([prefix, fragment]));
+  });
+
   it.each(["file", "directory"] as const)(
     "replays after an initial %s sync failure",
     async (kind) => {
@@ -1371,6 +1583,103 @@ describe("agent registry durability and coordination", () => {
     await expect(accepted).resolves.toMatchObject({ state: "ACTIVE" });
     await expect(flush).resolves.toBeUndefined();
   });
+
+  it("keeps a gated pre-stop list claim inside the flush cut without repairing history", async () => {
+    const { statePath } = await fixture();
+    const v1 = bundle(1);
+    const published = await registry(statePath).publish(v1, OPERATION_1);
+    const historyBefore = await readFile(entriesPath(statePath));
+    const quarantineBefore = await readdir(path.join(statePath, "agents", "quarantine"));
+    let release!: () => void;
+    let reached!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const claimReached = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    const agents = registry(statePath, {
+      privateStoreOperationHooks: {
+        beforeClaimFileSync: async () => {
+          reached();
+          await gate;
+        },
+      },
+    });
+    const listed = agents.list();
+    await claimReached;
+    agents.stopIntake();
+    const flush = agents.flush(new AbortController().signal);
+    let flushSettled = false;
+    void flush.then(() => {
+      flushSettled = true;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(flushSettled).toBe(false);
+    release();
+    await expect(listed).resolves.toEqual([published]);
+    await expect(flush).resolves.toBeUndefined();
+    expect(await readFile(entriesPath(statePath))).toEqual(historyBefore);
+    expect(await readdir(path.join(statePath, "agents", "quarantine"))).toEqual(quarantineBefore);
+    expect(existsSync(path.join(registryDirectory(statePath), "mutation.claim"))).toBe(false);
+  });
+
+  it.each(["list", "resolveForExecution", "resolveForResume"] as const)(
+    "reads fully valid state after stop without a claim or durable mutation through %s",
+    async (method) => {
+      const { statePath } = await fixture();
+      const v1 = bundle(1);
+      const published = await registry(statePath).publish(v1, OPERATION_1);
+      const historyBefore = await readFile(entriesPath(statePath));
+      const quarantinePath = path.join(statePath, "agents", "quarantine");
+      const quarantineBefore = await readdir(quarantinePath);
+      let claimAttempts = 0;
+      const agents = registry(statePath, {
+        privateStoreOperationHooks: {
+          beforeClaimFileSync: () => {
+            claimAttempts += 1;
+            return Promise.reject(new Error("post-stop reads must not acquire a claim"));
+          },
+        },
+      });
+      agents.stopIntake();
+
+      const operation =
+        method === "list" ? agents.list() : agents[method](definitionReference(v1.definition));
+      await expect(operation).resolves.toEqual(method === "list" ? [published] : v1);
+      expect(claimAttempts).toBe(0);
+      expect(await readFile(entriesPath(statePath))).toEqual(historyBefore);
+      expect(await readdir(quarantinePath)).toEqual(quarantineBefore);
+      expect(existsSync(path.join(registryDirectory(statePath), "mutation.claim"))).toBe(false);
+    },
+  );
+
+  it.each(["list", "resolveForExecution", "resolveForResume"] as const)(
+    "fails closed without post-stop mutation when %s observes a partial tail",
+    async (method) => {
+      const { statePath } = await fixture();
+      const agents = registry(statePath);
+      const v1 = bundle(1);
+      await agents.publish(v1, OPERATION_1);
+      const fragment = Buffer.from('{"partial":', "utf8");
+      await appendFile(entriesPath(statePath), fragment);
+      const historyBefore = await readFile(entriesPath(statePath));
+      const quarantinePath = path.join(statePath, "agents", "quarantine");
+      const quarantineBefore = await readdir(quarantinePath);
+      agents.stopIntake();
+      await agents.flush(new AbortController().signal);
+
+      const operation =
+        method === "list" ? agents.list() : agents[method](definitionReference(v1.definition));
+      await expect(operation).rejects.toMatchObject({
+        code: "RUNTIME_AGENT_REGISTRY_CORRUPT",
+      });
+      expect(await readFile(entriesPath(statePath))).toEqual(historyBefore);
+      expect(await readdir(quarantinePath)).toEqual(quarantineBefore);
+      expect(existsSync(path.join(registryDirectory(statePath), "mutation.claim"))).toBe(false);
+    },
+  );
 
   it("rejects post-stop recovery and flushes a recovery accepted before stop", async () => {
     const { statePath } = await fixture();

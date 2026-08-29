@@ -11,6 +11,7 @@ import {
   readSync,
   realpathSync,
   renameSync,
+  unlinkSync,
   writeSync,
   type BigIntStats,
 } from "node:fs";
@@ -51,9 +52,9 @@ const MAX_HISTORY_BYTES = 16 * 1024 * 1024;
 const MAX_OPERATION_RECORD_BYTES = 65_536;
 const MAX_AGENTS_CANDIDATES = 3;
 const MAX_OBJECT_CANDIDATES = 65_536;
-const MAX_REGISTRY_CANDIDATES = 3;
+const MAX_REGISTRY_CANDIDATES = 4;
 const MAX_MUTATION_CLAIM_BYTES = 128;
-const MAX_REGISTRY_AGGREGATE_BYTES = MAX_HISTORY_BYTES * 2 + MAX_MUTATION_CLAIM_BYTES;
+const MAX_REGISTRY_AGGREGATE_BYTES = MAX_HISTORY_BYTES * 3 + MAX_MUTATION_CLAIM_BYTES;
 const MAX_QUARANTINE_CANDIDATES = 4096;
 const MAX_QUARANTINE_AGGREGATE_BYTES = MAX_HISTORY_BYTES;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
@@ -61,6 +62,8 @@ const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const IDENTIFIER_PATTERN = /^[A-Za-z][A-Za-z0-9._:-]{0,127}$/u;
 const QUARANTINE_PATTERN =
   /^agent-registry(?:-operations)?-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.bin$/u;
+const RECOVERY_STAGE_PATTERN =
+  /^\.(lifecycle|operations)-recovery\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.stage$/u;
 
 type AgentRegistryHistoryKind = "lifecycle" | "operations" | "quarantine" | "recovery";
 
@@ -69,6 +72,16 @@ interface AgentRegistryOperationHooks {
   readonly beforeHistoryDirectorySync?: (directoryPath: string) => void;
   readonly afterQuarantinePublished?: (filePath: string) => void;
   readonly afterObjectsPublished?: () => Promise<void>;
+  readonly beforeRecoveryStageDirectorySync?: (
+    kind: "lifecycle" | "operations",
+    stagePath: string,
+  ) => void;
+  readonly beforeRecoveryRename?: (
+    kind: "lifecycle" | "operations",
+    stagePath: string,
+    historyPath: string,
+  ) => void;
+  readonly afterRecoveryRename?: (kind: "lifecycle" | "operations", historyPath: string) => void;
 }
 
 export interface CreateAgentRegistryOptions {
@@ -113,6 +126,20 @@ interface CandidateFileSnapshot {
   readonly name: string;
   readonly identity: PrivateFileIdentity;
   readonly size: bigint;
+}
+
+interface RecoveryStageSnapshot extends CandidateFileSnapshot {
+  readonly kind: "lifecycle" | "operations";
+  readonly operationId: string;
+}
+
+interface RegistryCandidateOptions {
+  readonly allowMutationClaim: boolean;
+  readonly allowRecoveryStage: boolean;
+}
+
+interface RegistryLoadOptions extends RegistryCandidateOptions {
+  readonly recoverPartials: boolean;
 }
 
 interface DirectoryContentToken {
@@ -461,26 +488,54 @@ function canonicalStatePath(candidate: string): string {
   }
 }
 
-function assertRegistryCandidates(registryPath: string, scans: CandidateScanOptions): void {
-  const allowed = new Set(["entries.jsonl", "operations.jsonl", "mutation.claim"]);
+function assertRegistryCandidates(
+  registryPath: string,
+  scans: CandidateScanOptions,
+  options: RegistryCandidateOptions,
+): readonly RecoveryStageSnapshot[] {
+  const allowed = new Set(["entries.jsonl", "operations.jsonl"]);
   let aggregateBytes = 0n;
+  const recoveryStages: RecoveryStageSnapshot[] = [];
   scanCandidateDirectory(
     registryPath,
     scans.limits.registryCount,
     (entry) => {
-      if (!allowed.has(entry.name) || !entry.isFile() || entry.isSymbolicLink()) {
+      const claim = entry.name === "mutation.claim";
+      const recoveryStage = RECOVERY_STAGE_PATTERN.exec(entry.name);
+      if (
+        (!allowed.has(entry.name) &&
+          !(claim && options.allowMutationClaim) &&
+          !(recoveryStage !== null && options.allowRecoveryStage)) ||
+        !entry.isFile() ||
+        entry.isSymbolicLink()
+      ) {
         registryCorrupt();
       }
-      const claim = entry.name === "mutation.claim";
       const maximumBytes = claim ? MAX_MUTATION_CLAIM_BYTES : MAX_HISTORY_BYTES;
       const metadata = lstatSync(path.join(registryPath, entry.name), { bigint: true });
-      assertPrivateFile(metadata, undefined, claim ? 0o700 : 0o600);
+      const candidateIdentity = assertPrivateFile(metadata, undefined, claim ? 0o700 : 0o600);
       if (metadata.size > BigInt(maximumBytes)) registryCorrupt();
       aggregateBytes += metadata.size;
       if (aggregateBytes > BigInt(scans.limits.registryAggregateBytes)) registryCorrupt();
+      if (recoveryStage !== null) {
+        const kind = recoveryStage[1];
+        const operationId = recoveryStage[2];
+        if ((kind !== "lifecycle" && kind !== "operations") || operationId === undefined) {
+          registryCorrupt();
+        }
+        recoveryStages.push({
+          name: entry.name,
+          identity: candidateIdentity,
+          size: metadata.size,
+          kind,
+          operationId,
+        });
+        if (recoveryStages.length > 1) registryCorrupt();
+      }
     },
     scans.openCandidateDirectory,
   );
+  return Object.freeze(recoveryStages);
 }
 
 function assertCanonicalStoredAgentObject(bytes: Uint8Array, hash: `sha256:${string}`): void {
@@ -647,8 +702,9 @@ function readHistoryFile(
   candidate: string,
   registryPath: string,
   scans: CandidateScanOptions,
+  candidateOptions: RegistryCandidateOptions,
 ): PrivateFileSnapshot | null {
-  assertRegistryCandidates(registryPath, scans);
+  assertRegistryCandidates(registryPath, scans, candidateOptions);
   let descriptor: number | undefined;
   try {
     let before: BigIntStats;
@@ -678,6 +734,221 @@ function readHistoryFile(
   }
 }
 
+function readExactPrivateFile(options: {
+  readonly candidate: string;
+  readonly parentPath: string;
+  readonly maximumBytes: number;
+  readonly expectedIdentity?: PrivateFileIdentity;
+}): PrivateFileSnapshot {
+  let descriptor: number | undefined;
+  try {
+    const before = lstatSync(options.candidate, { bigint: true });
+    const expected = assertPrivateFile(before, options.expectedIdentity);
+    if (before.size > BigInt(options.maximumBytes)) registryCorrupt();
+    descriptor = openSync(options.candidate, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const held = fstatSync(descriptor, { bigint: true });
+    assertPrivateFile(held, expected);
+    if (held.size > BigInt(options.maximumBytes)) registryCorrupt();
+    const bytes = readAll(descriptor, Number(held.size));
+    fsyncSync(descriptor);
+    exactFile(options.candidate, descriptor, expected, bytes);
+    syncPrivateDirectory(options.parentPath);
+    exactFile(options.candidate, descriptor, expected, bytes);
+    return { bytes, identity: expected };
+  } catch (error) {
+    if (error instanceof RuntimeAgentError) throw error;
+    return registryCorrupt();
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+function quarantineArtifactName(kind: "lifecycle" | "operations", operationId: string): string {
+  return kind === "lifecycle"
+    ? `agent-registry-${operationId}.bin`
+    : `agent-registry-operations-${operationId}.bin`;
+}
+
+function quarantineOperationId(kind: "lifecycle" | "operations", name: string): string | undefined {
+  const prefix = kind === "lifecycle" ? "agent-registry-" : "agent-registry-operations-";
+  if (!name.startsWith(prefix) || !name.endsWith(".bin")) return undefined;
+  const operationId = name.slice(prefix.length, -".bin".length);
+  return UUID_PATTERN.test(operationId) ? operationId : undefined;
+}
+
+function reusableQuarantine(options: {
+  readonly quarantinePath: string;
+  readonly kind: "lifecycle" | "operations";
+  readonly fragment: Uint8Array;
+  readonly scans: CandidateScanOptions;
+}):
+  | Readonly<{
+      operationId: string;
+      candidate: string;
+      identity: PrivateFileIdentity;
+    }>
+  | undefined {
+  const usage = assertStableQuarantineCandidates(options.quarantinePath, options.scans);
+  const matches: {
+    operationId: string;
+    candidate: string;
+    identity: PrivateFileIdentity;
+  }[] = [];
+  for (const snapshot of usage.candidates) {
+    if (snapshot.size !== BigInt(options.fragment.byteLength)) continue;
+    const operationId = quarantineOperationId(options.kind, snapshot.name);
+    if (operationId === undefined) continue;
+    const candidate = path.join(options.quarantinePath, snapshot.name);
+    const exact = readExactPrivateFile({
+      candidate,
+      parentPath: options.quarantinePath,
+      maximumBytes: MAX_HISTORY_BYTES,
+      expectedIdentity: snapshot.identity,
+    });
+    if (Buffer.from(exact.bytes).equals(Buffer.from(options.fragment))) {
+      matches.push({ operationId, candidate, identity: exact.identity });
+      if (matches.length > 1) registryCorrupt();
+    }
+  }
+  return matches[0] === undefined ? undefined : Object.freeze(matches[0]);
+}
+
+function cleanupOwnedRecoveryStage(
+  stagePath: string,
+  registryPath: string,
+  expectedIdentity: PrivateFileIdentity,
+): void {
+  try {
+    const metadata = lstatSync(stagePath, { bigint: true });
+    assertPrivateFile(metadata, expectedIdentity);
+    unlinkSync(stagePath);
+    syncPrivateDirectory(registryPath);
+  } catch {
+    // A missing or identity-replaced path is not ours to remove. Preserve it so
+    // the next explicit recovery can fail closed against the exact candidate.
+  }
+}
+
+function assertExactRecoveryStageCandidate(options: {
+  readonly stageName: string;
+  readonly stageIdentity: PrivateFileIdentity;
+  readonly stageSize: bigint;
+  readonly registryPath: string;
+  readonly scans: CandidateScanOptions;
+}): void {
+  const stages = assertRegistryCandidates(options.registryPath, options.scans, {
+    allowMutationClaim: true,
+    allowRecoveryStage: true,
+  });
+  const stage = stages[0];
+  if (
+    stages.length !== 1 ||
+    stage === undefined ||
+    stage.name !== options.stageName ||
+    stage.size !== options.stageSize ||
+    !identitiesMatch(stage.identity, options.stageIdentity)
+  ) {
+    registryCorrupt();
+  }
+}
+
+function completeRecoveryStage(options: {
+  readonly stage: RecoveryStageSnapshot;
+  readonly candidate: string;
+  readonly registryPath: string;
+  readonly quarantinePath: string;
+  readonly expected: PrivateFileSnapshot;
+  readonly prefix: Uint8Array;
+  readonly fragment: Uint8Array;
+  readonly scans: CandidateScanOptions;
+  readonly assertRegistryIdentity: () => void;
+  readonly hooks?: AgentRegistryOperationHooks;
+}): void {
+  const stagePath = path.join(options.registryPath, options.stage.name);
+  const quarantineName = quarantineArtifactName(options.stage.kind, options.stage.operationId);
+  const quarantinePath = path.join(options.quarantinePath, quarantineName);
+  let stageDescriptor: number | undefined;
+  let currentDescriptor: number | undefined;
+  try {
+    options.assertRegistryIdentity();
+    const quarantineUsage = assertStableQuarantineCandidates(options.quarantinePath, options.scans);
+    const quarantineSnapshot = quarantineUsage.candidates.find(
+      (candidate) => candidate.name === quarantineName,
+    );
+    if (
+      quarantineSnapshot === undefined ||
+      quarantineSnapshot.size !== BigInt(options.fragment.byteLength)
+    ) {
+      registryCorrupt();
+    }
+    const quarantine = readExactPrivateFile({
+      candidate: quarantinePath,
+      parentPath: options.quarantinePath,
+      maximumBytes: MAX_HISTORY_BYTES,
+      expectedIdentity: quarantineSnapshot.identity,
+    });
+    if (!Buffer.from(quarantine.bytes).equals(Buffer.from(options.fragment))) registryCorrupt();
+    const stableQuarantine = assertStableQuarantineCandidates(
+      options.quarantinePath,
+      options.scans,
+    ).candidates.find((candidate) => candidate.name === quarantineName);
+    if (
+      stableQuarantine === undefined ||
+      stableQuarantine.size !== quarantineSnapshot.size ||
+      !identitiesMatch(stableQuarantine.identity, quarantineSnapshot.identity)
+    ) {
+      registryCorrupt();
+    }
+
+    const stageBefore = lstatSync(stagePath, { bigint: true });
+    assertPrivateFile(stageBefore, options.stage.identity);
+    if (stageBefore.size !== options.stage.size) registryCorrupt();
+    stageDescriptor = openSync(stagePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const heldStage = fstatSync(stageDescriptor, { bigint: true });
+    assertPrivateFile(heldStage, options.stage.identity);
+    if (
+      heldStage.size !== BigInt(options.prefix.byteLength) ||
+      !readAll(stageDescriptor, options.prefix.byteLength).equals(Buffer.from(options.prefix))
+    ) {
+      registryCorrupt();
+    }
+    fsyncSync(stageDescriptor);
+    exactFile(stagePath, stageDescriptor, options.stage.identity, options.prefix);
+
+    currentDescriptor = openSync(options.candidate, constants.O_RDONLY | constants.O_NOFOLLOW);
+    exactFile(
+      options.candidate,
+      currentDescriptor,
+      options.expected.identity,
+      options.expected.bytes,
+    );
+    options.hooks?.beforeRecoveryRename?.(options.stage.kind, stagePath, options.candidate);
+    assertExactRecoveryStageCandidate({
+      stageName: options.stage.name,
+      stageIdentity: options.stage.identity,
+      stageSize: options.stage.size,
+      registryPath: options.registryPath,
+      scans: options.scans,
+    });
+    renameSync(stagePath, options.candidate);
+    exactFile(options.candidate, stageDescriptor, options.stage.identity, options.prefix);
+    options.hooks?.afterRecoveryRename?.(options.stage.kind, options.candidate);
+    assertRegistryCandidates(options.registryPath, options.scans, {
+      allowMutationClaim: true,
+      allowRecoveryStage: false,
+    });
+    syncPrivateDirectory(options.registryPath, options.hooks?.beforeHistoryDirectorySync);
+    exactFile(options.candidate, stageDescriptor, options.stage.identity, options.prefix);
+    options.assertRegistryIdentity();
+  } catch (error) {
+    if (error instanceof RuntimeAgentError) throw error;
+    registryCorrupt();
+  } finally {
+    if (currentDescriptor !== undefined) closeSync(currentDescriptor);
+    if (stageDescriptor !== undefined) closeSync(stageDescriptor);
+  }
+}
+
 function appendHistoryFile(options: {
   readonly candidate: string;
   readonly registryPath: string;
@@ -687,7 +958,10 @@ function appendHistoryFile(options: {
   readonly scans: CandidateScanOptions;
   readonly hooks?: AgentRegistryOperationHooks;
 }): void {
-  assertRegistryCandidates(options.registryPath, options.scans);
+  assertRegistryCandidates(options.registryPath, options.scans, {
+    allowMutationClaim: true,
+    allowRecoveryStage: false,
+  });
   const prefix = options.expected?.bytes ?? new Uint8Array();
   if (prefix.byteLength + options.bytes.byteLength > MAX_HISTORY_BYTES) registryCorrupt();
   let descriptor: number | undefined;
@@ -748,40 +1022,66 @@ function recoverPartial(options: {
   readonly hooks?: AgentRegistryOperationHooks;
 }): void {
   if (options.prefix.byteLength === 0 || options.fragment.byteLength === 0) registryCorrupt();
-  assertRegistryCandidates(options.registryPath, options.scans);
-  const quarantineUsage = assertQuarantineCandidates(options.quarantinePath, options.scans);
-  if (
-    quarantineUsage.count >= options.scans.limits.quarantineCount ||
-    quarantineUsage.aggregateBytes + BigInt(options.fragment.byteLength) >
-      BigInt(options.scans.limits.quarantineAggregateBytes)
-  ) {
-    registryCorrupt();
+  assertRegistryCandidates(options.registryPath, options.scans, {
+    allowMutationClaim: true,
+    allowRecoveryStage: false,
+  });
+  const reusable = reusableQuarantine({
+    quarantinePath: options.quarantinePath,
+    kind: options.kind,
+    fragment: options.fragment,
+    scans: options.scans,
+  });
+  if (reusable === undefined) {
+    const quarantineUsage = assertQuarantineCandidates(options.quarantinePath, options.scans);
+    if (
+      quarantineUsage.count >= options.scans.limits.quarantineCount ||
+      quarantineUsage.aggregateBytes + BigInt(options.fragment.byteLength) >
+        BigInt(options.scans.limits.quarantineAggregateBytes)
+    ) {
+      registryCorrupt();
+    }
   }
-  const randomId = canonicalUuid(options.randomId(), "RUNTIME_AGENT_REGISTRY_CORRUPT");
-  const artifact =
-    options.kind === "lifecycle"
-      ? `agent-registry-${randomId}.bin`
-      : `agent-registry-operations-${randomId}.bin`;
-  const quarantineFile = path.join(options.quarantinePath, artifact);
+  const randomId =
+    reusable?.operationId ?? canonicalUuid(options.randomId(), "RUNTIME_AGENT_REGISTRY_CORRUPT");
+  const quarantineFile =
+    reusable?.candidate ??
+    path.join(options.quarantinePath, quarantineArtifactName(options.kind, randomId));
   const stagePath = path.join(options.registryPath, `.${options.kind}-recovery.${randomId}.stage`);
   let quarantine: number | undefined;
   let stage: number | undefined;
   let current: number | undefined;
+  let quarantineIdentity: PrivateFileIdentity | undefined;
+  let stageIdentity: PrivateFileIdentity | undefined;
+  let renamed = false;
+  let failure: unknown;
   try {
-    quarantine = openSync(
-      quarantineFile,
-      constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW,
-      0o600,
-    );
-    fchmodSync(quarantine, 0o600);
-    const quarantineIdentity = assertPrivateFile(fstatSync(quarantine, { bigint: true }));
-    writeAll(quarantine, options.fragment);
-    options.hooks?.beforeHistoryFileSync?.("quarantine", quarantineFile);
-    fsyncSync(quarantine);
-    exactFile(quarantineFile, quarantine, quarantineIdentity, options.fragment);
-    syncPrivateDirectory(options.quarantinePath, options.hooks?.beforeHistoryDirectorySync);
-    exactFile(quarantineFile, quarantine, quarantineIdentity, options.fragment);
-    options.hooks?.afterQuarantinePublished?.(quarantineFile);
+    if (reusable === undefined) {
+      quarantine = openSync(
+        quarantineFile,
+        constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW,
+        0o600,
+      );
+      fchmodSync(quarantine, 0o600);
+      quarantineIdentity = assertPrivateFile(fstatSync(quarantine, { bigint: true }));
+      writeAll(quarantine, options.fragment);
+      options.hooks?.beforeHistoryFileSync?.("quarantine", quarantineFile);
+      fsyncSync(quarantine);
+      exactFile(quarantineFile, quarantine, quarantineIdentity, options.fragment);
+      syncPrivateDirectory(options.quarantinePath, options.hooks?.beforeHistoryDirectorySync);
+      exactFile(quarantineFile, quarantine, quarantineIdentity, options.fragment);
+      options.hooks?.afterQuarantinePublished?.(quarantineFile);
+    } else {
+      quarantine = openSync(quarantineFile, constants.O_RDONLY | constants.O_NOFOLLOW);
+      quarantineIdentity = assertPrivateFile(
+        fstatSync(quarantine, { bigint: true }),
+        reusable.identity,
+      );
+      exactFile(quarantineFile, quarantine, quarantineIdentity, options.fragment);
+      fsyncSync(quarantine);
+      syncPrivateDirectory(options.quarantinePath);
+      exactFile(quarantineFile, quarantine, quarantineIdentity, options.fragment);
+    }
     options.assertRegistryIdentity();
     try {
       assertStableQuarantineCandidates(options.quarantinePath, options.scans);
@@ -796,24 +1096,49 @@ function recoverPartial(options: {
       0o600,
     );
     fchmodSync(stage, 0o600);
-    const stageIdentity = assertPrivateFile(fstatSync(stage, { bigint: true }));
+    stageIdentity = assertPrivateFile(fstatSync(stage, { bigint: true }));
     writeAll(stage, options.prefix);
     options.hooks?.beforeHistoryFileSync?.("recovery", stagePath);
     fsyncSync(stage);
     exactFile(stagePath, stage, stageIdentity, options.prefix);
+    syncPrivateDirectory(options.registryPath, (directoryPath) => {
+      options.hooks?.beforeRecoveryStageDirectorySync?.(options.kind, stagePath);
+      options.hooks?.beforeHistoryDirectorySync?.(directoryPath);
+    });
+    exactFile(stagePath, stage, stageIdentity, options.prefix);
     current = openSync(options.candidate, constants.O_RDONLY | constants.O_NOFOLLOW);
     exactFile(options.candidate, current, options.expected.identity, options.expected.bytes);
+    options.hooks?.beforeRecoveryRename?.(options.kind, stagePath, options.candidate);
+    assertExactRecoveryStageCandidate({
+      stageName: path.basename(stagePath),
+      stageIdentity,
+      stageSize: BigInt(options.prefix.byteLength),
+      registryPath: options.registryPath,
+      scans: options.scans,
+    });
     renameSync(stagePath, options.candidate);
+    renamed = true;
     exactFile(options.candidate, stage, stageIdentity, options.prefix);
+    options.hooks?.afterRecoveryRename?.(options.kind, options.candidate);
+    assertRegistryCandidates(options.registryPath, options.scans, {
+      allowMutationClaim: true,
+      allowRecoveryStage: false,
+    });
     syncPrivateDirectory(options.registryPath, options.hooks?.beforeHistoryDirectorySync);
     exactFile(options.candidate, stage, stageIdentity, options.prefix);
   } catch (error) {
-    if (error instanceof RuntimeAgentError) throw error;
-    registryCorrupt();
+    failure = error;
   } finally {
     if (current !== undefined) closeSync(current);
     if (stage !== undefined) closeSync(stage);
     if (quarantine !== undefined) closeSync(quarantine);
+  }
+  if (failure !== undefined) {
+    if (stageIdentity !== undefined && !renamed) {
+      cleanupOwnedRecoveryStage(stagePath, options.registryPath, stageIdentity);
+    }
+    if (failure instanceof RuntimeAgentError) throw failure;
+    registryCorrupt();
   }
 }
 
@@ -1503,13 +1828,21 @@ function createAgentRegistryImplementation(
     return operations;
   };
 
-  const load = async (): Promise<RegistryHistory> => {
+  const load = async (loadOptions: RegistryLoadOptions): Promise<RegistryHistory> => {
     assertRegistryIdentity();
+    const recoveryStages = assertRegistryCandidates(store.registryPath, scans, loadOptions);
+    const recoveryStage = recoveryStages[0];
+    let recoveryStageConsumed = false;
     assertAgentCandidates(store.agentsPath, store.objectsPath, scans);
     assertQuarantineCandidates(store.quarantinePath, scans);
-    let lifecycleFile = readHistoryFile(lifecyclePath, store.registryPath, scans);
+    let lifecycleFile = readHistoryFile(lifecyclePath, store.registryPath, scans, loadOptions);
     if (lifecycleFile === null) {
-      if (readHistoryFile(operationPath, store.registryPath, scans) !== null) registryCorrupt();
+      if (
+        recoveryStage !== undefined ||
+        readHistoryFile(operationPath, store.registryPath, scans, loadOptions) !== null
+      ) {
+        registryCorrupt();
+      }
       assertRegistryIdentity();
       return {
         lifecycleFile: null,
@@ -1529,31 +1862,53 @@ function createAgentRegistryImplementation(
     if (lifecycle.fragment.byteLength > 0) {
       if (lifecycle.records.length === 0) registryCorrupt();
       await validateLifecycle(lifecycle.records);
+      if (!loadOptions.recoverPartials) registryCorrupt();
       assertRegistryIdentity();
-      recoverPartial({
-        candidate: lifecyclePath,
-        registryPath: store.registryPath,
-        quarantinePath: store.quarantinePath,
-        expected: lifecycleFile,
-        prefix: lifecycleFile.bytes.subarray(0, lifecycle.prefixLength),
-        fragment: lifecycle.fragment,
-        kind: "lifecycle",
-        randomId: options.randomId,
-        scans,
-        assertRegistryIdentity,
-        ...(dependencies.operationHooks === undefined
-          ? {}
-          : { hooks: dependencies.operationHooks }),
-      });
+      if (recoveryStage !== undefined) {
+        if (recoveryStage.kind !== "lifecycle") registryCorrupt();
+        completeRecoveryStage({
+          stage: recoveryStage,
+          candidate: lifecyclePath,
+          registryPath: store.registryPath,
+          quarantinePath: store.quarantinePath,
+          expected: lifecycleFile,
+          prefix: lifecycleFile.bytes.subarray(0, lifecycle.prefixLength),
+          fragment: lifecycle.fragment,
+          scans,
+          assertRegistryIdentity,
+          ...(dependencies.operationHooks === undefined
+            ? {}
+            : { hooks: dependencies.operationHooks }),
+        });
+        recoveryStageConsumed = true;
+      } else {
+        recoverPartial({
+          candidate: lifecyclePath,
+          registryPath: store.registryPath,
+          quarantinePath: store.quarantinePath,
+          expected: lifecycleFile,
+          prefix: lifecycleFile.bytes.subarray(0, lifecycle.prefixLength),
+          fragment: lifecycle.fragment,
+          kind: "lifecycle",
+          randomId: options.randomId,
+          scans,
+          assertRegistryIdentity,
+          ...(dependencies.operationHooks === undefined
+            ? {}
+            : { hooks: dependencies.operationHooks }),
+        });
+      }
       assertRegistryIdentity();
-      lifecycleFile = readHistoryFile(lifecyclePath, store.registryPath, scans);
+      lifecycleFile = readHistoryFile(lifecyclePath, store.registryPath, scans, loadOptions);
       if (lifecycleFile === null) registryCorrupt();
       lifecycle = parseJsonl(lifecycleFile.bytes, parseLifecycleLine);
       if (lifecycle.fragment.byteLength > 0) registryCorrupt();
+    } else if (recoveryStage?.kind === "lifecycle") {
+      registryCorrupt();
     }
     const lifecycleState = await validateLifecycle(lifecycle.records);
 
-    let operationFile = readHistoryFile(operationPath, store.registryPath, scans);
+    let operationFile = readHistoryFile(operationPath, store.registryPath, scans, loadOptions);
     let operationRecords: readonly AgentOperationRecordV1[] = Object.freeze([]);
     if (operationFile !== null) {
       let operationHistory = parseJsonl(operationFile.bytes, parseOperationRecord);
@@ -1564,30 +1919,55 @@ function createAgentRegistryImplementation(
           lifecycle.records,
           lifecycleState.operations,
         );
+        if (!loadOptions.recoverPartials) registryCorrupt();
         assertRegistryIdentity();
-        recoverPartial({
-          candidate: operationPath,
-          registryPath: store.registryPath,
-          quarantinePath: store.quarantinePath,
-          expected: operationFile,
-          prefix: operationFile.bytes.subarray(0, operationHistory.prefixLength),
-          fragment: operationHistory.fragment,
-          kind: "operations",
-          randomId: options.randomId,
-          scans,
-          assertRegistryIdentity,
-          ...(dependencies.operationHooks === undefined
-            ? {}
-            : { hooks: dependencies.operationHooks }),
-        });
+        if (recoveryStage !== undefined && !recoveryStageConsumed) {
+          if (recoveryStage.kind !== "operations") registryCorrupt();
+          completeRecoveryStage({
+            stage: recoveryStage,
+            candidate: operationPath,
+            registryPath: store.registryPath,
+            quarantinePath: store.quarantinePath,
+            expected: operationFile,
+            prefix: operationFile.bytes.subarray(0, operationHistory.prefixLength),
+            fragment: operationHistory.fragment,
+            scans,
+            assertRegistryIdentity,
+            ...(dependencies.operationHooks === undefined
+              ? {}
+              : { hooks: dependencies.operationHooks }),
+          });
+          recoveryStageConsumed = true;
+        } else {
+          recoverPartial({
+            candidate: operationPath,
+            registryPath: store.registryPath,
+            quarantinePath: store.quarantinePath,
+            expected: operationFile,
+            prefix: operationFile.bytes.subarray(0, operationHistory.prefixLength),
+            fragment: operationHistory.fragment,
+            kind: "operations",
+            randomId: options.randomId,
+            scans,
+            assertRegistryIdentity,
+            ...(dependencies.operationHooks === undefined
+              ? {}
+              : { hooks: dependencies.operationHooks }),
+          });
+        }
         assertRegistryIdentity();
-        operationFile = readHistoryFile(operationPath, store.registryPath, scans);
+        operationFile = readHistoryFile(operationPath, store.registryPath, scans, loadOptions);
         if (operationFile === null) registryCorrupt();
         operationHistory = parseJsonl(operationFile.bytes, parseOperationRecord);
         if (operationHistory.fragment.byteLength > 0) registryCorrupt();
+      } else if (recoveryStage?.kind === "operations") {
+        registryCorrupt();
       }
       operationRecords = operationHistory.records;
+    } else if (recoveryStage?.kind === "operations") {
+      registryCorrupt();
     }
+    if (recoveryStage !== undefined && !recoveryStageConsumed) registryCorrupt();
     const operations = validateOperationRecords(
       operationRecords,
       lifecycle.records,
@@ -1621,6 +2001,33 @@ function createAgentRegistryImplementation(
     return known.result;
   };
 
+  const readValidated = <T>(
+    operation: (history: RegistryHistory) => Promise<T> | T,
+  ): Promise<T> => {
+    const claimAcceptedBeforeStop = !intakeStopped;
+    return enqueue(
+      async () =>
+        claimAcceptedBeforeStop
+          ? await withClaim(async () =>
+              operation(
+                await load({
+                  recoverPartials: false,
+                  allowMutationClaim: true,
+                  allowRecoveryStage: false,
+                }),
+              ),
+            )
+          : await operation(
+              await load({
+                recoverPartials: false,
+                allowMutationClaim: false,
+                allowRecoveryStage: false,
+              }),
+            ),
+      claimAcceptedBeforeStop,
+    );
+  };
+
   const appendEntry = (history: RegistryHistory, entry: AgentRegistryEntryV1): void => {
     assertRegistryIdentity();
     appendHistoryFile({
@@ -1652,7 +2059,18 @@ function createAgentRegistryImplementation(
   return {
     recover: () => {
       if (intakeStopped) return Promise.reject(new RuntimeAgentError("RUNTIME_AGENT_NOT_FOUND"));
-      return enqueue(() => withClaim(async () => void (await load())), true);
+      return enqueue(
+        () =>
+          withClaim(
+            async () =>
+              void (await load({
+                recoverPartials: true,
+                allowMutationClaim: true,
+                allowRecoveryStage: true,
+              })),
+          ),
+        true,
+      );
     },
     async publish(candidate, operationId) {
       if (intakeStopped) return Promise.reject(new RuntimeAgentError("RUNTIME_AGENT_NOT_FOUND"));
@@ -1664,7 +2082,11 @@ function createAgentRegistryImplementation(
       return enqueue(
         () =>
           withClaim(async () => {
-            const history = await load();
+            const history = await load({
+              recoverPartials: false,
+              allowMutationClaim: true,
+              allowRecoveryStage: false,
+            });
             const replayed = replay(history, canonicalOperationId, operationHash);
             if (replayed !== undefined) return replayed;
             const active = history.active.get(snapshot.bundle.definition.agent_id);
@@ -1729,7 +2151,11 @@ function createAgentRegistryImplementation(
       return enqueue(
         () =>
           withClaim(async () => {
-            const history = await load();
+            const history = await load({
+              recoverPartials: false,
+              allowMutationClaim: true,
+              allowRecoveryStage: false,
+            });
             const replayed = replay(history, canonicalOperationId, operationHash);
             if (replayed !== undefined) return replayed;
             const resolved = history.bundles.get(referenceKey(definitionRef));
@@ -1755,52 +2181,39 @@ function createAgentRegistryImplementation(
     },
     async resolveForExecution(candidate) {
       const definitionRef = normalizeDefinitionReference(candidate);
-      return enqueue(
-        () =>
-          withClaim(async () => {
-            const history = await load();
-            const resolved = history.bundles.get(referenceKey(definitionRef));
-            if (resolved === undefined) return agentError("RUNTIME_AGENT_NOT_FOUND");
-            const active = history.active.get(definitionRef.artifact_id);
-            if (active === undefined || !exactReference(active.definition, definitionRef)) {
-              return agentError("RUNTIME_AGENT_STALE_REVISION");
-            }
-            return resolved;
-          }),
-        false,
-      );
+      return readValidated((history) => {
+        const resolved = history.bundles.get(referenceKey(definitionRef));
+        if (resolved === undefined) return agentError("RUNTIME_AGENT_NOT_FOUND");
+        const active = history.active.get(definitionRef.artifact_id);
+        if (active === undefined || !exactReference(active.definition, definitionRef)) {
+          return agentError("RUNTIME_AGENT_STALE_REVISION");
+        }
+        return resolved;
+      });
     },
     async resolveForResume(candidate) {
       const definitionRef = normalizeDefinitionReference(candidate);
-      return enqueue(
-        () =>
-          withClaim(async () => {
-            const resolved = (await load()).bundles.get(referenceKey(definitionRef));
-            if (resolved === undefined) return agentError("RUNTIME_AGENT_NOT_FOUND");
-            return resolved;
-          }),
-        false,
-      );
+      return readValidated((history) => {
+        const resolved = history.bundles.get(referenceKey(definitionRef));
+        if (resolved === undefined) return agentError("RUNTIME_AGENT_NOT_FOUND");
+        return resolved;
+      });
     },
     list: () =>
-      enqueue(
-        () =>
-          withClaim(async () =>
-            Object.freeze(
-              [...(await load()).active.values()].sort((left, right) =>
-                Buffer.from(
-                  `${left.definition.artifact_id}\u0000${String(left.definition.revision)}`,
-                  "utf8",
-                ).compare(
-                  Buffer.from(
-                    `${right.definition.artifact_id}\u0000${String(right.definition.revision)}`,
-                    "utf8",
-                  ),
-                ),
+      readValidated((history) =>
+        Object.freeze(
+          [...history.active.values()].sort((left, right) =>
+            Buffer.from(
+              `${left.definition.artifact_id}\u0000${String(left.definition.revision)}`,
+              "utf8",
+            ).compare(
+              Buffer.from(
+                `${right.definition.artifact_id}\u0000${String(right.definition.revision)}`,
+                "utf8",
               ),
             ),
           ),
-        false,
+        ),
       ),
     stopIntake() {
       intakeStopped = true;
