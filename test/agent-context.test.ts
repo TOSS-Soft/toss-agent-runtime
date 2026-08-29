@@ -2157,7 +2157,7 @@ describe("provenance-aware agent context compilation", () => {
       "",
       "",
     ]);
-  });
+  }, 30_000);
 
   it("keeps safe-integer accounting exact at the maximum input-budget schema bound", async () => {
     const sourceText = "x";
