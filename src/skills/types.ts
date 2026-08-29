@@ -5,19 +5,9 @@ import type { RuntimeSkillErrorCode } from "./errors.js";
 export type SkillSourceKind = "configured" | "bundled";
 export type SkillResourceRole = "reference" | "asset" | "script";
 export type SuperpowersPhaseName =
-  | "BRAINSTORMING"
-  | "TEST_DESIGN"
-  | "RED"
-  | "GREEN"
-  | "DEBUGGING"
-  | "REVIEW"
-  | "VERIFICATION";
+  "BRAINSTORMING" | "TEST_DESIGN" | "RED" | "GREEN" | "DEBUGGING" | "REVIEW" | "VERIFICATION";
 export type SuperpowersPhaseStatus =
-  | "STARTED"
-  | "APPROVAL_PENDING"
-  | "COMPLETED"
-  | "FAILED"
-  | "BLOCKED";
+  "STARTED" | "APPROVAL_PENDING" | "COMPLETED" | "FAILED" | "BLOCKED";
 
 export const SKILL_LIMITS = Object.freeze({
   roots: 16,
@@ -100,9 +90,7 @@ export interface SuperpowersPhaseV1 extends RuntimeDocument {
   readonly document_hash: `sha256:${string}`;
 }
 
-export type SuperpowersApprovalV1 =
-  | SuperpowersApprovalRequestV1
-  | SuperpowersApprovalDecisionV1;
+export type SuperpowersApprovalV1 = SuperpowersApprovalRequestV1 | SuperpowersApprovalDecisionV1;
 
 export interface SuperpowersApprovalRequestV1 extends RuntimeDocument {
   readonly protocol_version: "runtime-contract.v1";

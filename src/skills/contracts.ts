@@ -67,7 +67,9 @@ function orderedUnique(values: readonly string[]): boolean {
   );
 }
 
-function hashable<T extends { readonly document_hash: `sha256:${string}` }>(value: T): Omit<T, "document_hash"> {
+function hashable<T extends { readonly document_hash: `sha256:${string}` }>(
+  value: T,
+): Omit<T, "document_hash"> {
   const normalized = parseJsonBytes(canonicalJson(value, DOCUMENT_LIMITS), DOCUMENT_LIMITS);
   if (!isRecord(normalized)) throw new TypeError("skill document must be an object");
   const result = { ...normalized };
@@ -75,7 +77,9 @@ function hashable<T extends { readonly document_hash: `sha256:${string}` }>(valu
   return result as Omit<T, "document_hash">;
 }
 
-function documentHash<T extends { readonly document_hash: `sha256:${string}` }>(value: T): `sha256:${string}` {
+function documentHash<T extends { readonly document_hash: `sha256:${string}` }>(
+  value: T,
+): `sha256:${string}` {
   return sha256(hashable(value), DOCUMENT_LIMITS);
 }
 
@@ -107,10 +111,12 @@ export function hashSkillExecutionEvidence(value: SkillExecutionEvidenceV1): `sh
   return documentHash(value);
 }
 
-export function hashSkillPackage(value: Pick<
-  SkillSnapshotV1,
-  "descriptor" | "skill_markdown_hash" | "skill_markdown_bytes" | "resources"
->): `sha256:${string}` {
+export function hashSkillPackage(
+  value: Pick<
+    SkillSnapshotV1,
+    "descriptor" | "skill_markdown_hash" | "skill_markdown_bytes" | "resources"
+  >,
+): `sha256:${string}` {
   return sha256(
     {
       name: value.descriptor.name,
@@ -150,9 +156,18 @@ function parseDocument<T extends RuntimeDocument>(
 function descriptorIssues(value: SkillDescriptorV1): readonly ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   if (!orderedUnique(value.required_runtime_capabilities)) {
-    issues.push(issue("/required_runtime_capabilities", "order", "capabilities must be ASCII-sorted and unique"));
+    issues.push(
+      issue(
+        "/required_runtime_capabilities",
+        "order",
+        "capabilities must be ASCII-sorted and unique",
+      ),
+    );
   }
-  if (!hashMatches(value)) issues.push(issue("/document_hash", "canonicalHash", "document hash does not match canonical content"));
+  if (!hashMatches(value))
+    issues.push(
+      issue("/document_hash", "canonicalHash", "document hash does not match canonical content"),
+    );
   return issues;
 }
 
@@ -170,25 +185,45 @@ function snapshotIssues(value: SkillSnapshotV1): readonly ValidationIssue[] {
   const resourceBytes = value.resources.reduce((total, resource) => total + resource.bytes, 0);
   const expectedTotal = value.skill_markdown_bytes + resourceBytes;
   if (value.descriptor.resource_count !== value.resources.length) {
-    issues.push(issue("/descriptor/resource_count", "accounting", "resource count does not match resources"));
+    issues.push(
+      issue("/descriptor/resource_count", "accounting", "resource count does not match resources"),
+    );
   }
   if (value.descriptor.total_bytes !== expectedTotal || value.total_bytes !== expectedTotal) {
     issues.push(issue("/total_bytes", "accounting", "total bytes do not match package members"));
   }
   const packageHash = hashSkillPackage(value);
   if (value.package_hash !== packageHash || value.descriptor.package_hash !== packageHash) {
-    issues.push(issue("/package_hash", "packageHash", "package hash does not match intrinsic package content"));
+    issues.push(
+      issue(
+        "/package_hash",
+        "packageHash",
+        "package hash does not match intrinsic package content",
+      ),
+    );
   }
-  if (!hashMatches(value)) issues.push(issue("/document_hash", "canonicalHash", "document hash does not match canonical content"));
+  if (!hashMatches(value))
+    issues.push(
+      issue("/document_hash", "canonicalHash", "document hash does not match canonical content"),
+    );
   return issues;
 }
 
 function phaseIssues(value: SuperpowersPhaseV1): readonly ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   if ((value.status === "COMPLETED") !== (value.output_hash !== null)) {
-    issues.push(issue("/output_hash", "status", "completed phases require output and incomplete phases do not"));
+    issues.push(
+      issue(
+        "/output_hash",
+        "status",
+        "completed phases require output and incomplete phases do not",
+      ),
+    );
   }
-  if (!hashMatches(value)) issues.push(issue("/document_hash", "canonicalHash", "document hash does not match canonical content"));
+  if (!hashMatches(value))
+    issues.push(
+      issue("/document_hash", "canonicalHash", "document hash does not match canonical content"),
+    );
   return issues;
 }
 
@@ -207,7 +242,8 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
     ["/approvals", value.approvals.map((approval) => approval.request_hash)],
   ];
   for (const [path, values] of stringSets) {
-    if (!orderedUnique(values)) issues.push(issue(path, "order", "members must be ASCII-sorted and unique"));
+    if (!orderedUnique(values))
+      issues.push(issue(path, "order", "members must be ASCII-sorted and unique"));
   }
   const decisions = value.approvals.flatMap((approval) =>
     approval.decision_hash === null ? [] : [approval.decision_hash],
@@ -215,28 +251,54 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
   if (new Set(decisions).size !== decisions.length) {
     issues.push(issue("/approvals", "uniqueDecision", "approval decision hashes must be unique"));
   }
-  if (!hashMatches(value)) issues.push(issue("/document_hash", "canonicalHash", "document hash does not match canonical content"));
+  if (!hashMatches(value))
+    issues.push(
+      issue("/document_hash", "canonicalHash", "document hash does not match canonical content"),
+    );
   return issues;
 }
 
-export function parseSkillDescriptor(input: string | Uint8Array): ValidationResult<SkillDescriptorV1> {
-  return parseDocument(input, "skill-descriptor", { ...DOCUMENT_LIMITS, maxBytes: SKILL_LIMITS.descriptorBytes }, descriptorIssues);
+export function parseSkillDescriptor(
+  input: string | Uint8Array,
+): ValidationResult<SkillDescriptorV1> {
+  return parseDocument(
+    input,
+    "skill-descriptor",
+    { ...DOCUMENT_LIMITS, maxBytes: SKILL_LIMITS.descriptorBytes },
+    descriptorIssues,
+  );
 }
 
 export function parseSkillSnapshot(input: string | Uint8Array): ValidationResult<SkillSnapshotV1> {
   return parseDocument(input, "skill-snapshot", DOCUMENT_LIMITS, snapshotIssues);
 }
 
-export function parseSuperpowersPhase(input: string | Uint8Array): ValidationResult<SuperpowersPhaseV1> {
-  return parseDocument(input, "superpowers-phase", { ...DOCUMENT_LIMITS, maxBytes: SKILL_LIMITS.phaseOutputBytes }, phaseIssues);
+export function parseSuperpowersPhase(
+  input: string | Uint8Array,
+): ValidationResult<SuperpowersPhaseV1> {
+  return parseDocument(
+    input,
+    "superpowers-phase",
+    { ...DOCUMENT_LIMITS, maxBytes: SKILL_LIMITS.phaseOutputBytes },
+    phaseIssues,
+  );
 }
 
-export function parseSuperpowersApproval(input: string | Uint8Array): ValidationResult<SuperpowersApprovalV1> {
+export function parseSuperpowersApproval(
+  input: string | Uint8Array,
+): ValidationResult<SuperpowersApprovalV1> {
   return parseDocument(input, "superpowers-approval", DOCUMENT_LIMITS, approvalIssues);
 }
 
-export function parseSkillExecutionEvidence(input: string | Uint8Array): ValidationResult<SkillExecutionEvidenceV1> {
-  return parseDocument(input, "skill-execution-evidence", { ...DOCUMENT_LIMITS, maxBytes: SKILL_LIMITS.evidenceBytes }, evidenceIssues);
+export function parseSkillExecutionEvidence(
+  input: string | Uint8Array,
+): ValidationResult<SkillExecutionEvidenceV1> {
+  return parseDocument(
+    input,
+    "skill-execution-evidence",
+    { ...DOCUMENT_LIMITS, maxBytes: SKILL_LIMITS.evidenceBytes },
+    evidenceIssues,
+  );
 }
 
 export type {

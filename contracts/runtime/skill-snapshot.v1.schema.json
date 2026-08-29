@@ -4,7 +4,18 @@
   "title": "TOSS skill snapshot v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["protocol_version", "schema_version", "document_type", "descriptor", "skill_markdown_hash", "skill_markdown_bytes", "resources", "package_hash", "total_bytes", "document_hash"],
+  "required": [
+    "protocol_version",
+    "schema_version",
+    "document_type",
+    "descriptor",
+    "skill_markdown_hash",
+    "skill_markdown_bytes",
+    "resources",
+    "package_hash",
+    "total_bytes",
+    "document_hash"
+  ],
   "properties": {
     "protocol_version": { "const": "runtime-contract.v1" },
     "schema_version": { "const": "skill-snapshot.v1" },
@@ -25,7 +36,12 @@
       "properties": {
         "path": { "$ref": "runtime-common.v1.schema.json#/$defs/relative_location" },
         "role": { "enum": ["reference", "asset", "script"] },
-        "media_type": { "type": "string", "minLength": 3, "maxLength": 127, "pattern": "^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$" },
+        "media_type": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 127,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$"
+        },
         "bytes": { "type": "integer", "minimum": 1, "maximum": 2097152 },
         "hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
       }

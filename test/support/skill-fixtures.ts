@@ -4,7 +4,9 @@ const HASH = `sha256:${"a".repeat(64)}` as const;
 const OTHER_HASH = `sha256:${"b".repeat(64)}` as const;
 const ZERO_HASH = `sha256:${"0".repeat(64)}` as const;
 
-function document<T extends Record<string, unknown>>(value: T): T & { document_hash: `sha256:${string}` } {
+function document<T extends Record<string, unknown>>(
+  value: T,
+): T & { document_hash: `sha256:${string}` } {
   const hashable = { ...value };
   delete hashable.document_hash;
   return { ...hashable, document_hash: sha256(hashable) };
@@ -167,7 +169,13 @@ export function validSkillExecutionEvidence() {
     },
     resource_hashes: [HASH, OTHER_HASH],
     phases: [
-      { phase: "GREEN" as const, handler_hash: HASH, phase_hash: OTHER_HASH, input_hash: HASH, output_hash: OTHER_HASH },
+      {
+        phase: "GREEN" as const,
+        handler_hash: HASH,
+        phase_hash: OTHER_HASH,
+        input_hash: HASH,
+        output_hash: OTHER_HASH,
+      },
     ],
     approvals: [{ request_hash: HASH, decision_hash: null, journal_head: JOURNAL_HEAD }],
     context_hashes: [OTHER_HASH],
