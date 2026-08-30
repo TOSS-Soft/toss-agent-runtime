@@ -2,9 +2,11 @@ import { createHash } from "node:crypto";
 import {
   access,
   appendFile,
+  link,
   lstat,
   mkdir,
   mkdtemp,
+  open,
   readFile,
   readdir,
   realpath,
@@ -161,6 +163,16 @@ async function fixture(): Promise<{ readonly root: string; readonly statePath: s
   const root = await mkdtemp(path.join(await realpath("/tmp"), "toss-skill-engine-"));
   roots.push(root);
   return { root, statePath: path.join(root, "state") };
+}
+
+async function writePrivateFile(candidate: string, bytes: Uint8Array): Promise<void> {
+  const handle = await open(candidate, "wx", 0o600);
+  try {
+    await handle.writeFile(bytes);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
 }
 
 function journalCommand(
@@ -444,6 +456,396 @@ describe("hash-chained Superpowers phase history", () => {
     await worker.terminate();
   });
 
+  it("does not treat an independent worker's partial publication stage as a corrupt final", async () => {
+    const { statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const tdd = snapshot("test-driven-development");
+    const host = engine(statePath, journal, [tdd], { idOffset: 590 });
+    await host.recover();
+    const operationId = "00000000-0000-4000-8000-999999999996";
+    const runHash = rawHash(Buffer.from("run-1")).slice("sha256:".length);
+    const phasesPath = path.join(statePath, "skills", "phases");
+    const stagePath = path.join(
+      phasesPath,
+      `.phase-mutation-stage.run-1.${process.pid}.${operationId}.stage`,
+    );
+    const finalPath = path.join(phasesPath, `.phase-mutation-${runHash}.lock`);
+    const claim = canonicalJson({
+      schema_version: "superpowers-phase-mutation.v1",
+      run_id: "run-1",
+      operation_id: operationId,
+      owner_pid: process.pid,
+      created_at: "2026-08-30T12:00:00.000Z",
+    });
+    const worker = new Worker(
+      `
+        const { parentPort, workerData } = require("node:worker_threads");
+        const fs = require("node:fs");
+        const path = require("node:path");
+        const flags = fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_RDWR | fs.constants.O_NOFOLLOW;
+        const stage = fs.openSync(workerData.stagePath, flags, 0o600);
+        fs.fchmodSync(stage, 0o600);
+        fs.writeFileSync(stage, '{"created_at":', "utf8");
+        fs.fsyncSync(stage);
+        parentPort.postMessage("partial");
+        parentPort.once("message", () => {
+          fs.ftruncateSync(stage, 0);
+          fs.writeSync(stage, workerData.claim, 0, "utf8");
+          fs.fsyncSync(stage);
+          fs.linkSync(workerData.stagePath, workerData.finalPath);
+          const directory = fs.openSync(path.dirname(workerData.finalPath), fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+          fs.fsyncSync(directory);
+          parentPort.postMessage("linked");
+          parentPort.once("message", () => {
+            fs.unlinkSync(workerData.stagePath);
+            fs.fsyncSync(directory);
+            fs.closeSync(directory);
+            fs.closeSync(stage);
+            parentPort.postMessage("published");
+            parentPort.once("message", () => {
+              fs.unlinkSync(workerData.finalPath);
+              const releaseDirectory = fs.openSync(path.dirname(workerData.finalPath), fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+              fs.fsyncSync(releaseDirectory);
+              fs.closeSync(releaseDirectory);
+              parentPort.postMessage("released");
+            });
+          });
+        });
+      `,
+      { eval: true, workerData: { stagePath, finalPath, claim } },
+    );
+    try {
+      await new Promise<void>((resolve, reject) => {
+        worker.once("message", () => resolve());
+        worker.once("error", reject);
+      });
+      const starting = host.startPhase(
+        startRequest(head, tdd, "TEST_DESIGN", "worker-partial-publication"),
+      );
+      const whilePartial = await Promise.race([
+        starting.then(
+          () => "started" as const,
+          (error: unknown) =>
+            error instanceof Error ? (error.stack ?? error.message) : String(error),
+        ),
+        new Promise<"blocked">((resolve) => setTimeout(resolve, 250, "blocked")),
+      ]);
+      expect(whilePartial).toBe("blocked");
+
+      worker.postMessage("publish");
+      await new Promise<void>((resolve, reject) => {
+        worker.once("message", () => resolve());
+        worker.once("error", reject);
+      });
+      const whileLinked = await Promise.race([
+        starting.then(
+          () => "started" as const,
+          (error: unknown) =>
+            error instanceof Error ? (error.stack ?? error.message) : String(error),
+        ),
+        new Promise<"blocked">((resolve) => setTimeout(resolve, 250, "blocked")),
+      ]);
+      expect(whileLinked).toBe("blocked");
+
+      worker.postMessage("cleanup");
+      await new Promise<void>((resolve, reject) => {
+        worker.once("message", () => resolve());
+        worker.once("error", reject);
+      });
+      const whilePublished = await Promise.race([
+        starting.then(
+          () => "started" as const,
+          (error: unknown) =>
+            error instanceof Error ? (error.stack ?? error.message) : String(error),
+        ),
+        new Promise<"blocked">((resolve) => setTimeout(resolve, 250, "blocked")),
+      ]);
+      expect(whilePublished).toBe("blocked");
+
+      worker.postMessage("release");
+      await new Promise<void>((resolve, reject) => {
+        worker.once("message", () => resolve());
+        worker.once("error", reject);
+      });
+      await expect(starting).resolves.toMatchObject({ phase: { phase_revision: 1 } });
+    } finally {
+      await worker.terminate();
+    }
+  });
+
+  it("reconciles exact dead empty, partial, full, and linked publication stages on restart", async () => {
+    const { statePath } = await fixture();
+    const { journal } = await runningJournal(statePath);
+    const tdd = snapshot("test-driven-development");
+    const bootstrap = engine(statePath, journal, [tdd], { idOffset: 609 });
+    await bootstrap.recover();
+    const phasesPath = path.join(statePath, "skills", "phases");
+    const finalPath = path.join(
+      phasesPath,
+      `.phase-mutation-${rawHash(Buffer.from("run-1")).slice("sha256:".length)}.lock`,
+    );
+    const cases = [
+      {
+        pid: 999_991,
+        operationId: "00000000-0000-4000-8000-999999999991",
+        bytes: Buffer.alloc(0),
+        linked: false,
+      },
+      {
+        pid: 999_992,
+        operationId: "00000000-0000-4000-8000-999999999992",
+        bytes: Buffer.from('{"created_at":"', "utf8"),
+        linked: false,
+      },
+      {
+        pid: 999_993,
+        operationId: "00000000-0000-4000-8000-999999999993",
+        bytes: Buffer.from(
+          canonicalJson({
+            schema_version: "superpowers-phase-mutation.v1",
+            run_id: "run-1",
+            operation_id: "00000000-0000-4000-8000-999999999993",
+            owner_pid: 999_993,
+            created_at: "2026-08-30T12:00:00.000Z",
+          }),
+          "utf8",
+        ),
+        linked: false,
+      },
+      {
+        pid: 999_994,
+        operationId: "00000000-0000-4000-8000-999999999994",
+        bytes: Buffer.from(
+          canonicalJson({
+            schema_version: "superpowers-phase-mutation.v1",
+            run_id: "run-1",
+            operation_id: "00000000-0000-4000-8000-999999999994",
+            owner_pid: 999_994,
+            created_at: "2026-08-30T12:00:00.000Z",
+          }),
+          "utf8",
+        ),
+        linked: true,
+      },
+    ] as const;
+    const stagePaths: string[] = [];
+    for (const value of cases) {
+      const stagePath = path.join(
+        phasesPath,
+        `.phase-mutation-stage.run-1.${value.pid}.${value.operationId}.stage`,
+      );
+      await writePrivateFile(stagePath, value.bytes);
+      stagePaths.push(stagePath);
+      if (value.linked) await link(stagePath, finalPath);
+    }
+
+    const restarted = engine(statePath, journal, [tdd], {
+      idOffset: 619,
+      isProcessAlive: (pid) => (pid >= 999_991 && pid <= 999_994 ? "dead" : "alive"),
+    });
+    await restarted.recover();
+
+    for (const stagePath of stagePaths) {
+      await expect(access(stagePath)).rejects.toMatchObject({ code: "ENOENT" });
+    }
+    await expect(access(finalPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each([
+    { name: "unknown owner", liveness: "unknown" as const, listener: "absent" as const },
+    { name: "present listener", liveness: "dead" as const, listener: "present" as const },
+    { name: "unknown listener", liveness: "dead" as const, listener: "unknown" as const },
+  ])("preserves a partial stage for $name", async ({ liveness, listener }) => {
+    const { statePath } = await fixture();
+    const { journal } = await runningJournal(statePath);
+    const tdd = snapshot("test-driven-development");
+    const bootstrap = engine(statePath, journal, [tdd], { idOffset: 629 });
+    await bootstrap.recover();
+    const stagePath = path.join(
+      statePath,
+      "skills",
+      "phases",
+      ".phase-mutation-stage.run-1.999995.00000000-0000-4000-8000-999999999995.stage",
+    );
+    await writePrivateFile(stagePath, Buffer.from('{"created_at":', "utf8"));
+    const restarted = engine(statePath, journal, [tdd], {
+      idOffset: 639,
+      isProcessAlive: () => liveness,
+      listener: () => Promise.resolve(listener),
+    });
+
+    await expect(restarted.recover()).rejects.toMatchObject({
+      code: "RUNTIME_SKILL_INTEGRITY",
+    });
+    await expect(readFile(stagePath)).resolves.toEqual(Buffer.from('{"created_at":', "utf8"));
+  });
+
+  it.each([
+    { name: "complete malformed", bytes: Buffer.from('{"created_at":"invalid"}', "utf8") },
+    {
+      name: "noncanonical partial",
+      bytes: Buffer.from('{"created_at":"not-an-owned-prefix', "utf8"),
+    },
+  ])("preserves and rejects a $name dead publication stage", async ({ bytes }) => {
+    const { statePath } = await fixture();
+    const { journal } = await runningJournal(statePath);
+    const tdd = snapshot("test-driven-development");
+    const bootstrap = engine(statePath, journal, [tdd], { idOffset: 649 });
+    await bootstrap.recover();
+    const stagePath = path.join(
+      statePath,
+      "skills",
+      "phases",
+      ".phase-mutation-stage.run-1.999996.00000000-0000-4000-8000-999999999996.stage",
+    );
+    await writePrivateFile(stagePath, bytes);
+    const restarted = engine(statePath, journal, [tdd], {
+      idOffset: 659,
+      isProcessAlive: () => "dead",
+    });
+
+    await expect(restarted.recover()).rejects.toMatchObject({ code: "RUNTIME_SKILL_INTEGRITY" });
+    await expect(readFile(stagePath)).resolves.toEqual(bytes);
+  });
+
+  it("preflights every stage before cleaning any recoverable sibling", async () => {
+    const { statePath } = await fixture();
+    const { journal } = await runningJournal(statePath);
+    const tdd = snapshot("test-driven-development");
+    const bootstrap = engine(statePath, journal, [tdd], { idOffset: 657 });
+    await bootstrap.recover();
+    const phasesPath = path.join(statePath, "skills", "phases");
+    const validOperation = "00000000-0000-4000-8000-999999999990";
+    const validBytes = Buffer.from(
+      canonicalJson({
+        schema_version: "superpowers-phase-mutation.v1",
+        run_id: "run-1",
+        operation_id: validOperation,
+        owner_pid: 999_990,
+        created_at: "2026-08-30T12:00:00.000Z",
+      }),
+      "utf8",
+    );
+    const validPath = path.join(
+      phasesPath,
+      `.phase-mutation-stage.run-1.999990.${validOperation}.stage`,
+    );
+    const malformedPath = path.join(
+      phasesPath,
+      ".phase-mutation-stage.run-1.999996.00000000-0000-4000-8000-999999999996.stage",
+    );
+    const malformedBytes = Buffer.from('{"created_at":"invalid"}', "utf8");
+    await writePrivateFile(validPath, validBytes);
+    await writePrivateFile(malformedPath, malformedBytes);
+    const restarted = engine(statePath, journal, [tdd], {
+      idOffset: 658,
+      isProcessAlive: () => "dead",
+    });
+
+    await expect(restarted.recover()).rejects.toMatchObject({ code: "RUNTIME_SKILL_INTEGRITY" });
+    await expect(readFile(validPath)).resolves.toEqual(validBytes);
+    await expect(readFile(malformedPath)).resolves.toEqual(malformedBytes);
+  });
+
+  it.each([
+    { name: "missing final", replacement: false },
+    { name: "replacement final", replacement: true },
+  ])("preserves and rejects a linked stage with a $name", async ({ replacement }) => {
+    const { root, statePath } = await fixture();
+    const { journal } = await runningJournal(statePath);
+    const tdd = snapshot("test-driven-development");
+    const bootstrap = engine(statePath, journal, [tdd], { idOffset: 660 });
+    await bootstrap.recover();
+    const operationId = "00000000-0000-4000-8000-999999999997";
+    const bytes = Buffer.from(
+      canonicalJson({
+        schema_version: "superpowers-phase-mutation.v1",
+        run_id: "run-1",
+        operation_id: operationId,
+        owner_pid: 999_997,
+        created_at: "2026-08-30T12:00:00.000Z",
+      }),
+      "utf8",
+    );
+    const phasesPath = path.join(statePath, "skills", "phases");
+    const stagePath = path.join(
+      phasesPath,
+      `.phase-mutation-stage.run-1.999997.${operationId}.stage`,
+    );
+    const extraPath = path.join(root, "unexpected-linked-claim");
+    const finalPath = path.join(
+      phasesPath,
+      `.phase-mutation-${rawHash(Buffer.from("run-1")).slice("sha256:".length)}.lock`,
+    );
+    await writePrivateFile(stagePath, bytes);
+    await link(stagePath, extraPath);
+    if (replacement) await writePrivateFile(finalPath, bytes);
+    const restarted = engine(statePath, journal, [tdd], {
+      idOffset: 665,
+      isProcessAlive: () => "dead",
+    });
+
+    await expect(restarted.recover()).rejects.toMatchObject({
+      code: "RUNTIME_SKILL_PATH_UNSAFE",
+    });
+    await expect(readFile(stagePath)).resolves.toEqual(bytes);
+    await expect(readFile(extraPath)).resolves.toEqual(bytes);
+    if (replacement) await expect(readFile(finalPath)).resolves.toEqual(bytes);
+  });
+
+  it.each([
+    { hook: "afterMutationStageCreate", published: false, hasBytes: false },
+    { hook: "afterMutationStageWrite", published: false, hasBytes: true },
+    { hook: "afterMutationStageFileSync", published: false, hasBytes: true },
+    { hook: "beforeMutationClaimLink", published: false, hasBytes: true },
+    { hook: "afterMutationClaimDirectorySync", published: true, hasBytes: true },
+    { hook: "beforeMutationStageCleanup", published: true, hasBytes: true },
+  ] as const)(
+    "recovers a crash at atomic claim boundary $hook",
+    async ({ hook, published, hasBytes }) => {
+      const { statePath } = await fixture();
+      const { journal, head } = await runningJournal(statePath);
+      const tdd = snapshot("test-driven-development");
+      let observed: { stagePath: string; finalPath: string } | undefined;
+      const hooks = {
+        [hook]: (stagePath: string, finalPath: string) => {
+          observed = { stagePath, finalPath };
+          throw new Error(`simulated ${hook} crash`);
+        },
+      } as unknown as PhaseHistoryOperationHooks;
+      const first = engine(statePath, journal, [tdd], { idOffset: 669, hooks });
+
+      await expect(
+        first.startPhase(startRequest(head, tdd, "TEST_DESIGN", `crash-${hook}`)),
+      ).rejects.toThrow(`simulated ${hook} crash`);
+      expect(observed).toBeDefined();
+      const paths = observed!;
+      const stageBytes = await readFile(paths.stagePath);
+      expect(stageBytes.byteLength > 0).toBe(hasBytes);
+      if (published) {
+        const finalBytes = await readFile(paths.finalPath);
+        expect(finalBytes).toEqual(stageBytes);
+        const [stageStat, finalStat] = await Promise.all([
+          lstat(paths.stagePath),
+          lstat(paths.finalPath),
+        ]);
+        expect(stageStat.ino).toBe(finalStat.ino);
+        expect(stageStat.nlink).toBe(2);
+        expect(finalStat.nlink).toBe(2);
+      } else {
+        await expect(access(paths.finalPath)).rejects.toMatchObject({ code: "ENOENT" });
+      }
+
+      const restarted = engine(statePath, journal, [tdd], {
+        idOffset: 679,
+        isProcessAlive: () => "dead",
+      });
+      await restarted.recover();
+      await expect(access(paths.stagePath)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(access(paths.finalPath)).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
+
   it("reclaims a canonical dead claim only after the injected listener is absent", async () => {
     const { statePath } = await fixture();
     const { journal, head } = await runningJournal(statePath);
@@ -573,6 +975,86 @@ describe("governed phase execution", () => {
       host.startPhase(startRequest(head, tdd, "TEST_DESIGN", "custom-journal")),
     ).rejects.toMatchObject({ code: "RUNTIME_SKILL_UNAVAILABLE" });
     expect(await host.phaseHistory("run-1")).toEqual([]);
+  });
+
+  it("does not let a proxy impersonate an officially coordinated journal", async () => {
+    const { root, statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const phaseStatePath = path.join(root, "separate-phase-state");
+    const tdd = snapshot("test-driven-development");
+    expect(Reflect.ownKeys(journal).filter((key) => typeof key === "symbol")).toEqual([]);
+    const host = engine(phaseStatePath, new Proxy(journal, {}), [tdd], { idOffset: 607 });
+
+    await expect(
+      host.startPhase(startRequest(head, tdd, "TEST_DESIGN", "proxied-journal")),
+    ).rejects.toMatchObject({ code: "RUNTIME_SKILL_UNAVAILABLE" });
+    await expect(access(phaseStatePath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects unsupported journals before phase intake or any filesystem effect", async () => {
+    const { statePath } = await fixture();
+    const effects: string[] = [];
+    const custom: RunJournalStore = {
+      recover: () => {
+        effects.push("journal-recover");
+        return Promise.resolve();
+      },
+      stopIntake: () => effects.push("journal-stop"),
+      flush: () => Promise.resolve(),
+      transition: () => Promise.reject(new Error("unused")),
+      load: () => {
+        effects.push("journal-load");
+        return Promise.resolve(null);
+      },
+      list: () => Promise.resolve([]),
+      unresolvedSideEffects: () => Promise.resolve([]),
+      interruptActive: () => Promise.resolve(),
+    };
+    const tdd = snapshot("test-driven-development");
+    const loader: SkillLoader = {
+      load: () => {
+        effects.push("snapshot-load");
+        return Promise.reject(new Error("must not load"));
+      },
+      assembleContext: () => {
+        effects.push("context-assemble");
+        return Promise.reject(new Error("must not assemble"));
+      },
+    };
+    const touch = (name: string) => () => {
+      effects.push(name);
+    };
+    const host = engine(statePath, custom, [tdd], {
+      loader,
+      idOffset: 608,
+      hooks: {
+        beforeAppendWrite: touch("history-append"),
+        beforeHistoryFileSync: touch("history-file-sync"),
+        beforeHistoryDirectorySync: touch("history-directory-sync"),
+        beforeCreatePublication: touch("history-create"),
+        beforeRecoveryRename: touch("history-recovery"),
+      },
+    });
+    const unreadable = <T>(name: string): T =>
+      new Proxy(Object.create(null) as object, {
+        get: () => {
+          effects.push(`${name}-request-read`);
+          throw new Error("request must remain unread");
+        },
+      }) as T;
+
+    await expect(
+      host.startPhase(unreadable<StartSuperpowersPhaseRequest>("start")),
+    ).rejects.toMatchObject({
+      code: "RUNTIME_SKILL_UNAVAILABLE",
+    });
+    await expect(
+      host.completePhase(unreadable<CompleteSuperpowersPhaseRequest>("complete")),
+    ).rejects.toMatchObject({
+      code: "RUNTIME_SKILL_UNAVAILABLE",
+    });
+    expect(effects).toEqual([]);
+    await expect(access(statePath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("keeps a journal transition behind the final start publication barrier", async () => {

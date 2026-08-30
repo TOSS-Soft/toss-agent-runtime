@@ -44,13 +44,16 @@ export interface RunJournalStore {
   interruptActive(signal: AbortSignal): Promise<void>;
 }
 
-const INTERNAL_RUN_JOURNAL_BARRIER = Symbol("toss.run-journal-barrier");
+type InternalRunJournalBarrier = <T>(
+  runId: string,
+  operation: (snapshot: RunJournalSnapshot | null) => Promise<T>,
+) => Promise<T>;
 
-interface OfficialRunJournalStore extends RunJournalStore {
-  [INTERNAL_RUN_JOURNAL_BARRIER]<T>(
-    runId: string,
-    operation: (snapshot: RunJournalSnapshot | null) => Promise<T>,
-  ): Promise<T>;
+const OFFICIAL_RUN_JOURNAL_BARRIERS = new WeakMap<RunJournalStore, InternalRunJournalBarrier>();
+
+/** @internal Skills-engine capability check; official stores are identity-branded. */
+export function hasOfficialRunJournalBarrier(store: RunJournalStore): boolean {
+  return OFFICIAL_RUN_JOURNAL_BARRIERS.has(store);
 }
 
 export function withRunJournalBarrier<T>(
@@ -58,11 +61,11 @@ export function withRunJournalBarrier<T>(
   runId: string,
   operation: (snapshot: RunJournalSnapshot | null) => Promise<T>,
 ): Promise<T> {
-  const barrier = (store as Partial<OfficialRunJournalStore>)[INTERNAL_RUN_JOURNAL_BARRIER];
-  if (typeof barrier !== "function") {
+  const barrier = OFFICIAL_RUN_JOURNAL_BARRIERS.get(store);
+  if (barrier === undefined) {
     return Promise.reject(new RuntimeJournalError("RUNTIME_JOURNAL_UNAVAILABLE"));
   }
-  return barrier.call(store, runId, operation) as Promise<T>;
+  return barrier(runId, operation);
 }
 
 interface ParsedJournal {
@@ -344,13 +347,7 @@ export function createRunJournalStore(options: CreateRunJournalStoreOptions): Ru
     return Object.freeze(result);
   };
 
-  const store: OfficialRunJournalStore = {
-    [INTERNAL_RUN_JOURNAL_BARRIER](runId, operation) {
-      if (intakeStopped) {
-        return Promise.reject(new RuntimeJournalError("RUNTIME_JOURNAL_UNAVAILABLE"));
-      }
-      return enqueue(runId, async () => operation(await loadInternal(runId)));
-    },
+  const store: RunJournalStore = {
     async recover() {
       await coordinator;
       await listInternal();
@@ -415,5 +412,11 @@ export function createRunJournalStore(options: CreateRunJournalStoreOptions): Ru
       }
     },
   };
+  OFFICIAL_RUN_JOURNAL_BARRIERS.set(store, (runId, operation) => {
+    if (intakeStopped) {
+      return Promise.reject(new RuntimeJournalError("RUNTIME_JOURNAL_UNAVAILABLE"));
+    }
+    return enqueue(runId, async () => operation(await loadInternal(runId)));
+  });
   return store;
 }

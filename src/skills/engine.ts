@@ -21,6 +21,7 @@ import path from "node:path";
 
 import { RuntimeJournalError } from "../journal/errors.js";
 import {
+  hasOfficialRunJournalBarrier,
   withRunJournalBarrier,
   type RunJournalSnapshot,
   type RunJournalStore,
@@ -73,6 +74,8 @@ const QUARANTINE_STAGE_PATTERN =
   /^\.phase-quarantine\.([A-Za-z][A-Za-z0-9._:-]{0,127})\.([0-9a-f-]{36})\.stage$/u;
 const QUARANTINE_NAME_PATTERN = /^phase-history-[0-9a-f]{64}-(0|[1-9][0-9]*)\.bin$/u;
 const MUTATION_LOCK_PATTERN = /^\.phase-mutation-([0-9a-f]{64})\.lock$/u;
+const MUTATION_STAGE_PATTERN =
+  /^\.phase-mutation-stage\.([A-Za-z][A-Za-z0-9._:-]{0,127})\.([1-9][0-9]*)\.([0-9a-f-]{36})\.stage$/u;
 const MUTATION_TOMBSTONE_PATTERN =
   /^\.phase-mutation-(release|recovery)-([0-9a-f]{64})\.([1-9][0-9]*)\.([0-9a-f-]{36})\.([0-9a-f]{64})\.tombstone$/u;
 const MAX_MUTATION_CLAIM_BYTES = 2_048;
@@ -97,6 +100,10 @@ interface OpenedDirectory {
 interface HistoryFileSnapshot {
   readonly bytes: Uint8Array;
   readonly identity: FileIdentity;
+}
+
+interface MutationArtifactSnapshot extends HistoryFileSnapshot {
+  readonly links: 1 | 2;
 }
 
 interface LoadedHistory {
@@ -125,6 +132,24 @@ interface PhaseMutationClaim {
 const COORDINATORS = new Map<string, PhaseCoordinator>();
 
 export interface PhaseHistoryOperationHooks {
+  readonly afterMutationStageCreate?: (
+    stagePath: string,
+    claimPath: string,
+  ) => void | Promise<void>;
+  readonly afterMutationStageWrite?: (stagePath: string, claimPath: string) => void | Promise<void>;
+  readonly afterMutationStageFileSync?: (
+    stagePath: string,
+    claimPath: string,
+  ) => void | Promise<void>;
+  readonly beforeMutationClaimLink?: (stagePath: string, claimPath: string) => void | Promise<void>;
+  readonly afterMutationClaimDirectorySync?: (
+    stagePath: string,
+    claimPath: string,
+  ) => void | Promise<void>;
+  readonly beforeMutationStageCleanup?: (
+    stagePath: string,
+    claimPath: string,
+  ) => void | Promise<void>;
   readonly beforeAppendWrite?: (historyPath: string) => void | Promise<void>;
   readonly beforeHistoryFileSync?: (historyPath: string) => void | Promise<void>;
   readonly beforeHistoryDirectorySync?: (directoryPath: string) => void | Promise<void>;
@@ -1171,6 +1196,8 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
   const isCurrentUser = options.isCurrentUser ?? defaultCurrentUser;
   const isProcessAlive = options.isProcessAlive ?? defaultProcessLiveness;
   const hooks = options.historyHooks;
+  const journalStore = options.journal;
+  const officialJournal = hasOfficialRunJournalBarrier(journalStore);
   const coordinatorKey = path.resolve(statePath);
   const pending = new Set<Promise<unknown>>();
   let intakeStopped = false;
@@ -1230,6 +1257,36 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
       exactFile(candidate, descriptor, identity(held), bytes, isCurrentUser);
       revalidateDirectoryChain(parentDirectories, statePath, isCurrentUser);
       return { bytes, identity: identity(held) };
+    } finally {
+      closeSync(descriptor);
+    }
+  };
+
+  const readMutationArtifact = (
+    candidate: string,
+    parentDirectories: readonly OpenedDirectory[],
+  ): MutationArtifactSnapshot => {
+    const before = lstatSync(candidate, { bigint: true });
+    const links = before.nlink === 1n ? 1 : before.nlink === 2n ? 2 : pathUnsafe();
+    assertPrivateFile(before, candidate, isCurrentUser, links);
+    if (before.size > BigInt(MAX_MUTATION_CLAIM_BYTES)) limitExceeded();
+    const descriptor = openSync(
+      candidate,
+      constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW,
+    );
+    try {
+      const held = fstatSync(descriptor, { bigint: true });
+      assertPrivateFile(held, candidate, isCurrentUser, links);
+      if (
+        !identitiesMatch(identity(before), identity(held)) ||
+        held.size > BigInt(MAX_MUTATION_CLAIM_BYTES)
+      ) {
+        pathUnsafe();
+      }
+      const bytes = readAll(descriptor, Number(held.size));
+      exactFile(candidate, descriptor, identity(held), bytes, isCurrentUser, links);
+      revalidateDirectoryChain(parentDirectories, statePath, isCurrentUser);
+      return { bytes, identity: identity(held), links };
     } finally {
       closeSync(descriptor);
     }
@@ -1302,46 +1359,72 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
   };
 
   const parseMutationClaim = (runId: string | null, bytes: Uint8Array): PhaseMutationClaim => {
-    let value: JsonValue;
     try {
-      value = parseJsonBytes(bytes, {
+      const value = parseJsonBytes(bytes, {
         maxBytes: MAX_MUTATION_CLAIM_BYTES,
         maxDepth: 3,
         maxMembers: 8,
       });
+      const claim = closedDataRecord(value, [
+        "schema_version",
+        "run_id",
+        "operation_id",
+        "owner_pid",
+        "created_at",
+      ]);
+      if (
+        claim.schema_version !== "superpowers-phase-mutation.v1" ||
+        typeof claim.run_id !== "string" ||
+        !IDENTIFIER_PATTERN.test(claim.run_id) ||
+        (runId !== null && claim.run_id !== runId) ||
+        typeof claim.operation_id !== "string" ||
+        !UUID_PATTERN.test(claim.operation_id) ||
+        typeof claim.owner_pid !== "number" ||
+        !Number.isSafeInteger(claim.owner_pid) ||
+        claim.owner_pid <= 0 ||
+        typeof claim.created_at !== "string"
+      ) {
+        integrity();
+      }
+      const createdAt = new Date(claim.created_at);
+      if (!Number.isFinite(createdAt.getTime()) || createdAt.toISOString() !== claim.created_at) {
+        integrity();
+      }
+      const parsed = claim as unknown as PhaseMutationClaim;
+      if (canonicalJson(parsed) !== Buffer.from(bytes).toString("utf8")) {
+        integrity();
+      }
+      return parsed;
     } catch {
       integrity();
     }
-    const claim = closedDataRecord(value, [
-      "schema_version",
-      "run_id",
-      "operation_id",
-      "owner_pid",
-      "created_at",
-    ]);
-    if (
-      claim.schema_version !== "superpowers-phase-mutation.v1" ||
-      typeof claim.run_id !== "string" ||
-      !IDENTIFIER_PATTERN.test(claim.run_id) ||
-      (runId !== null && claim.run_id !== runId) ||
-      typeof claim.operation_id !== "string" ||
-      !UUID_PATTERN.test(claim.operation_id) ||
-      typeof claim.owner_pid !== "number" ||
-      !Number.isSafeInteger(claim.owner_pid) ||
-      claim.owner_pid <= 0 ||
-      typeof claim.created_at !== "string"
-    ) {
-      integrity();
+  };
+
+  const isMutationClaimPrefix = (
+    runId: string,
+    ownerPid: number,
+    operationId: string,
+    bytes: Uint8Array,
+  ): boolean => {
+    const text = Buffer.from(bytes).toString("utf8");
+    if (!Buffer.from(text, "utf8").equals(Buffer.from(bytes))) return false;
+    const prefix = '{"created_at":"';
+    if (text.length <= prefix.length) return prefix.startsWith(text);
+    if (!text.startsWith(prefix)) return false;
+    const remainder = text.slice(prefix.length);
+    const isoShape = "0000-00-00T00:00:00.000Z";
+    const datePrefix = remainder.slice(0, Math.min(remainder.length, isoShape.length));
+    for (let index = 0; index < datePrefix.length; index += 1) {
+      const expected = isoShape[index]!;
+      const observed = datePrefix[index]!;
+      if (expected === "0" ? !/[0-9]/u.test(observed) : observed !== expected) return false;
     }
-    const createdAt = new Date(claim.created_at);
-    if (!Number.isFinite(createdAt.getTime()) || createdAt.toISOString() !== claim.created_at) {
-      integrity();
-    }
-    const parsed = claim as unknown as PhaseMutationClaim;
-    if (canonicalJson(parsed) !== Buffer.from(bytes).toString("utf8")) {
-      integrity();
-    }
-    return parsed;
+    if (remainder.length < isoShape.length) return true;
+    const occurredAt = remainder.slice(0, isoShape.length);
+    const date = new Date(occurredAt);
+    if (!Number.isFinite(date.getTime()) || date.toISOString() !== occurredAt) return false;
+    const suffix = `","operation_id":"${operationId}","owner_pid":${ownerPid},"run_id":"${runId}","schema_version":"superpowers-phase-mutation.v1"}`;
+    return suffix.startsWith(remainder.slice(isoShape.length));
   };
 
   const syncPhaseDirectory = (): void => {
@@ -1353,14 +1436,24 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
     }
   };
 
-  const removeExactMutationArtifact = (candidate: string, expected: HistoryFileSnapshot): void => {
+  const removeExactMutationArtifact = (
+    candidate: string,
+    expected: MutationArtifactSnapshot,
+  ): void => {
     const directories = openDirectoryChain(phasesPath, statePath, isCurrentUser);
     const descriptor = openSync(
       candidate,
       constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW,
     );
     try {
-      exactFile(candidate, descriptor, expected.identity, expected.bytes, isCurrentUser);
+      exactFile(
+        candidate,
+        descriptor,
+        expected.identity,
+        expected.bytes,
+        isCurrentUser,
+        expected.links,
+      );
       revalidateDirectoryChain(directories, statePath, isCurrentUser);
       unlinkSync(candidate);
       requireMissing(candidate);
@@ -1376,7 +1469,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
     const runHash = rawHash(Buffer.from(runId)).slice("sha256:".length);
     const directories = openDirectoryChain(phasesPath, statePath, isCurrentUser);
     try {
-      for (const name of scanNames(phasesPath, MAX_PHASE_HISTORY_FILES * 3 + 16)) {
+      for (const name of scanNames(phasesPath, MAX_PHASE_HISTORY_FILES * 4 + 32)) {
         const match = MUTATION_TOMBSTONE_PATTERN.exec(name);
         if (match?.[2] !== runHash) continue;
         const cleanerPid = Number(match[3]);
@@ -1390,7 +1483,14 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
           integrity();
         }
         const candidate = path.join(phasesPath, name);
-        const exact = readExactFile(candidate, directories, MAX_MUTATION_CLAIM_BYTES);
+        let exact: MutationArtifactSnapshot;
+        try {
+          exact = readMutationArtifact(candidate, directories);
+        } catch (error) {
+          if (isMissing(error)) continue;
+          throw error;
+        }
+        if (exact.links !== 1) pathUnsafe();
         parseMutationClaim(runId, exact.bytes);
         if (rawHash(exact.bytes).slice("sha256:".length) !== match[5]) integrity();
         const cleanerLiveness = safeProcessLiveness(isProcessAlive, cleanerPid);
@@ -1412,11 +1512,116 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
     }
   };
 
+  const reconcileMutationStages = async (runId: string): Promise<"ready" | "busy"> => {
+    let busy = false;
+    const recoverable: {
+      readonly candidate: string;
+      readonly artifact: MutationArtifactSnapshot;
+    }[] = [];
+    const directories = openDirectoryChain(phasesPath, statePath, isCurrentUser);
+    try {
+      for (const name of scanNames(phasesPath, MAX_PHASE_HISTORY_FILES * 4 + 32)) {
+        const match = MUTATION_STAGE_PATTERN.exec(name);
+        if (match?.[1] !== runId) continue;
+        const ownerPid = Number(match[2]);
+        const operationId = match[3];
+        if (
+          !Number.isSafeInteger(ownerPid) ||
+          ownerPid <= 0 ||
+          operationId === undefined ||
+          !UUID_PATTERN.test(operationId)
+        ) {
+          integrity();
+        }
+        const candidate = path.join(phasesPath, name);
+        let named: BigIntStats;
+        try {
+          named = lstatSync(candidate, { bigint: true });
+        } catch (error) {
+          if (isMissing(error)) continue;
+          throw error;
+        }
+        const namedLinks = named.nlink === 1n ? 1 : named.nlink === 2n ? 2 : pathUnsafe();
+        assertPrivateFile(named, candidate, isCurrentUser, namedLinks);
+        if (named.size > BigInt(MAX_MUTATION_CLAIM_BYTES)) limitExceeded();
+        const liveness = safeProcessLiveness(isProcessAlive, ownerPid);
+        if (liveness === "alive") {
+          busy = true;
+          continue;
+        }
+        if (
+          liveness !== "dead" ||
+          (await safeServiceListener(options.hasServiceListener)) !== "absent"
+        ) {
+          integrity();
+        }
+        let artifact: MutationArtifactSnapshot;
+        try {
+          artifact = readMutationArtifact(candidate, directories);
+        } catch (error) {
+          if (isMissing(error)) continue;
+          throw error;
+        }
+
+        let claim: PhaseMutationClaim | null = null;
+        try {
+          claim = parseMutationClaim(runId, artifact.bytes);
+        } catch (error) {
+          if (
+            artifact.links !== 1 ||
+            !isMutationClaimPrefix(runId, ownerPid, operationId, artifact.bytes)
+          ) {
+            throw error;
+          }
+        }
+        if (
+          claim !== null &&
+          (claim.owner_pid !== ownerPid || claim.operation_id !== operationId)
+        ) {
+          integrity();
+        }
+        if (artifact.links === 2) {
+          if (claim === null) integrity();
+          let final: MutationArtifactSnapshot;
+          try {
+            final = readMutationArtifact(mutationLockPath(runId), directories);
+          } catch (error) {
+            if (isMissing(error)) pathUnsafe();
+            throw error;
+          }
+          if (
+            final.links !== 2 ||
+            !identitiesMatch(final.identity, artifact.identity) ||
+            !Buffer.from(final.bytes).equals(Buffer.from(artifact.bytes))
+          ) {
+            pathUnsafe();
+          }
+        }
+        recoverable.push({ candidate, artifact });
+      }
+      if (busy) return "busy";
+      for (const { candidate, artifact } of recoverable) {
+        try {
+          removeExactMutationArtifact(candidate, artifact);
+        } catch (error) {
+          if (!isMissing(error)) throw error;
+        }
+      }
+    } finally {
+      closeDirectoryChain(directories);
+    }
+    return "ready";
+  };
+
   const acquireMutationClaim = async (runId: string): Promise<() => void> => {
     assertIdentifier(runId);
     for (;;) {
       ensureRoots();
       await cleanupMutationTombstones(runId);
+      if ((await reconcileMutationStages(runId)) === "busy") {
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+        continue;
+      }
       const candidate = mutationLockPath(runId);
       const operationId = options.randomId();
       if (!UUID_PATTERN.test(operationId)) integrity();
@@ -1430,10 +1635,17 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
         created_at: occurredAt.toISOString(),
       });
       const bytes = Buffer.from(canonicalJson(claim as unknown as JsonValue), "utf8");
+      const stagePath = path.join(
+        phasesPath,
+        `.phase-mutation-stage.${runId}.${process.pid}.${operationId}.stage`,
+      );
       let descriptor: number | undefined;
+      let published = false;
+      let claimIdentity: FileIdentity | undefined;
+      const publicationDirectories = openDirectoryChain(phasesPath, statePath, isCurrentUser);
       try {
         descriptor = openSync(
-          candidate,
+          stagePath,
           constants.O_CREAT |
             constants.O_EXCL |
             constants.O_RDWR |
@@ -1443,13 +1655,102 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
         );
         fchmodSync(descriptor, 0o600);
         const metadata = fstatSync(descriptor, { bigint: true });
-        assertPrivateFile(metadata, candidate, isCurrentUser);
-        const claimIdentity = identity(metadata);
+        assertPrivateFile(metadata, stagePath, isCurrentUser);
+        claimIdentity = identity(metadata);
+        exactFile(stagePath, descriptor, claimIdentity, Buffer.alloc(0), isCurrentUser);
+        await invokeHook(
+          hooks?.afterMutationStageCreate === undefined
+            ? undefined
+            : () => hooks.afterMutationStageCreate!(stagePath, candidate),
+          publicationDirectories,
+        );
+        exactFile(stagePath, descriptor, claimIdentity, Buffer.alloc(0), isCurrentUser);
         writeAll(descriptor, bytes);
+        exactFile(stagePath, descriptor, claimIdentity, bytes, isCurrentUser);
+        await invokeHook(
+          hooks?.afterMutationStageWrite === undefined
+            ? undefined
+            : () => hooks.afterMutationStageWrite!(stagePath, candidate),
+          publicationDirectories,
+        );
+        exactFile(stagePath, descriptor, claimIdentity, bytes, isCurrentUser);
         fsyncSync(descriptor);
-        exactFile(candidate, descriptor, claimIdentity, bytes, isCurrentUser);
-        syncPhaseDirectory();
-        exactFile(candidate, descriptor, claimIdentity, bytes, isCurrentUser);
+        exactFile(stagePath, descriptor, claimIdentity, bytes, isCurrentUser);
+        await invokeHook(
+          hooks?.afterMutationStageFileSync === undefined
+            ? undefined
+            : () => hooks.afterMutationStageFileSync!(stagePath, candidate),
+          publicationDirectories,
+        );
+        exactFile(stagePath, descriptor, claimIdentity, bytes, isCurrentUser);
+        await invokeHook(
+          hooks?.beforeMutationClaimLink === undefined
+            ? undefined
+            : () => hooks.beforeMutationClaimLink!(stagePath, candidate),
+          publicationDirectories,
+        );
+        exactFile(stagePath, descriptor, claimIdentity, bytes, isCurrentUser);
+
+        // Node 24 exposes no openat/linkat. Under the descriptor-held private directory,
+        // the irreducible same-UID pathname interval stays synchronous: no hook or await is
+        // permitted between namespace revalidation, no-overwrite link, and directory sync.
+        revalidateDirectoryChain(publicationDirectories, statePath, isCurrentUser);
+        try {
+          linkSync(stagePath, candidate);
+          published = true;
+        } catch (error) {
+          if (!isExisting(error)) throw error;
+        }
+        if (published) {
+          exactFile(stagePath, descriptor, claimIdentity, bytes, isCurrentUser, 2);
+          syncDirectoryChain(publicationDirectories, statePath, isCurrentUser);
+          exactFile(candidate, descriptor, claimIdentity, bytes, isCurrentUser, 2);
+          exactFile(stagePath, descriptor, claimIdentity, bytes, isCurrentUser, 2);
+          await invokeHook(
+            hooks?.afterMutationClaimDirectorySync === undefined
+              ? undefined
+              : () => hooks.afterMutationClaimDirectorySync!(stagePath, candidate),
+            publicationDirectories,
+          );
+          exactFile(candidate, descriptor, claimIdentity, bytes, isCurrentUser, 2);
+          exactFile(stagePath, descriptor, claimIdentity, bytes, isCurrentUser, 2);
+          await invokeHook(
+            hooks?.beforeMutationStageCleanup === undefined
+              ? undefined
+              : () => hooks.beforeMutationStageCleanup!(stagePath, candidate),
+            publicationDirectories,
+          );
+          exactFile(candidate, descriptor, claimIdentity, bytes, isCurrentUser, 2);
+          exactFile(stagePath, descriptor, claimIdentity, bytes, isCurrentUser, 2);
+          // Node has no fd-relative conditional unlink. Keep exact revalidation, unlink,
+          // absence proof, and parent sync in one synchronous, non-hooked interval.
+          unlinkSync(stagePath);
+          requireMissing(stagePath);
+          syncDirectoryChain(publicationDirectories, statePath, isCurrentUser);
+          exactFile(candidate, descriptor, claimIdentity, bytes, isCurrentUser);
+        } else {
+          exactFile(stagePath, descriptor, claimIdentity, bytes, isCurrentUser);
+          await invokeHook(
+            hooks?.beforeMutationStageCleanup === undefined
+              ? undefined
+              : () => hooks.beforeMutationStageCleanup!(stagePath, candidate),
+            publicationDirectories,
+          );
+          exactFile(stagePath, descriptor, claimIdentity, bytes, isCurrentUser);
+          // The same accepted Node conditional-unlink interval applies to a losing stage.
+          unlinkSync(stagePath);
+          requireMissing(stagePath);
+          syncDirectoryChain(publicationDirectories, statePath, isCurrentUser);
+        }
+      } catch (error) {
+        if (descriptor !== undefined) closeSync(descriptor);
+        closeDirectoryChain(publicationDirectories);
+        if (isExisting(error) && !published) integrity();
+        throw error;
+      }
+      closeDirectoryChain(publicationDirectories);
+      if (published && descriptor !== undefined && claimIdentity !== undefined) {
+        const publishedIdentity = claimIdentity;
         closeSync(descriptor);
         descriptor = undefined;
         let released = false;
@@ -1465,13 +1766,13 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
             `.phase-mutation-release-${rawHash(Buffer.from(runId)).slice("sha256:".length)}.${process.pid}.${operationId}.${rawHash(bytes).slice("sha256:".length)}.tombstone`,
           );
           try {
-            exactFile(candidate, held, claimIdentity, bytes, isCurrentUser);
+            exactFile(candidate, held, publishedIdentity, bytes, isCurrentUser);
             requireMissing(tombstone);
             renameSync(candidate, tombstone);
             requireMissing(candidate);
-            exactFile(tombstone, held, claimIdentity, bytes, isCurrentUser);
+            exactFile(tombstone, held, publishedIdentity, bytes, isCurrentUser);
             syncPhaseDirectory();
-            exactFile(tombstone, held, claimIdentity, bytes, isCurrentUser);
+            exactFile(tombstone, held, publishedIdentity, bytes, isCurrentUser);
             unlinkSync(tombstone);
             requireMissing(tombstone);
             syncPhaseDirectory();
@@ -1479,16 +1780,14 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
             closeSync(held);
           }
         };
-      } catch (error) {
-        if (descriptor !== undefined) closeSync(descriptor);
-        if (!isExisting(error)) throw error;
       }
+      if (descriptor !== undefined) closeSync(descriptor);
 
       const directories = openDirectoryChain(phasesPath, statePath, isCurrentUser);
-      let existing: HistoryFileSnapshot | undefined;
+      let existing: MutationArtifactSnapshot | undefined;
       try {
         try {
-          existing = readExactFile(candidate, directories, MAX_MUTATION_CLAIM_BYTES);
+          existing = readMutationArtifact(candidate, directories);
         } catch (error) {
           if (!isMissing(error)) throw error;
         }
@@ -1496,7 +1795,41 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
         closeDirectoryChain(directories);
       }
       if (existing === undefined) continue;
-      const existingClaim = parseMutationClaim(runId, existing.bytes);
+      let existingClaim = parseMutationClaim(runId, existing.bytes);
+      if (existing.links === 2) {
+        const expectedStage = path.join(
+          phasesPath,
+          `.phase-mutation-stage.${runId}.${existingClaim.owner_pid}.${existingClaim.operation_id}.stage`,
+        );
+        const linkedDirectories = openDirectoryChain(phasesPath, statePath, isCurrentUser);
+        try {
+          try {
+            const linked = readMutationArtifact(expectedStage, linkedDirectories);
+            if (
+              linked.links !== 2 ||
+              !identitiesMatch(linked.identity, existing.identity) ||
+              !Buffer.from(linked.bytes).equals(Buffer.from(existing.bytes))
+            ) {
+              pathUnsafe();
+            }
+            continue;
+          } catch (error) {
+            if (!isMissing(error)) throw error;
+          }
+          const refreshed = readMutationArtifact(candidate, linkedDirectories);
+          if (
+            refreshed.links !== 1 ||
+            !identitiesMatch(refreshed.identity, existing.identity) ||
+            !Buffer.from(refreshed.bytes).equals(Buffer.from(existing.bytes))
+          ) {
+            pathUnsafe();
+          }
+          existing = refreshed;
+          existingClaim = parseMutationClaim(runId, refreshed.bytes);
+        } finally {
+          closeDirectoryChain(linkedDirectories);
+        }
+      }
       const liveness = safeProcessLiveness(isProcessAlive, existingClaim.owner_pid);
       if (liveness === "alive") {
         await new Promise<void>((resolve) => setTimeout(resolve, 10));
@@ -1551,13 +1884,14 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
     const phaseDirectories = openDirectoryChain(phasesPath, statePath, isCurrentUser);
     const quarantineDirectories = openDirectoryChain(quarantinePath, statePath, isCurrentUser);
     try {
-      const phaseNames = scanNames(phasesPath, MAX_PHASE_HISTORY_FILES * 3 + 16);
+      const phaseNames = scanNames(phasesPath, MAX_PHASE_HISTORY_FILES * 4 + 32);
       const finalIdentities = new Map<string, FileIdentity>();
       for (const name of phaseNames) {
         if (
           name === "quarantine" ||
           HISTORY_STAGE_PATTERN.test(name) ||
           MUTATION_LOCK_PATTERN.test(name) ||
+          MUTATION_STAGE_PATTERN.test(name) ||
           MUTATION_TOMBSTONE_PATTERN.test(name)
         ) {
           continue;
@@ -2003,7 +2337,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
     operation: (snapshot: RunJournalSnapshot | null) => Promise<T>,
   ): Promise<T> => {
     try {
-      return await withRunJournalBarrier(options.journal, runId, operation);
+      return await withRunJournalBarrier(journalStore, runId, operation);
     } catch (error) {
       if (error instanceof RuntimeSkillError) throw error;
       if (error instanceof RuntimeJournalError) {
@@ -2053,7 +2387,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
       return phaseOutcome(replay.at(-1)!, true);
     }
 
-    const journal = await options.journal.load(request.run_id);
+    const journal = await journalStore.load(request.run_id);
     if (
       journal === null ||
       journal.state !== "RUNNING" ||
@@ -2213,25 +2547,27 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
       return accept(() =>
         schedule(async () => {
           ensureRoots();
-          const names = scanNames(phasesPath, MAX_PHASE_HISTORY_FILES * 3 + 16);
+          const names = scanNames(phasesPath, MAX_PHASE_HISTORY_FILES * 4 + 32);
           const runIds = new Set<string>();
           for (const name of names) {
             if (name === "quarantine") continue;
             const historyStage = HISTORY_STAGE_PATTERN.exec(name);
+            const mutationStage = MUTATION_STAGE_PATTERN.exec(name);
             const lock = MUTATION_LOCK_PATTERN.exec(name);
             const tombstone = MUTATION_TOMBSTONE_PATTERN.exec(name);
             if (historyStage?.[1] !== undefined) {
               runIds.add(historyStage[1]);
               continue;
             }
+            if (mutationStage?.[1] !== undefined) {
+              runIds.add(mutationStage[1]);
+              continue;
+            }
             if (lock?.[1] !== undefined || tombstone?.[1] !== undefined) {
               const directories = openDirectoryChain(phasesPath, statePath, isCurrentUser);
               try {
-                const exact = readExactFile(
-                  path.join(phasesPath, name),
-                  directories,
-                  MAX_MUTATION_CLAIM_BYTES,
-                );
+                const exact = readMutationArtifact(path.join(phasesPath, name), directories);
+                if (tombstone !== null && exact.links !== 1) pathUnsafe();
                 const claim = parseMutationClaim(null, exact.bytes);
                 const expectedRunHash = rawHash(Buffer.from(claim.run_id)).slice("sha256:".length);
                 if ((lock?.[1] ?? tombstone?.[2]) !== expectedRunHash) integrity();
@@ -2281,6 +2617,8 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
       return accept(() => options.loader.assembleContext(selection, request));
     },
     startPhase(request) {
+      if (!officialJournal)
+        return Promise.reject(new RuntimeSkillError("RUNTIME_SKILL_UNAVAILABLE"));
       if (intakeStopped) return Promise.reject(new RuntimeSkillError("RUNTIME_SKILL_UNAVAILABLE"));
       let captured: CapturedStart;
       try {
@@ -2301,6 +2639,8 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
       );
     },
     completePhase(request) {
+      if (!officialJournal)
+        return Promise.reject(new RuntimeSkillError("RUNTIME_SKILL_UNAVAILABLE"));
       if (intakeStopped) return Promise.reject(new RuntimeSkillError("RUNTIME_SKILL_UNAVAILABLE"));
       let captured: CapturedCompletion;
       try {
