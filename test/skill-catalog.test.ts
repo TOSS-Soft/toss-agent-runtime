@@ -491,6 +491,8 @@ describe("skill catalog metadata discovery", () => {
     const resource = {
       path: "references/guide.md",
       role: "reference" as const,
+      phases: ["GREEN"] as const,
+      priority: null,
       media_type: "text/markdown",
       bytes: 4,
       hash: rawHash(Buffer.alloc(4)),
@@ -535,6 +537,8 @@ describe("skill catalog metadata discovery", () => {
     const resource = {
       path: "references/guide.md",
       role: "reference" as const,
+      phases: ["GREEN"] as const,
+      priority: null,
       media_type: "text/markdown",
       bytes: 4,
       hash: rawHash(Buffer.alloc(4)),
@@ -632,6 +636,8 @@ describe("skill catalog metadata discovery", () => {
     const resource = {
       path: "references/guide.md",
       role: "reference" as const,
+      phases: ["GREEN"] as const,
+      priority: null,
       media_type: "text/markdown",
       bytes: 4,
       hash: rawHash(Buffer.alloc(4)),

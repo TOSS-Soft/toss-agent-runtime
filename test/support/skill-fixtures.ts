@@ -22,6 +22,8 @@ function packageHash(input: {
   readonly resources: readonly {
     readonly path: string;
     readonly role: string;
+    readonly phases: readonly string[];
+    readonly priority: number | null;
     readonly media_type: string;
     readonly bytes: number;
     readonly hash: `sha256:${string}`;
@@ -60,6 +62,8 @@ export function validSkillSnapshot() {
     {
       path: "references/guide.md",
       role: "reference" as const,
+      phases: ["GREEN"] as const,
+      priority: null,
       media_type: "text/markdown",
       bytes: 5,
       hash: OTHER_HASH,

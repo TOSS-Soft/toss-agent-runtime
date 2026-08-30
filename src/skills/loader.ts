@@ -18,6 +18,7 @@ import {
   sha256,
   type JsonValue,
 } from "../protocol/json.js";
+import { assembleSkillContext, type SkillContext, type SkillContextRequest } from "./context.js";
 import {
   resolveSkillSelectionForLoader,
   type CatalogFileIdentity,
@@ -67,6 +68,7 @@ export interface CreateSkillLoaderForTestOptions extends CreateSkillLoaderOption
 
 export interface SkillLoader {
   load(selection: SkillSelection): Promise<SkillSnapshotV1>;
+  assembleContext(selection: SkillSelection, request: SkillContextRequest): Promise<SkillContext>;
 }
 
 interface HeldDirectory {
@@ -856,23 +858,44 @@ function createLoader(
   store: SkillPrivateStore,
 ): SkillLoader {
   const hooks = options.hooks ?? {};
+  const exactRecord = async (selection: SkillSelection): Promise<PrivateSkillRecord> => {
+    const source = resolveSkillSelectionForLoader(options.catalog, selection);
+    const record = await loadSource(source, selection, hooks);
+    const canonical = Buffer.from(canonicalJson(record as unknown as JsonValue), "utf8");
+    if (canonical.byteLength > SKILL_LIMITS.storedObjectBytes) limitExceeded();
+    const replay = await store.readObject(selection.descriptor.package_hash);
+    if (replay !== null) {
+      if (!Buffer.from(replay).equals(canonical)) integrity();
+      return parsePrivateRecord(replay, selection);
+    }
+    return parsePrivateRecord(
+      await store.publishObject(selection.descriptor.package_hash, canonical),
+      selection,
+    );
+  };
   return {
     async load(selection: SkillSelection): Promise<SkillSnapshotV1> {
-      const source = resolveSkillSelectionForLoader(options.catalog, selection);
-      const record = await loadSource(source, selection, hooks);
-      const canonical = Buffer.from(canonicalJson(record as unknown as JsonValue), "utf8");
-      if (canonical.byteLength > SKILL_LIMITS.storedObjectBytes) limitExceeded();
-      const replay = await store.readObject(selection.descriptor.package_hash);
-      if (replay !== null) {
-        if (!Buffer.from(replay).equals(canonical)) integrity();
-        return deepFreezeJson(
-          parsePrivateRecord(replay, selection).snapshot as unknown as JsonValue,
-        ) as unknown as SkillSnapshotV1;
+      const record = await exactRecord(selection);
+      return deepFreezeJson(record.snapshot as unknown as JsonValue) as unknown as SkillSnapshotV1;
+    },
+    async assembleContext(
+      selection: SkillSelection,
+      request: SkillContextRequest,
+    ): Promise<SkillContext> {
+      const record = await exactRecord(selection);
+      if (
+        request.snapshot_hash !== record.snapshot.document_hash ||
+        canonicalJson(request.snapshot) !== canonicalJson(record.snapshot)
+      ) {
+        integrity();
       }
-      const published = await store.publishObject(selection.descriptor.package_hash, canonical);
-      return deepFreezeJson(
-        parsePrivateRecord(published, selection).snapshot as unknown as JsonValue,
-      ) as unknown as SkillSnapshotV1;
+      return assembleSkillContext(request, {
+        skill_markdown: decodeCanonicalBase64(record.skill_markdown_base64),
+        resources: record.resources.map((resource) => ({
+          path: resource.path,
+          bytes: decodeCanonicalBase64(resource.bytes_base64),
+        })),
+      });
     },
   };
 }

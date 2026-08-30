@@ -45,6 +45,8 @@ function packageManifest(
     .map((entry) => ({
       path: entry.path,
       role: entry.role,
+      phases: entry.phases,
+      priority: entry.priority,
       media_type: entry.media_type,
       bytes: entry.bytes,
       hash: entry.hash,
@@ -124,6 +126,8 @@ function resource(
   return {
     path: resourcePath,
     role,
+    phases: role === "reference" ? ["GREEN"] : [],
+    priority: null,
     media_type: mediaType,
     bytes: content.byteLength,
     hash: rawHash(content),
@@ -270,6 +274,32 @@ describe("immutable skill loading", () => {
     const snapshot = await loader.load(selection);
     expect(snapshot.resources.some((entry) => entry.role === "script")).toBe(true);
     expect(processes).toEqual([]);
+  });
+
+  it("assembles context only from the exact selected stored snapshot", async () => {
+    const first = await fixture();
+    const second = await fixture();
+    const snapshot = await first.loader.load(first.selection);
+    const otherSnapshot = await second.loader.load(second.selection);
+    const request = {
+      snapshot,
+      snapshot_hash: snapshot.document_hash,
+      phase: "GREEN" as const,
+      max_bytes: 1024,
+      max_tokens: 256,
+    };
+
+    await expect(first.loader.assembleContext(first.selection, request)).resolves.toMatchObject({
+      snapshot: { snapshot_hash: snapshot.document_hash },
+      segments: [{ path: "SKILL.md" }, { path: "references/guide.md" }],
+    });
+    await expect(
+      first.loader.assembleContext(first.selection, {
+        ...request,
+        snapshot: otherSnapshot,
+        snapshot_hash: otherSnapshot.document_hash,
+      }),
+    ).rejects.toEqual(new RuntimeSkillError("RUNTIME_SKILL_INTEGRITY"));
   });
 
   it.each(["deleted", "altered", "mode", "extra"] as const)(
@@ -456,6 +486,8 @@ describe("immutable skill loading", () => {
         {
           path: "assets/blob.bin",
           role: "asset",
+          phases: [],
+          priority: null,
           media_type: "application/octet-stream",
           bytes: size,
           hash: rawHash(Buffer.alloc(1)),

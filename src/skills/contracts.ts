@@ -23,6 +23,7 @@ import type {
   SkillExecutionEvidenceV1,
   SkillSnapshotV1,
   SuperpowersApprovalV1,
+  SuperpowersPhaseName,
   SuperpowersPhaseV1,
 } from "./types.js";
 import { SKILL_LIMITS } from "./types.js";
@@ -128,6 +129,8 @@ export function hashSkillPackage(
       resources: value.resources.map((resource) => ({
         path: resource.path,
         role: resource.role,
+        phases: resource.phases,
+        priority: resource.priority,
         media_type: resource.media_type,
         bytes: resource.bytes,
         hash: resource.hash,
@@ -175,8 +178,58 @@ function resourcePaths(resources: SkillSnapshotV1["resources"]): readonly string
   return resources.map((resource) => resource.path);
 }
 
+const SUPERPOWERS_PHASES = new Set<SuperpowersPhaseName>([
+  "BRAINSTORMING",
+  "DEBUGGING",
+  "GREEN",
+  "RED",
+  "REVIEW",
+  "TEST_DESIGN",
+  "VERIFICATION",
+]);
+
+function resourcePolicyIssues(value: SkillSnapshotV1): readonly ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  for (const [index, resource] of value.resources.entries()) {
+    const path = `/resources/${index}`;
+    if (!resource.phases.every((phase) => SUPERPOWERS_PHASES.has(phase))) {
+      issues.push(issue(`${path}/phases`, "phase", "resource phases must be recognized"));
+    }
+    if (!orderedUnique(resource.phases)) {
+      issues.push(
+        issue(`${path}/phases`, "order", "resource phases must be UTF-8-byte sorted and unique"),
+      );
+    }
+    if (resource.role === "reference") {
+      if (resource.phases.length === 0) {
+        issues.push(issue(`${path}/phases`, "required", "reference phases must be non-empty"));
+      }
+      if (
+        resource.priority !== null &&
+        (!Number.isSafeInteger(resource.priority) ||
+          resource.priority < 0 ||
+          resource.priority > 255)
+      ) {
+        issues.push(
+          issue(
+            `${path}/priority`,
+            "range",
+            "reference priority must be null or an integer from 0 through 255",
+          ),
+        );
+      }
+    } else if (resource.phases.length !== 0 || resource.priority !== null) {
+      issues.push(
+        issue(path, "policy", "assets and scripts must have empty phases and null priority"),
+      );
+    }
+  }
+  return issues;
+}
+
 function snapshotIssues(value: SkillSnapshotV1): readonly ValidationIssue[] {
   const issues: ValidationIssue[] = [];
+  issues.push(...resourcePolicyIssues(value));
   const descriptor = parseSkillDescriptor(canonicalJson(value.descriptor, DOCUMENT_LIMITS));
   if (!descriptor.ok) issues.push(issue("/descriptor", "semantic", "descriptor is invalid"));
   if (!orderedUnique(resourcePaths(value.resources))) {

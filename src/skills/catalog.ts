@@ -33,6 +33,7 @@ import {
   type SkillResourceRole,
   type SkillResourceV1,
   type SkillSourceKind,
+  type SuperpowersPhaseName,
 } from "./types.js";
 
 const HASH_PATTERN = /^sha256:[0-9a-f]{64}$/u;
@@ -41,6 +42,15 @@ const VERSION_PATTERN = /^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/u;
 const MEDIA_TYPE_PATTERN = /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/u;
 const DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
+const SUPERPOWERS_PHASES = [
+  "BRAINSTORMING",
+  "DEBUGGING",
+  "GREEN",
+  "RED",
+  "REVIEW",
+  "TEST_DESIGN",
+  "VERIFICATION",
+] as const satisfies readonly SuperpowersPhaseName[];
 
 export interface SkillMarkdownDeclaration {
   readonly path: "SKILL.md";
@@ -270,10 +280,15 @@ function parseResources(value: JsonValue): readonly SkillResourceV1[] {
   if (!isJsonArray(value) || value.length > SKILL_LIMITS.resourcesPerPackage) integrity();
   const resources: SkillResourceV1[] = [];
   for (const member of value) {
-    if (!isRecord(member) || !hasExactKeys(member, ["path", "role", "media_type", "bytes", "hash"]))
+    if (
+      !isRecord(member) ||
+      !hasExactKeys(member, ["path", "role", "phases", "priority", "media_type", "bytes", "hash"])
+    )
       integrity();
     const resourcePath = requiredMember(member, "path");
     const role = requiredMember(member, "role");
+    const phases = requiredMember(member, "phases");
+    const priority = requiredMember(member, "priority");
     const mediaType = requiredMember(member, "media_type");
     const bytes = requiredMember(member, "bytes");
     const hash = requiredMember(member, "hash");
@@ -281,6 +296,22 @@ function parseResources(value: JsonValue): readonly SkillResourceV1[] {
       typeof resourcePath !== "string" ||
       typeof role !== "string" ||
       !(["reference", "asset", "script"] as readonly string[]).includes(role) ||
+      !isJsonArray(phases) ||
+      !phases.every(
+        (phase) =>
+          typeof phase === "string" && SUPERPOWERS_PHASES.includes(phase as SuperpowersPhaseName),
+      ) ||
+      !isOrderedUnique(phases as readonly string[]) ||
+      (role === "reference"
+        ? phases.length === 0 ||
+          !(
+            priority === null ||
+            (typeof priority === "number" &&
+              Number.isSafeInteger(priority) &&
+              priority >= 0 &&
+              priority <= 255)
+          )
+        : phases.length !== 0 || priority !== null) ||
       typeof mediaType !== "string" ||
       !MEDIA_TYPE_PATTERN.test(mediaType) ||
       !isSafeCount(bytes, SKILL_LIMITS.resourceBytes) ||
@@ -298,6 +329,8 @@ function parseResources(value: JsonValue): readonly SkillResourceV1[] {
     resources.push({
       path: portablePath,
       role: role as SkillResourceRole,
+      phases: phases as readonly SuperpowersPhaseName[],
+      priority: priority as number | null,
       media_type: mediaType,
       bytes,
       hash,
@@ -400,6 +433,8 @@ export function parseSkillPackageManifest(value: JsonValue): SkillPackageManifes
     resources: manifest.resources.map((resource) => ({
       path: resource.path,
       role: resource.role,
+      phases: resource.phases,
+      priority: resource.priority,
       media_type: resource.media_type,
       bytes: resource.bytes,
       hash: resource.hash,

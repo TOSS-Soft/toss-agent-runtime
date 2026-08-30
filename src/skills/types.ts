@@ -51,6 +51,8 @@ export interface SkillDescriptorV1 extends RuntimeDocument {
 export interface SkillResourceV1 {
   readonly path: string;
   readonly role: SkillResourceRole;
+  readonly phases: readonly SuperpowersPhaseName[];
+  readonly priority: number | null;
   readonly media_type: string;
   readonly bytes: number;
   readonly hash: `sha256:${string}`;
