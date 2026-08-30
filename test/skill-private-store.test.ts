@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { renameSync, writeFileSync } from "node:fs";
 import {
   chmod,
+  link,
   lstat,
   mkdir,
   mkdtemp,
@@ -719,5 +720,124 @@ describe.sequential("private skill object publication", () => {
     expect(await readFile(claimPath)).toEqual(claim);
     expect(await readFile(preservedClaimPath)).toEqual(claim);
     expect(await readFile(tombstonePath)).toEqual(expected);
+  });
+
+  it("preserves a recoverable transaction before rejecting cross-final hard-link aliases", async () => {
+    const statePath = await privateTemporaryDirectory("toss-skill-store-");
+    const objectsPath = path.join(statePath, "skills", "objects");
+    const transactionBytes = Buffer.from('{"record":"transaction-preserved"}', "utf8");
+    const aliasedBytes = Buffer.from('{"record":"unclaimed-alias"}', "utf8");
+    const ownerPid = 998885;
+    const operationId = "77000000-0000-4000-8000-000000000009";
+    const claim = claimBytes(ownerPid, operationId, transactionBytes);
+    const claimPath = path.join(objectsPath, `.object-${ownerPid}-${operationId}.claim`);
+    const firstHash = `sha256:${"b".repeat(64)}` as const;
+    const secondHash = `sha256:${"c".repeat(64)}` as const;
+    const firstFinal = objectPath(statePath, firstHash);
+    const secondFinal = objectPath(statePath, secondHash);
+    let livenessCalls = 0;
+    let listenerCalls = 0;
+    const store = createSkillPrivateStoreForTest(
+      storeOptions(statePath, {
+        isProcessAlive() {
+          livenessCalls += 1;
+          return "dead";
+        },
+        hasServiceListener() {
+          listenerCalls += 1;
+          return Promise.resolve("absent");
+        },
+      }),
+    );
+    await store.ensureRoots();
+    await writeFile(claimPath, claim, { mode: 0o600 });
+    await writeFile(firstFinal, aliasedBytes, { mode: 0o600 });
+    await link(firstFinal, secondFinal);
+    const firstBefore = await lstat(firstFinal);
+    const secondBefore = await lstat(secondFinal);
+
+    await expectSkillError(
+      store.publishObject(HASH, transactionBytes),
+      "RUNTIME_SKILL_PATH_UNSAFE",
+    );
+
+    expect(livenessCalls).toBe(0);
+    expect(listenerCalls).toBe(0);
+    expect(await readFile(claimPath)).toEqual(claim);
+    expect(await readFile(firstFinal)).toEqual(aliasedBytes);
+    expect(await readFile(secondFinal)).toEqual(aliasedBytes);
+    const firstAfter = await lstat(firstFinal);
+    const secondAfter = await lstat(secondFinal);
+    expect({ dev: firstAfter.dev, ino: firstAfter.ino, nlink: firstAfter.nlink }).toEqual({
+      dev: firstBefore.dev,
+      ino: firstBefore.ino,
+      nlink: firstBefore.nlink,
+    });
+    expect({ dev: secondAfter.dev, ino: secondAfter.ino, nlink: secondAfter.nlink }).toEqual({
+      dev: secondBefore.dev,
+      ino: secondBefore.ino,
+      nlink: secondBefore.nlink,
+    });
+    expect(firstAfter.ino).toBe(secondAfter.ino);
+    expect(firstAfter.nlink).toBe(2);
+  });
+
+  it("preserves a recoverable transaction before rejecting an orphan hard-linked final", async () => {
+    const statePath = await privateTemporaryDirectory("toss-skill-store-");
+    const objectsPath = path.join(statePath, "skills", "objects");
+    const transactionBytes = Buffer.from('{"record":"orphan-transaction-preserved"}', "utf8");
+    const orphanBytes = Buffer.from('{"record":"orphan-final"}', "utf8");
+    const ownerPid = 998886;
+    const operationId = "77000000-0000-4000-8000-000000000010";
+    const claim = claimBytes(ownerPid, operationId, transactionBytes);
+    const claimPath = path.join(objectsPath, `.object-${ownerPid}-${operationId}.claim`);
+    const orphanHash = `sha256:${"d".repeat(64)}` as const;
+    const finalPath = objectPath(statePath, orphanHash);
+    const externalLink = path.join(statePath, "orphan-preserved");
+    let livenessCalls = 0;
+    let listenerCalls = 0;
+    const store = createSkillPrivateStoreForTest(
+      storeOptions(statePath, {
+        isProcessAlive() {
+          livenessCalls += 1;
+          return "dead";
+        },
+        hasServiceListener() {
+          listenerCalls += 1;
+          return Promise.resolve("absent");
+        },
+      }),
+    );
+    await store.ensureRoots();
+    await writeFile(claimPath, claim, { mode: 0o600 });
+    await writeFile(finalPath, orphanBytes, { mode: 0o600 });
+    await link(finalPath, externalLink);
+    const finalBefore = await lstat(finalPath);
+    const externalBefore = await lstat(externalLink);
+
+    await expectSkillError(
+      store.publishObject(HASH, transactionBytes),
+      "RUNTIME_SKILL_PATH_UNSAFE",
+    );
+
+    expect(livenessCalls).toBe(0);
+    expect(listenerCalls).toBe(0);
+    expect(await readFile(claimPath)).toEqual(claim);
+    expect(await readFile(finalPath)).toEqual(orphanBytes);
+    expect(await readFile(externalLink)).toEqual(orphanBytes);
+    const finalAfter = await lstat(finalPath);
+    const externalAfter = await lstat(externalLink);
+    expect({ dev: finalAfter.dev, ino: finalAfter.ino, nlink: finalAfter.nlink }).toEqual({
+      dev: finalBefore.dev,
+      ino: finalBefore.ino,
+      nlink: finalBefore.nlink,
+    });
+    expect({ dev: externalAfter.dev, ino: externalAfter.ino, nlink: externalAfter.nlink }).toEqual({
+      dev: externalBefore.dev,
+      ino: externalBefore.ino,
+      nlink: externalBefore.nlink,
+    });
+    expect(finalAfter.ino).toBe(externalAfter.ino);
+    expect(finalAfter.nlink).toBe(2);
   });
 });

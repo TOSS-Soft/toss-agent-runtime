@@ -88,6 +88,13 @@ interface RecoveryArtifact {
   readonly tombstone: TombstoneBinding | null;
 }
 
+interface OpenedRecoveryFinal {
+  readonly hash: `sha256:${string}`;
+  readonly path: string;
+  readonly opened: OpenedFile;
+  transaction: OpenedRecoveryTransaction | null;
+}
+
 interface OpenedRecoveryTransaction {
   readonly key: string;
   readonly ownerPid: number;
@@ -1163,15 +1170,13 @@ export function createSkillPrivateStoreForTest(
       string,
       Readonly<{ name: string; binding: TombstoneBinding }>
     >();
+    const finalNames = new Map<`sha256:${string}`, string>();
     for (const name of names) {
       const final = OBJECT_PATTERN.exec(name);
       if (final !== null) {
-        const metadata = lstatSync(path.join(objectsPath, name), { bigint: true });
-        const links: 1 | 2 = metadata.nlink === 2n ? 2 : 1;
-        assertPrivateFile(metadata, path.join(objectsPath, name), isCurrentUser, links);
-        if (metadata.size < 1n || metadata.size > BigInt(SKILL_LIMITS.storedObjectBytes)) {
-          limitExceeded();
-        }
+        const hash = final[1] as `sha256:${string}`;
+        if (finalNames.has(hash)) integrity();
+        finalNames.set(hash, name);
         continue;
       }
       const tombstone = parseTombstoneName(name);
@@ -1206,7 +1211,20 @@ export function createSkillPrivateStoreForTest(
     const transactions: OpenedRecoveryTransaction[] = [];
     const heldDescriptors: number[] = [];
     const objectTransactions = new Map<string, string>();
+    const openedFinals = new Map<`sha256:${string}`, OpenedRecoveryFinal>();
     try {
+      const finalIdentities = new Map<string, string>();
+      for (const [hash, name] of finalNames) {
+        const finalPath = path.join(objectsPath, name);
+        const opened = openRecoveryFinal(finalPath, isCurrentUser);
+        if (opened === null) pathUnsafe();
+        heldDescriptors.push(opened.handle.fd);
+        const identityKey = `${opened.identity.device}:${opened.identity.inode}`;
+        if (finalIdentities.has(identityKey)) pathUnsafe();
+        finalIdentities.set(identityKey, finalPath);
+        openedFinals.set(hash, { hash, path: finalPath, opened, transaction: null });
+      }
+
       for (const key of operationKeys) {
         const regularClaimName = claims.get(key);
         const claimTombstone = claimTombstones.get(key);
@@ -1260,8 +1278,8 @@ export function createSkillPrivateStoreForTest(
         }
 
         const finalPath = objectPath(objectsPath, claimDocument.object_hash);
-        const openedFinal = openRecoveryFinal(finalPath, isCurrentUser);
-        if (openedFinal !== null) heldDescriptors.push(openedFinal.handle.fd);
+        const finalEntry = openedFinals.get(claimDocument.object_hash);
+        const openedFinal = finalEntry?.opened ?? null;
         const priorTransaction = objectTransactions.get(claimDocument.object_hash);
         if (priorTransaction !== undefined && priorTransaction !== key) integrity();
         objectTransactions.set(claimDocument.object_hash, key);
@@ -1276,20 +1294,74 @@ export function createSkillPrivateStoreForTest(
           final: openedFinal,
           finalLinks: openedFinal?.links ?? 1,
         };
+        if (finalEntry !== undefined) {
+          if (finalEntry.transaction !== null) integrity();
+          finalEntry.transaction = transaction;
+        }
         validateRecoveryTransaction(transaction, isCurrentUser);
         transactions.push(transaction);
       }
 
+      for (const final of openedFinals.values()) {
+        if (final.transaction === null && final.opened.links !== 1) pathUnsafe();
+      }
+
+      const validateFinalNamespace = (): void => {
+        const currentFinals = scanObjectNames(objectsPath)
+          .filter((name) => OBJECT_PATTERN.test(name))
+          .map((name) => path.join(objectsPath, name));
+        const expectedFinals = [...openedFinals.values()]
+          .map((entry) => entry.path)
+          .sort((left, right) => Buffer.from(left).compare(Buffer.from(right)));
+        if (
+          currentFinals.length !== expectedFinals.length ||
+          currentFinals.some((candidate, index) => candidate !== expectedFinals[index])
+        ) {
+          integrity();
+        }
+        const identities = new Set<string>();
+        for (const final of openedFinals.values()) {
+          if (final.path !== objectPath(objectsPath, final.hash)) integrity();
+          const links = final.transaction?.finalLinks ?? 1;
+          exactFile(
+            final.path,
+            final.opened.handle,
+            final.opened.identity,
+            final.opened.bytes,
+            isCurrentUser,
+            links,
+          );
+          const identityKey = `${final.opened.identity.device}:${final.opened.identity.inode}`;
+          if (identities.has(identityKey)) pathUnsafe();
+          identities.add(identityKey);
+        }
+      };
+
       const validateTransactions = (active: ReadonlySet<OpenedRecoveryTransaction>): void => {
         revalidateDirectoryChain(directories, isCurrentUser);
+        validateFinalNamespace();
         for (const transaction of active) {
           validateRecoveryTransaction(transaction, isCurrentUser);
         }
       };
+      const validateCleanupParticipants = (
+        active: ReadonlySet<OpenedRecoveryTransaction>,
+        transaction: OpenedRecoveryTransaction,
+        artifact: "claim" | "stage",
+      ): void => {
+        revalidateDirectoryChain(directories, isCurrentUser);
+        validateRecoveryCleanupContext(transaction, artifact, isCurrentUser);
+        validateFinalNamespace();
+        for (const other of active) {
+          if (other !== transaction) validateRecoveryTransaction(other, isCurrentUser);
+        }
+      };
       const active = new Set(transactions);
+      validateTransactions(active);
       const initialNamespace = namespaceSnapshot(objectsPath, isCurrentUser);
       for (const transaction of transactions) {
         if (safeLiveness(isProcessAlive, transaction.ownerPid) !== "dead") integrity();
+        validateTransactions(active);
         const listener = await invokeExactNamespaceHook(
           directories,
           isCurrentUser,
@@ -1329,8 +1401,7 @@ export function createSkillPrivateStoreForTest(
           validateTransactions(active);
           requireExpectedNamespace();
         }
-        validateRecoveryTransaction(transaction, isCurrentUser);
-        revalidateDirectoryChain(directories, isCurrentUser);
+        validateTransactions(active);
         unlinkSync(artifact.path);
         requireMissing(artifact.path);
         revalidateDirectoryChain(directories, isCurrentUser);
@@ -1356,7 +1427,7 @@ export function createSkillPrivateStoreForTest(
               directories,
               transaction.operationId,
               hooks,
-              () => validateRecoveryCleanupContext(transaction, "stage", isCurrentUser),
+              () => validateCleanupParticipants(active, transaction, "stage"),
             );
             expectedNamespace = namespaceSnapshot(objectsPath, isCurrentUser);
           } else {
@@ -1383,7 +1454,7 @@ export function createSkillPrivateStoreForTest(
             directories,
             transaction.operationId,
             hooks,
-            () => validateRecoveryCleanupContext(transaction, "claim", isCurrentUser),
+            () => validateCleanupParticipants(active, transaction, "claim"),
           );
           expectedNamespace = namespaceSnapshot(objectsPath, isCurrentUser);
         } else {
