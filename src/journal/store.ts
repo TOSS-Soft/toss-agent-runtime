@@ -46,7 +46,10 @@ export interface RunJournalStore {
 
 type InternalRunJournalBarrier = <T>(
   runId: string,
-  operation: (snapshot: RunJournalSnapshot | null) => Promise<T>,
+  operation: (
+    snapshot: RunJournalSnapshot | null,
+    transition: (command: TransitionCommand) => Promise<TransitionResult>,
+  ) => Promise<T>,
 ) => Promise<T>;
 
 const OFFICIAL_RUN_JOURNAL_BARRIERS = new WeakMap<RunJournalStore, InternalRunJournalBarrier>();
@@ -59,7 +62,10 @@ export function hasOfficialRunJournalBarrier(store: RunJournalStore): boolean {
 export function withRunJournalBarrier<T>(
   store: RunJournalStore,
   runId: string,
-  operation: (snapshot: RunJournalSnapshot | null) => Promise<T>,
+  operation: (
+    snapshot: RunJournalSnapshot | null,
+    transition: (command: TransitionCommand) => Promise<TransitionResult>,
+  ) => Promise<T>,
 ): Promise<T> {
   const barrier = OFFICIAL_RUN_JOURNAL_BARRIERS.get(store);
   if (barrier === undefined) {
@@ -416,7 +422,23 @@ export function createRunJournalStore(options: CreateRunJournalStoreOptions): Ru
     if (intakeStopped) {
       return Promise.reject(new RuntimeJournalError("RUNTIME_JOURNAL_UNAVAILABLE"));
     }
-    return enqueue(runId, async () => operation(await loadInternal(runId)));
+    return enqueue(runId, async () => {
+      const snapshot = await loadInternal(runId);
+      let active = true;
+      let used = false;
+      const transition = async (command: TransitionCommand): Promise<TransitionResult> => {
+        if (!active || used || command.run_id !== runId) {
+          throw new RuntimeJournalError("RUNTIME_JOURNAL_UNAVAILABLE");
+        }
+        used = true;
+        return appendInternal(command);
+      };
+      try {
+        return await operation(snapshot, transition);
+      } finally {
+        active = false;
+      }
+    });
   });
   return store;
 }

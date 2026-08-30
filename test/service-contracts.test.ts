@@ -12,6 +12,7 @@ import {
   parseRuntimeCapabilities,
 } from "../src/protocol/capabilities.js";
 import { canonicalJson } from "../src/protocol/json.js";
+import { RuntimeSkillError } from "../src/skills/errors.js";
 
 const lock = {
   schema_version: "service-lock.v1",
@@ -100,6 +101,39 @@ describe("local service contracts", () => {
     ).toMatchObject({ ok: false });
   });
 
+  it("accepts only the closed exact Superpowers approval request shape", () => {
+    const approval = {
+      ...request,
+      command: "superpowers-approve",
+      operation_id: "00000000-0000-4000-8000-000000000090",
+      run_id: "run-1",
+      expected_journal_revision: 4,
+      expected_journal_head_hash: `sha256:${"a".repeat(64)}`,
+      phase: "BRAINSTORMING",
+      skill_name: "brainstorming",
+      skill_version: "1.0.0",
+      skill_snapshot_hash: `sha256:${"b".repeat(64)}`,
+      approval_request_hash: `sha256:${"c".repeat(64)}`,
+      decision: "APPROVE",
+    } as const;
+
+    expect(parseServiceControlRequest(canonicalJson(approval))).toMatchObject({
+      ok: true,
+      value: approval,
+    });
+    for (const mutation of [
+      { ...approval, root: "/private/tmp/project" },
+      { ...approval, project_id: "00000000-0000-4000-8000-000000000001" },
+      { ...approval, skill_version: "01.0.0" },
+      { ...approval, expected_journal_revision: 0 },
+      { ...approval, expected_journal_head_hash: `sha256:${"A".repeat(64)}` },
+      { ...approval, phase: "MODEL_TEXT" },
+      { ...approval, decision: "YES" },
+    ]) {
+      expect(parseServiceControlRequest(canonicalJson(mutation))).toMatchObject({ ok: false });
+    }
+  });
+
   it("rejects input larger than the exact transport limit", () => {
     const bytes = new Uint8Array(MAX_CONTROL_MESSAGE_BYTES + 1);
     expect(parseServiceControlResponse(bytes)).toMatchObject({ ok: false });
@@ -173,6 +207,69 @@ describe("local service contracts", () => {
     expect(
       parseServiceControlResponse(
         canonicalJson({ ...listResponse, data: { ...listResponse.data, extra: true } }),
+      ),
+    ).toMatchObject({ ok: false });
+  });
+
+  it("accepts one closed approval decision response bound to the request", () => {
+    const approvalResponse = {
+      schema_version: "service-control-response.v1",
+      document_type: "service-control-response",
+      request_id: request.request_id,
+      ok: true,
+      status: null,
+      data: {
+        kind: "superpowers-approval",
+        run_id: "run-1",
+        state: "RUNNING",
+        phase: "BRAINSTORMING",
+        journal_head: {
+          journal_revision: 5,
+          sequence: 5,
+          entry_hash: `sha256:${"d".repeat(64)}`,
+        },
+        approval_request_hash: `sha256:${"c".repeat(64)}`,
+        approval_decision_hash: `sha256:${"e".repeat(64)}`,
+        replayed: false,
+      },
+      error: null,
+    } as const;
+
+    expect(parseServiceControlResponse(canonicalJson(approvalResponse))).toMatchObject({
+      ok: true,
+      value: approvalResponse,
+    });
+    expect(
+      parseServiceControlResponse(
+        canonicalJson({
+          ...approvalResponse,
+          data: { ...approvalResponse.data, state: "APPROVAL_PENDING" },
+        }),
+      ),
+    ).toMatchObject({ ok: false });
+  });
+
+  it("accepts every fixed safe skill error and rejects forged details", () => {
+    const error = new RuntimeSkillError("RUNTIME_SKILL_STALE_STATE");
+    const failure = {
+      schema_version: "service-control-response.v1",
+      document_type: "service-control-response",
+      request_id: request.request_id,
+      ok: false,
+      status: null,
+      data: null,
+      error: {
+        code: error.code,
+        category: error.category,
+        retryable: error.retryable,
+        safe_message: error.safe_message,
+      },
+    } as const;
+
+    expect(parseServiceControlResponse(canonicalJson(failure))).toMatchObject({ ok: true });
+    expect(
+      parseServiceControlResponse(
+        canonicalJson({ ...failure, error: { ...failure.error, retryable: true } }),
       ),
     ).toMatchObject({ ok: false });
   });

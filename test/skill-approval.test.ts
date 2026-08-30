@@ -1,0 +1,603 @@
+import { createHash } from "node:crypto";
+import { lstat, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import path from "node:path";
+
+import { afterEach, describe, expect, it } from "vitest";
+
+import { ZERO_JOURNAL_HASH } from "../src/journal/entry.js";
+import { createRunJournalStore, type RunJournalStore } from "../src/journal/store.js";
+import type { TransitionCommand } from "../src/journal/state-machine.js";
+import type { JournalHead, RunState } from "../src/journal/types.js";
+import { deepFreezeJson, sha256, type JsonValue } from "../src/protocol/json.js";
+import type { SkillCatalog, SkillSelection } from "../src/skills/catalog.js";
+import { hashSkillPackage } from "../src/skills/contracts.js";
+import {
+  createSkillsEngineForTest,
+  type CompleteSuperpowersPhaseRequest,
+  type PhaseHistoryOperationHooks,
+  type SkillsEngine,
+  type StartSuperpowersPhaseRequest,
+} from "../src/skills/engine.js";
+import { RuntimeSkillError } from "../src/skills/errors.js";
+import type { SkillLoader } from "../src/skills/loader.js";
+import type {
+  ResumeSuperpowersApprovalRequest,
+  SuperpowersApprovalOutcome,
+} from "../src/skills/approval.js";
+import { decisionMetadata } from "../src/skills/approval.js";
+import type { SkillSnapshotV1 } from "../src/skills/types.js";
+
+const roots: string[] = [];
+const TRACE = {
+  trace_id: "1".repeat(32),
+  span_id: "2".repeat(16),
+  trace_flags: 1,
+} as const;
+const EXECUTION_REQUEST_HASH = `sha256:${"e".repeat(64)}` as const;
+const APPROVAL_OPERATION_ID = "00000000-0000-4000-8000-000000000777";
+
+function rawHash(bytes: Uint8Array): `sha256:${string}` {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+function document<T extends Record<string, unknown>>(
+  value: T,
+): T & { document_hash: `sha256:${string}` } {
+  return { ...value, document_hash: sha256(value) };
+}
+
+function resignDocument<T extends Record<string, unknown>>(value: T): T {
+  const hashable = { ...value };
+  delete hashable.document_hash;
+  return { ...hashable, document_hash: sha256(hashable) };
+}
+
+function brainstormingSnapshot(version = "1.0.0"): SkillSnapshotV1 {
+  const bytes = Buffer.from("# brainstorming\n", "utf8");
+  const descriptorBase = {
+    protocol_version: "runtime-contract.v1" as const,
+    schema_version: "skill-descriptor.v1" as const,
+    document_type: "skill-descriptor" as const,
+    name: "brainstorming",
+    description: "brainstorming fixture",
+    version,
+    source: { kind: "bundled" as const, identity: "brainstorming" },
+    package_hash: `sha256:${"0".repeat(64)}` as const,
+    resource_count: 0,
+    total_bytes: bytes.byteLength,
+    required_runtime_capabilities: [] as const,
+  };
+  const packageHash = hashSkillPackage({
+    descriptor: document(descriptorBase),
+    skill_markdown_hash: rawHash(bytes),
+    skill_markdown_bytes: bytes.byteLength,
+    resources: [],
+  });
+  const descriptor = document({ ...descriptorBase, package_hash: packageHash });
+  return document({
+    protocol_version: "runtime-contract.v1" as const,
+    schema_version: "skill-snapshot.v1" as const,
+    document_type: "skill-snapshot" as const,
+    descriptor,
+    skill_markdown_hash: rawHash(bytes),
+    skill_markdown_bytes: bytes.byteLength,
+    resources: [],
+    package_hash: packageHash,
+    total_bytes: bytes.byteLength,
+  });
+}
+
+function selection(snapshot: SkillSnapshotV1): SkillSelection {
+  return deepFreezeJson({
+    descriptor: snapshot.descriptor,
+    catalog_hash: `sha256:${"c".repeat(64)}`,
+    package_handle: sha256({ name: snapshot.descriptor.name }),
+  } as unknown as JsonValue) as unknown as SkillSelection;
+}
+
+function fakeCatalog(): SkillCatalog {
+  return {
+    discover: () => Promise.resolve(Object.freeze({ descriptors: [], catalog_hash: sha256([]) })),
+    select: () => {
+      throw new Error("selection fixture is not configured");
+    },
+  };
+}
+
+function fakeLoader(snapshot: SkillSnapshotV1): SkillLoader {
+  const exact = (selected: SkillSelection): SkillSnapshotV1 => {
+    if (selected.descriptor.document_hash !== snapshot.descriptor.document_hash) {
+      throw new RuntimeSkillError("RUNTIME_SKILL_INTEGRITY");
+    }
+    return snapshot;
+  };
+  return {
+    load: (selected) => Promise.resolve(exact(selected)),
+    assembleContext: (selected, request) => {
+      const value = exact(selected);
+      if (request.snapshot !== value || request.snapshot_hash !== value.document_hash) {
+        throw new RuntimeSkillError("RUNTIME_SKILL_INTEGRITY");
+      }
+      return Promise.resolve(
+        Object.freeze({
+          snapshot: Object.freeze({
+            name: value.descriptor.name,
+            version: value.descriptor.version,
+            package_hash: value.package_hash,
+            snapshot_hash: value.document_hash,
+          }),
+          phase: request.phase,
+          segments: [],
+          included_resource_hashes: [],
+          omitted_resource_hashes: [],
+          original_utf8_bytes: 0,
+          included_utf8_bytes: 0,
+          original_tokens: 0,
+          included_tokens: 0,
+          remaining_bytes: request.max_bytes,
+          remaining_tokens: request.max_tokens,
+          truncations: [],
+          context_hash: sha256({ phase: request.phase }),
+        }),
+      );
+    },
+  };
+}
+
+function clock(): () => Date {
+  let value = 0;
+  return () => new Date(Date.UTC(2026, 7, 30, 12, 0, value++));
+}
+
+function ids(offset = 0): () => string {
+  let value = offset;
+  return () => `00000000-0000-4000-8000-${String(++value).padStart(12, "0")}`;
+}
+
+async function fixture(): Promise<{ readonly statePath: string }> {
+  const root = await mkdtemp(path.join(await realpath("/tmp"), "toss-skill-approval-"));
+  roots.push(root);
+  return { statePath: path.join(root, "state") };
+}
+
+function journalCommand(
+  runId: string,
+  state: RunState,
+  head: JournalHead | null,
+): TransitionCommand {
+  return {
+    run_id: runId,
+    expected_revision: head?.journal_revision ?? 0,
+    expected_head_hash: head?.entry_hash ?? ZERO_JOURNAL_HASH,
+    command_id: `${runId}-${state.toLowerCase()}`,
+    operation_id: null,
+    next_state: state,
+    reason_code: `MOVE_${state}`,
+    trace: TRACE,
+    metadata: {},
+    side_effect: null,
+  };
+}
+
+async function runningJournal(
+  statePath: string,
+): Promise<{ readonly journal: RunJournalStore; readonly head: JournalHead }> {
+  const journal = createRunJournalStore({ statePath, now: clock(), randomId: ids(100) });
+  let head: JournalHead | null = null;
+  for (const state of ["CREATED", "ROUTED", "RUNNING"] as const) {
+    head = (await journal.transition(journalCommand("run-1", state, head))).head;
+  }
+  if (head === null) throw new Error("running journal fixture did not produce a head");
+  return { journal, head };
+}
+
+function engine(
+  statePath: string,
+  journal: RunJournalStore,
+  snapshot: SkillSnapshotV1,
+  options: {
+    readonly hooks?: PhaseHistoryOperationHooks;
+    readonly idOffset?: number;
+  } = {},
+): SkillsEngine {
+  return createSkillsEngineForTest({
+    statePath,
+    journal,
+    catalog: fakeCatalog(),
+    loader: fakeLoader(snapshot),
+    now: clock(),
+    randomId: ids(options.idOffset ?? 200),
+    hasServiceListener: () => Promise.resolve("absent"),
+    ...(options.hooks === undefined ? {} : { historyHooks: options.hooks }),
+  });
+}
+
+function startRequest(head: JournalHead, snapshot: SkillSnapshotV1): StartSuperpowersPhaseRequest {
+  return {
+    run_id: "run-1",
+    expected_journal_head: head,
+    execution_request_hash: EXECUTION_REQUEST_HASH,
+    selection: selection(snapshot),
+    phase: "BRAINSTORMING",
+    input: Buffer.from("brainstorming input", "utf8"),
+    operation_id: "brainstorm-phase",
+    trace: TRACE,
+  };
+}
+
+function completeRequest(
+  started: Awaited<ReturnType<SkillsEngine["startPhase"]>>,
+): CompleteSuperpowersPhaseRequest {
+  return {
+    run_id: started.phase.run_id,
+    expected_phase_revision: started.phase.phase_revision,
+    expected_phase_head_hash: started.phase.document_hash,
+    phase: started.phase.phase,
+    skill_snapshot_hash: started.phase.skill.snapshot_hash,
+    operation_id: started.phase.operation_id,
+    outcome: "COMPLETED",
+    output: Buffer.from("approved plan", "utf8"),
+    trace: TRACE,
+  };
+}
+
+function resumeRequest(
+  pending: SuperpowersApprovalOutcome,
+  decision: "APPROVE" | "REJECT" = "APPROVE",
+  operationId = APPROVAL_OPERATION_ID,
+): ResumeSuperpowersApprovalRequest {
+  if (pending.approval.kind !== "REQUEST") throw new Error("expected approval request");
+  return {
+    run_id: pending.approval.run_id,
+    expected_journal_head: pending.approval.pending_journal_head,
+    phase: pending.approval.phase,
+    skill_name: pending.approval.skill_name,
+    skill_version: pending.approval.skill_version,
+    skill_snapshot_hash: pending.approval.skill_snapshot_hash,
+    approval_request_hash: pending.approval.document_hash,
+    operation_id: operationId,
+    decision,
+    trace: TRACE,
+  };
+}
+
+async function pendingApproval(options: {
+  readonly statePath: string;
+  readonly journal: RunJournalStore;
+  readonly head: JournalHead;
+  readonly snapshot: SkillSnapshotV1;
+  readonly hooks?: PhaseHistoryOperationHooks;
+}): Promise<{
+  readonly host: SkillsEngine;
+  readonly completion: CompleteSuperpowersPhaseRequest;
+  readonly pending: SuperpowersApprovalOutcome;
+}> {
+  const host = engine(options.statePath, options.journal, options.snapshot, {
+    ...(options.hooks === undefined ? {} : { hooks: options.hooks }),
+  });
+  const started = await host.startPhase(startRequest(options.head, options.snapshot));
+  const completion = completeRequest(started);
+  const pending = await host.completePhase(completion);
+  if (pending.approval === null) throw new Error("approval challenge was not returned");
+  return { host, completion, pending: pending as SuperpowersApprovalOutcome };
+}
+
+afterEach(async () => {
+  for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
+});
+
+describe("durable Superpowers approval transaction", () => {
+  it("persists phase-first pending state and exposes one exact challenge only after both barriers", async () => {
+    const { statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const snapshot = brainstormingSnapshot();
+    const observed: string[] = [];
+    const { host, pending } = await pendingApproval({
+      statePath,
+      journal,
+      head,
+      snapshot,
+      hooks: {
+        afterApprovalPendingPhaseSync: (state) => {
+          observed.push(state);
+        },
+        afterApprovalPendingJournalSync: (state) => {
+          observed.push(state);
+        },
+      },
+    });
+
+    expect(observed).toEqual(["RUNNING", "APPROVAL_PENDING"]);
+    expect(pending).toMatchObject({
+      state: "APPROVAL_PENDING",
+      replayed: false,
+      phase: { status: "APPROVAL_PENDING", output_hash: rawHash(Buffer.from("approved plan")) },
+      journal_head: { journal_revision: head.journal_revision + 1 },
+      approval: {
+        kind: "REQUEST",
+        decision: null,
+        pending_journal_head: { journal_revision: head.journal_revision + 1 },
+        phase_operation_id: "brainstorm-phase",
+      },
+    });
+    expect(Object.isFrozen(pending)).toBe(true);
+    expect(Object.isFrozen(pending.approval)).toBe(true);
+    expect(await host.phaseHistory("run-1")).toHaveLength(2);
+    const loaded = await journal.load("run-1");
+    expect(loaded?.state).toBe("APPROVAL_PENDING");
+    expect(loaded?.entries.at(-1)?.metadata).toMatchObject({
+      kind: "superpowers-approval-pending",
+      phase: pending.phase,
+    });
+  });
+
+  it("reconstructs a byte-identical challenge after restart without growing either history", async () => {
+    const { statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const snapshot = brainstormingSnapshot();
+    const first = await pendingApproval({ statePath, journal, head, snapshot });
+    const phasePath = path.join(statePath, "skills", "phases", "run-1.jsonl");
+    const journalPath = path.join(statePath, "journals", "run-1", "events.jsonl");
+    const before = [(await lstat(phasePath)).size, (await lstat(journalPath)).size] as const;
+
+    const restarted = engine(statePath, journal, snapshot, { idOffset: 500 });
+    await restarted.recover();
+    const replay = await restarted.completePhase(first.completion);
+
+    expect(replay).toEqual({ ...first.pending, replayed: true });
+    expect([(await lstat(phasePath)).size, (await lstat(journalPath)).size]).toEqual(before);
+  });
+
+  it("accepts every exact binding, durably binds the decision, and replays without growth", async () => {
+    const { statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const snapshot = brainstormingSnapshot();
+    const { host, pending } = await pendingApproval({ statePath, journal, head, snapshot });
+    const request = resumeRequest(pending);
+    const phasePath = path.join(statePath, "skills", "phases", "run-1.jsonl");
+    const journalPath = path.join(statePath, "journals", "run-1", "events.jsonl");
+
+    const approved = await host.resumeApproval(request);
+    const after = [(await lstat(phasePath)).size, (await lstat(journalPath)).size] as const;
+    const replay = await host.resumeApproval(request);
+
+    expect(approved).toMatchObject({
+      state: "RUNNING",
+      replayed: false,
+      phase: { status: "COMPLETED", output_hash: pending.phase.output_hash },
+      approval: { kind: "DECISION", decision: "APPROVE", operation_id: request.operation_id },
+    });
+    expect((await journal.load("run-1"))?.state).toBe("RUNNING");
+    expect(await host.phaseHistory("run-1")).toHaveLength(3);
+    expect(replay).toEqual({ ...approved, replayed: true });
+    expect([(await lstat(phasePath)).size, (await lstat(journalPath)).size]).toEqual(after);
+  });
+
+  it("replays the original brainstorming completion as the exact durable approval decision", async () => {
+    const { statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const snapshot = brainstormingSnapshot();
+    const { host, completion, pending } = await pendingApproval({
+      statePath,
+      journal,
+      head,
+      snapshot,
+    });
+    const approved = await host.resumeApproval(resumeRequest(pending));
+
+    await expect(host.completePhase(completion)).resolves.toEqual({
+      ...approved,
+      replayed: true,
+    });
+  });
+
+  it("replays the exact durable decision after unrelated journal advancement", async () => {
+    const { statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const snapshot = brainstormingSnapshot();
+    const { host, completion, pending } = await pendingApproval({
+      statePath,
+      journal,
+      head,
+      snapshot,
+    });
+    const request = resumeRequest(pending);
+    const approved = await host.resumeApproval(request);
+    const advanced = await journal.transition(
+      journalCommand("run-1", "REVIEW_PENDING", approved.journal_head),
+    );
+    const phasePath = path.join(statePath, "skills", "phases", "run-1.jsonl");
+    const journalPath = path.join(statePath, "journals", "run-1", "events.jsonl");
+    const before = [(await lstat(phasePath)).size, (await lstat(journalPath)).size] as const;
+
+    await expect(host.resumeApproval(request)).resolves.toEqual({ ...approved, replayed: true });
+    await expect(host.completePhase(completion)).resolves.toEqual({ ...approved, replayed: true });
+    expect([(await lstat(phasePath)).size, (await lstat(journalPath)).size]).toEqual(before);
+    expect((await journal.load("run-1"))?.head).toEqual(advanced.head);
+  });
+
+  it("transitions an exact rejection to BLOCKED without a successful phase output", async () => {
+    const { statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const snapshot = brainstormingSnapshot();
+    const { host, pending } = await pendingApproval({ statePath, journal, head, snapshot });
+
+    const rejected = await host.resumeApproval(resumeRequest(pending, "REJECT"));
+
+    expect(rejected).toMatchObject({
+      state: "BLOCKED",
+      phase: { status: "BLOCKED", output_hash: null },
+      approval: { kind: "DECISION", decision: "REJECT" },
+    });
+    expect((await journal.load("run-1"))?.state).toBe("BLOCKED");
+  });
+
+  it("rejects every stale or conflicting approval binding", async () => {
+    const { statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const snapshot = brainstormingSnapshot();
+    const { host, pending } = await pendingApproval({ statePath, journal, head, snapshot });
+    const exact = resumeRequest(pending);
+    const staleMutations: readonly Partial<ResumeSuperpowersApprovalRequest>[] = [
+      {
+        expected_journal_head: {
+          ...exact.expected_journal_head,
+          entry_hash: `sha256:${"a".repeat(64)}`,
+        },
+      },
+      { run_id: "run-other" },
+      { phase: "RED" },
+      { skill_name: "test-driven-development" },
+      { skill_version: "9.9.9" },
+      { skill_snapshot_hash: `sha256:${"b".repeat(64)}` },
+      { approval_request_hash: `sha256:${"d".repeat(64)}` },
+    ];
+    for (const mutation of staleMutations) {
+      await expect(host.resumeApproval({ ...exact, ...mutation })).rejects.toMatchObject({
+        code: "RUNTIME_SKILL_STALE_STATE",
+      });
+    }
+
+    const approved = await host.resumeApproval(exact);
+    await expect(host.resumeApproval({ ...exact, decision: "REJECT" })).rejects.toMatchObject({
+      code: "RUNTIME_SKILL_OPERATION_CONFLICT",
+    });
+    await expect(
+      host.resumeApproval({ ...exact, operation_id: "00000000-0000-4000-8000-000000000778" }),
+    ).rejects.toMatchObject({ code: "RUNTIME_SKILL_STALE_STATE" });
+    expect(approved.state).toBe("RUNNING");
+  });
+
+  it("recovers every two-file crash cut to the same pause or decision and never auto-approves", async () => {
+    const pendingCuts = [
+      "afterApprovalPendingPhaseSync",
+      "afterApprovalPendingJournalSync",
+    ] as const;
+    for (const [index, hookName] of pendingCuts.entries()) {
+      const { statePath } = await fixture();
+      const { journal, head } = await runningJournal(statePath);
+      const snapshot = brainstormingSnapshot();
+      let crash = true;
+      const hooks: PhaseHistoryOperationHooks = {
+        [hookName]: () => {
+          if (crash) throw new Error(`crash:${hookName}`);
+        },
+      };
+      const host = engine(statePath, journal, snapshot, { hooks, idOffset: 600 + index * 20 });
+      const started = await host.startPhase(startRequest(head, snapshot));
+      const completion = completeRequest(started);
+      await expect(host.completePhase(completion)).rejects.toThrow(`crash:${hookName}`);
+      crash = false;
+
+      const restarted = engine(statePath, journal, snapshot, { idOffset: 700 + index * 20 });
+      await restarted.recover();
+      expect((await journal.load("run-1"))?.state).toBe("APPROVAL_PENDING");
+      const pending = await restarted.completePhase(completion);
+      expect(pending).toMatchObject({ state: "APPROVAL_PENDING", replayed: true });
+      expect(await restarted.phaseHistory("run-1")).toHaveLength(2);
+    }
+
+    const decisionCuts = [
+      "afterApprovalDecisionPhaseSync",
+      "afterApprovalDecisionJournalSync",
+    ] as const;
+    for (const [index, hookName] of decisionCuts.entries()) {
+      const { statePath } = await fixture();
+      const { journal, head } = await runningJournal(statePath);
+      const snapshot = brainstormingSnapshot();
+      const initial = await pendingApproval({ statePath, journal, head, snapshot });
+      let crash = true;
+      const hooks: PhaseHistoryOperationHooks = {
+        [hookName]: () => {
+          if (crash) throw new Error(`crash:${hookName}`);
+        },
+      };
+      const crashing = engine(statePath, journal, snapshot, {
+        hooks,
+        idOffset: 800 + index * 20,
+      });
+      const request = resumeRequest(initial.pending);
+      await expect(crashing.resumeApproval(request)).rejects.toThrow(`crash:${hookName}`);
+      crash = false;
+
+      const restarted = engine(statePath, journal, snapshot, { idOffset: 900 + index * 20 });
+      await restarted.recover();
+      expect((await journal.load("run-1"))?.state).toBe("RUNNING");
+      const replay = await restarted.resumeApproval(request);
+      expect(replay).toMatchObject({ state: "RUNNING", replayed: true });
+      expect(await restarted.phaseHistory("run-1")).toHaveLength(3);
+    }
+  }, 20_000);
+
+  it("fails recovery when the journal pause has no exact phase record", async () => {
+    const { statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const snapshot = brainstormingSnapshot();
+    await pendingApproval({ statePath, journal, head, snapshot });
+    const phasePath = path.join(statePath, "skills", "phases", "run-1.jsonl");
+    await rm(phasePath);
+
+    const restarted = engine(statePath, journal, snapshot, { idOffset: 950 });
+    await expect(restarted.recover()).rejects.toMatchObject({
+      code: "RUNTIME_SKILL_INTEGRITY",
+    });
+    expect((await journal.load("run-1"))?.state).toBe("APPROVAL_PENDING");
+  });
+
+  it("rejects approval after the shutdown intake cut before reading mutable request fields", async () => {
+    const { statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const snapshot = brainstormingSnapshot();
+    const { host, pending } = await pendingApproval({ statePath, journal, head, snapshot });
+    host.stopIntake();
+    let reads = 0;
+    const request = new Proxy(resumeRequest(pending), {
+      get(target, property, receiver) {
+        reads += 1;
+        return Reflect.get(target, property, receiver) as unknown;
+      },
+    });
+
+    await expect(host.resumeApproval(request)).rejects.toMatchObject({
+      code: "RUNTIME_SKILL_UNAVAILABLE",
+    });
+    expect(reads).toBe(0);
+  });
+
+  it("keeps exact canonical approval and phase bytes private and bounded", async () => {
+    const { statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const snapshot = brainstormingSnapshot();
+    const { host, pending } = await pendingApproval({ statePath, journal, head, snapshot });
+    await host.resumeApproval(resumeRequest(pending));
+
+    const phaseBytes = await readFile(path.join(statePath, "skills", "phases", "run-1.jsonl"));
+    const journalBytes = await readFile(path.join(statePath, "journals", "run-1", "events.jsonl"));
+    expect(phaseBytes.byteLength).toBeLessThan(64 * 1024);
+    expect(journalBytes.byteLength).toBeLessThan(64 * 1024);
+    expect(phaseBytes.toString("utf8")).not.toContain(statePath);
+    expect(journalBytes.toString("utf8")).not.toContain(statePath);
+  });
+
+  it("rejects a re-signed journal decision whose repeated approval binding changed", async () => {
+    const { statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const snapshot = brainstormingSnapshot();
+    const { host, pending } = await pendingApproval({ statePath, journal, head, snapshot });
+    await host.resumeApproval(resumeRequest(pending));
+    const entry = (await journal.load("run-1"))?.entries.at(-1);
+    if (entry === undefined || typeof entry.metadata !== "object" || entry.metadata === null) {
+      throw new Error("decision journal entry was not persisted");
+    }
+    const metadata = entry.metadata as Record<string, unknown>;
+    const decision = metadata.decision as Record<string, unknown>;
+    const mutatedDecision = resignDocument({ ...decision, skill_version: "9.9.9" });
+
+    expect(() =>
+      decisionMetadata({
+        ...entry,
+        metadata: { ...metadata, decision: mutatedDecision },
+      }),
+    ).toThrowError(new RuntimeSkillError("RUNTIME_SKILL_INTEGRITY"));
+  });
+});

@@ -108,12 +108,28 @@ describe("skill runtime contracts", () => {
     const fixture = validSuperpowersPhase();
     expect(
       parseSuperpowersPhase(
-        canonicalJson({ ...fixture, status: "STARTED", output_hash: fixture.output_hash }),
+        canonicalJson(
+          resignDocument({ ...fixture, status: "STARTED", output_hash: fixture.output_hash }),
+        ),
       ),
     ).toMatchObject({ ok: false });
     expect(
-      parseSuperpowersPhase(canonicalJson({ ...fixture, status: "COMPLETED", output_hash: null })),
+      parseSuperpowersPhase(
+        canonicalJson(resignDocument({ ...fixture, status: "COMPLETED", output_hash: null })),
+      ),
     ).toMatchObject({ ok: false });
+    expect(
+      parseSuperpowersPhase(
+        canonicalJson(
+          resignDocument({ ...fixture, status: "APPROVAL_PENDING", output_hash: null }),
+        ),
+      ),
+    ).toMatchObject({ ok: false });
+    expect(
+      parseSuperpowersPhase(
+        canonicalJson(resignDocument({ ...fixture, status: "APPROVAL_PENDING" })),
+      ),
+    ).toMatchObject({ ok: true });
   });
 
   it("parses a phase whose exact predecessor completion hashes are content-bound", () => {
@@ -160,6 +176,21 @@ describe("skill runtime contracts", () => {
       ok: true,
       value: { kind: "DECISION", decision: "APPROVE" },
     });
+  });
+
+  it("accepts only a canonical UUID alternative for an approval decision operation id", () => {
+    const fixture = validSuperpowersApprovalDecision();
+    const canonical = resignDocument({
+      ...fixture,
+      operation_id: "00000000-0000-4000-8000-000000000777",
+    });
+    const uppercase = resignDocument({
+      ...fixture,
+      operation_id: "00000000-0000-4000-8000-000000000ABC",
+    });
+
+    expect(parseSuperpowersApproval(canonicalJson(canonical))).toMatchObject({ ok: true });
+    expect(parseSuperpowersApproval(canonicalJson(uppercase))).toMatchObject({ ok: false });
   });
 
   it("rejects evidence with duplicate resource and phase hashes", () => {

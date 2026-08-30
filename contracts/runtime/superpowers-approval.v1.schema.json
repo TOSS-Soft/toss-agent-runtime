@@ -131,7 +131,16 @@
             "skill_snapshot_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
             "phase_operation_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
             "approval_request_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
-            "operation_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+            "operation_id": {
+              "oneOf": [
+                { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+                {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                }
+              ]
+            },
             "decision": { "enum": ["APPROVE", "REJECT"] },
             "trace": { "$ref": "runtime-common.v1.schema.json#/$defs/trace_context" },
             "document_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }

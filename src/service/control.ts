@@ -24,9 +24,16 @@ import {
   type ServiceControlResponseV1,
   type ServiceProjectDataV1,
   type ServiceProjectRequestV1,
+  type ServiceSkillRequestV1,
   type ServiceStatusV1,
+  type ServiceSuperpowersApproveRequestV1,
+  type SuperpowersApprovalDataV1,
 } from "./contracts.js";
-import { RuntimeServiceError, type RuntimeServiceErrorCode } from "./errors.js";
+import {
+  isRuntimeServiceErrorCode,
+  RuntimeServiceError,
+  type RuntimeServiceErrorCode,
+} from "./errors.js";
 import {
   isServiceControlArtifactBasename,
   isServiceControlSocketClaimBasename,
@@ -35,6 +42,7 @@ import {
   serviceSocketLayoutFits,
 } from "./paths.js";
 import { RuntimeProjectError, type RuntimeProjectErrorCode } from "./project/errors.js";
+import { RuntimeSkillError, type RuntimeSkillErrorCode } from "../skills/errors.js";
 
 const RESPONSE_FRAME_BYTES = MAX_CONTROL_MESSAGE_BYTES + 1;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
@@ -74,6 +82,9 @@ export interface CreateServiceControlServerOptions {
   readonly handleProjectRequest?: (
     request: ServiceProjectRequestV1,
   ) => Promise<ServiceProjectDataV1>;
+  readonly handleSkillRequest?: (
+    request: ServiceSkillRequestV1,
+  ) => Promise<SuperpowersApprovalDataV1>;
   /** @internal Deterministic current-platform seam for portable path-budget tests. */
   readonly socketPathPlatform?: "darwin" | "linux";
   /** @internal Deterministic Unix-socket ABI-budget seam for portable tests. */
@@ -131,6 +142,12 @@ export interface RequestProjectOperationOptions {
   readonly createRequestId?: () => string;
   readonly operationId?: string;
   readonly createOperationId?: () => string;
+  readonly idleTimeoutMs?: 5_000;
+}
+
+export interface RequestSuperpowersApprovalDecisionOptions {
+  readonly socketPath: string;
+  readonly request: ServiceSuperpowersApproveRequestV1;
   readonly idleTimeoutMs?: 5_000;
 }
 
@@ -1035,7 +1052,7 @@ async function reclaimStaleStagedSockets(options: {
   }
 }
 
-type ControlErrorCode = RuntimeServiceErrorCode | RuntimeProjectErrorCode;
+type ControlErrorCode = RuntimeServiceErrorCode | RuntimeProjectErrorCode | RuntimeSkillErrorCode;
 
 function plainError(code: ControlErrorCode): Readonly<{
   code: ControlErrorCode;
@@ -1044,9 +1061,11 @@ function plainError(code: ControlErrorCode): Readonly<{
   safe_message: string;
 }> {
   const error =
-    code.startsWith("RUNTIME_PROJECT_") || code === "RUNTIME_OPERATION_CONFLICT"
-      ? new RuntimeProjectError(code as RuntimeProjectErrorCode)
-      : new RuntimeServiceError(code as RuntimeServiceErrorCode);
+    code === "BLOCKED_SUPERPOWERS_MISSING" || code.startsWith("RUNTIME_SKILL_")
+      ? new RuntimeSkillError(code as RuntimeSkillErrorCode)
+      : code.startsWith("RUNTIME_PROJECT_") || code === "RUNTIME_OPERATION_CONFLICT"
+        ? new RuntimeProjectError(code as RuntimeProjectErrorCode)
+        : new RuntimeServiceError(code as RuntimeServiceErrorCode);
   return {
     code: error.code,
     category: error.category,
@@ -1150,6 +1169,39 @@ function validatedProjectResponse(
   }
 }
 
+function validatedSkillResponse(
+  request: ServiceSkillRequestV1,
+  data: SuperpowersApprovalDataV1,
+): ServiceControlResponseV1 | undefined {
+  try {
+    if (
+      data.kind !== "superpowers-approval" ||
+      data.run_id !== request.run_id ||
+      data.phase !== request.phase ||
+      data.approval_request_hash !== request.approval_request_hash ||
+      data.state !== (request.decision === "APPROVE" ? "RUNNING" : "BLOCKED") ||
+      data.journal_head.journal_revision !== request.expected_journal_revision + 1 ||
+      data.journal_head.sequence !== request.expected_journal_revision + 1 ||
+      data.journal_head.entry_hash === request.expected_journal_head_hash
+    ) {
+      return undefined;
+    }
+    const response: ServiceControlResponseV1 = {
+      schema_version: "service-control-response.v1",
+      document_type: "service-control-response",
+      request_id: request.request_id,
+      ok: true,
+      status: null,
+      data,
+      error: null,
+    };
+    const parsed = parseServiceControlResponse(canonicalJson(response));
+    return parsed.ok ? parsed.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function canonicalProjectRequest(request: ServiceProjectRequestV1): ServiceProjectRequestV1 {
   if (request.command === "project-list") return request;
   if (request.command === "project-register") {
@@ -1162,7 +1214,18 @@ function canonicalProjectRequest(request: ServiceProjectRequestV1): ServiceProje
   };
 }
 
+function canonicalSkillRequest(request: ServiceSkillRequestV1): ServiceSkillRequestV1 {
+  return { ...request, operation_id: request.operation_id.toLowerCase() };
+}
+
 function safeOperationFailure(error: unknown): ControlErrorCode {
+  if (error instanceof RuntimeSkillError) {
+    try {
+      return new RuntimeSkillError(error.code).code;
+    } catch {
+      return "RUNTIME_SERVICE_UNAVAILABLE";
+    }
+  }
   if (error instanceof RuntimeProjectError) {
     try {
       return new RuntimeProjectError(error.code).code;
@@ -1182,6 +1245,8 @@ function validatedConfiguration(options: CreateServiceControlServerOptions): boo
     typeof options.status === "function" &&
     (options.handleProjectRequest === undefined ||
       typeof options.handleProjectRequest === "function") &&
+    (options.handleSkillRequest === undefined ||
+      typeof options.handleSkillRequest === "function") &&
     typeof options.serviceInstanceId === "string" &&
     UUID_PATTERN.test(options.serviceInstanceId)
   );
@@ -1262,6 +1327,21 @@ export function createServiceControlServer(
       return framedResponse(
         success ?? failureResponse(request.request_id, "RUNTIME_SERVICE_UNAVAILABLE"),
       );
+    }
+    if (request.command === "superpowers-approve") {
+      if (options.handleSkillRequest === undefined) {
+        return framedResponse(failureResponse(request.request_id, "RUNTIME_SERVICE_UNAVAILABLE"));
+      }
+      try {
+        const canonicalRequest = canonicalSkillRequest(request);
+        const data = await options.handleSkillRequest(canonicalRequest);
+        const success = validatedSkillResponse(canonicalRequest, data);
+        return framedResponse(
+          success ?? failureResponse(request.request_id, "RUNTIME_SERVICE_UNAVAILABLE"),
+        );
+      } catch (error) {
+        return framedResponse(failureResponse(request.request_id, safeOperationFailure(error)));
+      }
     }
     if (options.handleProjectRequest === undefined) {
       return framedResponse(failureResponse(request.request_id, "RUNTIME_SERVICE_UNAVAILABLE"));
@@ -1917,6 +1997,14 @@ async function readControlResponse(
 function throwControlFailure(response: ServiceControlResponseV1): never {
   const code = response.error?.code;
   if (typeof code !== "string") unavailable();
+  if (code === "BLOCKED_SUPERPOWERS_MISSING" || code.startsWith("RUNTIME_SKILL_")) {
+    try {
+      throw new RuntimeSkillError(code as RuntimeSkillErrorCode);
+    } catch (error) {
+      if (error instanceof RuntimeSkillError) throw error;
+      unavailable();
+    }
+  }
   if (code.startsWith("RUNTIME_PROJECT_") || code === "RUNTIME_OPERATION_CONFLICT") {
     try {
       throw new RuntimeProjectError(code as RuntimeProjectErrorCode);
@@ -1925,7 +2013,8 @@ function throwControlFailure(response: ServiceControlResponseV1): never {
       unavailable();
     }
   }
-  throw serviceError(code as RuntimeServiceErrorCode);
+  if (!isRuntimeServiceErrorCode(code)) unavailable();
+  throw serviceError(code);
 }
 
 export async function requestServiceStatus(
@@ -1963,7 +2052,13 @@ export async function requestProjectOperation(
       ...options.operation,
     } as const;
     const validated = parseServiceControlRequest(canonicalJson(request));
-    if (!validated.ok || validated.value.command === "status") controlInvalid();
+    if (
+      !validated.ok ||
+      validated.value.command === "status" ||
+      validated.value.command === "superpowers-approve"
+    ) {
+      controlInvalid();
+    }
     const response = await readControlResponse(options, validated.value);
     if (!response.ok) throwControlFailure(response);
     if (response.status !== null || response.data === null) unavailable();
@@ -1974,7 +2069,7 @@ export async function requestProjectOperation(
     ) {
       unavailable();
     }
-    return response.data;
+    return response.data as ServiceProjectDataV1;
   } catch (error) {
     if (error instanceof RuntimeProjectError) {
       let normalized: RuntimeProjectError;
@@ -1984,6 +2079,46 @@ export async function requestProjectOperation(
         unavailable();
       }
       throw normalized;
+    }
+    if (error instanceof RuntimeServiceError && internalServiceErrors.has(error)) throw error;
+    unavailable();
+  }
+}
+
+export async function requestSuperpowersApprovalDecision(
+  options: RequestSuperpowersApprovalDecisionOptions,
+): Promise<SuperpowersApprovalDataV1> {
+  try {
+    const validated = parseServiceControlRequest(canonicalJson(options.request));
+    if (!validated.ok || validated.value.command !== "superpowers-approve") controlInvalid();
+    const response = await readControlResponse(
+      { socketPath: options.socketPath, idleTimeoutMs: options.idleTimeoutMs ?? 5_000 },
+      validated.value,
+    );
+    if (!response.ok) throwControlFailure(response);
+    if (
+      response.status !== null ||
+      response.data?.kind !== "superpowers-approval" ||
+      response.data.run_id !== validated.value.run_id ||
+      response.data.phase !== validated.value.phase ||
+      response.data.approval_request_hash !== validated.value.approval_request_hash ||
+      response.data.state !== (validated.value.decision === "APPROVE" ? "RUNNING" : "BLOCKED") ||
+      response.data.journal_head.journal_revision !==
+        validated.value.expected_journal_revision + 1 ||
+      response.data.journal_head.sequence !== validated.value.expected_journal_revision + 1 ||
+      response.data.journal_head.entry_hash === validated.value.expected_journal_head_hash
+    ) {
+      unavailable();
+    }
+    return response.data;
+  } catch (error) {
+    if (error instanceof RuntimeSkillError) {
+      try {
+        throw new RuntimeSkillError(error.code);
+      } catch (normalized) {
+        if (normalized instanceof RuntimeSkillError) throw normalized;
+        unavailable();
+      }
     }
     if (error instanceof RuntimeServiceError && internalServiceErrors.has(error)) throw error;
     unavailable();

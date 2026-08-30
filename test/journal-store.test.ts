@@ -116,6 +116,56 @@ describe("private append-only run journal store", () => {
     await expect(routed).resolves.toMatchObject({ head: { journal_revision: 2 } });
   });
 
+  it("permits one run-bound transition only while the exact official barrier is held", async () => {
+    const { statePath } = await fixture();
+    const store = createStore(statePath);
+    const running = await advance(store, "run-scoped", ["CREATED", "ROUTED", "RUNNING"]);
+    let escaped: ((command: TransitionCommand) => Promise<TransitionResult>) | undefined;
+
+    const pending = await withRunJournalBarrier(
+      store,
+      "run-scoped",
+      async (snapshot, transition) => {
+        expect(snapshot?.head).toEqual(running.head);
+        escaped = transition;
+        return transition(
+          command("run-scoped", "APPROVAL_PENDING", running.head, {
+            command_id: "scoped-approval-pending",
+          }),
+        );
+      },
+    );
+
+    expect(pending).toMatchObject({ replayed: false, entry: { state: "APPROVAL_PENDING" } });
+    expect((await store.load("run-scoped"))?.head).toEqual(pending.head);
+    if (escaped === undefined) throw new Error("scoped transition was not captured");
+    await expect(
+      escaped(
+        command("run-scoped", "RUNNING", pending.head, {
+          command_id: "escaped-approval-decision",
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "RUNTIME_JOURNAL_UNAVAILABLE" });
+  });
+
+  it("rejects a scoped transition for another run without creating that run", async () => {
+    const { statePath } = await fixture();
+    const store = createStore(statePath);
+    const running = await advance(store, "run-bound", ["CREATED", "ROUTED", "RUNNING"]);
+
+    await expect(
+      withRunJournalBarrier(store, "run-bound", async (_snapshot, transition) =>
+        transition(
+          command("run-other", "CREATED", null, {
+            command_id: "wrong-run",
+          }),
+        ),
+      ),
+    ).rejects.toMatchObject({ code: "RUNTIME_JOURNAL_UNAVAILABLE" });
+    expect((await store.load("run-bound"))?.head).toEqual(running.head);
+    expect(await store.load("run-other")).toBeNull();
+  });
+
   it("rejects a custom journal that cannot provide the official atomic barrier", async () => {
     const custom = {
       recover: () => Promise.resolve(),

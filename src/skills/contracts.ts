@@ -264,12 +264,15 @@ function snapshotIssues(value: SkillSnapshotV1): readonly ValidationIssue[] {
 
 function phaseIssues(value: SuperpowersPhaseV1): readonly ValidationIssue[] {
   const issues: ValidationIssue[] = [];
-  if ((value.status === "COMPLETED") !== (value.output_hash !== null)) {
+  if (
+    (value.status === "COMPLETED" || value.status === "APPROVAL_PENDING") !==
+    (value.output_hash !== null)
+  ) {
     issues.push(
       issue(
         "/output_hash",
         "status",
-        "completed phases require output and incomplete phases do not",
+        "completed and approval-pending phases require output and other phases do not",
       ),
     );
   }

@@ -25,8 +25,10 @@ import {
   withRunJournalBarrier,
   type RunJournalSnapshot,
   type RunJournalStore,
+  type TransitionResult,
 } from "../journal/store.js";
-import type { JournalHead } from "../journal/types.js";
+import type { TransitionCommand } from "../journal/state-machine.js";
+import type { JournalHead, RunJournalEntryV1 } from "../journal/types.js";
 import {
   canonicalJson,
   deepFreezeJson,
@@ -35,6 +37,21 @@ import {
   type JsonValue,
 } from "../protocol/json.js";
 import type { TraceContext } from "../protocol/types.js";
+import {
+  approvalDecision,
+  approvalDecisionCommand,
+  approvalRequest,
+  approvalTerminalPhase,
+  captureResumeSuperpowersApprovalRequest,
+  decisionMetadata,
+  decisionOutcome,
+  pendingMetadata,
+  pendingOutcome,
+  requestSuperpowersApproval,
+  approvalPendingCommand,
+  type ApprovalDecisionJournalMetadata,
+  type ResumeSuperpowersApprovalRequest,
+} from "./approval.js";
 import type {
   SkillCatalog,
   SkillCatalogSnapshot,
@@ -165,6 +182,12 @@ export interface PhaseHistoryOperationHooks {
   ) => void | Promise<void>;
   readonly afterQuarantinePublished?: (quarantinePath: string) => void | Promise<void>;
   readonly beforeRecoveryRename?: (stagePath: string, historyPath: string) => void | Promise<void>;
+  readonly afterApprovalPendingPhaseSync?: (state: "RUNNING") => void | Promise<void>;
+  readonly afterApprovalPendingJournalSync?: (state: "APPROVAL_PENDING") => void | Promise<void>;
+  readonly afterApprovalDecisionJournalSync?: (
+    state: "RUNNING" | "BLOCKED",
+  ) => void | Promise<void>;
+  readonly afterApprovalDecisionPhaseSync?: () => void | Promise<void>;
 }
 
 export interface StartSuperpowersPhaseRequest {
@@ -233,6 +256,7 @@ export interface SkillsEngine {
   assembleContext(selection: SkillSelection, request: SkillContextRequest): Promise<SkillContext>;
   startPhase(request: StartSuperpowersPhaseRequest): Promise<SuperpowersPhaseOutcome>;
   completePhase(request: CompleteSuperpowersPhaseRequest): Promise<SuperpowersPhaseOutcome>;
+  resumeApproval(request: ResumeSuperpowersApprovalRequest): Promise<SuperpowersPhaseOutcome>;
   phaseHistory(runId: string): Promise<readonly SuperpowersPhaseV1[]>;
   stopIntake(): void;
   flush(signal: AbortSignal): Promise<void>;
@@ -998,7 +1022,7 @@ function validateHistory(runId: string, entries: readonly SuperpowersPhaseV1[]):
         unmatched === null ||
         unmatched.phase !== "BRAINSTORMING" ||
         !samePhaseBinding(unmatched, entry) ||
-        entry.output_hash !== null
+        entry.output_hash === null
       ) {
         integrity();
       }
@@ -1074,6 +1098,32 @@ function exactJournalHead(left: JournalHead, right: JournalHead): boolean {
     left.journal_revision === right.journal_revision &&
     left.sequence === right.sequence &&
     left.entry_hash === right.entry_hash
+  );
+}
+
+function journalHeadForEntry(entry: RunJournalEntryV1): JournalHead {
+  return Object.freeze({
+    journal_revision: entry.journal_revision,
+    sequence: entry.sequence,
+    entry_hash: entry.entry_hash,
+  });
+}
+
+function metadataKind(entry: RunJournalEntryV1): JsonValue | undefined {
+  const metadata = entry.metadata;
+  if (typeof metadata !== "object" || metadata === null || Array.isArray(metadata))
+    return undefined;
+  return (metadata as Readonly<Record<string, JsonValue>>).kind;
+}
+
+function approvalDecisionRecords(journal: RunJournalSnapshot): readonly Readonly<{
+  entry: RunJournalEntryV1;
+  metadata: ApprovalDecisionJournalMetadata;
+}>[] {
+  return Object.freeze(
+    journal.entries
+      .filter((entry) => metadataKind(entry) === "superpowers-approval-decision")
+      .map((entry) => Object.freeze({ entry, metadata: decisionMetadata(entry) })),
   );
 }
 
@@ -2397,7 +2447,10 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
 
   const journalBarrier = async <T>(
     runId: string,
-    operation: (snapshot: RunJournalSnapshot | null) => Promise<T>,
+    operation: (
+      snapshot: RunJournalSnapshot | null,
+      transition: (command: TransitionCommand) => Promise<TransitionResult>,
+    ) => Promise<T>,
   ): Promise<T> => {
     try {
       return await withRunJournalBarrier(journalStore, runId, operation);
@@ -2405,6 +2458,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
       if (error instanceof RuntimeSkillError) throw error;
       if (error instanceof RuntimeJournalError) {
         if (error.code === "RUNTIME_STATE_STALE") stale();
+        if (error.code === "RUNTIME_OPERATION_CONFLICT") conflict();
         if (
           error.code === "RUNTIME_JOURNAL_CORRUPT" ||
           error.code === "RUNTIME_JOURNAL_PATH_UNSAFE"
@@ -2517,7 +2571,6 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
 
   const completeInternal = async (
     request: CompleteSuperpowersPhaseRequest,
-    output: Uint8Array,
     outputHash: `sha256:${string}`,
   ): Promise<SuperpowersPhaseOutcome> => {
     assertIdentifier(request.run_id);
@@ -2528,10 +2581,44 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
     const operation = latestOperation(loaded.entries, request.operation_id);
     const started = operation[0];
     if (started === undefined || started.status !== "STARTED") stale();
+    const pending = operation.find((entry) => entry.status === "APPROVAL_PENDING");
     const terminal = operation.find(
       (entry) => entry.status !== "STARTED" && entry.status !== "APPROVAL_PENDING",
     );
     if (terminal !== undefined) {
+      if (pending !== undefined && started.phase === "BRAINSTORMING") {
+        if (
+          request.expected_phase_revision !== started.phase_revision ||
+          request.expected_phase_head_hash !== started.document_hash ||
+          request.phase !== pending.phase ||
+          request.skill_snapshot_hash !== pending.skill.snapshot_hash ||
+          request.outcome !== "COMPLETED" ||
+          pending.output_hash !== outputHash ||
+          !exactJson(request.trace, pending.trace)
+        ) {
+          conflict();
+        }
+        return journalBarrier(request.run_id, (journal) => {
+          if (journal === null) stale();
+          const matches = approvalDecisionRecords(journal).filter(
+            ({ metadata }) => metadata.phase.document_hash === terminal.document_hash,
+          );
+          if (matches.length !== 1) integrity();
+          const record = matches[0]!;
+          return Promise.resolve(
+            decisionOutcome({
+              phase: terminal,
+              transition: Object.freeze({
+                entry: record.entry,
+                head: journalHeadForEntry(record.entry),
+                replayed: true,
+              }),
+              approval: record.metadata.decision,
+              replayed: true,
+            }),
+          );
+        });
+      }
       const expectedOutput = request.outcome === "COMPLETED" ? outputHash : null;
       if (
         request.expected_phase_revision !== started.phase_revision ||
@@ -2546,6 +2633,42 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
       }
       return phaseOutcome(terminal, true);
     }
+    if (pending !== undefined) {
+      if (
+        request.expected_phase_revision !== started.phase_revision ||
+        request.expected_phase_head_hash !== started.document_hash ||
+        request.phase !== pending.phase ||
+        request.skill_snapshot_hash !== pending.skill.snapshot_hash ||
+        request.outcome !== "COMPLETED" ||
+        pending.output_hash !== outputHash ||
+        !exactJson(request.trace, pending.trace) ||
+        loaded.entries.at(-1)?.document_hash !== pending.document_hash
+      ) {
+        conflict();
+      }
+      return journalBarrier(request.run_id, async (journal, transition) => {
+        if (journal === null) stale();
+        let result: TransitionResult;
+        if (
+          journal.state === "RUNNING" &&
+          exactJournalHead(journal.head, pending.observed_journal_head)
+        ) {
+          result = await transition(approvalPendingCommand(pending));
+          await hooks?.afterApprovalPendingJournalSync?.("APPROVAL_PENDING");
+        } else if (journal.state === "APPROVAL_PENDING") {
+          const metadata = pendingMetadata(journal.entries.at(-1)!);
+          if (metadata.phase.document_hash !== pending.document_hash) integrity();
+          result = Object.freeze({
+            entry: journal.entries.at(-1)!,
+            head: journal.head,
+            replayed: true,
+          });
+        } else {
+          stale();
+        }
+        return pendingOutcome({ phase: pending, transition: result, replayed: true });
+      });
+    }
     if (
       request.expected_phase_revision !== started.phase_revision ||
       request.expected_phase_head_hash !== started.document_hash ||
@@ -2558,7 +2681,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
     const handler = builtInSuperpowersHandler(started.phase);
     if (started.handler.version !== handler.version || started.handler.hash !== handler.hash)
       stale();
-    return journalBarrier(request.run_id, async (journal) => {
+    return journalBarrier(request.run_id, async (journal, transition) => {
       if (
         journal === null ||
         journal.state !== "RUNNING" ||
@@ -2572,12 +2695,17 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
         handler.semantic.completion.approval === "REQUIRED" &&
         request.outcome === handler.semantic.completion.success_status
       ) {
-        if (options.brainstormingApprovalHandoff === undefined) unavailable();
-        return options.brainstormingApprovalHandoff({
+        const pending = requestSuperpowersApproval({
           started,
-          completion: Object.freeze({ ...request, output: Buffer.from(output) }),
           output_hash: outputHash,
+          occurred_at: options.now().toISOString(),
+          trace: request.trace,
         });
+        await appendRecord(request.run_id, current, pending);
+        await hooks?.afterApprovalPendingPhaseSync?.("RUNNING");
+        const result = await transition(approvalPendingCommand(pending));
+        await hooks?.afterApprovalPendingJournalSync?.("APPROVAL_PENDING");
+        return pendingOutcome({ phase: pending, transition: result, replayed: false });
       }
       const latest = current.entries.at(-1)!;
       const completed = record({
@@ -2605,6 +2733,102 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
     });
   };
 
+  const resumeInternal = async (
+    request: ResumeSuperpowersApprovalRequest,
+  ): Promise<SuperpowersPhaseOutcome> => {
+    return journalBarrier(request.run_id, async (journal, transition) => {
+      if (journal === null) stale();
+      let loaded = await loadExisting(request.run_id);
+      const pending = [...loaded.entries]
+        .reverse()
+        .find((entry) => entry.status === "APPROVAL_PENDING");
+      if (pending === undefined || pending.phase !== "BRAINSTORMING") stale();
+      const terminal = loaded.entries.find(
+        (entry) =>
+          entry.previous_phase_hash === pending.document_hash &&
+          entry.status !== "STARTED" &&
+          entry.status !== "APPROVAL_PENDING",
+      );
+
+      const pendingMatches = journal.entries
+        .filter((entry) => metadataKind(entry) === "superpowers-approval-pending")
+        .map((entry) => Object.freeze({ entry, metadata: pendingMetadata(entry) }))
+        .filter(({ metadata }) => metadata.phase.document_hash === pending.document_hash);
+      if (pendingMatches.length !== 1) integrity();
+      const pendingRecord = pendingMatches[0]!;
+      const challenge = approvalRequest(pending, journalHeadForEntry(pendingRecord.entry));
+      const exactBinding =
+        request.run_id === challenge.run_id &&
+        exactJournalHead(request.expected_journal_head, challenge.pending_journal_head) &&
+        request.phase === challenge.phase &&
+        request.skill_name === challenge.skill_name &&
+        request.skill_version === challenge.skill_version &&
+        request.skill_snapshot_hash === challenge.skill_snapshot_hash &&
+        request.approval_request_hash === challenge.document_hash;
+      if (!exactBinding) stale();
+
+      const decision = approvalDecision(challenge, request);
+      const decisions = approvalDecisionRecords(journal);
+      const challengeDecisions = decisions.filter(
+        ({ metadata }) => metadata.request.document_hash === challenge.document_hash,
+      );
+      if (challengeDecisions.length > 1) integrity();
+      const decided = challengeDecisions[0];
+      if (decided !== undefined) {
+        if (decided.metadata.decision.operation_id !== request.operation_id) stale();
+        if (decided.metadata.decision.document_hash !== decision.document_hash) conflict();
+        if (terminal === undefined) {
+          loaded = await loadExisting(request.run_id);
+          if (loaded.entries.at(-1)?.document_hash !== pending.document_hash) integrity();
+          await appendRecord(request.run_id, loaded, decided.metadata.phase);
+          await hooks?.afterApprovalDecisionPhaseSync?.();
+        } else if (terminal.document_hash !== decided.metadata.phase.document_hash) {
+          integrity();
+        }
+        return decisionOutcome({
+          phase: decided.metadata.phase,
+          transition: Object.freeze({
+            entry: decided.entry,
+            head: journalHeadForEntry(decided.entry),
+            replayed: true,
+          }),
+          approval: decided.metadata.decision,
+          replayed: true,
+        });
+      }
+      if (decisions.some(({ entry }) => entry.operation_id === request.operation_id)) conflict();
+      if (terminal !== undefined) integrity();
+      if (
+        journal.state !== "APPROVAL_PENDING" ||
+        !exactJournalHead(journal.head, journalHeadForEntry(pendingRecord.entry))
+      ) {
+        stale();
+      }
+
+      const completed = approvalTerminalPhase({
+        pending,
+        decision,
+        occurred_at: options.now().toISOString(),
+      });
+      const result = await transition(
+        approvalDecisionCommand({ request: challenge, decision, terminal: completed }),
+      );
+      await hooks?.afterApprovalDecisionJournalSync?.(
+        decision.decision === "APPROVE" ? "RUNNING" : "BLOCKED",
+      );
+      loaded = await loadExisting(request.run_id);
+      if (loaded.entries.at(-1)?.document_hash !== pending.document_hash) integrity();
+      await appendRecord(request.run_id, loaded, completed);
+      await hooks?.afterApprovalDecisionPhaseSync?.();
+      return decisionOutcome({
+        phase: completed,
+        transition: result,
+        approval: decision,
+        replayed: false,
+      });
+    });
+  };
+
   return {
     recover() {
       return accept(() =>
@@ -2612,6 +2836,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
           ensureRoots();
           const names = scanNames(phasesPath, MAX_PHASE_HISTORY_FILES * 4 + 32);
           const runIds = new Set<string>();
+          for (const journal of await journalStore.list()) runIds.add(journal.run_id);
           for (const name of names) {
             if (name === "quarantine") continue;
             const historyStage = HISTORY_STAGE_PATTERN.exec(name);
@@ -2661,7 +2886,47 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
             Buffer.from(left).compare(Buffer.from(right)),
           )) {
             await withMutationClaim(runId, async () => {
-              await loadExisting(runId);
+              await journalBarrier(runId, async (journal, transition) => {
+                const loaded = await loadExisting(runId);
+                const latest = loaded.entries.at(-1);
+                if (latest === undefined) {
+                  if (journal?.state === "APPROVAL_PENDING") integrity();
+                  return;
+                }
+                const pending = [...loaded.entries]
+                  .reverse()
+                  .find((entry) => entry.status === "APPROVAL_PENDING");
+                if (pending === undefined) {
+                  if (journal?.state === "APPROVAL_PENDING") integrity();
+                  return;
+                }
+                if (latest.status === "APPROVAL_PENDING") {
+                  if (
+                    journal?.state === "RUNNING" &&
+                    exactJournalHead(journal.head, pending.observed_journal_head)
+                  ) {
+                    await transition(approvalPendingCommand(pending));
+                    return;
+                  }
+                  if (journal?.state === "APPROVAL_PENDING") {
+                    const metadata = pendingMetadata(journal.entries.at(-1)!);
+                    if (metadata.phase.document_hash !== pending.document_hash) integrity();
+                    return;
+                  }
+                  if (journal?.state === "RUNNING" || journal?.state === "BLOCKED") {
+                    const metadata = decisionMetadata(journal.entries.at(-1)!);
+                    if (metadata.request.phase_document_hash !== pending.document_hash) integrity();
+                    await appendRecord(runId, loaded, metadata.phase);
+                    return;
+                  }
+                  integrity();
+                }
+                if (latest.previous_phase_hash === pending.document_hash) {
+                  if (journal?.state !== "RUNNING" && journal?.state !== "BLOCKED") integrity();
+                  const metadata = decisionMetadata(journal.entries.at(-1)!);
+                  if (metadata.phase.document_hash !== latest.document_hash) integrity();
+                }
+              });
             });
           }
         }),
@@ -2718,9 +2983,27 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
       return accept(() =>
         schedule(() =>
           withMutationClaim(captured.request.run_id, () =>
-            completeInternal(captured.request, captured.output, captured.outputHash),
+            completeInternal(captured.request, captured.outputHash),
           ),
         ),
+      );
+    },
+    resumeApproval(request) {
+      if (!officialJournal)
+        return Promise.reject(new RuntimeSkillError("RUNTIME_SKILL_UNAVAILABLE"));
+      if (intakeStopped) return Promise.reject(new RuntimeSkillError("RUNTIME_SKILL_UNAVAILABLE"));
+      let captured: ResumeSuperpowersApprovalRequest;
+      try {
+        captured = captureResumeSuperpowersApprovalRequest(request);
+      } catch (error) {
+        return Promise.reject(
+          error instanceof RuntimeSkillError
+            ? error
+            : new RuntimeSkillError("RUNTIME_SKILL_INVALID"),
+        );
+      }
+      return accept(() =>
+        schedule(() => withMutationClaim(captured.run_id, () => resumeInternal(captured))),
       );
     },
     phaseHistory(runId) {

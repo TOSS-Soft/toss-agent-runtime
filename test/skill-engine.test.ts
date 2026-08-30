@@ -1529,7 +1529,7 @@ describe("governed phase execution", () => {
     ).rejects.toMatchObject({ code: "RUNTIME_SKILL_INVALID" });
   });
 
-  it("leaves brainstorming completion at the unavailable approval handoff without fake completion", async () => {
+  it("hands brainstorming completion to one durable approval pause without fake completion", async () => {
     const { statePath } = await fixture();
     const { journal, head } = await runningJournal(statePath);
     const brainstorming = snapshot("brainstorming");
@@ -1538,10 +1538,12 @@ describe("governed phase execution", () => {
       startRequest(head, brainstorming, "BRAINSTORMING", "brainstorm"),
     );
 
-    await expect(host.completePhase(completeRequest(started))).rejects.toMatchObject({
-      code: "RUNTIME_SKILL_UNAVAILABLE",
+    await expect(host.completePhase(completeRequest(started))).resolves.toMatchObject({
+      state: "APPROVAL_PENDING",
+      phase: { status: "APPROVAL_PENDING" },
+      approval: { kind: "REQUEST", decision: null },
     });
-    expect(await host.phaseHistory("run-1")).toEqual([started.phase]);
+    expect(await host.phaseHistory("run-1")).toHaveLength(2);
   });
 });
 
