@@ -78,6 +78,8 @@ const MUTATION_STAGE_PATTERN =
   /^\.phase-mutation-stage\.([A-Za-z][A-Za-z0-9._:-]{0,127})\.([1-9][0-9]*)\.([0-9a-f-]{36})\.stage$/u;
 const MUTATION_TOMBSTONE_PATTERN =
   /^\.phase-mutation-(release|recovery)-([0-9a-f]{64})\.([1-9][0-9]*)\.([0-9a-f-]{36})\.([0-9a-f]{64})\.tombstone$/u;
+const MUTATION_TIMESTAMP_PATTERN =
+  /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$/u;
 const MAX_MUTATION_CLAIM_BYTES = 2_048;
 const LISTENER_PROBE_TIMEOUT_MS = 250;
 
@@ -1382,7 +1384,8 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
         typeof claim.owner_pid !== "number" ||
         !Number.isSafeInteger(claim.owner_pid) ||
         claim.owner_pid <= 0 ||
-        typeof claim.created_at !== "string"
+        typeof claim.created_at !== "string" ||
+        !MUTATION_TIMESTAMP_PATTERN.test(claim.created_at)
       ) {
         integrity();
       }
@@ -1412,19 +1415,77 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
     if (text.length <= prefix.length) return prefix.startsWith(text);
     if (!text.startsWith(prefix)) return false;
     const remainder = text.slice(prefix.length);
-    const isoShape = "0000-00-00T00:00:00.000Z";
-    const datePrefix = remainder.slice(0, Math.min(remainder.length, isoShape.length));
-    for (let index = 0; index < datePrefix.length; index += 1) {
-      const expected = isoShape[index]!;
-      const observed = datePrefix[index]!;
-      if (expected === "0" ? !/[0-9]/u.test(observed) : observed !== expected) return false;
-    }
-    if (remainder.length < isoShape.length) return true;
-    const occurredAt = remainder.slice(0, isoShape.length);
-    const date = new Date(occurredAt);
-    if (!Number.isFinite(date.getTime()) || date.toISOString() !== occurredAt) return false;
+    let offset = 0;
+    const decimal = (
+      width: number,
+      minimum: number,
+      maximum: number,
+    ):
+      | { readonly state: "complete"; readonly value: number }
+      | { readonly state: "partial" }
+      | null => {
+      const available = Math.min(width, remainder.length - offset);
+      const observed = remainder.slice(offset, offset + available);
+      if (!/^[0-9]*$/u.test(observed)) return null;
+      if (available < width) {
+        const lower = Number(observed.padEnd(width, "0"));
+        const upper = Number(observed.padEnd(width, "9"));
+        return lower <= maximum && upper >= minimum ? { state: "partial" } : null;
+      }
+      const value = Number(observed);
+      if (value < minimum || value > maximum) return null;
+      offset += width;
+      return { state: "complete", value };
+    };
+    const literal = (expected: string): "complete" | "partial" | null => {
+      const observed = remainder.slice(offset, offset + expected.length);
+      if (!expected.startsWith(observed)) return null;
+      if (observed.length < expected.length) return "partial";
+      offset += expected.length;
+      return "complete";
+    };
+
+    const year = decimal(4, 0, 9_999);
+    if (year === null) return false;
+    if (year.state === "partial") return true;
+    let boundary = literal("-");
+    if (boundary !== "complete") return boundary === "partial";
+    const month = decimal(2, 1, 12);
+    if (month === null) return false;
+    if (month.state === "partial") return true;
+    boundary = literal("-");
+    if (boundary !== "complete") return boundary === "partial";
+    const leapYear = year.value % 4 === 0 && (year.value % 100 !== 0 || year.value % 400 === 0);
+    const maximumDay = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][
+      month.value - 1
+    ]!;
+    const day = decimal(2, 1, maximumDay);
+    if (day === null) return false;
+    if (day.state === "partial") return true;
+    boundary = literal("T");
+    if (boundary !== "complete") return boundary === "partial";
+    const hour = decimal(2, 0, 23);
+    if (hour === null) return false;
+    if (hour.state === "partial") return true;
+    boundary = literal(":");
+    if (boundary !== "complete") return boundary === "partial";
+    const minute = decimal(2, 0, 59);
+    if (minute === null) return false;
+    if (minute.state === "partial") return true;
+    boundary = literal(":");
+    if (boundary !== "complete") return boundary === "partial";
+    const second = decimal(2, 0, 59);
+    if (second === null) return false;
+    if (second.state === "partial") return true;
+    boundary = literal(".");
+    if (boundary !== "complete") return boundary === "partial";
+    const millisecond = decimal(3, 0, 999);
+    if (millisecond === null) return false;
+    if (millisecond.state === "partial") return true;
+    boundary = literal("Z");
+    if (boundary !== "complete") return boundary === "partial";
     const suffix = `","operation_id":"${operationId}","owner_pid":${ownerPid},"run_id":"${runId}","schema_version":"superpowers-phase-mutation.v1"}`;
-    return suffix.startsWith(remainder.slice(isoShape.length));
+    return suffix.startsWith(remainder.slice(offset));
   };
 
   const syncPhaseDirectory = (): void => {
@@ -1627,12 +1688,14 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
       if (!UUID_PATTERN.test(operationId)) integrity();
       const occurredAt = options.now();
       if (!(occurredAt instanceof Date) || !Number.isFinite(occurredAt.getTime())) integrity();
+      const createdAt = occurredAt.toISOString();
+      if (!MUTATION_TIMESTAMP_PATTERN.test(createdAt)) integrity();
       const claim: PhaseMutationClaim = Object.freeze({
         schema_version: "superpowers-phase-mutation.v1",
         run_id: runId,
         operation_id: operationId,
         owner_pid: process.pid,
-        created_at: occurredAt.toISOString(),
+        created_at: createdAt,
       });
       const bytes = Buffer.from(canonicalJson(claim as unknown as JsonValue), "utf8");
       const stagePath = path.join(

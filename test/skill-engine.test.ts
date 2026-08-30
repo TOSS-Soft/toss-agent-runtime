@@ -217,6 +217,7 @@ function engine(
     readonly loader?: SkillLoader;
     readonly listener?: () => Promise<PhaseMutationListenerState>;
     readonly isProcessAlive?: (pid: number) => PhaseMutationProcessLiveness;
+    readonly now?: () => Date;
   } = {},
 ): SkillsEngine {
   return createSkillsEngineForTest({
@@ -225,7 +226,7 @@ function engine(
     catalog: fakeCatalog(),
     loader:
       options.loader ?? fakeLoader(new Map(values.map((value) => [value.descriptor.name, value]))),
-    now: clock(),
+    now: options.now ?? clock(),
     randomId: ids(options.idOffset ?? 200),
     hasServiceListener: options.listener ?? (() => Promise.resolve("absent")),
     ...(options.isProcessAlive === undefined ? {} : { isProcessAlive: options.isProcessAlive }),
@@ -706,6 +707,131 @@ describe("hash-chained Superpowers phase history", () => {
 
     await expect(restarted.recover()).rejects.toMatchObject({ code: "RUNTIME_SKILL_INTEGRITY" });
     await expect(readFile(stagePath)).resolves.toEqual(bytes);
+  });
+
+  it("preserves every dead stage whose bytes cannot extend to the filename-bound claim", async () => {
+    const { statePath } = await fixture();
+    const { journal } = await runningJournal(statePath);
+    const tdd = snapshot("test-driven-development");
+    const runId = "prefix-case";
+    const ownerPid = 999_988;
+    const operationId = "00000000-0000-4000-8000-999999999988";
+    const bootstrap = engine(statePath, journal, [tdd], {
+      idOffset: 650,
+      isProcessAlive: () => "dead",
+    });
+    await bootstrap.recover();
+    const stagePath = path.join(
+      statePath,
+      "skills",
+      "phases",
+      `.phase-mutation-stage.${runId}.${ownerPid}.${operationId}.stage`,
+    );
+    const malformed = [
+      '{"created_at":"2026-00',
+      '{"created_at":"2026-13',
+      '{"created_at":"2026-2',
+      '{"created_at":"2026-08-00',
+      '{"created_at":"2026-04-31',
+      '{"created_at":"2026-02-29',
+      '{"created_at":"2024-02-30',
+      '{"created_at":"2024-02-29T24',
+      '{"created_at":"2024-02-29T23:60',
+      '{"created_at":"2024-02-29T23:59:60',
+      '{"created_at":"2024-02-29T23:59:59.00x',
+      '{"created_at":"2024-02-29T23:59:59.9990',
+      '{"created_at":"2024-02-29T23:59:59.999z',
+      '{"created_at":"2024-02-29T23:59:59.999+',
+      '{"created_at":"+010000',
+      '{"created_at":"-000001',
+      '{"created_at":"20240',
+      '{"created_at":"2024/02',
+      '{"created_at":"2024-02-29 23',
+      '{ "created_at"',
+      '{"createdAt"',
+      '{"operation_id"',
+      '{"created\\u005fat"',
+      '{"created_at" :',
+      '{"created_at":"2024-02-29T23:59:59.999\\u005a',
+      '{"created_at":"2024-02-29T23:59:59.999Z","owner_pid"',
+      '{"created_at":"2024-02-29T23:59:59.999Z","operation_id":"00000000-0000-4000-8000-999999999987',
+      '{"created_at":"2024-02-29T23:59:59.999Z","operation_id":"00000000-0000-4000-8000-999999999988","owner_pid":999989',
+      '{"created_at":"2024-02-29T23:59:59.999Z","operation_id":"00000000-0000-4000-8000-999999999988","owner_pid":999988,"run_id":"other',
+      '{"created_at":"2024-02-29T23:59:59.999Z","operation_id":"00000000-0000-4000-8000-999999999988","owner_pid":999988,"run_id":"prefix-case","schema_version":"wrong',
+      '{"created_at":"+010000-01-01T00:00:00.000Z","operation_id":"00000000-0000-4000-8000-999999999988","owner_pid":999988,"run_id":"prefix-case","schema_version":"superpowers-phase-mutation.v1"}',
+    ] as const;
+
+    for (const text of malformed) {
+      const bytes = Buffer.from(text, "utf8");
+      await writePrivateFile(stagePath, bytes);
+      const before = await lstat(stagePath, { bigint: true });
+      await expect(bootstrap.phaseHistory(runId)).rejects.toMatchObject({
+        code: "RUNTIME_SKILL_INTEGRITY",
+      });
+      await expect(readFile(stagePath)).resolves.toEqual(bytes);
+      const after = await lstat(stagePath, { bigint: true });
+      expect({ device: after.dev, inode: after.ino, links: after.nlink }).toEqual({
+        device: before.dev,
+        inode: before.ino,
+        links: before.nlink,
+      });
+      await rm(stagePath);
+    }
+  });
+
+  it("recovers every byte prefix of one exact filename-bound canonical claim", async () => {
+    const { statePath } = await fixture();
+    const { journal } = await runningJournal(statePath);
+    const tdd = snapshot("test-driven-development");
+    const runId = "prefix-case";
+    const ownerPid = 999_988;
+    const operationId = "00000000-0000-4000-8000-999999999988";
+    const canonicalClaim =
+      '{"created_at":"2024-02-29T23:59:59.999Z","operation_id":"00000000-0000-4000-8000-999999999988","owner_pid":999988,"run_id":"prefix-case","schema_version":"superpowers-phase-mutation.v1"}';
+    const claimBytes = Buffer.from(canonicalClaim, "utf8");
+    const bootstrap = engine(statePath, journal, [tdd], {
+      idOffset: 680,
+      isProcessAlive: () => "dead",
+    });
+    await bootstrap.recover();
+    const stagePath = path.join(
+      statePath,
+      "skills",
+      "phases",
+      `.phase-mutation-stage.${runId}.${ownerPid}.${operationId}.stage`,
+    );
+
+    for (let length = 0; length <= claimBytes.byteLength; length += 1) {
+      await writePrivateFile(stagePath, claimBytes.subarray(0, length));
+      await expect(bootstrap.phaseHistory(runId)).resolves.toEqual([]);
+      await expect(access(stagePath)).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  }, 20_000);
+
+  it("rejects a generated timestamp outside the exact claim domain before stage publication", async () => {
+    const { statePath } = await fixture();
+    const { journal } = await runningJournal(statePath);
+    const tdd = snapshot("test-driven-development");
+    let publishedStage = false;
+    const host = engine(statePath, journal, [tdd], {
+      idOffset: 690,
+      now: () => new Date("+010000-01-01T00:00:00.000Z"),
+      hooks: {
+        afterMutationStageCreate: () => {
+          publishedStage = true;
+        },
+      },
+    });
+
+    await expect(host.phaseHistory("run-1")).rejects.toMatchObject({
+      code: "RUNTIME_SKILL_INTEGRITY",
+    });
+    expect(publishedStage).toBe(false);
+    expect(
+      (await readdir(path.join(statePath, "skills", "phases"))).filter((name) =>
+        name.startsWith(".phase-mutation"),
+      ),
+    ).toEqual([]);
   });
 
   it("preflights every stage before cleaning any recoverable sibling", async () => {
