@@ -1164,6 +1164,16 @@ function approvalPendingRecords(journal: RunJournalSnapshot): readonly Readonly<
   );
 }
 
+function approvalJournalProjection(journal: RunJournalSnapshot): Readonly<{
+  pending: ReturnType<typeof approvalPendingRecords>;
+  decisions: ReturnType<typeof approvalDecisionRecords>;
+}> {
+  return Object.freeze({
+    pending: approvalPendingRecords(journal),
+    decisions: approvalDecisionRecords(journal),
+  });
+}
+
 function copyTrace(trace: TraceContext): TraceContext {
   return Object.freeze({
     trace_id: trace.trace_id,
@@ -2569,11 +2579,10 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
         stale();
       }
       loaded = await loadExisting(request.run_id);
-      const pendingRecords = approvalPendingRecords(currentJournal);
-      const decisionRecords = approvalDecisionRecords(currentJournal);
+      const approval = approvalJournalProjection(currentJournal);
       if (
         loaded.entries.length === 0 &&
-        (pendingRecords.length > 0 || decisionRecords.length > 0)
+        (approval.pending.length > 0 || approval.decisions.length > 0)
       ) {
         integrity();
       }
@@ -2645,7 +2654,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
         }
         return journalBarrier(request.run_id, (journal) => {
           if (journal === null) stale();
-          const matches = approvalDecisionRecords(journal).filter(
+          const matches = approvalJournalProjection(journal).decisions.filter(
             ({ metadata }) => metadata.phase.document_hash === terminal.document_hash,
           );
           if (matches.length !== 1) integrity();
@@ -2693,6 +2702,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
       }
       return journalBarrier(request.run_id, async (journal, transition) => {
         if (journal === null) stale();
+        const approval = approvalJournalProjection(journal);
         let result: TransitionResult;
         if (
           journal.state === "RUNNING" &&
@@ -2701,10 +2711,14 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
           result = await transition(approvalPendingCommand(pending));
           await hooks?.afterApprovalPendingJournalSync?.("APPROVAL_PENDING");
         } else if (journal.state === "APPROVAL_PENDING") {
-          const metadata = pendingMetadata(journal.entries.at(-1)!);
-          if (metadata.phase.document_hash !== pending.document_hash) integrity();
+          const matches = approval.pending.filter(
+            ({ metadata }) => metadata.phase.document_hash === pending.document_hash,
+          );
+          if (matches.length !== 1 || matches[0]!.entry.entry_hash !== journal.head.entry_hash) {
+            integrity();
+          }
           result = Object.freeze({
-            entry: journal.entries.at(-1)!,
+            entry: matches[0]!.entry,
             head: journal.head,
             replayed: true,
           });
@@ -2784,6 +2798,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
   ): Promise<SuperpowersPhaseOutcome> => {
     return journalBarrier(request.run_id, async (journal, transition) => {
       if (journal === null) stale();
+      const approval = approvalJournalProjection(journal);
       let loaded = await loadExisting(request.run_id);
       const pending = [...loaded.entries]
         .reverse()
@@ -2796,10 +2811,9 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
           entry.status !== "APPROVAL_PENDING",
       );
 
-      const pendingMatches = journal.entries
-        .filter((entry) => metadataKind(entry) === "superpowers-approval-pending")
-        .map((entry) => Object.freeze({ entry, metadata: pendingMetadata(entry) }))
-        .filter(({ metadata }) => metadata.phase.document_hash === pending.document_hash);
+      const pendingMatches = approval.pending.filter(
+        ({ metadata }) => metadata.phase.document_hash === pending.document_hash,
+      );
       if (pendingMatches.length !== 1) integrity();
       const pendingRecord = pendingMatches[0]!;
       const challenge = approvalRequest(pending, journalHeadForEntry(pendingRecord.entry));
@@ -2814,7 +2828,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
       if (!exactBinding) stale();
 
       const decision = approvalDecision(challenge, request);
-      const decisions = approvalDecisionRecords(journal);
+      const decisions = approval.decisions;
       const challengeDecisions = decisions.filter(
         ({ metadata }) => metadata.request.document_hash === challenge.document_hash,
       );
@@ -2934,24 +2948,31 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
             await withMutationClaim(runId, async () => {
               await journalBarrier(runId, async (journal, transition) => {
                 const loaded = await loadExisting(runId);
-                const pendingRecords =
-                  journal === null ? Object.freeze([]) : approvalPendingRecords(journal);
-                const decisionRecords =
-                  journal === null ? Object.freeze([]) : approvalDecisionRecords(journal);
+                const approval = journal === null ? null : approvalJournalProjection(journal);
                 const latest = loaded.entries.at(-1);
                 if (latest === undefined) {
-                  if (pendingRecords.length > 0 || decisionRecords.length > 0) integrity();
+                  if (
+                    approval !== null &&
+                    (approval.pending.length > 0 || approval.decisions.length > 0)
+                  ) {
+                    integrity();
+                  }
                   return;
                 }
                 const pending = [...loaded.entries]
                   .reverse()
                   .find((entry) => entry.status === "APPROVAL_PENDING");
                 if (pending === undefined) {
-                  if (pendingRecords.length > 0 || decisionRecords.length > 0) integrity();
+                  if (
+                    approval !== null &&
+                    (approval.pending.length > 0 || approval.decisions.length > 0)
+                  ) {
+                    integrity();
+                  }
                   return;
                 }
-                if (journal === null) integrity();
-                const pendingMatches = pendingRecords.filter(
+                if (journal === null || approval === null) integrity();
+                const pendingMatches = approval.pending.filter(
                   ({ metadata }) => metadata.phase.document_hash === pending.document_hash,
                 );
                 if (pendingMatches.length === 0) {
@@ -2967,7 +2988,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
                 }
                 if (pendingMatches.length !== 1) integrity();
                 const pendingRecord = pendingMatches[0]!;
-                const decisions = decisionRecords.filter(
+                const decisions = approval.decisions.filter(
                   ({ metadata }) => metadata.request.phase_document_hash === pending.document_hash,
                 );
                 if (decisions.length === 0) {
@@ -3080,8 +3101,21 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
       );
     },
     phaseHistory(runId) {
+      if (!officialJournal) {
+        return accept(() =>
+          schedule(() => withMutationClaim(runId, async () => (await loadExisting(runId)).entries)),
+        );
+      }
       return accept(() =>
-        schedule(() => withMutationClaim(runId, async () => (await loadExisting(runId)).entries)),
+        schedule(() =>
+          withMutationClaim(runId, () =>
+            journalBarrier(runId, async (journal) => {
+              const loaded = await loadExisting(runId);
+              if (journal !== null) approvalJournalProjection(journal);
+              return loaded.entries;
+            }),
+          ),
+        ),
       );
     },
     stopIntake() {

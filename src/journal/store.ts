@@ -51,6 +51,7 @@ type InternalRunJournalBarrier = <T>(
     snapshot: RunJournalSnapshot | null,
     transition: (command: TransitionCommand) => Promise<TransitionResult>,
   ) => Promise<T>,
+  inherited: readonly HeldOfficialBarrier[],
 ) => Promise<T>;
 
 const OFFICIAL_RUN_JOURNAL_BARRIERS = new WeakMap<RunJournalStore, InternalRunJournalBarrier>();
@@ -78,7 +79,10 @@ export function withRunJournalBarrier<T>(
   if (barrier === undefined) {
     return Promise.reject(new RuntimeJournalError("RUNTIME_JOURNAL_UNAVAILABLE"));
   }
-  return barrier(runId, operation);
+  const inherited = Object.freeze(
+    (HELD_OFFICIAL_BARRIERS.getStore() ?? []).filter((held) => held.active),
+  );
+  return barrier(runId, operation, inherited);
 }
 
 interface ParsedJournal {
@@ -432,16 +436,15 @@ export function createRunJournalStore(options: CreateRunJournalStoreOptions): Ru
       snapshot: RunJournalSnapshot | null,
       transition: (command: TransitionCommand) => Promise<TransitionResult>,
     ) => Promise<T>,
+    inherited: readonly HeldOfficialBarrier[],
   ): Promise<T> => {
     if (intakeStopped) {
       return Promise.reject(new RuntimeJournalError("RUNTIME_JOURNAL_UNAVAILABLE"));
     }
-    const inherited = HELD_OFFICIAL_BARRIERS.getStore() ?? [];
     const accepted = coordinator.then((shared) => {
       const targetKey = Buffer.from(`${shared.canonicalRoot}\0${runId}`, "utf8");
       const violatesOrder = inherited.some(
         (held) =>
-          held.active &&
           Buffer.from(`${held.coordinator.canonicalRoot}\0${held.runId}`, "utf8").compare(
             targetKey,
           ) >= 0,

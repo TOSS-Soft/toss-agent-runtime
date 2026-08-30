@@ -294,6 +294,151 @@ describe("private append-only run journal store", () => {
     });
   });
 
+  it.each(["return", "throw"] as const)(
+    "rejects a fire-and-forget casing-alias reacquisition after outer callback $mode",
+    async (mode) => {
+      const { root, statePath } = await fixture();
+      const store = createStore(statePath);
+      const created = await advance(store, "run-delayed-alias", ["CREATED"]);
+      const aliasPath = path.join(root, path.basename(statePath).toUpperCase());
+      expect(await realpath(aliasPath)).toBe(await realpath(statePath));
+      let aliasStore: RunJournalStore | undefined;
+      let nested: Promise<unknown> | undefined;
+      let nestedRan = false;
+
+      const outer = withRunJournalBarrier(store, "run-delayed-alias", () => {
+        aliasStore = createStore(aliasPath);
+        nested = withRunJournalBarrier(
+          aliasStore,
+          "run-delayed-alias",
+          async (_snapshot, transition) => {
+            nestedRan = true;
+            return transition(
+              command("run-delayed-alias", "ROUTED", created.head, {
+                command_id: `delayed-alias-${mode}`,
+              }),
+            );
+          },
+        );
+        void nested.catch(() => undefined);
+        if (mode === "throw") throw new Error("outer-alias-failed");
+        return Promise.resolve("outer-returned");
+      });
+
+      if (mode === "throw") await expect(outer).rejects.toThrow("outer-alias-failed");
+      else await expect(outer).resolves.toBe("outer-returned");
+      if (nested === undefined || aliasStore === undefined) {
+        throw new Error("nested alias barrier was not invoked");
+      }
+      await expect(within(nested)).rejects.toMatchObject({
+        code: "RUNTIME_JOURNAL_UNAVAILABLE",
+      });
+      expect(nestedRan).toBe(false);
+      expect((await store.load("run-delayed-alias"))?.head).toEqual(created.head);
+
+      store.stopIntake();
+      aliasStore.stopIntake();
+      await expect(within(store.flush(new AbortController().signal))).resolves.toBeUndefined();
+      await expect(within(aliasStore.flush(new AbortController().signal))).resolves.toBeUndefined();
+    },
+  );
+
+  it("rejects a delayed same-store call but permits one invoked after callback closure", async () => {
+    const { statePath } = await fixture();
+    const store = createStore(statePath);
+    await advance(store, "run-call-time", ["CREATED"]);
+    let nested: Promise<unknown> | undefined;
+    let afterClose: Promise<unknown> | undefined;
+    let afterCloseInvoked: (() => void) | undefined;
+    const invoked = new Promise<void>((resolve) => {
+      afterCloseInvoked = resolve;
+    });
+
+    await withRunJournalBarrier(store, "run-call-time", () => {
+      nested = withRunJournalBarrier(store, "run-call-time", () => Promise.resolve("nested"));
+      void nested.catch(() => undefined);
+      setImmediate(() => {
+        afterClose = withRunJournalBarrier(store, "run-call-time", () =>
+          Promise.resolve("after-close"),
+        );
+        afterCloseInvoked?.();
+      });
+      return Promise.resolve();
+    });
+    if (nested === undefined) throw new Error("nested barrier was not invoked");
+    await expect(nested).rejects.toMatchObject({ code: "RUNTIME_JOURNAL_UNAVAILABLE" });
+    await invoked;
+    if (afterClose === undefined) throw new Error("post-callback barrier was not invoked");
+    await expect(afterClose).resolves.toBe("after-close");
+  });
+
+  it("rejects a cyclic cross-run reacquisition through a canonical casing alias", async () => {
+    const { root, statePath } = await fixture();
+    const store = createStore(statePath);
+    await advance(store, "run-alias-cycle-a", ["CREATED"]);
+    await advance(store, "run-alias-cycle-b", ["CREATED"]);
+    const aliasPath = path.join(root, path.basename(statePath).toUpperCase());
+    const aliasStore = createStore(aliasPath);
+
+    const cyclic = withRunJournalBarrier(store, "run-alias-cycle-a", async () =>
+      withRunJournalBarrier(aliasStore, "run-alias-cycle-b", async () =>
+        withRunJournalBarrier(store, "run-alias-cycle-a", () => Promise.resolve("unreachable")),
+      ),
+    );
+
+    await expect(within(cyclic)).rejects.toMatchObject({
+      code: "RUNTIME_JOURNAL_UNAVAILABLE",
+    });
+  });
+
+  it("does not share active leases between parallel alias-store callers", async () => {
+    const { root, statePath } = await fixture();
+    const store = createStore(statePath);
+    await advance(store, "run-alias-parallel", ["CREATED"]);
+    const aliasPath = path.join(root, path.basename(statePath).toUpperCase());
+    const aliasStore = createStore(aliasPath);
+    const order: string[] = [];
+
+    const first = withRunJournalBarrier(store, "run-alias-parallel", async () => {
+      order.push("first");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      return 1;
+    });
+    const second = withRunJournalBarrier(aliasStore, "run-alias-parallel", () => {
+      order.push("second");
+      return Promise.resolve(2);
+    });
+
+    await expect(within(Promise.all([first, second]))).resolves.toEqual([1, 2]);
+    expect(order).toEqual(["first", "second"]);
+  });
+
+  it("keeps a symlink state-root alias closed without invoking its nested callback", async () => {
+    const { root, statePath } = await fixture();
+    const store = createStore(statePath);
+    await advance(store, "run-symlink-alias", ["CREATED"]);
+    const aliasPath = path.join(root, "state-link");
+    await symlink(statePath, aliasPath);
+    let nestedRan = false;
+    let nested: Promise<unknown> | undefined;
+
+    await withRunJournalBarrier(store, "run-symlink-alias", () => {
+      const aliasStore = createStore(aliasPath);
+      nested = withRunJournalBarrier(aliasStore, "run-symlink-alias", () => {
+        nestedRan = true;
+        return Promise.resolve();
+      });
+      void nested.catch(() => undefined);
+      return Promise.resolve();
+    });
+
+    if (nested === undefined) throw new Error("symlink alias barrier was not invoked");
+    await expect(within(nested)).rejects.toMatchObject({
+      code: "RUNTIME_JOURNAL_PATH_UNSAFE",
+    });
+    expect(nestedRan).toBe(false);
+  });
+
   it("allows bounded different-run nesting but rejects a cyclic reacquisition", async () => {
     const { statePath } = await fixture();
     const store = createStore(statePath);

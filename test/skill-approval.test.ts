@@ -483,9 +483,158 @@ describe("durable Superpowers approval transaction", () => {
 
     await expect(host.resumeApproval(request)).resolves.toEqual({ ...approved, replayed: true });
     await expect(host.completePhase(completion)).resolves.toEqual({ ...approved, replayed: true });
+    await expect(host.phaseHistory("run-1")).resolves.toEqual([
+      expect.objectContaining({ status: "STARTED" }),
+      expect.objectContaining({ status: "APPROVAL_PENDING" }),
+      expect.objectContaining({ status: "COMPLETED" }),
+    ]);
     expect([(await lstat(phasePath)).size, (await lstat(journalPath)).size]).toEqual(before);
     expect((await journal.load("run-1"))?.head).toEqual(advanced.head);
   });
+
+  it("rejects a live replay when a later command-only entry claims approval pending", async () => {
+    const { statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const snapshot = brainstormingSnapshot();
+    const { host, completion, pending } = await pendingApproval({
+      statePath,
+      journal,
+      head,
+      snapshot,
+    });
+    const request = resumeRequest(pending);
+    const approved = await host.resumeApproval(request);
+    await journal.transition({
+      ...journalCommand("run-1", "APPROVAL_PENDING", approved.journal_head),
+      command_id: `approval-pending:sha256:${"a".repeat(64)}`,
+      reason_code: "MOVE_APPROVAL_PENDING",
+      metadata: {},
+    });
+    const phasePath = path.join(statePath, "skills", "phases", "run-1.jsonl");
+    const journalPath = path.join(statePath, "journals", "run-1", "events.jsonl");
+    const before = [await readFile(phasePath), await readFile(journalPath)] as const;
+
+    const results = await Promise.allSettled([
+      host.resumeApproval(request),
+      host.completePhase(completion),
+      host.phaseHistory("run-1"),
+    ]);
+
+    expect(results).toHaveLength(3);
+    for (const result of results) {
+      expect(result).toMatchObject({
+        status: "rejected",
+        reason: { code: "RUNTIME_SKILL_INTEGRITY" },
+      });
+    }
+    expect(await readFile(phasePath)).toEqual(before[0]);
+    expect(await readFile(journalPath)).toEqual(before[1]);
+  });
+
+  it.each([
+    { claim: "reason-only", decision: "REJECT", successors: ["RUNNING"] },
+    {
+      claim: "wrong-kind",
+      decision: "APPROVE",
+      successors: ["TOOL_PENDING", "RUNNING"],
+    },
+    {
+      claim: "duplicate",
+      decision: "REJECT",
+      successors: ["RUNNING", "TOOL_PENDING", "RUNNING"],
+    },
+    { claim: "resigned-conflict", decision: "APPROVE", successors: [] },
+    { claim: "wrong-phase", decision: "REJECT", successors: ["RUNNING"] },
+    {
+      claim: "decision-command-only",
+      decision: "APPROVE",
+      successors: ["TOOL_PENDING", "RUNNING"],
+    },
+  ] as const)(
+    "keeps live and restart reads aligned for a $claim approval claim",
+    async ({ claim, decision, successors }) => {
+      const { statePath } = await fixture();
+      const { journal, head } = await runningJournal(statePath);
+      const snapshot = brainstormingSnapshot();
+      const { host, completion, pending } = await pendingApproval({
+        statePath,
+        journal,
+        head,
+        snapshot,
+      });
+      const request = resumeRequest(pending, decision);
+      const pendingEntry = (await journal.load("run-1"))?.entries.at(-1);
+      if (
+        pendingEntry === undefined ||
+        typeof pendingEntry.metadata !== "object" ||
+        pendingEntry.metadata === null
+      ) {
+        throw new Error("pending journal metadata was not persisted");
+      }
+      const pendingMetadata = pendingEntry.metadata as Record<string, unknown>;
+      const pendingPhase = pendingMetadata.phase as Record<string, unknown>;
+      const decided = await host.resumeApproval(request);
+      let advancedHead = decided.journal_head;
+      for (const [index, state] of successors.entries()) {
+        advancedHead = (
+          await journal.transition({
+            ...journalCommand("run-1", state, advancedHead),
+            command_id: `live-validation-successor-${index}-${state.toLowerCase()}`,
+          })
+        ).head;
+      }
+      const claimedMetadata: JsonValue =
+        claim === "wrong-kind"
+          ? { kind: "superpowers-approval-decision" }
+          : claim === "duplicate"
+            ? pendingEntry.metadata
+            : claim === "resigned-conflict" || claim === "wrong-phase"
+              ? {
+                  kind: "superpowers-approval-pending",
+                  phase: resignDocument({
+                    ...pendingPhase,
+                    ...(claim === "wrong-phase"
+                      ? { phase: "RED" }
+                      : { output_hash: `sha256:${"8".repeat(64)}` }),
+                  }),
+                }
+              : {};
+      await journal.transition({
+        ...journalCommand("run-1", "APPROVAL_PENDING", advancedHead),
+        command_id:
+          claim === "decision-command-only"
+            ? "approval-decision:a0000000-0000-4000-8000-000000000780"
+            : claim === "reason-only"
+              ? "malformed-reason-only-approval"
+              : claim === "duplicate"
+                ? "malformed-duplicate-approval"
+                : `approval-pending:sha256:${"b".repeat(64)}`,
+        reason_code:
+          claim === "reason-only" ? "SUPERPOWERS_APPROVAL_REQUIRED" : "MOVE_APPROVAL_PENDING",
+        metadata: claimedMetadata,
+      });
+      const phasePath = path.join(statePath, "skills", "phases", "run-1.jsonl");
+      const journalPath = path.join(statePath, "journals", "run-1", "events.jsonl");
+      const bytes = [await readFile(phasePath), await readFile(journalPath)] as const;
+
+      await expect(host.resumeApproval(request)).rejects.toMatchObject({
+        code: "RUNTIME_SKILL_INTEGRITY",
+      });
+      await expect(host.completePhase(completion)).rejects.toMatchObject({
+        code: "RUNTIME_SKILL_INTEGRITY",
+      });
+      await expect(host.phaseHistory("run-1")).rejects.toMatchObject({
+        code: "RUNTIME_SKILL_INTEGRITY",
+      });
+      const restarted = engine(statePath, journal, snapshot, { idOffset: 575 });
+      await expect(restarted.recover()).rejects.toMatchObject({
+        code: "RUNTIME_SKILL_INTEGRITY",
+      });
+      expect(await readFile(phasePath)).toEqual(bytes[0]);
+      expect(await readFile(journalPath)).toEqual(bytes[1]);
+    },
+    20_000,
+  );
 
   it.each([
     { decision: "APPROVE", successors: ["REVIEW_PENDING"] },
