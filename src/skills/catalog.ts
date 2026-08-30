@@ -18,7 +18,11 @@ import {
   sha256,
   type JsonValue,
 } from "../protocol/json.js";
-import { loadBundledCatalog, type BundledCatalogTestOverride } from "./bundled.js";
+import {
+  BUNDLED_MANIFEST_PATH,
+  loadBundledCatalog,
+  type BundledCatalogTestOverride,
+} from "./bundled.js";
 import { hashSkillCatalog, hashSkillDescriptor, parseSkillDescriptor } from "./contracts.js";
 import { RuntimeSkillError } from "./errors.js";
 import { assertConfiguredSkillRootPath, assertSkillRelativePath } from "./paths.js";
@@ -137,6 +141,26 @@ interface PrivateCatalogEntry {
   readonly manifestIdentity: `sha256:${string}`;
   readonly absoluteDirectory: string;
   readonly sourceKind: SkillSourceKind;
+  readonly source: InternalSkillPackageSource;
+}
+
+/** @internal Retained authority passed only from the catalog to the loader. */
+export interface InternalSkillDirectorySnapshot {
+  readonly absolutePath: string;
+  readonly identity: CatalogFileIdentity;
+}
+
+/** @internal Retained authority passed only from the catalog to the loader. */
+export interface InternalSkillPackageSource {
+  readonly absoluteDirectory: string;
+  readonly sourceKind: SkillSourceKind;
+  readonly currentUid: number;
+  readonly configuredRoot: string | null;
+  readonly manifest: SkillPackageManifest;
+  readonly manifestPath: string;
+  readonly manifestHash: `sha256:${string}`;
+  readonly manifestFileIdentity: CatalogFileIdentity;
+  readonly packageChain: readonly InternalSkillDirectorySnapshot[];
 }
 
 interface HeldDirectory {
@@ -594,6 +618,30 @@ function openHeldManifestSync(
 
 function closeHeldDirectories(chain: readonly HeldDirectory[]): void {
   for (const held of [...chain].reverse()) closeSync(held.descriptor);
+}
+
+function retainedDirectoryChain(
+  chain: readonly HeldDirectory[],
+): readonly InternalSkillDirectorySnapshot[] {
+  return chain.map((held) => ({
+    absolutePath: held.absolutePath,
+    identity: held.identity,
+  }));
+}
+
+function captureDirectoryChain(
+  absoluteDirectory: string,
+  hooks: CatalogTestHooks,
+): readonly InternalSkillDirectorySnapshot[] {
+  const chain: HeldDirectory[] = [];
+  try {
+    for (const candidate of configuredAncestorPaths(absoluteDirectory)) {
+      chain.push(openHeldDirectorySync(candidate, chain, hooks));
+    }
+    return retainedDirectoryChain(chain);
+  } finally {
+    closeHeldDirectories(chain);
+  }
 }
 
 function readDirectoryNamesSync(
@@ -1155,6 +1203,17 @@ async function configuredEntries(
               manifestIdentity: rawHash(manifestBytes),
               absoluteDirectory: packagePath,
               sourceKind: "configured",
+              source: {
+                absoluteDirectory: packagePath,
+                sourceKind: "configured",
+                currentUid: options.currentUid,
+                configuredRoot: root,
+                manifest,
+                manifestPath,
+                manifestHash: rawHash(manifestBytes),
+                manifestFileIdentity: heldManifest.identity,
+                packageChain: retainedDirectoryChain(packageChain),
+              },
             });
           } finally {
             closeSync(heldManifest.descriptor);
@@ -1302,11 +1361,20 @@ function deduplicateEntries(
   return [...semantic.values()].sort(entryOrder);
 }
 
+const INTERNAL_RESOLVE: unique symbol = Symbol("skill-catalog-loader-resolver");
+
+interface RetainedSkillSelection {
+  readonly entry: PrivateCatalogEntry;
+  readonly catalogHash: `sha256:${string}`;
+  readonly packageHandle: `sha256:${string}`;
+}
+
 class FileSystemSkillCatalog implements SkillCatalog {
   private readonly snapshots = new WeakMap<
     SkillCatalogSnapshot,
     ReadonlyMap<string, PrivateCatalogEntry>
   >();
+  private readonly selections = new WeakMap<SkillSelection, RetainedSkillSelection>();
 
   constructor(private readonly options: CatalogImplementationOptions) {}
 
@@ -1326,16 +1394,32 @@ class FileSystemSkillCatalog implements SkillCatalog {
           hooks: this.options.hooks,
         })
       : [];
-    const bundled: PrivateCatalogEntry[] = bundledRecords.map((entry) => ({
-      descriptor: descriptorFor(entry.manifest, {
-        kind: "bundled",
-        identity: entry.sourceIdentity,
-      }),
-      manifest: entry.manifest,
-      manifestIdentity: entry.manifestIdentity,
-      absoluteDirectory: entry.absoluteDirectory,
-      sourceKind: "bundled",
-    }));
+    const bundledManifestPath = this.options.bundled?.manifestPath ?? BUNDLED_MANIFEST_PATH;
+    const bundledManifestIdentity = syncPathIdentity(bundledManifestPath, this.options.hooks);
+    const bundled: PrivateCatalogEntry[] = bundledRecords.map((entry) => {
+      const packageChain = captureDirectoryChain(entry.absoluteDirectory, this.options.hooks);
+      return {
+        descriptor: descriptorFor(entry.manifest, {
+          kind: "bundled",
+          identity: entry.sourceIdentity,
+        }),
+        manifest: entry.manifest,
+        manifestIdentity: entry.manifestIdentity,
+        absoluteDirectory: entry.absoluteDirectory,
+        sourceKind: "bundled",
+        source: {
+          absoluteDirectory: entry.absoluteDirectory,
+          sourceKind: "bundled",
+          currentUid: this.options.currentUid,
+          configuredRoot: null,
+          manifest: entry.manifest,
+          manifestPath: bundledManifestPath,
+          manifestHash: entry.manifestIdentity,
+          manifestFileIdentity: bundledManifestIdentity,
+          packageChain,
+        },
+      };
+    });
     const entries = deduplicateEntries([...configured, ...bundled]);
     const selected = entries.filter(
       (entry) =>
@@ -1400,12 +1484,69 @@ class FileSystemSkillCatalog implements SkillCatalog {
       descriptor: referenceOf(entry.descriptor),
       manifest_identity: entry.manifestIdentity,
     });
-    return deepFreezeJson({
+    const selection = deepFreezeJson({
       descriptor: entry.descriptor,
       catalog_hash: snapshot.catalog_hash,
       package_handle: packageHandle,
     } as unknown as JsonValue) as unknown as SkillSelection;
+    this.selections.set(selection, {
+      entry,
+      catalogHash: snapshot.catalog_hash,
+      packageHandle,
+    });
+    return selection;
   }
+
+  [INTERNAL_RESOLVE](selection: SkillSelection): InternalSkillPackageSource {
+    if (
+      !isClosedDataObject(selection, ["descriptor", "catalog_hash", "package_handle"]) ||
+      typeof selection.catalog_hash !== "string" ||
+      !HASH_PATTERN.test(selection.catalog_hash) ||
+      typeof selection.package_handle !== "string" ||
+      !HASH_PATTERN.test(selection.package_handle)
+    ) {
+      integrity();
+    }
+    const retained = this.selections.get(selection);
+    if (retained === undefined) integrity();
+    let parsed: ReturnType<typeof parseSkillDescriptor>;
+    try {
+      parsed = parseSkillDescriptor(canonicalJson(selection.descriptor));
+    } catch {
+      integrity();
+    }
+    if (!parsed.ok) integrity();
+    const { entry } = retained;
+    const expectedHandle = sha256({
+      catalog_hash: retained.catalogHash,
+      descriptor: referenceOf(entry.descriptor),
+      manifest_identity: entry.manifestIdentity,
+    });
+    if (
+      selection.catalog_hash !== retained.catalogHash ||
+      selection.package_handle !== retained.packageHandle ||
+      selection.package_handle !== expectedHandle ||
+      canonicalJson(parsed.value) !== canonicalJson(entry.descriptor)
+    ) {
+      integrity();
+    }
+    return entry.source;
+  }
+}
+
+interface InternalResolvableSkillCatalog extends SkillCatalog {
+  [INTERNAL_RESOLVE](selection: SkillSelection): InternalSkillPackageSource;
+}
+
+/** @internal Loader-only bridge; not re-exported from the package root. */
+export function resolveSkillSelectionForLoader(
+  catalog: SkillCatalog,
+  selection: SkillSelection,
+): InternalSkillPackageSource {
+  const candidate = catalog as Partial<InternalResolvableSkillCatalog>;
+  const resolver = candidate[INTERNAL_RESOLVE];
+  if (typeof resolver !== "function") integrity();
+  return resolver.call(catalog, selection);
 }
 
 function currentUid(): number {
