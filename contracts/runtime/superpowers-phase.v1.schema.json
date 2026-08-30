@@ -13,6 +13,7 @@
     "previous_phase_hash",
     "execution_request_hash",
     "observed_journal_head",
+    "catalog_hash",
     "skill",
     "phase",
     "handler",
@@ -20,6 +21,7 @@
     "status",
     "predecessor_phase_hashes",
     "input_hash",
+    "context_hash",
     "output_hash",
     "occurred_at",
     "trace",
@@ -34,6 +36,7 @@
     "previous_phase_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
     "execution_request_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
     "observed_journal_head": { "$ref": "#/$defs/journal_head" },
+    "catalog_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
     "skill": { "$ref": "#/$defs/skill" },
     "phase": { "$ref": "#/$defs/phase" },
     "handler": { "$ref": "#/$defs/handler" },
@@ -46,6 +49,7 @@
       "items": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
     },
     "input_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+    "context_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
     "output_hash": {
       "oneOf": [{ "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }, { "type": "null" }]
     },
@@ -68,11 +72,23 @@
     "skill": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "version", "snapshot_hash"],
+      "required": ["name", "version", "source", "package_hash", "document_hash", "snapshot_hash"],
       "properties": {
         "name": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
         "version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "source": { "$ref": "#/$defs/source" },
+        "package_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+        "document_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
         "snapshot_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "identity"],
+      "properties": {
+        "kind": { "enum": ["configured", "bundled"] },
+        "identity": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" }
       }
     },
     "phase": {

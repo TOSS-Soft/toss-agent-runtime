@@ -1,4 +1,14 @@
-import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -6,12 +16,54 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { computeExecutableHash, createMainServices, runCli } from "../src/cli/main.js";
 import { defaultConfig } from "../src/config/load.js";
-import { requestProjectOperation } from "../src/service/control.js";
+import { ZERO_JOURNAL_HASH } from "../src/journal/entry.js";
+import { createRunJournalStore } from "../src/journal/store.js";
+import type { TransitionCommand } from "../src/journal/state-machine.js";
+import type { JournalHead, RunState } from "../src/journal/types.js";
+import {
+  requestProjectOperation,
+  requestSuperpowersApprovalDecision,
+} from "../src/service/control.js";
 import type { InstanceLock } from "../src/service/instance-lock.js";
 import { runSupervisor } from "../src/service/supervisor.js";
+import { createSkillsHost } from "../src/skills/index.js";
 import { FakeSignals } from "./support/fake-signals.js";
 
 const temporaryDirectories: string[] = [];
+const TRACE = {
+  trace_id: "1".repeat(32),
+  span_id: "2".repeat(16),
+  trace_flags: 1,
+} as const;
+
+function journalCommand(
+  runId: string,
+  state: RunState,
+  head: JournalHead | null,
+): TransitionCommand {
+  return {
+    run_id: runId,
+    expected_revision: head?.journal_revision ?? 0,
+    expected_head_hash: head?.entry_hash ?? ZERO_JOURNAL_HASH,
+    command_id: `${runId}-${state.toLowerCase()}`,
+    operation_id: null,
+    next_state: state,
+    reason_code: `MOVE_${state}`,
+    trace: TRACE,
+    metadata: {},
+    side_effect: null,
+  };
+}
+
+async function transientSkillArtifacts(root: string): Promise<readonly string[]> {
+  const entries = await readdir(root, { recursive: true }).catch((error: unknown) => {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  });
+  return entries.filter((entry) => /(?:\.stage|\.claim|\.lock|\.tombstone)(?:\.|$)/u.test(entry));
+}
 
 afterEach(async () => {
   await Promise.all(
@@ -59,7 +111,7 @@ describe("serve command lifecycle integration", () => {
       resolveReady = resolve;
     });
     const services = createMainServices({
-      platform: { os: "darwin", arch: "arm64", node: "22.23.1" },
+      platform: { os: "darwin", arch: "arm64", node: "24.20.0" },
       env: {},
       home: root,
       signals,
@@ -81,6 +133,98 @@ describe("serve command lifecycle integration", () => {
     expect(socket.mode & 0o777).toBe(0o600);
     expect(lockOwner).toMatchObject({ executable_hash: "a".repeat(64) });
     expect(JSON.stringify(lockOwner)).not.toContain(process.execPath);
+    expect((await lstat(path.join(config.paths.state, "skills", "phases"))).isDirectory()).toBe(
+      true,
+    );
+
+    const journal = createRunJournalStore({
+      statePath: config.paths.state,
+      now: () => new Date("2026-08-19T12:00:01.000Z"),
+      randomId: () => "00000000-0000-4000-8000-000000000101",
+    });
+    let head: JournalHead | null = null;
+    for (const state of ["CREATED", "ROUTED", "RUNNING"] as const) {
+      head = (await journal.transition(journalCommand("run-production-skills", state, head))).head;
+    }
+    if (head === null) throw new Error("journal setup failed");
+    const externalSkills = createSkillsHost({
+      statePath: config.paths.state,
+      configuredRoots: [],
+      journal,
+      now: () => new Date("2026-08-19T12:00:02.000Z"),
+      randomId: () => "00000000-0000-4000-8000-000000000102",
+      hasServiceListener: () => Promise.resolve("present"),
+    });
+    const selection = await externalSkills.select({
+      mode: "implicit",
+      capability: "brainstorming",
+      allowed_capabilities: ["brainstorming"],
+      query: null,
+      descriptor: null,
+    });
+    const snapshot = await externalSkills.load(selection);
+    const started = await externalSkills.startPhase({
+      run_id: "run-production-skills",
+      expected_journal_head: head,
+      execution_request_hash: `sha256:${"e".repeat(64)}`,
+      selection,
+      phase: "BRAINSTORMING",
+      input: Buffer.from("production brainstorming", "utf8"),
+      operation_id: "production-brainstorming",
+      trace: TRACE,
+    });
+    const pending = await externalSkills.completePhase({
+      run_id: "run-production-skills",
+      expected_phase_revision: started.phase.phase_revision,
+      expected_phase_head_hash: started.phase.document_hash,
+      phase: "BRAINSTORMING",
+      skill_snapshot_hash: snapshot.document_hash,
+      operation_id: started.phase.operation_id,
+      outcome: "COMPLETED",
+      output: Buffer.from("production plan", "utf8"),
+      trace: TRACE,
+    });
+    if (pending.approval?.kind !== "REQUEST") throw new Error("approval request expected");
+    const approvalControlRequest = {
+      schema_version: "service-control-request.v1",
+      document_type: "service-control-request",
+      request_id: "00000000-0000-4000-8000-000000000103",
+      command: "superpowers-approve",
+      operation_id: "00000000-0000-4000-8000-000000000104",
+      run_id: pending.approval.run_id,
+      expected_journal_revision: pending.approval.pending_journal_head.journal_revision,
+      expected_journal_head_hash: pending.approval.pending_journal_head.entry_hash,
+      phase: pending.approval.phase,
+      skill_name: pending.approval.skill_name,
+      skill_version: pending.approval.skill_version,
+      skill_snapshot_hash: pending.approval.skill_snapshot_hash,
+      approval_request_hash: pending.approval.document_hash,
+      decision: "APPROVE",
+    } as const;
+    await expect(
+      requestSuperpowersApprovalDecision({
+        socketPath: config.paths.socket,
+        request: approvalControlRequest,
+      }),
+    ).resolves.toMatchObject({
+      kind: "superpowers-approval",
+      run_id: "run-production-skills",
+      state: "RUNNING",
+      approval_request_hash: pending.approval.document_hash,
+    });
+    await expect(
+      requestSuperpowersApprovalDecision({
+        socketPath: config.paths.socket,
+        request: {
+          ...approvalControlRequest,
+          request_id: "00000000-0000-4000-8000-000000000105",
+        },
+      }),
+    ).resolves.toMatchObject({
+      run_id: "run-production-skills",
+      state: "RUNNING",
+      replayed: true,
+    });
 
     const projectRoot = path.join(root, "project");
     await mkdir(path.join(projectRoot, ".toss"), { recursive: true, mode: 0o700 });
@@ -127,6 +271,10 @@ describe("serve command lifecycle integration", () => {
     signals.emit("SIGTERM");
     await expect(running).resolves.toMatchObject({ reason: "SIGTERM", forced: false });
     await expect(lstat(ownerPath)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(config.paths.socket)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(transientSkillArtifacts(path.join(config.paths.state, "skills"))).resolves.toEqual(
+      [],
+    );
     await rm(root, { recursive: true, force: true });
   });
 

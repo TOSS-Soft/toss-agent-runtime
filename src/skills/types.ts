@@ -80,13 +80,15 @@ export interface SuperpowersPhaseV1 extends RuntimeDocument {
   readonly previous_phase_hash: `sha256:${string}`;
   readonly execution_request_hash: `sha256:${string}`;
   readonly observed_journal_head: JournalHead;
-  readonly skill: Readonly<{ name: string; version: string; snapshot_hash: `sha256:${string}` }>;
+  readonly catalog_hash: `sha256:${string}`;
+  readonly skill: SkillDescriptorReference & Readonly<{ snapshot_hash: `sha256:${string}` }>;
   readonly phase: SuperpowersPhaseName;
   readonly handler: Readonly<{ version: string; hash: `sha256:${string}` }>;
   readonly operation_id: string;
   readonly status: SuperpowersPhaseStatus;
   readonly predecessor_phase_hashes: readonly `sha256:${string}`[];
   readonly input_hash: `sha256:${string}`;
+  readonly context_hash: `sha256:${string}`;
   readonly output_hash: `sha256:${string}` | null;
   readonly occurred_at: string;
   readonly trace: TraceContext;

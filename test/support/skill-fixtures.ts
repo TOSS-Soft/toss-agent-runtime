@@ -95,6 +95,7 @@ const TRACE = { trace_id: "1".repeat(32), span_id: "2".repeat(16), trace_flags: 
 const JOURNAL_HEAD = { journal_revision: 1, sequence: 1, entry_hash: ZERO_HASH } as const;
 
 export function validSuperpowersPhase() {
+  const descriptor = validSkillDescriptor();
   return document({
     protocol_version: "runtime-contract.v1" as const,
     schema_version: "superpowers-phase.v1" as const,
@@ -104,13 +105,22 @@ export function validSuperpowersPhase() {
     previous_phase_hash: ZERO_HASH,
     execution_request_hash: HASH,
     observed_journal_head: JOURNAL_HEAD,
-    skill: { name: "superpowers", version: "1.0.0", snapshot_hash: OTHER_HASH },
+    catalog_hash: ZERO_HASH,
+    skill: {
+      name: descriptor.name,
+      version: descriptor.version,
+      source: descriptor.source,
+      package_hash: descriptor.package_hash,
+      document_hash: descriptor.document_hash,
+      snapshot_hash: OTHER_HASH,
+    },
     phase: "GREEN" as const,
     handler: { version: "1.0.0", hash: HASH },
     operation_id: "operation-1",
     status: "COMPLETED" as const,
     predecessor_phase_hashes: [],
     input_hash: OTHER_HASH,
+    context_hash: ZERO_HASH,
     output_hash: HASH,
     occurred_at: "2026-08-30T12:00:00.000Z",
     trace: TRACE,
@@ -158,7 +168,7 @@ export function validSuperpowersApprovalDecision() {
 }
 
 export function validSkillExecutionEvidence() {
-  return document({
+  const hashable = {
     protocol_version: "runtime-contract.v1" as const,
     schema_version: "skill-execution-evidence.v1" as const,
     document_type: "skill-execution-evidence" as const,
@@ -184,7 +194,10 @@ export function validSkillExecutionEvidence() {
     ],
     approvals: [{ request_hash: HASH, decision_hash: null, journal_head: JOURNAL_HEAD }],
     context_hashes: [OTHER_HASH],
-    handoff_hash: ZERO_HASH,
     terminal_code: null,
+  };
+  return document({
+    ...hashable,
+    handoff_hash: sha256({ schema_version: "skill-execution-handoff.v1", evidence: hashable }),
   });
 }

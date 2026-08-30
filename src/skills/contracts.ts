@@ -112,6 +112,12 @@ export function hashSkillExecutionEvidence(value: SkillExecutionEvidenceV1): `sh
   return documentHash(value);
 }
 
+export function hashSkillExecutionHandoff(
+  value: Omit<SkillExecutionEvidenceV1, "handoff_hash" | "document_hash">,
+): `sha256:${string}` {
+  return sha256({ schema_version: "skill-execution-handoff.v1", evidence: value }, DOCUMENT_LIMITS);
+}
+
 export function hashSkillPackage(
   value: Pick<
     SkillSnapshotV1,
@@ -294,12 +300,40 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
   const stringSets: readonly [string, readonly string[]][] = [
     ["/resource_hashes", value.resource_hashes],
     ["/context_hashes", value.context_hashes],
-    ["/phases", value.phases.map((phase) => phase.phase_hash)],
-    ["/approvals", value.approvals.map((approval) => approval.request_hash)],
   ];
   for (const [path, values] of stringSets) {
     if (!orderedUnique(values))
       issues.push(issue(path, "order", "members must be ASCII-sorted and unique"));
+  }
+  const phaseOrder: readonly SuperpowersPhaseName[] = [
+    "BRAINSTORMING",
+    "TEST_DESIGN",
+    "RED",
+    "GREEN",
+    "DEBUGGING",
+    "REVIEW",
+    "VERIFICATION",
+  ];
+  if (
+    new Set(value.phases.map((phase) => phase.phase_hash)).size !== value.phases.length ||
+    value.phases.some(
+      (phase, index) =>
+        index > 0 &&
+        phaseOrder.indexOf(value.phases[index - 1]!.phase) >= phaseOrder.indexOf(phase.phase),
+    )
+  ) {
+    issues.push(issue("/phases", "order", "phases must follow protocol order and be unique"));
+  }
+  if (
+    new Set(value.approvals.map((approval) => approval.request_hash)).size !==
+      value.approvals.length ||
+    value.approvals.some(
+      (approval, index) =>
+        index > 0 &&
+        value.approvals[index - 1]!.journal_head.sequence >= approval.journal_head.sequence,
+    )
+  ) {
+    issues.push(issue("/approvals", "order", "approvals must follow journal order and be unique"));
   }
   const decisions = value.approvals.flatMap((approval) =>
     approval.decision_hash === null ? [] : [approval.decision_hash],
@@ -311,6 +345,11 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
     issues.push(
       issue("/document_hash", "canonicalHash", "document hash does not match canonical content"),
     );
+  const { handoff_hash: handoffHash, document_hash: documentHashValue, ...handoffInput } = value;
+  void documentHashValue;
+  if (handoffHash !== hashSkillExecutionHandoff(handoffInput)) {
+    issues.push(issue("/handoff_hash", "handoffHash", "handoff hash does not match evidence"));
+  }
   return issues;
 }
 

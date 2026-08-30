@@ -1,4 +1,4 @@
-import { cp, mkdir, readdir } from "node:fs/promises";
+import { cp, mkdir, readdir, rm } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -16,3 +16,14 @@ for (const entry of await readdir(source, { withFileTypes: true })) {
     });
   }
 }
+
+const bundledSkillsSource = path.join(root, "skills", "bundled");
+const bundledSkillsDestination = path.join(root, "dist", "skills", "bundled");
+await rm(bundledSkillsDestination, { recursive: true, force: true });
+await mkdir(path.dirname(bundledSkillsDestination), { recursive: true });
+await cp(bundledSkillsSource, bundledSkillsDestination, {
+  recursive: true,
+  dereference: false,
+  errorOnExist: false,
+  force: true,
+});

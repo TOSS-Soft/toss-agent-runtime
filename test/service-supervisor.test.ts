@@ -5,7 +5,11 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { LoadedConfig } from "../src/config/types.js";
-import type { ServiceStatusV1 } from "../src/service/contracts.js";
+import type {
+  ServiceStatusV1,
+  ServiceSuperpowersApproveRequestV1,
+  SuperpowersApprovalDataV1,
+} from "../src/service/contracts.js";
 import type { ServiceControlServer } from "../src/service/control.js";
 import { RuntimeServiceError } from "../src/service/errors.js";
 import type { InstanceLock } from "../src/service/instance-lock.js";
@@ -191,6 +195,83 @@ afterEach(async () => {
 });
 
 describe("runtime service supervisor", () => {
+  it("recovers the skills participant before readiness and forwards its distinct control handler", async () => {
+    const events: string[] = [];
+    const handleSkillRequest = (
+      request: ServiceSuperpowersApproveRequestV1,
+    ): Promise<SuperpowersApprovalDataV1> =>
+      Promise.resolve({
+        kind: "superpowers-approval",
+        run_id: request.run_id,
+        state: request.decision === "APPROVE" ? "RUNNING" : "BLOCKED",
+        phase: request.phase,
+        journal_head: {
+          journal_revision: request.expected_journal_revision + 1,
+          sequence: request.expected_journal_revision + 1,
+          entry_hash: `sha256:${"b".repeat(64)}`,
+        },
+        approval_request_hash: request.approval_request_hash,
+        approval_decision_hash: `sha256:${"c".repeat(64)}`,
+        replayed: false,
+      });
+    const participant = (name: string): RecoveryParticipant => ({
+      recover: () => {
+        events.push(`recover-${name}`);
+        return Promise.resolve();
+      },
+      stopIntake: () => events.push(`stop-${name}`),
+      flush: () => {
+        events.push(`flush-${name}`);
+        return Promise.resolve();
+      },
+    });
+    const running = runSupervisor(
+      options({
+        recoveryParticipants: [
+          participant("journal"),
+          participant("skills"),
+          participant("projects"),
+        ],
+        handleSkillRequest,
+        createControlServer: (serverOptions) => {
+          expect(serverOptions.handleSkillRequest).toBe(handleSkillRequest);
+          return fakeServer({
+            listen: () => {
+              events.push("listen");
+              return Promise.resolve();
+            },
+            drain: () => {
+              events.push("drain-control");
+              return Promise.resolve();
+            },
+            close: () => {
+              events.push("close-control");
+              return Promise.resolve();
+            },
+          });
+        },
+        onReady: () => {
+          events.push("ready");
+          resolveReady?.();
+        },
+      }),
+    );
+
+    await readyObserved;
+    expect(events.slice(0, 5)).toEqual([
+      "recover-journal",
+      "recover-skills",
+      "recover-projects",
+      "listen",
+      "ready",
+    ]);
+    signals.emit("SIGTERM");
+    await running;
+    expect(events.indexOf("stop-skills")).toBeLessThan(events.indexOf("flush-skills"));
+    expect(events.indexOf("flush-skills")).toBeLessThan(events.indexOf("drain-control"));
+    expect(events.indexOf("drain-control")).toBeLessThan(events.indexOf("close-control"));
+  });
+
   it("durably logs recovery, readiness, and shutdown before acknowledging each boundary", async () => {
     const events: string[] = [];
     let degraded = false;

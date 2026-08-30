@@ -307,6 +307,16 @@ describe("hash-chained Superpowers phase history", () => {
       status: "STARTED",
       observed_journal_head: head,
       input_hash: rawHash(Buffer.from("TEST_DESIGN input")),
+      catalog_hash: selection(tdd).catalog_hash,
+      context_hash: sha256({ phase: "TEST_DESIGN" }),
+      skill: {
+        name: tdd.descriptor.name,
+        version: tdd.descriptor.version,
+        source: tdd.descriptor.source,
+        package_hash: tdd.descriptor.package_hash,
+        document_hash: tdd.descriptor.document_hash,
+        snapshot_hash: tdd.document_hash,
+      },
       handler: {
         version: builtInSuperpowersHandler("TEST_DESIGN").version,
         hash: builtInSuperpowersHandler("TEST_DESIGN").hash,
@@ -317,6 +327,9 @@ describe("hash-chained Superpowers phase history", () => {
       previous_phase_hash: started.phase.document_hash,
       status: "COMPLETED",
       output_hash: rawHash(Buffer.from("phase output")),
+      catalog_hash: started.phase.catalog_hash,
+      context_hash: started.phase.context_hash,
+      skill: started.phase.skill,
     });
     expect(history).toEqual([started.phase, completed.phase]);
     expect((await lstat(statePath)).mode & 0o777).toBe(0o700);

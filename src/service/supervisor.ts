@@ -57,6 +57,7 @@ export interface RunSupervisorOptions {
   readonly socketProbe: SocketIdentityProbe;
   readonly recoveryParticipants: readonly RecoveryParticipant[];
   readonly interruptionRecorder: InterruptionRecorder;
+  readonly handleSkillRequest?: CreateServiceControlServerOptions["handleSkillRequest"];
   readonly operationalLogger?: SupervisorOperationalLogger;
   readonly onReady: () => void;
   readonly acquireLock?: (options: AcquireInstanceLockOptions) => Promise<InstanceLock>;
@@ -349,6 +350,9 @@ export async function runSupervisor(options: RunSupervisorOptions): Promise<Supe
           idleTimeoutMs: 5_000,
           maxConnections: 32,
           cacheSize: 256,
+          ...(options.handleSkillRequest === undefined
+            ? {}
+            : { handleSkillRequest: options.handleSkillRequest }),
         });
         await server.listen();
         await logLifecycle("service.ready");

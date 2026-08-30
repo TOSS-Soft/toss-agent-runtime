@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { realpath } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
@@ -48,6 +48,7 @@ import { createProjectIntake } from "../service/project/intake.js";
 import { RuntimeProjectError, type RuntimeProjectErrorCode } from "../service/project/errors.js";
 import { createProjectRegistry } from "../service/project/registry.js";
 import { createProjectWatcher } from "../service/project/watcher.js";
+import { createSkillsHost, RuntimeSkillError } from "../skills/index.js";
 import { PACKAGE_VERSION } from "../version.js";
 import { CliUsageError, parseCli, type BaselineCommand, type ServiceAction } from "./grammar.js";
 import {
@@ -346,6 +347,34 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
         intake,
         runtimeStatePath: loaded.config.paths.state,
       });
+      const hasServiceListener = async (): Promise<"present" | "absent" | "unknown"> => {
+        try {
+          if (!(await lstat(loaded.config.paths.socket)).isSocket()) return "unknown";
+        } catch (error) {
+          return typeof error === "object" &&
+            error !== null &&
+            "code" in error &&
+            error.code === "ENOENT"
+            ? "absent"
+            : "unknown";
+        }
+        try {
+          return (await probeRuntimeServiceIdentity({ socketPath: loaded.config.paths.socket })) ===
+            null
+            ? "unknown"
+            : "present";
+        } catch {
+          return "unknown";
+        }
+      };
+      const skills = createSkillsHost({
+        statePath: loaded.config.paths.state,
+        configuredRoots: loaded.config.skill_roots,
+        journal,
+        now: options.now,
+        randomId: randomUUID,
+        hasServiceListener,
+      });
       return runSupervisor({
         loaded,
         signals: options.signals,
@@ -357,8 +386,47 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
         socketProbe: {
           identify: (socketPath) => probeRuntimeServiceIdentity({ socketPath }),
         },
-        recoveryParticipants: [journal, projects],
+        recoveryParticipants: [journal, skills, projects],
         interruptionRecorder: journal,
+        handleSkillRequest: async (request) => {
+          const traceHash = createHash("sha256")
+            .update(`skill-control:${request.operation_id}`, "utf8")
+            .digest("hex");
+          const outcome = await skills.resumeApproval({
+            run_id: request.run_id,
+            expected_journal_head: {
+              journal_revision: request.expected_journal_revision,
+              sequence: request.expected_journal_revision,
+              entry_hash: request.expected_journal_head_hash,
+            },
+            phase: request.phase,
+            skill_name: request.skill_name,
+            skill_version: request.skill_version,
+            skill_snapshot_hash: request.skill_snapshot_hash,
+            approval_request_hash: request.approval_request_hash,
+            operation_id: request.operation_id,
+            decision: request.decision,
+            trace: {
+              trace_id: traceHash.slice(0, 32),
+              span_id: traceHash.slice(32, 48),
+              trace_flags: 1,
+            },
+          });
+          const expectedState = request.decision === "APPROVE" ? "RUNNING" : "BLOCKED";
+          if (outcome.approval?.kind !== "DECISION" || outcome.state !== expectedState) {
+            throw new RuntimeSkillError("RUNTIME_SKILL_INTEGRITY");
+          }
+          return {
+            kind: "superpowers-approval",
+            run_id: outcome.phase.run_id,
+            state: outcome.state,
+            phase: outcome.phase.phase,
+            journal_head: outcome.journal_head,
+            approval_request_hash: outcome.approval.approval_request_hash,
+            approval_decision_hash: outcome.approval.document_hash,
+            replayed: outcome.replayed,
+          };
+        },
         operationalLogger: logStore,
         acquireLock: acquireInstanceLock,
         createControlServer: (serverOptions) =>

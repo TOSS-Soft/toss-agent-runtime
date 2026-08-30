@@ -4,7 +4,6 @@ import { requireEvidenceEmitter } from "../src/evidence/index.js";
 import { requireAgentLoop } from "../src/orchestration/index.js";
 import * as routingApi from "../src/routing/index.js";
 import { requireSecurityRuntime } from "../src/security/index.js";
-import { requireSkillsHost } from "../src/skills/index.js";
 import { requireToolBroker } from "../src/tools/index.js";
 import {
   createAgentgatewayTransport,
@@ -27,7 +26,6 @@ describe("future subsystem boundaries", () => {
   });
 
   it.each([
-    ["skills", requireSkillsHost],
     ["tools", requireToolBroker],
     ["orchestration", requireAgentLoop],
     ["evidence", requireEvidenceEmitter],

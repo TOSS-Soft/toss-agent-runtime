@@ -259,6 +259,13 @@ export interface SkillsEngine {
   completePhase(request: CompleteSuperpowersPhaseRequest): Promise<SuperpowersPhaseOutcome>;
   resumeApproval(request: ResumeSuperpowersApprovalRequest): Promise<SuperpowersPhaseOutcome>;
   phaseHistory(runId: string): Promise<readonly SuperpowersPhaseV1[]>;
+  /** @internal Atomic verified source for the evidence builder. */
+  evidenceHistory(runId: string): Promise<
+    Readonly<{
+      phases: readonly SuperpowersPhaseV1[];
+      journal: RunJournalSnapshot | null;
+    }>
+  >;
   stopIntake(): void;
   flush(signal: AbortSignal): Promise<void>;
 }
@@ -952,12 +959,14 @@ function samePhaseBinding(left: SuperpowersPhaseV1, right: SuperpowersPhaseV1): 
     left.run_id === right.run_id &&
     left.execution_request_hash === right.execution_request_hash &&
     exactJson(left.observed_journal_head, right.observed_journal_head) &&
+    left.catalog_hash === right.catalog_hash &&
     exactJson(left.skill, right.skill) &&
     left.phase === right.phase &&
     exactJson(left.handler, right.handler) &&
     exactJson(left.predecessor_phase_hashes, right.predecessor_phase_hashes) &&
     left.operation_id === right.operation_id &&
-    left.input_hash === right.input_hash
+    left.input_hash === right.input_hash &&
+    left.context_hash === right.context_hash
   );
 }
 
@@ -2647,7 +2656,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
     validateLoadedSnapshot(request.selection, snapshot);
     enforcePredecessors(loaded.entries, request.phase, snapshot, request.execution_request_hash);
     const contextBudget = builtInPhaseContextBudget(request.phase, input.byteLength);
-    await options.loader.assembleContext(request.selection, {
+    const context = await options.loader.assembleContext(request.selection, {
       snapshot,
       snapshot_hash: snapshot.document_hash,
       phase: request.phase,
@@ -2687,9 +2696,13 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
         previous_phase_hash: latest?.document_hash ?? ZERO_PHASE_HASH,
         execution_request_hash: request.execution_request_hash,
         observed_journal_head: Object.freeze({ ...request.expected_journal_head }),
+        catalog_hash: request.selection.catalog_hash,
         skill: Object.freeze({
           name: snapshot.descriptor.name,
           version: snapshot.descriptor.version,
+          source: snapshot.descriptor.source,
+          package_hash: snapshot.descriptor.package_hash,
+          document_hash: snapshot.descriptor.document_hash,
           snapshot_hash: snapshot.document_hash,
         }),
         phase: request.phase,
@@ -2698,6 +2711,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
         status: "STARTED",
         predecessor_phase_hashes: predecessorPhaseHashes,
         input_hash: inputHash,
+        context_hash: context.context_hash,
         output_hash: null,
         occurred_at: options.now().toISOString(),
         trace: copyTrace(request.trace),
@@ -2862,6 +2876,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
         previous_phase_hash: latest.document_hash,
         execution_request_hash: started.execution_request_hash,
         observed_journal_head: started.observed_journal_head,
+        catalog_hash: started.catalog_hash,
         skill: started.skill,
         phase: started.phase,
         handler: started.handler,
@@ -2869,6 +2884,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
         status: request.outcome,
         predecessor_phase_hashes: started.predecessor_phase_hashes,
         input_hash: started.input_hash,
+        context_hash: started.context_hash,
         output_hash: request.outcome === "COMPLETED" ? outputHash : null,
         occurred_at: options.now().toISOString(),
         trace: copyTrace(request.trace),
@@ -3199,6 +3215,22 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
               const loaded = await loadExisting(runId);
               approvalJournalProjection(journal, loaded.entries);
               return loaded.entries;
+            }),
+          ),
+        ),
+      );
+    },
+    evidenceHistory(runId) {
+      if (!officialJournal) {
+        return Promise.reject(new RuntimeSkillError("RUNTIME_SKILL_UNAVAILABLE"));
+      }
+      return accept(() =>
+        schedule(() =>
+          withMutationClaim(runId, () =>
+            journalBarrier(runId, async (journal) => {
+              const loaded = await loadExisting(runId);
+              approvalJournalProjection(journal, loaded.entries);
+              return Object.freeze({ phases: loaded.entries, journal });
             }),
           ),
         ),

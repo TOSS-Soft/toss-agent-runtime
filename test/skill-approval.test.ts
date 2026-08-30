@@ -1396,22 +1396,30 @@ describe("durable Superpowers approval transaction", () => {
       { phase_revision: (phase.phase_revision as number) + 1 },
       { previous_phase_hash: `sha256:${"7".repeat(64)}` },
       { execution_request_hash: `sha256:${"6".repeat(64)}` },
+      { catalog_hash: `sha256:${"5".repeat(64)}` },
+      { context_hash: `sha256:${"4".repeat(64)}` },
       {
         observed_journal_head: {
           ...(phase.observed_journal_head as Record<string, unknown>),
-          entry_hash: `sha256:${"5".repeat(64)}`,
+          entry_hash: `sha256:${"3".repeat(64)}`,
         },
       },
       {
         skill: {
           ...(phase.skill as Record<string, unknown>),
-          snapshot_hash: `sha256:${"4".repeat(64)}`,
+          snapshot_hash: `sha256:${"2".repeat(64)}`,
+        },
+      },
+      {
+        skill: {
+          ...(phase.skill as Record<string, unknown>),
+          package_hash: `sha256:${"1".repeat(64)}`,
         },
       },
       {
         handler: {
           ...(phase.handler as Record<string, unknown>),
-          hash: `sha256:${"3".repeat(64)}`,
+          hash: `sha256:${"0".repeat(64)}`,
         },
       },
       { predecessor_phase_hashes: [`sha256:${"2".repeat(64)}`] },
