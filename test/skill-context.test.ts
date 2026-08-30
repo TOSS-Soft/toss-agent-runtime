@@ -124,6 +124,7 @@ describe("bounded skill context", () => {
       "SKILL.md",
       "references/green.md",
     ]);
+    expect(context.segments.map((segment) => segment.role)).toEqual(["skill", "reference"]);
     expect(context.included_resource_hashes).toEqual([green.hash]);
     expect(context.omitted_resource_hashes).toEqual([asset.hash, red.hash, script.hash]);
   });

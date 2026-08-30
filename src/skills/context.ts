@@ -21,7 +21,7 @@ export interface SkillContextMaterial {
 
 export interface SkillContextSegment {
   readonly path: string;
-  readonly role: "skill_markdown" | "reference";
+  readonly role: "skill" | "reference" | "asset";
   readonly source_hash: `sha256:${string}`;
   readonly included_hash: `sha256:${string}`;
   readonly original_bytes: number;
@@ -194,7 +194,7 @@ export function assembleSkillContext(
   const selected = [
     segment(
       "SKILL.md",
-      "skill_markdown",
+      "skill",
       snapshot.skill_markdown_hash,
       snapshot.skill_markdown_bytes,
       material.skill_markdown,
