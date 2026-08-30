@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { mkdirSync, renameSync } from "node:fs";
 import {
   chmod,
   link,
@@ -271,13 +272,22 @@ describe("immutable skill loading", () => {
     expect(processes).toEqual([]);
   });
 
-  it("replays a stored immutable object after source removal", async () => {
-    const { loader, selection, directory } = await fixture();
-    const first = await loader.load(selection);
-    await rm(directory, { recursive: true });
+  it.each(["deleted", "altered", "mode", "extra"] as const)(
+    "fails closed on a cached load when the exact selected source is %s",
+    async (kind) => {
+      const { loader, selection, directory } = await fixture();
+      await loader.load(selection);
+      const member = path.join(directory, "references", "guide.md");
+      if (kind === "deleted") await rm(directory, { recursive: true });
+      if (kind === "altered") await writeFile(member, Buffer.from("xxxxx\n"), { mode: 0o600 });
+      if (kind === "mode") await chmod(member, 0o640);
+      if (kind === "extra") {
+        await writeFile(path.join(directory, "extra.txt"), "x", { mode: 0o600 });
+      }
 
-    expect(await loader.load(selection)).toEqual(first);
-  });
+      await expectSkillError(loader.load(selection));
+    },
+  );
 
   it.each(["handle", "descriptor", "catalog", "unknown"] as const)(
     "rejects a forged, rebound, stale, or %s selection without reopening a caller path",
@@ -479,6 +489,32 @@ describe("immutable skill loading", () => {
     mutate = true;
 
     await expectSkillError(loaded.loader.load(loaded.selection));
+  });
+
+  it("starts a fresh held-chain sandwich before every post-hook pathname operation", async () => {
+    let packageDirectory = "";
+    let displacedDirectory = "";
+    let mutated = false;
+    const hooks: SkillLoaderTestHooks = {
+      afterPathOperation(operation, candidate) {
+        if (
+          mutated ||
+          operation !== "lstat" ||
+          candidate !== path.join(packageDirectory, "SKILL.md")
+        ) {
+          return;
+        }
+        mutated = true;
+        renameSync(packageDirectory, displacedDirectory);
+        mkdirSync(packageDirectory, { mode: 0o700 });
+      },
+    };
+    const loaded = await fixture({ hooks });
+    packageDirectory = loaded.directory;
+    displacedDirectory = `${loaded.directory}.displaced`;
+
+    await expectSkillError(loaded.loader.load(loaded.selection));
+    expect(mutated).toBe(true);
   });
 
   it("lets two loader hosts converge on one byte-identical object", async () => {

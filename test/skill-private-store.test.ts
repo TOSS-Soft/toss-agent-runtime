@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { renameSync, writeFileSync } from "node:fs";
 import {
   chmod,
   lstat,
@@ -7,6 +8,7 @@ import {
   readFile,
   readdir,
   realpath,
+  rename,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -57,6 +59,31 @@ function rawHash(bytes: Uint8Array): `sha256:${string}` {
 
 function objectPath(statePath: string, hash: `sha256:${string}`): string {
   return path.join(statePath, "skills", "objects", `${hash}.json`);
+}
+
+function tombstoneName(
+  kind: "claim" | "stage" | "recovery-claim" | "recovery-stage",
+  ownerPid: number,
+  operationId: string,
+  artifact: "claim" | "stage",
+  bytes: Uint8Array,
+): string {
+  return `.delete-${kind}-${ownerPid}-${operationId}-${artifact}-${bytes.byteLength}-${rawHash(bytes).slice("sha256:".length)}.tombstone`;
+}
+
+function claimBytes(ownerPid: number, operationId: string, bytes: Uint8Array): Uint8Array {
+  return Buffer.from(
+    canonicalJson({
+      schema_version: "skill-store-operation.v1",
+      operation_id: operationId,
+      owner_pid: ownerPid,
+      created_at: "2026-08-30T12:00:00.000Z",
+      object_hash: HASH,
+      record_bytes: bytes.byteLength,
+      record_hash: rawHash(bytes),
+    }),
+    "utf8",
+  );
 }
 
 function expectSkillError(
@@ -143,7 +170,7 @@ describe.sequential("private skill object publication", () => {
       } as SkillPrivateStoreOperationHooks;
       const failing = createSkillPrivateStoreForTest(storeOptions(statePath, { operationHooks }));
 
-      await expectSkillError(failing.publishObject(HASH, bytes));
+      await expect(failing.publishObject(HASH, bytes)).rejects.toBeInstanceOf(RuntimeSkillError);
       const objectsPath = path.join(statePath, "skills", "objects");
       const names = await readdir(objectsPath);
       expect(names.filter((name) => name.startsWith(".object-"))).toEqual([]);
@@ -156,6 +183,105 @@ describe.sequential("private skill object publication", () => {
       );
     },
   );
+
+  it.each(
+    (["stage", "claim"] as const).flatMap((targetKind) =>
+      (
+        [
+          "beforeCleanupRename",
+          "afterCleanupRename",
+          "beforeCleanupParentSync",
+          "afterCleanupParentSync",
+          "beforeCleanupUnlink",
+          "afterCleanupUnlink",
+          "beforeCleanupFinalSync",
+          "afterCleanupFinalSync",
+        ] as const
+      ).map((hookName) => [targetKind, hookName] as const),
+    ),
+  )(
+    "recovers a %s cleanup interruption at %s without a tombstone or operation artifact",
+    async (targetKind, hookName) => {
+      const statePath = await privateTemporaryDirectory("toss-skill-store-");
+      const bytes = Buffer.from(`{"cleanup":"${hookName}"}`, "utf8");
+      let interrupted = false;
+      const operationHooks = {
+        [hookName]: (kind: string) => {
+          if (kind !== targetKind || interrupted) return Promise.resolve();
+          interrupted = true;
+          return Promise.reject(new Error("simulated cleanup crash boundary"));
+        },
+      } as unknown as SkillPrivateStoreOperationHooks;
+      const failing = createSkillPrivateStoreForTest(storeOptions(statePath, { operationHooks }));
+
+      await expect(failing.publishObject(HASH, bytes)).rejects.toBeInstanceOf(RuntimeSkillError);
+      expect(interrupted).toBe(true);
+
+      const recovering = createSkillPrivateStoreForTest(
+        storeOptions(statePath, {
+          isProcessAlive: () => "dead",
+          hasServiceListener: () => Promise.resolve("absent"),
+        }),
+      );
+      expect(await recovering.publishObject(HASH, bytes)).toEqual(bytes);
+      const names = await readdir(path.join(statePath, "skills", "objects"));
+      expect(names).toEqual([`${HASH}.json`]);
+    },
+  );
+
+  it("rebinds the final object after awaited claim cleanup and preserves a replacement", async () => {
+    const statePath = await privateTemporaryDirectory("toss-skill-store-");
+    const bytes = Buffer.from('{"record":"cleanup-replacement"}', "utf8");
+    const finalPath = objectPath(statePath, HASH);
+    const preservedPath = `${finalPath}.preserved`;
+    let replaced = false;
+    const operationHooks: SkillPrivateStoreOperationHooks = {
+      afterTombstoneRename(kind) {
+        if (kind !== "claim" || replaced) return;
+        replaced = true;
+        renameSync(finalPath, preservedPath);
+        writeFileSync(finalPath, bytes, { mode: 0o600 });
+      },
+    };
+    const store = createSkillPrivateStoreForTest(storeOptions(statePath, { operationHooks }));
+
+    await expect(store.publishObject(HASH, bytes)).rejects.toBeInstanceOf(RuntimeSkillError);
+    expect(replaced).toBe(true);
+    expect(await readFile(finalPath)).toEqual(bytes);
+    expect(await readFile(preservedPath)).toEqual(bytes);
+    expect((await lstat(finalPath)).ino).not.toBe((await lstat(preservedPath)).ino);
+  });
+
+  it("rebinds a collision object after awaited claim cleanup and preserves a replacement", async () => {
+    const statePath = await privateTemporaryDirectory("toss-skill-store-");
+    const bytes = Buffer.from('{"record":"collision-cleanup-replacement"}', "utf8");
+    const finalPath = objectPath(statePath, HASH);
+    const preservedPath = `${finalPath}.collision-preserved`;
+    let replaced = false;
+    const operationHooks: SkillPrivateStoreOperationHooks = {
+      afterTombstoneRename(kind) {
+        if (kind !== "claim" || replaced) return;
+        replaced = true;
+        renameSync(finalPath, preservedPath);
+        writeFileSync(finalPath, bytes, { mode: 0o600 });
+      },
+    };
+    const store = createSkillPrivateStoreForTest(
+      storeOptions(statePath, {
+        operationHooks,
+        linkFile(_stagePath, destination) {
+          writeFileSync(destination, bytes, { mode: 0o600, flag: "wx" });
+          throw Object.assign(new Error("simulated cross-host collision"), { code: "EEXIST" });
+        },
+      }),
+    );
+
+    await expect(store.publishObject(HASH, bytes)).rejects.toBeInstanceOf(RuntimeSkillError);
+    expect(replaced).toBe(true);
+    expect(await readFile(finalPath)).toEqual(bytes);
+    expect(await readFile(preservedPath)).toEqual(bytes);
+    expect((await lstat(finalPath)).ino).not.toBe((await lstat(preservedPath)).ino);
+  });
 
   it("revalidates the exact object namespace after every asynchronous publication hook", async () => {
     const statePath = await privateTemporaryDirectory("toss-skill-store-");
@@ -319,4 +445,84 @@ describe.sequential("private skill object publication", () => {
       await expect(lstat(candidate)).resolves.toBeDefined();
     },
   );
+
+  it("preserves a malformed cleanup tombstone and fails closed", async () => {
+    const statePath = await privateTemporaryDirectory("toss-skill-store-");
+    const store = createSkillPrivateStoreForTest(storeOptions(statePath));
+    await store.ensureRoots();
+    const candidate = path.join(statePath, "skills", "objects", ".delete-malformed.tombstone");
+    await writeFile(candidate, "replacement", { mode: 0o600 });
+
+    await expectSkillError(store.publishObject(HASH, Buffer.from("{}", "utf8")));
+    expect(await readFile(candidate, "utf8")).toBe("replacement");
+  });
+
+  it("preserves a content-rebound cleanup tombstone and fails closed", async () => {
+    const statePath = await privateTemporaryDirectory("toss-skill-store-");
+    const objectsPath = path.join(statePath, "skills", "objects");
+    const store = createSkillPrivateStoreForTest(
+      storeOptions(statePath, {
+        isProcessAlive: () => "dead",
+        hasServiceListener: () => Promise.resolve("absent"),
+      }),
+    );
+    await store.ensureRoots();
+    const expected = Buffer.from("original", "utf8");
+    const replacement = Buffer.from("replaced", "utf8");
+    const ownerPid = 998877;
+    const operationId = "77000000-0000-4000-8000-000000000001";
+    const candidate = path.join(
+      objectsPath,
+      tombstoneName("stage", ownerPid, operationId, "stage", expected),
+    );
+    await writeFile(
+      path.join(objectsPath, `.object-${ownerPid}-${operationId}.claim`),
+      claimBytes(ownerPid, operationId, expected),
+      { mode: 0o600 },
+    );
+    await writeFile(candidate, replacement, { mode: 0o600 });
+
+    await expectSkillError(store.publishObject(HASH, Buffer.from("{}", "utf8")));
+    expect(await readFile(candidate)).toEqual(replacement);
+  });
+
+  it("preserves a replacement made during exact tombstone recovery", async () => {
+    const statePath = await privateTemporaryDirectory("toss-skill-store-");
+    const objectsPath = path.join(statePath, "skills", "objects");
+    const bytes = Buffer.from("recoverable-stage", "utf8");
+    const ownerPid = 998878;
+    const operationId = "77000000-0000-4000-8000-000000000002";
+    const candidate = path.join(
+      objectsPath,
+      tombstoneName("stage", ownerPid, operationId, "stage", bytes),
+    );
+    const preserved = `${candidate}.preserved`;
+    let invoked = false;
+    const operationHooks = {
+      async beforeTombstoneRecovery(tombstonePath: string) {
+        invoked = true;
+        await rename(tombstonePath, preserved);
+        await writeFile(tombstonePath, bytes, { mode: 0o600 });
+      },
+    } as unknown as SkillPrivateStoreOperationHooks;
+    const store = createSkillPrivateStoreForTest(
+      storeOptions(statePath, {
+        operationHooks,
+        isProcessAlive: () => "dead",
+        hasServiceListener: () => Promise.resolve("absent"),
+      }),
+    );
+    await store.ensureRoots();
+    await writeFile(
+      path.join(objectsPath, `.object-${ownerPid}-${operationId}.claim`),
+      claimBytes(ownerPid, operationId, bytes),
+      { mode: 0o600 },
+    );
+    await writeFile(candidate, bytes, { mode: 0o600 });
+
+    await expectSkillError(store.publishObject(HASH, Buffer.from("{}", "utf8")));
+    expect(invoked).toBe(true);
+    expect(await readFile(candidate)).toEqual(bytes);
+    expect(await readFile(preserved)).toEqual(bytes);
+  });
 });

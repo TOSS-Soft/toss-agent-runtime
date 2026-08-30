@@ -48,6 +48,10 @@ export interface SkillLoaderTestHooks {
   readonly afterBoundary?: (boundary: SkillLoaderBoundary) => void | Promise<void>;
   readonly onFileRead?: (absolutePath: string) => void;
   readonly onProcess?: (command: string) => void;
+  readonly afterPathOperation?: (
+    operation: "lstat" | "open" | "enumerate",
+    absolutePath: string,
+  ) => void;
 }
 
 export interface CreateSkillLoaderOptions extends CreateSkillPrivateStoreOptions {
@@ -204,27 +208,77 @@ function assertSourceFile(
   }
 }
 
-function revalidateRetainedChain(
+function validateHeldOperationChain(
   retained: readonly InternalSkillDirectorySnapshot[],
   held: readonly HeldDirectory[],
   source: InternalSkillPackageSource,
 ): void {
-  if (retained.length !== held.length || held.length === 0) integrity();
+  if (held.length < retained.length || retained.length === 0) integrity();
   for (let index = 0; index < held.length; index += 1) {
-    const expected = retained[index]!;
     const opened = held[index]!;
-    const named = namedIdentity(opened.absolutePath);
     const descriptor = descriptorIdentity(opened.descriptor);
-    assertSourceDirectory(named, opened.absolutePath, source);
     assertSourceDirectory(descriptor, opened.absolutePath, source);
-    if (
-      !sameDirectoryIdentity(expected.identity, opened.identity) ||
-      !sameDirectoryIdentity(expected.identity, named) ||
-      !sameDirectoryIdentity(expected.identity, descriptor)
-    ) {
+    const expected = index < retained.length ? retained[index]!.identity : opened.identity;
+    const same = index < retained.length ? sameDirectoryIdentity : sameIdentity;
+    if (!same(expected, opened.identity) || !same(expected, descriptor)) {
       integrity();
     }
   }
+}
+
+function descriptorSandwich<T>(
+  source: InternalSkillPackageSource,
+  retained: readonly InternalSkillDirectorySnapshot[],
+  held: readonly HeldDirectory[],
+  operation: () => T,
+): T {
+  if (held.length === 0) {
+    const result = operation();
+    return result;
+  }
+  validateHeldOperationChain(retained, held, source);
+  const result = operation();
+  validateHeldOperationChain(retained, held, source);
+  return result;
+}
+
+function validateNamedOperationChain(
+  retained: readonly InternalSkillDirectorySnapshot[],
+  held: readonly HeldDirectory[],
+  source: InternalSkillPackageSource,
+): void {
+  validateHeldOperationChain(retained, held, source);
+  for (let index = 0; index < held.length; index += 1) {
+    const opened = held[index]!;
+    const named = descriptorSandwich(source, retained, held, () =>
+      namedIdentity(opened.absolutePath),
+    );
+    assertSourceDirectory(named, opened.absolutePath, source);
+    const expected = index < retained.length ? retained[index]!.identity : opened.identity;
+    const same = index < retained.length ? sameDirectoryIdentity : sameIdentity;
+    if (!same(expected, opened.identity) || !same(expected, named)) integrity();
+  }
+  validateHeldOperationChain(retained, held, source);
+}
+
+/*
+ * Node does not expose openat(2)/fdopendir(3). Each named-chain lstat is first
+ * enclosed by its own descriptor validation sandwich, then the one requested
+ * pathname operation is enclosed by complete named-chain validation. No await
+ * or caller hook occurs inside. The irreducible same-UID interval between the
+ * final validation and one syscall is accepted; no native addon is used.
+ */
+function onePathOperation<T>(
+  source: InternalSkillPackageSource,
+  retained: readonly InternalSkillDirectorySnapshot[],
+  held: readonly HeldDirectory[],
+  operation: () => T,
+): T {
+  if (held.length === 0) return operation();
+  validateNamedOperationChain(retained, held, source);
+  const result = descriptorSandwich(source, retained, held, operation);
+  validateNamedOperationChain(retained, held, source);
+  return result;
 }
 
 function revalidateOperationChain(
@@ -232,35 +286,25 @@ function revalidateOperationChain(
   held: readonly HeldDirectory[],
   source: InternalSkillPackageSource,
 ): void {
-  if (held.length < retained.length) integrity();
-  revalidateRetainedChain(retained, held.slice(0, retained.length), source);
-  for (const directory of held.slice(retained.length)) {
-    const named = namedIdentity(directory.absolutePath);
-    const descriptor = descriptorIdentity(directory.descriptor);
-    assertSourceDirectory(named, directory.absolutePath, source);
-    assertSourceDirectory(descriptor, directory.absolutePath, source);
-    if (!sameIdentity(directory.identity, named) || !sameIdentity(directory.identity, descriptor)) {
-      integrity();
-    }
-  }
+  validateNamedOperationChain(retained, held, source);
 }
 
-/*
- * Node does not expose openat(2)/fdopendir(3). Every pathname operation is
- * therefore enclosed by synchronous validation of the retained bigint chain.
- * The irreducible same-UID validate -> one syscall -> validate interval is the
- * accepted Node platform limit; no native addon is used.
- */
+function revalidateRetainedChain(
+  retained: readonly InternalSkillDirectorySnapshot[],
+  held: readonly HeldDirectory[],
+  source: InternalSkillPackageSource,
+): void {
+  if (retained.length !== held.length) integrity();
+  revalidateOperationChain(retained, held, source);
+}
+
 function syncSandwich<T>(
   source: InternalSkillPackageSource,
   retained: readonly InternalSkillDirectorySnapshot[],
   held: readonly HeldDirectory[],
   operation: () => T,
 ): T {
-  revalidateOperationChain(retained, held, source);
-  const result = operation();
-  revalidateOperationChain(retained, held, source);
-  return result;
+  return onePathOperation(source, retained, held, operation);
 }
 
 function openSourceChain(source: InternalSkillPackageSource): HeldDirectory[] {
@@ -269,27 +313,29 @@ function openSourceChain(source: InternalSkillPackageSource): HeldDirectory[] {
     for (let index = 0; index < source.packageChain.length; index += 1) {
       const retained = source.packageChain[index]!;
       const parentRetained = source.packageChain.slice(0, index);
-      const before =
-        opened.length === 0
-          ? namedIdentity(retained.absolutePath)
-          : syncSandwich(source, parentRetained, opened, () =>
-              namedIdentity(retained.absolutePath),
-            );
+      const before = onePathOperation(source, parentRetained, opened, () =>
+        namedIdentity(retained.absolutePath),
+      );
       assertSourceDirectory(before, retained.absolutePath, source);
-      const descriptor =
-        opened.length === 0
-          ? openSync(
-              retained.absolutePath,
-              constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-            )
-          : syncSandwich(source, parentRetained, opened, () =>
-              openSync(
-                retained.absolutePath,
-                constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-              ),
-            );
+      const descriptor = onePathOperation(source, parentRetained, opened, () =>
+        openSync(
+          retained.absolutePath,
+          constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+        ),
+      );
       const heldIdentity = descriptorIdentity(descriptor);
-      const after = namedIdentity(retained.absolutePath);
+      const tentative: HeldDirectory = {
+        descriptor,
+        absolutePath: retained.absolutePath,
+        identity: heldIdentity,
+        configured: source.sourceKind === "configured",
+      };
+      const after = onePathOperation(
+        source,
+        source.packageChain.slice(0, index + 1),
+        [...opened, tentative],
+        () => namedIdentity(retained.absolutePath),
+      );
       assertSourceDirectory(heldIdentity, retained.absolutePath, source);
       if (
         !sameDirectoryIdentity(retained.identity, before) ||
@@ -299,12 +345,7 @@ function openSourceChain(source: InternalSkillPackageSource): HeldDirectory[] {
         closeSync(descriptor);
         integrity();
       }
-      opened.push({
-        descriptor,
-        absolutePath: retained.absolutePath,
-        identity: heldIdentity,
-        configured: source.sourceKind === "configured",
-      });
+      opened.push(tentative);
     }
     return opened;
   } catch (error) {
@@ -434,18 +475,21 @@ function openDeclaredTree(
       openSync(childPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW),
     );
     const held = descriptorIdentity(descriptor);
-    const after = syncSandwich(source, retainedChain, chain, () => namedIdentity(childPath));
-    assertSourceDirectory(held, childPath, source);
-    if (!sameIdentity(before, held) || !sameIdentity(before, after)) {
-      closeSync(descriptor);
-      integrity();
-    }
-    const opened: HeldDirectory = {
+    const tentative: HeldDirectory = {
       descriptor,
       absolutePath: childPath,
       identity: held,
       configured: source.sourceKind === "configured",
     };
+    const after = syncSandwich(source, retainedChain, [...chain, tentative], () =>
+      namedIdentity(childPath),
+    );
+    assertSourceDirectory(held, childPath, source);
+    if (!sameIdentity(before, held) || !sameIdentity(before, after)) {
+      closeSync(descriptor);
+      integrity();
+    }
+    const opened = tentative;
     directories.push(opened);
     openDeclaredTree(
       source,
@@ -515,12 +559,16 @@ function revalidateLoadedSource(
   directories: readonly HeldDirectory[],
   manifest: HeldManifest,
   members: readonly HeldMember[],
+  hooks: SkillLoaderTestHooks,
 ): void {
-  revalidateRetainedChain(retainedChain, sourceChain, source);
   const allDirectories = [...sourceChain, ...directories];
+  revalidateOperationChain(retainedChain, allDirectories, source);
   for (let index = 0; index < allDirectories.length; index += 1) {
     const directory = allDirectories[index]!;
-    const named = namedIdentity(directory.absolutePath);
+    const named = syncSandwich(source, retainedChain, allDirectories, () =>
+      namedIdentity(directory.absolutePath),
+    );
+    hooks.afterPathOperation?.("lstat", directory.absolutePath);
     const held = descriptorIdentity(directory.descriptor);
     assertSourceDirectory(named, directory.absolutePath, source);
     assertSourceDirectory(held, directory.absolutePath, source);
@@ -529,11 +577,17 @@ function revalidateLoadedSource(
       integrity();
     }
     if (directory.expectedEntries !== undefined) {
-      const actual = directoryNames(directory.absolutePath);
+      const actual = syncSandwich(source, retainedChain, allDirectories, () =>
+        directoryNames(directory.absolutePath),
+      );
+      hooks.afterPathOperation?.("enumerate", directory.absolutePath);
       if (!sameNames(directory.expectedEntries, actual)) integrity();
     }
   }
-  const manifestNamed = namedIdentity(manifest.absolutePath);
+  const manifestNamed = syncSandwich(source, retainedChain, allDirectories, () =>
+    namedIdentity(manifest.absolutePath),
+  );
+  hooks.afterPathOperation?.("lstat", manifest.absolutePath);
   const manifestHeld = descriptorIdentity(manifest.descriptor);
   if (
     !sameIdentity(manifest.identity, manifestNamed) ||
@@ -546,7 +600,10 @@ function revalidateLoadedSource(
     if (!Buffer.from(bytes).equals(Buffer.from(manifest.bytes))) integrity();
   }
   for (const member of members) {
-    const named = namedIdentity(member.absolutePath);
+    const named = syncSandwich(source, retainedChain, allDirectories, () =>
+      namedIdentity(member.absolutePath),
+    );
+    hooks.afterPathOperation?.("lstat", member.absolutePath);
     const held = descriptorIdentity(member.descriptor);
     assertSourceFile(named, source, member.declaration.bytes);
     assertSourceFile(held, source, member.declaration.bytes);
@@ -556,6 +613,7 @@ function revalidateLoadedSource(
       if (!Buffer.from(bytes).equals(Buffer.from(member.bytes))) integrity();
     }
   }
+  revalidateOperationChain(retainedChain, allDirectories, source);
 }
 
 function decodeCanonicalBase64(value: string): Uint8Array {
@@ -721,6 +779,7 @@ async function loadSource(
       nestedDirectories,
       manifest,
       members,
+      hooks,
     );
   };
   const boundary = async (name: SkillLoaderBoundary): Promise<void> => {
@@ -800,15 +859,16 @@ function createLoader(
   return {
     async load(selection: SkillSelection): Promise<SkillSnapshotV1> {
       const source = resolveSkillSelectionForLoader(options.catalog, selection);
+      const record = await loadSource(source, selection, hooks);
+      const canonical = Buffer.from(canonicalJson(record as unknown as JsonValue), "utf8");
+      if (canonical.byteLength > SKILL_LIMITS.storedObjectBytes) limitExceeded();
       const replay = await store.readObject(selection.descriptor.package_hash);
       if (replay !== null) {
+        if (!Buffer.from(replay).equals(canonical)) integrity();
         return deepFreezeJson(
           parsePrivateRecord(replay, selection).snapshot as unknown as JsonValue,
         ) as unknown as SkillSnapshotV1;
       }
-      const record = await loadSource(source, selection, hooks);
-      const canonical = Buffer.from(canonicalJson(record as unknown as JsonValue), "utf8");
-      if (canonical.byteLength > SKILL_LIMITS.storedObjectBytes) limitExceeded();
       const published = await store.publishObject(selection.descriptor.package_hash, canonical);
       return deepFreezeJson(
         parsePrivateRecord(published, selection).snapshot as unknown as JsonValue,

@@ -27,6 +27,8 @@ const HASH_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const OBJECT_PATTERN = /^(sha256:[0-9a-f]{64})\.json$/u;
 const OPERATION_PATTERN = /^\.object-([1-9][0-9]*)-([0-9a-f-]{36})\.(claim|stage)$/u;
+const TOMBSTONE_PATTERN =
+  /^\.delete-(claim|stage|recovery-claim|recovery-stage)-([1-9][0-9]*)-([0-9a-f-]{36})-(claim|stage)-(0|[1-9][0-9]*)-([0-9a-f]{64})\.tombstone$/u;
 const MAX_OPERATION_BYTES = 2048;
 const MAX_OBJECT_ENTRIES = SKILL_LIMITS.roots * SKILL_LIMITS.packagesPerRoot * 3;
 const LISTENER_PROBE_TIMEOUT_MS = 250;
@@ -66,6 +68,20 @@ interface OpenedFile {
   readonly links: 1 | 2;
 }
 
+interface TombstoneBinding {
+  readonly kind: CleanupKind;
+  readonly ownerPid: number;
+  readonly operationId: string;
+  readonly artifact: "claim" | "stage";
+  readonly bytes: number;
+  readonly hash: `sha256:${string}`;
+}
+
+interface ExactObject {
+  readonly bytes: Uint8Array;
+  readonly identity: FileIdentity;
+}
+
 interface HeldDescriptor {
   readonly fd: number;
 }
@@ -86,6 +102,19 @@ export interface SkillPrivateStoreOperationHooks {
   readonly beforeRecovery?: (claimPath: string) => Promise<void>;
   readonly beforeCleanupSync?: (kind: CleanupKind, directoryPath: string) => Promise<void>;
   readonly afterCleanupSync?: (kind: CleanupKind, directoryPath: string) => Promise<void>;
+  readonly beforeCleanupRename?: (kind: CleanupKind, candidate: string) => Promise<void>;
+  readonly afterCleanupRename?: (
+    kind: CleanupKind,
+    candidate: string,
+    tombstone: string,
+  ) => Promise<void>;
+  readonly beforeCleanupParentSync?: (kind: CleanupKind, directoryPath: string) => Promise<void>;
+  readonly afterCleanupParentSync?: (kind: CleanupKind, directoryPath: string) => Promise<void>;
+  readonly beforeCleanupUnlink?: (kind: CleanupKind, tombstone: string) => Promise<void>;
+  readonly afterCleanupUnlink?: (kind: CleanupKind, tombstone: string) => Promise<void>;
+  readonly beforeCleanupFinalSync?: (kind: CleanupKind, directoryPath: string) => Promise<void>;
+  readonly afterCleanupFinalSync?: (kind: CleanupKind, directoryPath: string) => Promise<void>;
+  readonly beforeTombstoneRecovery?: (tombstonePath: string) => Promise<void>;
   readonly afterFinalSourceIdentityValidation?: (kind: CleanupKind, candidate: string) => void;
   readonly afterTombstoneRename?: (kind: CleanupKind, candidate: string, tombstone: string) => void;
 }
@@ -101,6 +130,7 @@ export interface CreateSkillPrivateStoreForTestOptions extends CreateSkillPrivat
   readonly isProcessAlive?: ((pid: number) => SkillPrivateStoreProcessLiveness) | undefined;
   readonly isCurrentUser?: CurrentUserCheck | undefined;
   readonly operationHooks?: SkillPrivateStoreOperationHooks | undefined;
+  readonly linkFile?: ((source: string, destination: string) => void) | undefined;
 }
 
 export interface SkillPrivateStore {
@@ -464,6 +494,70 @@ function objectPath(objectsPath: string, hash: `sha256:${string}`): string {
   return path.join(objectsPath, `${hash}.json`);
 }
 
+function parseTombstoneName(name: string): TombstoneBinding | null {
+  const match = TOMBSTONE_PATTERN.exec(name);
+  if (
+    match?.[1] === undefined ||
+    match[2] === undefined ||
+    match[3] === undefined ||
+    match[4] === undefined ||
+    match[5] === undefined ||
+    match[6] === undefined
+  ) {
+    return null;
+  }
+  const kind = match[1] as CleanupKind;
+  const ownerPid = Number(match[2]);
+  const operationId = match[3];
+  const artifact = match[4] as "claim" | "stage";
+  const bytes = Number(match[5]);
+  const expectedArtifact = kind.endsWith("claim") ? "claim" : "stage";
+  const maximum = artifact === "claim" ? MAX_OPERATION_BYTES : SKILL_LIMITS.storedObjectBytes;
+  if (
+    !Number.isSafeInteger(ownerPid) ||
+    ownerPid <= 0 ||
+    !UUID_PATTERN.test(operationId) ||
+    artifact !== expectedArtifact ||
+    !Number.isSafeInteger(bytes) ||
+    bytes < (artifact === "claim" ? 1 : 0) ||
+    bytes > maximum
+  ) {
+    integrity();
+  }
+  return {
+    kind,
+    ownerPid,
+    operationId,
+    artifact,
+    bytes,
+    hash: `sha256:${match[6]}`,
+  };
+}
+
+function tombstonePath(
+  candidate: string,
+  kind: CleanupKind,
+  operationId: string,
+  expectedBytes: Uint8Array,
+): string {
+  const operation = OPERATION_PATTERN.exec(path.basename(candidate));
+  if (
+    operation?.[1] === undefined ||
+    operation[2] === undefined ||
+    operation[3] === undefined ||
+    operation[2] !== operationId ||
+    !UUID_PATTERN.test(operationId)
+  ) {
+    integrity();
+  }
+  const artifact = operation[3] as "claim" | "stage";
+  if ((kind.endsWith("claim") ? "claim" : "stage") !== artifact) integrity();
+  return path.join(
+    path.dirname(candidate),
+    `.delete-${kind}-${operation[1]}-${operationId}-${artifact}-${expectedBytes.byteLength}-${rawHash(expectedBytes).slice("sha256:".length)}.tombstone`,
+  );
+}
+
 function requireMissing(candidate: string): void {
   try {
     lstatSync(candidate, { bigint: true });
@@ -476,7 +570,9 @@ function requireMissing(candidate: string): void {
 
 async function cleanupOwnedEntry(
   candidate: string,
+  expectedHandle: HeldDescriptor,
   expectedIdentity: FileIdentity,
+  expectedBytes: Uint8Array,
   isCurrentUser: CurrentUserCheck,
   links: 1 | 2,
   kind: CleanupKind,
@@ -484,21 +580,53 @@ async function cleanupOwnedEntry(
   operationId: string,
   hooks: SkillPrivateStoreOperationHooks | undefined,
 ): Promise<void> {
-  const tombstone = path.join(path.dirname(candidate), `.delete-${kind}-${operationId}.tombstone`);
+  const objectsPath = path.dirname(candidate);
+  const tombstone = tombstonePath(candidate, kind, operationId, expectedBytes);
+  const exactHook = async (hook: () => void | Promise<void>): Promise<void> => {
+    await invokeExactNamespaceHook(directories, isCurrentUser, objectsPath, hook);
+  };
   try {
+    if (hooks?.beforeCleanupRename !== undefined) {
+      await exactHook(() => hooks.beforeCleanupRename!(kind, candidate));
+    }
     revalidateDirectoryChain(directories, isCurrentUser);
     requireMissing(tombstone);
-    const source = lstatSync(candidate, { bigint: true });
-    assertPrivateFile(source, candidate, isCurrentUser, links, expectedIdentity);
+    exactFile(candidate, expectedHandle, expectedIdentity, expectedBytes, isCurrentUser, links);
     hooks?.afterFinalSourceIdentityValidation?.(kind, candidate);
 
     // Node has no unlinkat/openat identity primitive. This accepted same-UID
-    // interval is kept synchronous: validate, rename once, revalidate, unlink.
+    // interval is kept synchronous: validate, rename once, revalidate.
     renameSync(candidate, tombstone);
     hooks?.afterTombstoneRename?.(kind, candidate, tombstone);
-    const moved = lstatSync(tombstone, { bigint: true });
-    assertPrivateFile(moved, tombstone, isCurrentUser, links, expectedIdentity);
+    exactFile(tombstone, expectedHandle, expectedIdentity, expectedBytes, isCurrentUser, links);
     requireMissing(candidate);
+    revalidateDirectoryChain(directories, isCurrentUser);
+  } catch (error) {
+    if (error instanceof RuntimeSkillError) throw error;
+    pathUnsafe();
+  }
+
+  if (hooks?.afterCleanupRename !== undefined) {
+    await exactHook(() => hooks.afterCleanupRename!(kind, candidate, tombstone));
+  }
+  await syncDirectory(
+    directories,
+    isCurrentUser,
+    hooks?.beforeCleanupParentSync === undefined
+      ? undefined
+      : (directoryPath) => exactHook(() => hooks.beforeCleanupParentSync!(kind, directoryPath)),
+    hooks?.afterCleanupParentSync === undefined
+      ? undefined
+      : (directoryPath) => exactHook(() => hooks.afterCleanupParentSync!(kind, directoryPath)),
+  );
+
+  exactFile(tombstone, expectedHandle, expectedIdentity, expectedBytes, isCurrentUser, links);
+  if (hooks?.beforeCleanupUnlink !== undefined) {
+    await exactHook(() => hooks.beforeCleanupUnlink!(kind, tombstone));
+  }
+  try {
+    revalidateDirectoryChain(directories, isCurrentUser);
+    exactFile(tombstone, expectedHandle, expectedIdentity, expectedBytes, isCurrentUser, links);
     unlinkSync(tombstone);
     requireMissing(tombstone);
     revalidateDirectoryChain(directories, isCurrentUser);
@@ -506,21 +634,32 @@ async function cleanupOwnedEntry(
     if (error instanceof RuntimeSkillError) throw error;
     pathUnsafe();
   }
+  if (hooks?.afterCleanupUnlink !== undefined) {
+    await exactHook(() => hooks.afterCleanupUnlink!(kind, tombstone));
+  }
   await syncDirectory(
     directories,
     isCurrentUser,
-    hooks?.beforeCleanupSync === undefined
+    hooks?.beforeCleanupFinalSync === undefined && hooks?.beforeCleanupSync === undefined
       ? undefined
-      : (directoryPath) =>
-          invokeExactNamespaceHook(directories, isCurrentUser, path.dirname(candidate), () =>
-            hooks.beforeCleanupSync!(kind, directoryPath),
-          ),
-    hooks?.afterCleanupSync === undefined
+      : async (directoryPath) => {
+          if (hooks?.beforeCleanupFinalSync !== undefined) {
+            await exactHook(() => hooks.beforeCleanupFinalSync!(kind, directoryPath));
+          }
+          if (hooks?.beforeCleanupSync !== undefined) {
+            await exactHook(() => hooks.beforeCleanupSync!(kind, directoryPath));
+          }
+        },
+    hooks?.afterCleanupFinalSync === undefined && hooks?.afterCleanupSync === undefined
       ? undefined
-      : (directoryPath) =>
-          invokeExactNamespaceHook(directories, isCurrentUser, path.dirname(candidate), () =>
-            hooks.afterCleanupSync!(kind, directoryPath),
-          ),
+      : async (directoryPath) => {
+          if (hooks?.afterCleanupSync !== undefined) {
+            await exactHook(() => hooks.afterCleanupSync!(kind, directoryPath));
+          }
+          if (hooks?.afterCleanupFinalSync !== undefined) {
+            await exactHook(() => hooks.afterCleanupFinalSync!(kind, directoryPath));
+          }
+        },
   );
 }
 
@@ -695,13 +834,19 @@ function namespaceSnapshot(
     const metadata = lstatSync(candidate, { bigint: true });
     const operation = OPERATION_PATTERN.exec(name);
     const final = OBJECT_PATTERN.exec(name);
-    if (operation === null && final === null) integrity();
+    const tombstone = parseTombstoneName(name);
+    if (operation === null && final === null && tombstone === null) integrity();
     const links: 1 | 2 = metadata.nlink === 2n ? 2 : 1;
-    if (operation?.[3] === "claim" && links !== 1) integrity();
+    if ((operation?.[3] === "claim" || tombstone?.artifact === "claim") && links !== 1) {
+      integrity();
+    }
     assertPrivateFile(metadata, candidate, isCurrentUser, links);
     const maximum =
-      operation?.[3] === "claim" ? MAX_OPERATION_BYTES : SKILL_LIMITS.storedObjectBytes;
+      operation?.[3] === "claim" || tombstone?.artifact === "claim"
+        ? MAX_OPERATION_BYTES
+        : SKILL_LIMITS.storedObjectBytes;
     if (metadata.size > BigInt(maximum)) limitExceeded();
+    if (tombstone !== null && metadata.size !== BigInt(tombstone.bytes)) integrity();
     if (final !== null && metadata.size < 1n) integrity();
     return {
       name,
@@ -748,11 +893,21 @@ async function invokeExactNamespaceHook<T>(
 ): Promise<T> {
   revalidateDirectoryChain(directories, isCurrentUser);
   const before = namespaceSnapshot(objectsPath, isCurrentUser);
-  const result = await hook();
+  let result: T | undefined;
+  let hookError: unknown;
+  try {
+    result = await hook();
+  } catch (error) {
+    hookError = error;
+  }
   revalidateDirectoryChain(directories, isCurrentUser);
   const after = namespaceSnapshot(objectsPath, isCurrentUser);
   if (!sameNamespace(before, after)) integrity();
-  return result;
+  if (hookError !== undefined) {
+    if (hookError instanceof Error) throw hookError;
+    integrity();
+  }
+  return result as T;
 }
 
 export function createSkillPrivateStoreForTest(
@@ -764,6 +919,7 @@ export function createSkillPrivateStoreForTest(
   const isCurrentUser = options.isCurrentUser ?? defaultCurrentUser;
   const isProcessAlive = options.isProcessAlive ?? defaultProcessLiveness;
   const hooks = options.operationHooks;
+  const linkFile = options.linkFile ?? linkSync;
 
   const ensureRoots = async (): Promise<void> => {
     validateAbsolutePath(statePath);
@@ -775,7 +931,9 @@ export function createSkillPrivateStoreForTest(
   const readExactObject = async (
     hash: `sha256:${string}`,
     directories: readonly OpenedDirectory[],
-  ): Promise<Uint8Array | null> => {
+    expectedIdentity?: FileIdentity,
+    requireCleanNamespace = false,
+  ): Promise<ExactObject | null> => {
     const candidate = objectPath(objectsPath, hash);
     let handle: HeldDescriptor | undefined;
     try {
@@ -786,13 +944,19 @@ export function createSkillPrivateStoreForTest(
         if (isMissing(error)) return null;
         pathUnsafe();
       }
-      const expectedIdentity = assertPrivateFile(named, candidate, isCurrentUser, 1);
+      const openedIdentity = assertPrivateFile(
+        named,
+        candidate,
+        isCurrentUser,
+        1,
+        expectedIdentity,
+      );
       if (named.size < 1n || named.size > BigInt(SKILL_LIMITS.storedObjectBytes)) limitExceeded();
       handle = {
         fd: openSync(candidate, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW),
       };
       const held = fstatSync(handle.fd, { bigint: true });
-      assertPrivateFile(held, candidate, isCurrentUser, 1, expectedIdentity);
+      assertPrivateFile(held, candidate, isCurrentUser, 1, openedIdentity);
       if (hooks?.afterObjectOpen !== undefined) {
         await invokeExactNamespaceHook(directories, isCurrentUser, objectsPath, () =>
           hooks.afterObjectOpen!(candidate),
@@ -806,10 +970,16 @@ export function createSkillPrivateStoreForTest(
         );
       }
       fsyncSync(handle.fd);
-      exactFile(candidate, handle, expectedIdentity, bytes, isCurrentUser, 1);
+      exactFile(candidate, handle, openedIdentity, bytes, isCurrentUser, 1);
       await syncDirectory(directories, isCurrentUser);
-      exactFile(candidate, handle, expectedIdentity, bytes, isCurrentUser, 1);
-      return Buffer.from(bytes);
+      exactFile(candidate, handle, openedIdentity, bytes, isCurrentUser, 1);
+      if (requireCleanNamespace) {
+        const namespace = namespaceSnapshot(objectsPath, isCurrentUser);
+        if (namespace.some((entry) => OBJECT_PATTERN.exec(entry.name) === null)) integrity();
+        revalidateDirectoryChain(directories, isCurrentUser);
+        exactFile(candidate, handle, openedIdentity, bytes, isCurrentUser, 1);
+      }
+      return { bytes: Buffer.from(bytes), identity: openedIdentity };
     } catch (error) {
       if (error instanceof RuntimeSkillError) throw error;
       integrity();
@@ -823,14 +993,23 @@ export function createSkillPrivateStoreForTest(
     const names = scanObjectNames(objectsPath);
     const claims = new Map<string, string>();
     const stages = new Map<string, string>();
+    const tombstones = new Map<string, Readonly<{ name: string; binding: TombstoneBinding }>>();
     for (const name of names) {
       const final = OBJECT_PATTERN.exec(name);
       if (final !== null) {
         const metadata = lstatSync(path.join(objectsPath, name), { bigint: true });
-        assertPrivateFile(metadata, path.join(objectsPath, name), isCurrentUser, 1);
+        const links: 1 | 2 = metadata.nlink === 2n ? 2 : 1;
+        assertPrivateFile(metadata, path.join(objectsPath, name), isCurrentUser, links);
         if (metadata.size < 1n || metadata.size > BigInt(SKILL_LIMITS.storedObjectBytes)) {
           limitExceeded();
         }
+        continue;
+      }
+      const tombstone = parseTombstoneName(name);
+      if (tombstone !== null) {
+        const key = `${tombstone.ownerPid}:${tombstone.operationId}:${tombstone.artifact}`;
+        if (tombstones.has(key)) integrity();
+        tombstones.set(key, { name, binding: tombstone });
         continue;
       }
       const operation = OPERATION_PATTERN.exec(name);
@@ -847,7 +1026,102 @@ export function createSkillPrivateStoreForTest(
       if (destination.has(key)) integrity();
       destination.set(key, name);
     }
+    for (const { binding } of tombstones.values()) {
+      const operationKey = `${binding.ownerPid}:${binding.operationId}`;
+      if (
+        (binding.artifact === "stage" && (stages.has(operationKey) || !claims.has(operationKey))) ||
+        (binding.artifact === "claim" && (claims.has(operationKey) || stages.has(operationKey)))
+      ) {
+        integrity();
+      }
+    }
     for (const key of stages.keys()) if (!claims.has(key)) integrity();
+    for (const { name, binding } of tombstones.values()) {
+      const tombstonePath = path.join(objectsPath, name);
+      const operationKey = `${binding.ownerPid}:${binding.operationId}`;
+      const openedTombstone =
+        binding.artifact === "claim"
+          ? openExactFile(tombstonePath, MAX_OPERATION_BYTES, isCurrentUser)
+          : openRecoveryStage(tombstonePath, SKILL_LIMITS.storedObjectBytes, isCurrentUser);
+      const pairedClaimName = binding.artifact === "stage" ? claims.get(operationKey) : undefined;
+      const pairedClaim =
+        pairedClaimName === undefined
+          ? undefined
+          : openExactFile(
+              path.join(objectsPath, pairedClaimName),
+              MAX_OPERATION_BYTES,
+              isCurrentUser,
+            );
+      try {
+        if (
+          openedTombstone.bytes.byteLength !== binding.bytes ||
+          rawHash(openedTombstone.bytes) !== binding.hash
+        ) {
+          integrity();
+        }
+        if (binding.artifact === "claim") {
+          const claim = parseClaim(openedTombstone.bytes);
+          if (claim.owner_pid !== binding.ownerPid || claim.operation_id !== binding.operationId) {
+            integrity();
+          }
+        }
+        if (pairedClaim !== undefined) {
+          const claim = parseClaim(pairedClaim.bytes);
+          if (
+            claim.owner_pid !== binding.ownerPid ||
+            claim.operation_id !== binding.operationId ||
+            openedTombstone.bytes.byteLength > claim.record_bytes ||
+            (openedTombstone.bytes.byteLength === claim.record_bytes &&
+              rawHash(openedTombstone.bytes) !== claim.record_hash)
+          ) {
+            integrity();
+          }
+        }
+        if (safeLiveness(isProcessAlive, binding.ownerPid) !== "dead") integrity();
+        const listener = await invokeExactNamespaceHook(
+          directories,
+          isCurrentUser,
+          objectsPath,
+          () => safeListener(options.hasServiceListener),
+        );
+        if (listener !== "absent") integrity();
+        if (hooks?.beforeTombstoneRecovery !== undefined) {
+          await invokeExactNamespaceHook(directories, isCurrentUser, objectsPath, () =>
+            hooks.beforeTombstoneRecovery!(tombstonePath),
+          );
+        }
+        if (pairedClaim !== undefined && pairedClaimName !== undefined) {
+          exactFile(
+            path.join(objectsPath, pairedClaimName),
+            pairedClaim.handle,
+            pairedClaim.identity,
+            pairedClaim.bytes,
+            isCurrentUser,
+            1,
+          );
+        }
+        exactFile(
+          tombstonePath,
+          openedTombstone.handle,
+          openedTombstone.identity,
+          openedTombstone.bytes,
+          isCurrentUser,
+          openedTombstone.links,
+        );
+        revalidateDirectoryChain(directories, isCurrentUser);
+        unlinkSync(tombstonePath);
+        requireMissing(tombstonePath);
+        revalidateDirectoryChain(directories, isCurrentUser);
+        await syncDirectory(directories, isCurrentUser);
+        requireMissing(tombstonePath);
+      } catch (error) {
+        if (error instanceof RuntimeSkillError) throw error;
+        pathUnsafe();
+      } finally {
+        if (pairedClaim !== undefined) closeSync(pairedClaim.handle.fd);
+        closeSync(openedTombstone.handle.fd);
+      }
+    }
     for (const [key, claimName] of claims) {
       const [pidText, operationId] = key.split(":");
       const ownerPid = Number(pidText);
@@ -904,7 +1178,9 @@ export function createSkillPrivateStoreForTest(
         if (openedStage !== undefined) {
           await cleanupOwnedEntry(
             path.join(objectsPath, stages.get(key)!),
+            openedStage.handle,
             openedStage.identity,
+            openedStage.bytes,
             isCurrentUser,
             openedStage.links,
             "recovery-stage",
@@ -918,13 +1194,16 @@ export function createSkillPrivateStoreForTest(
         const final = await readExactObject(claim.object_hash, directories);
         if (
           final !== null &&
-          (final.byteLength !== claim.record_bytes || rawHash(final) !== claim.record_hash)
+          (final.bytes.byteLength !== claim.record_bytes ||
+            rawHash(final.bytes) !== claim.record_hash)
         ) {
           integrity();
         }
         await cleanupOwnedEntry(
           claimPath,
+          openedClaim.handle,
           openedClaim.identity,
+          openedClaim.bytes,
           isCurrentUser,
           1,
           "recovery-claim",
@@ -938,6 +1217,12 @@ export function createSkillPrivateStoreForTest(
       }
     }
     revalidateDirectoryChain(directories, isCurrentUser);
+    for (const name of scanObjectNames(objectsPath)) {
+      if (OBJECT_PATTERN.exec(name) === null) integrity();
+      const candidate = path.join(objectsPath, name);
+      const metadata = lstatSync(candidate, { bigint: true });
+      assertPrivateFile(metadata, candidate, isCurrentUser, 1);
+    }
   };
 
   const readObject = async (hash: `sha256:${string}`): Promise<Uint8Array | null> => {
@@ -948,7 +1233,7 @@ export function createSkillPrivateStoreForTest(
     const releaseOperation = await acquireDirectoryOperation(operationDirectory.identity);
     try {
       await recoverOperations(directories);
-      return await readExactObject(hash, directories);
+      return (await readExactObject(hash, directories, undefined, true))?.bytes ?? null;
     } finally {
       releaseOperation();
       closeDirectoryChain(directories);
@@ -970,8 +1255,10 @@ export function createSkillPrivateStoreForTest(
     const releaseOperation = await acquireDirectoryOperation(operationDirectory.identity);
     let claim: Readonly<{ fd: number }> | undefined;
     let claimIdentity: FileIdentity | undefined;
+    let claimBytes: Uint8Array | undefined;
     let stage: HeldDescriptor | undefined;
     let stageIdentity: FileIdentity | undefined;
+    let stageBytes: Uint8Array = Buffer.alloc(0);
     let stageLinks: 1 | 2 = 1;
     let operationId = "";
     let claimPath = "";
@@ -980,8 +1267,10 @@ export function createSkillPrivateStoreForTest(
       await recoverOperations(directories);
       const existing = await readExactObject(hash, directories);
       if (existing !== null) {
-        if (!Buffer.from(existing).equals(canonicalBytes)) integrity();
-        return existing;
+        if (!Buffer.from(existing.bytes).equals(canonicalBytes)) integrity();
+        const rebound = await readExactObject(hash, directories, existing.identity, true);
+        if (rebound === null || !Buffer.from(rebound.bytes).equals(canonicalBytes)) integrity();
+        return rebound.bytes;
       }
 
       operationId = options.randomId();
@@ -1000,7 +1289,7 @@ export function createSkillPrivateStoreForTest(
         record_bytes: canonicalBytes.byteLength,
         record_hash: rawHash(canonicalBytes),
       };
-      const claimBytes = Buffer.from(canonicalJson(claimDocument as unknown as JsonValue), "utf8");
+      claimBytes = Buffer.from(canonicalJson(claimDocument as unknown as JsonValue), "utf8");
       revalidateDirectoryChain(directories, isCurrentUser);
       const claimDescriptor = openSync(
         claimPath,
@@ -1051,6 +1340,7 @@ export function createSkillPrivateStoreForTest(
         );
       }
       writeAll(stage, canonicalBytes);
+      stageBytes = canonicalBytes;
       if (hooks?.afterStageWrite !== undefined) {
         await invokeExactNamespaceHook(directories, isCurrentUser, objectsPath, () =>
           hooks.afterStageWrite!(stagePath),
@@ -1076,13 +1366,15 @@ export function createSkillPrivateStoreForTest(
         );
       }
       try {
-        linkSync(stagePath, finalPath);
+        linkFile(stagePath, finalPath);
         stageLinks = 2;
       } catch (error) {
         if (!isExisting(error)) throw error;
         await cleanupOwnedEntry(
           stagePath,
+          stage,
           stageIdentity,
+          canonicalBytes,
           isCurrentUser,
           1,
           "stage",
@@ -1092,10 +1384,12 @@ export function createSkillPrivateStoreForTest(
         );
         stageIdentity = undefined;
         const collision = await readExactObject(hash, directories);
-        if (collision === null || !Buffer.from(collision).equals(canonicalBytes)) integrity();
+        if (collision === null || !Buffer.from(collision.bytes).equals(canonicalBytes)) integrity();
         await cleanupOwnedEntry(
           claimPath,
+          claim,
           claimIdentity,
+          claimBytes,
           isCurrentUser,
           1,
           "claim",
@@ -1104,7 +1398,9 @@ export function createSkillPrivateStoreForTest(
           hooks,
         );
         claimIdentity = undefined;
-        return collision;
+        const rebound = await readExactObject(hash, directories, collision.identity, true);
+        if (rebound === null || !Buffer.from(rebound.bytes).equals(canonicalBytes)) integrity();
+        return rebound.bytes;
       }
       exactFile(stagePath, stage, stageIdentity, canonicalBytes, isCurrentUser, 2);
       if (hooks?.afterLinkPublication !== undefined) {
@@ -1137,7 +1433,9 @@ export function createSkillPrivateStoreForTest(
       }
       await cleanupOwnedEntry(
         stagePath,
+        stage,
         stageIdentity,
+        canonicalBytes,
         isCurrentUser,
         2,
         "stage",
@@ -1155,7 +1453,9 @@ export function createSkillPrivateStoreForTest(
       exactFile(finalPath, stage, publishedIdentity, canonicalBytes, isCurrentUser, 1);
       await cleanupOwnedEntry(
         claimPath,
+        claim,
         claimIdentity,
+        claimBytes,
         isCurrentUser,
         1,
         "claim",
@@ -1164,13 +1464,23 @@ export function createSkillPrivateStoreForTest(
         hooks,
       );
       claimIdentity = undefined;
-      return Buffer.from(canonicalBytes);
+      const rebound = await readExactObject(hash, directories, publishedIdentity, true);
+      if (rebound === null || !Buffer.from(rebound.bytes).equals(canonicalBytes)) integrity();
+      return rebound.bytes;
     } catch (error) {
-      if (stageIdentity !== undefined && stagePath !== "" && operationId !== "") {
+      let stageCleanupComplete = stageIdentity === undefined;
+      if (
+        stage !== undefined &&
+        stageIdentity !== undefined &&
+        stagePath !== "" &&
+        operationId !== ""
+      ) {
         try {
           await cleanupOwnedEntry(
             stagePath,
+            stage,
             stageIdentity,
+            stageBytes,
             isCurrentUser,
             stageLinks,
             "stage",
@@ -1179,15 +1489,26 @@ export function createSkillPrivateStoreForTest(
             hooks,
           );
           stageIdentity = undefined;
+          stageCleanupComplete = true;
         } catch {
+          stageCleanupComplete = false;
           // Preserve the primary safe failure and any identity replacement.
         }
       }
-      if (claimIdentity !== undefined && claimPath !== "" && operationId !== "") {
+      if (
+        stageCleanupComplete &&
+        claim !== undefined &&
+        claimIdentity !== undefined &&
+        claimBytes !== undefined &&
+        claimPath !== "" &&
+        operationId !== ""
+      ) {
         try {
           await cleanupOwnedEntry(
             claimPath,
+            claim,
             claimIdentity,
+            claimBytes,
             isCurrentUser,
             1,
             "claim",
