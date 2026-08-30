@@ -753,6 +753,7 @@ describe.sequential("private skill object publication", () => {
     await writeFile(claimPath, claim, { mode: 0o600 });
     await writeFile(firstFinal, aliasedBytes, { mode: 0o600 });
     await link(firstFinal, secondFinal);
+    const claimBefore = await lstat(claimPath, { bigint: true });
     const firstBefore = await lstat(firstFinal);
     const secondBefore = await lstat(secondFinal);
 
@@ -766,8 +767,14 @@ describe.sequential("private skill object publication", () => {
     expect(await readFile(claimPath)).toEqual(claim);
     expect(await readFile(firstFinal)).toEqual(aliasedBytes);
     expect(await readFile(secondFinal)).toEqual(aliasedBytes);
+    const claimAfter = await lstat(claimPath, { bigint: true });
     const firstAfter = await lstat(firstFinal);
     const secondAfter = await lstat(secondFinal);
+    expect({ dev: claimAfter.dev, ino: claimAfter.ino, nlink: claimAfter.nlink }).toEqual({
+      dev: claimBefore.dev,
+      ino: claimBefore.ino,
+      nlink: claimBefore.nlink,
+    });
     expect({ dev: firstAfter.dev, ino: firstAfter.ino, nlink: firstAfter.nlink }).toEqual({
       dev: firstBefore.dev,
       ino: firstBefore.ino,
@@ -812,6 +819,7 @@ describe.sequential("private skill object publication", () => {
     await writeFile(claimPath, claim, { mode: 0o600 });
     await writeFile(finalPath, orphanBytes, { mode: 0o600 });
     await link(finalPath, externalLink);
+    const claimBefore = await lstat(claimPath, { bigint: true });
     const finalBefore = await lstat(finalPath);
     const externalBefore = await lstat(externalLink);
 
@@ -825,8 +833,14 @@ describe.sequential("private skill object publication", () => {
     expect(await readFile(claimPath)).toEqual(claim);
     expect(await readFile(finalPath)).toEqual(orphanBytes);
     expect(await readFile(externalLink)).toEqual(orphanBytes);
+    const claimAfter = await lstat(claimPath, { bigint: true });
     const finalAfter = await lstat(finalPath);
     const externalAfter = await lstat(externalLink);
+    expect({ dev: claimAfter.dev, ino: claimAfter.ino, nlink: claimAfter.nlink }).toEqual({
+      dev: claimBefore.dev,
+      ino: claimBefore.ino,
+      nlink: claimBefore.nlink,
+    });
     expect({ dev: finalAfter.dev, ino: finalAfter.ino, nlink: finalAfter.nlink }).toEqual({
       dev: finalBefore.dev,
       ino: finalBefore.ino,
