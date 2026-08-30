@@ -116,6 +116,27 @@ describe("skill runtime contracts", () => {
     ).toMatchObject({ ok: false });
   });
 
+  it("parses a phase whose exact predecessor completion hashes are content-bound", () => {
+    const fixture = validSuperpowersPhase();
+    const predecessor = `sha256:${"c".repeat(64)}` as const;
+    const bound = resignDocument({ ...fixture, predecessor_phase_hashes: [predecessor] });
+
+    expect(parseSuperpowersPhase(canonicalJson(bound))).toMatchObject({
+      ok: true,
+      value: { predecessor_phase_hashes: [predecessor] },
+    });
+    expect(
+      parseSuperpowersPhase(
+        canonicalJson(
+          resignDocument({
+            ...fixture,
+            predecessor_phase_hashes: [predecessor, predecessor],
+          }),
+        ),
+      ),
+    ).toMatchObject({ ok: false });
+  });
+
   it("rejects a snapshot with inconsistent package accounting", () => {
     const fixture = validSkillSnapshot();
     expect(

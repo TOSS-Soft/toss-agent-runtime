@@ -9,6 +9,7 @@ import {
   createRunJournalStore,
   type RunJournalStore,
   type TransitionResult,
+  withRunJournalBarrier,
 } from "../src/journal/store.js";
 import type { TransitionCommand } from "../src/journal/state-machine.js";
 import type { JournalHead, RunState, SideEffectRecord } from "../src/journal/types.js";
@@ -81,6 +82,57 @@ afterEach(async () => {
 });
 
 describe("private append-only run journal store", () => {
+  it("serializes official external effects with transitions on the exact run queue", async () => {
+    const { statePath } = await fixture();
+    const store = createStore(statePath);
+    const created = await store.transition(command("run-barrier", "CREATED", null));
+    let entered: (() => void) | undefined;
+    let release: (() => void) | undefined;
+    const atBarrier = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const barrier = withRunJournalBarrier(store, "run-barrier", async (snapshot) => {
+      entered?.();
+      await gate;
+      return snapshot?.head;
+    });
+    await atBarrier;
+    let transitioned = false;
+    const routed = store
+      .transition(command("run-barrier", "ROUTED", created.head))
+      .then((result) => {
+        transitioned = true;
+        return result;
+      });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(transitioned).toBe(false);
+
+    release?.();
+
+    await expect(barrier).resolves.toEqual(created.head);
+    await expect(routed).resolves.toMatchObject({ head: { journal_revision: 2 } });
+  });
+
+  it("rejects a custom journal that cannot provide the official atomic barrier", async () => {
+    const custom = {
+      recover: () => Promise.resolve(),
+      stopIntake: () => undefined,
+      flush: () => Promise.resolve(),
+      transition: () => Promise.reject(new Error("unused")),
+      load: () => Promise.resolve(null),
+      list: () => Promise.resolve([]),
+      unresolvedSideEffects: () => Promise.resolve([]),
+      interruptActive: () => Promise.resolve(),
+    } satisfies RunJournalStore;
+
+    await expect(
+      withRunJournalBarrier(custom, "run-1", () => Promise.resolve()),
+    ).rejects.toMatchObject({ code: "RUNTIME_JOURNAL_UNAVAILABLE" });
+  });
+
   it("preserves every published byte while appending an exact hash-linked successor", async () => {
     const { statePath } = await fixture();
     const store = createStore(statePath);

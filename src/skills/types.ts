@@ -85,6 +85,7 @@ export interface SuperpowersPhaseV1 extends RuntimeDocument {
   readonly handler: Readonly<{ version: string; hash: `sha256:${string}` }>;
   readonly operation_id: string;
   readonly status: SuperpowersPhaseStatus;
+  readonly predecessor_phase_hashes: readonly `sha256:${string}`[];
   readonly input_hash: `sha256:${string}`;
   readonly output_hash: `sha256:${string}` | null;
   readonly occurred_at: string;

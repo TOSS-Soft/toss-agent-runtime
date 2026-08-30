@@ -19,9 +19,20 @@ import {
 } from "node:fs";
 import path from "node:path";
 
-import type { RunJournalStore } from "../journal/store.js";
+import { RuntimeJournalError } from "../journal/errors.js";
+import {
+  withRunJournalBarrier,
+  type RunJournalSnapshot,
+  type RunJournalStore,
+} from "../journal/store.js";
 import type { JournalHead } from "../journal/types.js";
-import { canonicalJson, deepFreezeJson, sha256, type JsonValue } from "../protocol/json.js";
+import {
+  canonicalJson,
+  deepFreezeJson,
+  parseJsonBytes,
+  sha256,
+  type JsonValue,
+} from "../protocol/json.js";
 import type { TraceContext } from "../protocol/types.js";
 import type {
   SkillCatalog,
@@ -31,14 +42,13 @@ import type {
   SkillSelectionRequest,
 } from "./catalog.js";
 import type { SkillContext, SkillContextRequest } from "./context.js";
-import { parseSkillSnapshot, parseSuperpowersPhase } from "./contracts.js";
+import { parseSkillDescriptor, parseSkillSnapshot, parseSuperpowersPhase } from "./contracts.js";
 import { RuntimeSkillError } from "./errors.js";
 import type { SkillLoader } from "./loader.js";
 import {
-  BUILTIN_SUPERPOWERS_POLICY,
+  builtInPhaseContextBudget,
   builtInSuperpowersHandler,
   requiredBuiltInPhasePredecessors,
-  type BuiltInSuperpowersCapability,
 } from "./phases.js";
 import {
   SKILL_LIMITS,
@@ -57,11 +67,20 @@ const HASH_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const IDENTIFIER_PATTERN = /^[A-Za-z][A-Za-z0-9._:-]{0,127}$/u;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const HISTORY_NAME_PATTERN = /^([A-Za-z][A-Za-z0-9._:-]{0,127})\.jsonl$/u;
-const HISTORY_STAGE_PATTERN = /^\.phase-(?:create|recovery)\.[0-9a-f-]{36}\.stage$/u;
-const QUARANTINE_STAGE_PATTERN = /^\.phase-quarantine\.[0-9a-f-]{36}\.stage$/u;
+const HISTORY_STAGE_PATTERN =
+  /^\.phase-(?:create|recovery)\.([A-Za-z][A-Za-z0-9._:-]{0,127})\.([0-9a-f-]{36})\.stage$/u;
+const QUARANTINE_STAGE_PATTERN =
+  /^\.phase-quarantine\.([A-Za-z][A-Za-z0-9._:-]{0,127})\.([0-9a-f-]{36})\.stage$/u;
 const QUARANTINE_NAME_PATTERN = /^phase-history-[0-9a-f]{64}-(0|[1-9][0-9]*)\.bin$/u;
+const MUTATION_LOCK_PATTERN = /^\.phase-mutation-([0-9a-f]{64})\.lock$/u;
+const MUTATION_TOMBSTONE_PATTERN =
+  /^\.phase-mutation-(release|recovery)-([0-9a-f]{64})\.([1-9][0-9]*)\.([0-9a-f-]{36})\.([0-9a-f]{64})\.tombstone$/u;
+const MAX_MUTATION_CLAIM_BYTES = 2_048;
+const LISTENER_PROBE_TIMEOUT_MS = 250;
 
 type CurrentUserCheck = (userId: bigint, candidate: string) => boolean;
+export type PhaseMutationProcessLiveness = "alive" | "dead" | "unknown";
+export type PhaseMutationListenerState = "present" | "absent" | "unknown";
 
 interface FileIdentity {
   readonly device: bigint;
@@ -93,6 +112,14 @@ interface ParsedHistory {
 
 interface PhaseCoordinator {
   queue: Promise<unknown>;
+}
+
+interface PhaseMutationClaim {
+  readonly schema_version: "superpowers-phase-mutation.v1";
+  readonly run_id: string;
+  readonly operation_id: string;
+  readonly owner_pid: number;
+  readonly created_at: string;
 }
 
 const COORDINATORS = new Map<string, PhaseCoordinator>();
@@ -161,12 +188,14 @@ export interface CreateSkillsEngineOptions {
   readonly loader: SkillLoader;
   readonly now: () => Date;
   readonly randomId: () => string;
+  readonly hasServiceListener: () => Promise<PhaseMutationListenerState>;
   readonly brainstormingApprovalHandoff?: BrainstormingApprovalHandoff | undefined;
 }
 
 export interface CreateSkillsEngineForTestOptions extends CreateSkillsEngineOptions {
   readonly historyHooks?: PhaseHistoryOperationHooks | undefined;
   readonly isCurrentUser?: CurrentUserCheck | undefined;
+  readonly isProcessAlive?: ((pid: number) => PhaseMutationProcessLiveness) | undefined;
 }
 
 export interface SkillsEngine {
@@ -228,6 +257,49 @@ function defaultCurrentUser(userId: bigint): boolean {
   return typeof process.getuid !== "function" || BigInt(process.getuid()) === userId;
 }
 
+function defaultProcessLiveness(pid: number): PhaseMutationProcessLiveness {
+  try {
+    process.kill(pid, 0);
+    return "alive";
+  } catch (error) {
+    if (errorCode(error) === "ESRCH") return "dead";
+    if (errorCode(error) === "EPERM") return "alive";
+    return "unknown";
+  }
+}
+
+function safeProcessLiveness(
+  probe: (pid: number) => PhaseMutationProcessLiveness,
+  pid: number,
+): PhaseMutationProcessLiveness {
+  try {
+    const value = probe(pid);
+    return value === "alive" || value === "dead" || value === "unknown" ? value : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+async function safeServiceListener(
+  probe: () => Promise<PhaseMutationListenerState>,
+): Promise<PhaseMutationListenerState> {
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    const value = await Promise.race([
+      Promise.resolve().then(probe),
+      new Promise<"unknown">((resolve) => {
+        timeout = setTimeout(resolve, LISTENER_PROBE_TIMEOUT_MS, "unknown");
+        timeout.unref();
+      }),
+    ]);
+    return value === "present" || value === "absent" || value === "unknown" ? value : "unknown";
+  } catch {
+    return "unknown";
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
+
 function identity(metadata: Pick<BigIntStats, "dev" | "ino">): FileIdentity {
   return { device: metadata.dev, inode: metadata.ino };
 }
@@ -254,6 +326,285 @@ function assertIdentifier(value: string): void {
 
 function assertHash(value: string): asserts value is `sha256:${string}` {
   if (!HASH_PATTERN.test(value)) invalid();
+}
+
+function closedDataRecord(
+  value: unknown,
+  expectedKeys: readonly string[],
+): Readonly<Record<string, unknown>> {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) ||
+    Object.getOwnPropertySymbols(value).length !== 0
+  ) {
+    invalid();
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const keys = Object.keys(descriptors).sort();
+  const expected = [...expectedKeys].sort();
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+    invalid();
+  }
+  const result: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  for (const key of expectedKeys) {
+    const descriptor = descriptors[key];
+    if (
+      descriptor === undefined ||
+      descriptor.enumerable !== true ||
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined
+    ) {
+      invalid();
+    }
+    result[key] = descriptor.value;
+  }
+  return result;
+}
+
+function assertDeepFrozenData(
+  value: unknown,
+  state: { readonly seen: WeakSet<object>; members: number } = {
+    seen: new WeakSet<object>(),
+    members: 0,
+  },
+  depth = 0,
+): void {
+  if (value === null || ["string", "number", "boolean"].includes(typeof value)) return;
+  if (depth > 64) limitExceeded();
+  if (typeof value !== "object" || !Object.isFrozen(value)) integrity();
+  if (state.seen.has(value)) integrity();
+  state.seen.add(value);
+  if (Object.getOwnPropertySymbols(value).length !== 0) integrity();
+  if (!Array.isArray(value)) {
+    const prototype = Object.getPrototypeOf(value) as object | null;
+    if (prototype !== Object.prototype && prototype !== null) integrity();
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  state.members += Object.keys(descriptors).length;
+  if (state.members > 10_000) limitExceeded();
+  for (const [key, descriptor] of Object.entries(descriptors)) {
+    if (Array.isArray(value) && key === "length") continue;
+    if (
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined ||
+      descriptor.enumerable !== true
+    ) {
+      integrity();
+    }
+    assertDeepFrozenData(descriptor.value, state, depth + 1);
+  }
+  if (
+    Array.isArray(value) &&
+    Object.keys(descriptors).filter((key) => key !== "length").length !== value.length
+  ) {
+    integrity();
+  }
+}
+
+function exactSelectionAuthority(value: unknown): SkillSelection {
+  const selection = closedDataRecord(value, ["descriptor", "catalog_hash", "package_handle"]);
+  assertDeepFrozenData(value);
+  if (
+    typeof selection.catalog_hash !== "string" ||
+    !HASH_PATTERN.test(selection.catalog_hash) ||
+    typeof selection.package_handle !== "string" ||
+    !HASH_PATTERN.test(selection.package_handle)
+  ) {
+    invalid();
+  }
+  let parsed: ReturnType<typeof parseSkillDescriptor>;
+  try {
+    parsed = parseSkillDescriptor(canonicalJson(selection.descriptor));
+  } catch {
+    invalid();
+  }
+  if (!parsed.ok || canonicalJson(parsed.value) !== canonicalJson(selection.descriptor)) invalid();
+  return value as SkillSelection;
+}
+
+function copiedJournalHead(value: unknown): JournalHead {
+  const head = closedDataRecord(value, ["journal_revision", "sequence", "entry_hash"]);
+  if (
+    typeof head.journal_revision !== "number" ||
+    !Number.isSafeInteger(head.journal_revision) ||
+    head.journal_revision < 1 ||
+    typeof head.sequence !== "number" ||
+    !Number.isSafeInteger(head.sequence) ||
+    head.sequence < 1 ||
+    typeof head.entry_hash !== "string"
+  ) {
+    invalid();
+  }
+  assertHash(head.entry_hash);
+  return Object.freeze({
+    journal_revision: head.journal_revision,
+    sequence: head.sequence,
+    entry_hash: head.entry_hash,
+  });
+}
+
+function copiedTrace(value: unknown): TraceContext {
+  if (typeof value !== "object" || value === null) invalid();
+  const keys = Object.prototype.hasOwnProperty.call(value, "trace_state")
+    ? ["trace_id", "span_id", "trace_flags", "trace_state"]
+    : ["trace_id", "span_id", "trace_flags"];
+  const trace = closedDataRecord(value, keys);
+  if (
+    typeof trace.trace_id !== "string" ||
+    !/^[0-9a-f]{32}$/u.test(trace.trace_id) ||
+    typeof trace.span_id !== "string" ||
+    !/^[0-9a-f]{16}$/u.test(trace.span_id) ||
+    typeof trace.trace_flags !== "number" ||
+    !Number.isSafeInteger(trace.trace_flags) ||
+    trace.trace_flags < 0 ||
+    trace.trace_flags > 255 ||
+    (trace.trace_state !== undefined &&
+      (typeof trace.trace_state !== "string" || trace.trace_state.length > 512))
+  ) {
+    invalid();
+  }
+  return Object.freeze({
+    trace_id: trace.trace_id,
+    span_id: trace.span_id,
+    trace_flags: trace.trace_flags,
+    ...(trace.trace_state === undefined ? {} : { trace_state: trace.trace_state }),
+  });
+}
+
+interface CapturedStart {
+  readonly request: StartSuperpowersPhaseRequest;
+  readonly input: Uint8Array;
+  readonly inputHash: `sha256:${string}`;
+}
+
+function captureStartRequest(value: unknown): CapturedStart {
+  const source = closedDataRecord(value, [
+    "run_id",
+    "expected_journal_head",
+    "execution_request_hash",
+    "selection",
+    "phase",
+    "input",
+    "operation_id",
+    "trace",
+  ]);
+  if (
+    typeof source.run_id !== "string" ||
+    !IDENTIFIER_PATTERN.test(source.run_id) ||
+    typeof source.execution_request_hash !== "string" ||
+    !HASH_PATTERN.test(source.execution_request_hash) ||
+    typeof source.phase !== "string" ||
+    typeof source.operation_id !== "string" ||
+    !IDENTIFIER_PATTERN.test(source.operation_id) ||
+    !(source.input instanceof Uint8Array) ||
+    source.input.byteLength > SKILL_LIMITS.phaseInputBytes
+  ) {
+    if (
+      source.input instanceof Uint8Array &&
+      source.input.byteLength > SKILL_LIMITS.phaseInputBytes
+    ) {
+      limitExceeded();
+    }
+    invalid();
+  }
+  let handler;
+  try {
+    handler = builtInSuperpowersHandler(source.phase as SuperpowersPhaseName);
+  } catch {
+    invalid();
+  }
+  const selection = exactSelectionAuthority(source.selection);
+  if (selection.descriptor.name !== handler.capability) integrity();
+  const expectedJournalHead = copiedJournalHead(source.expected_journal_head);
+  const trace = copiedTrace(source.trace);
+  const input = Buffer.from(source.input);
+  const request = Object.freeze({
+    run_id: source.run_id,
+    expected_journal_head: expectedJournalHead,
+    execution_request_hash: source.execution_request_hash as `sha256:${string}`,
+    selection,
+    phase: source.phase as SuperpowersPhaseName,
+    input,
+    operation_id: source.operation_id,
+    trace,
+  });
+  return Object.freeze({ request, input, inputHash: rawHash(input) });
+}
+
+interface CapturedCompletion {
+  readonly request: CompleteSuperpowersPhaseRequest;
+  readonly output: Uint8Array;
+  readonly outputHash: `sha256:${string}`;
+}
+
+function captureCompletionRequest(value: unknown): CapturedCompletion {
+  const source = closedDataRecord(value, [
+    "run_id",
+    "expected_phase_revision",
+    "expected_phase_head_hash",
+    "phase",
+    "skill_snapshot_hash",
+    "operation_id",
+    "outcome",
+    "output",
+    "trace",
+  ]);
+  if (
+    typeof source.run_id !== "string" ||
+    !IDENTIFIER_PATTERN.test(source.run_id) ||
+    typeof source.expected_phase_revision !== "number" ||
+    !Number.isSafeInteger(source.expected_phase_revision) ||
+    source.expected_phase_revision < 1 ||
+    typeof source.expected_phase_head_hash !== "string" ||
+    !HASH_PATTERN.test(source.expected_phase_head_hash) ||
+    typeof source.phase !== "string" ||
+    typeof source.skill_snapshot_hash !== "string" ||
+    !HASH_PATTERN.test(source.skill_snapshot_hash) ||
+    typeof source.operation_id !== "string" ||
+    !IDENTIFIER_PATTERN.test(source.operation_id) ||
+    (source.outcome !== "COMPLETED" &&
+      source.outcome !== "FAILED" &&
+      source.outcome !== "BLOCKED") ||
+    !(source.output instanceof Uint8Array) ||
+    source.output.byteLength > SKILL_LIMITS.phaseOutputBytes
+  ) {
+    if (
+      source.output instanceof Uint8Array &&
+      source.output.byteLength > SKILL_LIMITS.phaseOutputBytes
+    ) {
+      limitExceeded();
+    }
+    invalid();
+  }
+  let handler;
+  try {
+    handler = builtInSuperpowersHandler(source.phase as SuperpowersPhaseName);
+  } catch {
+    invalid();
+  }
+  if (
+    source.outcome !== handler.semantic.completion.success_status &&
+    handler.semantic.completion.unsuccessful_output === "EMPTY" &&
+    source.output.byteLength !== 0
+  ) {
+    invalid();
+  }
+  const trace = copiedTrace(source.trace);
+  const output = Buffer.from(source.output);
+  const request = Object.freeze({
+    run_id: source.run_id,
+    expected_phase_revision: source.expected_phase_revision,
+    expected_phase_head_hash: source.expected_phase_head_hash as `sha256:${string}`,
+    phase: source.phase as SuperpowersPhaseName,
+    skill_snapshot_hash: source.skill_snapshot_hash as `sha256:${string}`,
+    operation_id: source.operation_id,
+    outcome: source.outcome,
+    output,
+    trace,
+  });
+  return Object.freeze({ request, output, outputHash: rawHash(output) });
 }
 
 function validateAbsolutePath(candidate: string): void {
@@ -541,8 +892,7 @@ function handlerMatches(entry: SuperpowersPhaseV1): boolean {
 }
 
 function phaseBelongsToSkill(skillName: string, phase: SuperpowersPhaseName): boolean {
-  const phases = BUILTIN_SUPERPOWERS_POLICY[skillName as BuiltInSuperpowersCapability];
-  return phases !== undefined && phases.includes(phase);
+  return builtInSuperpowersHandler(phase).capability === skillName;
 }
 
 function samePhaseBinding(left: SuperpowersPhaseV1, right: SuperpowersPhaseV1): boolean {
@@ -553,6 +903,7 @@ function samePhaseBinding(left: SuperpowersPhaseV1, right: SuperpowersPhaseV1): 
     exactJson(left.skill, right.skill) &&
     left.phase === right.phase &&
     exactJson(left.handler, right.handler) &&
+    exactJson(left.predecessor_phase_hashes, right.predecessor_phase_hashes) &&
     left.operation_id === right.operation_id &&
     left.input_hash === right.input_hash
   );
@@ -561,6 +912,11 @@ function samePhaseBinding(left: SuperpowersPhaseV1, right: SuperpowersPhaseV1): 
 function validateHistory(runId: string, entries: readonly SuperpowersPhaseV1[]): void {
   let unmatched: SuperpowersPhaseV1 | null = null;
   const seenOperations = new Set<string>();
+  const requestedPhases: SuperpowersPhaseName[] = [];
+  const latestAttempts = new Map<
+    SuperpowersPhaseName,
+    { readonly started: SuperpowersPhaseV1; terminal: SuperpowersPhaseV1 | null }
+  >();
   let executionRequestHash: `sha256:${string}` | undefined;
   for (const [index, entry] of entries.entries()) {
     const previous = entries[index - 1];
@@ -577,15 +933,37 @@ function validateHistory(runId: string, entries: readonly SuperpowersPhaseV1[]):
     else if (executionRequestHash !== entry.execution_request_hash) integrity();
 
     if (entry.status === "STARTED") {
+      const expectedPredecessors: `sha256:${string}`[] = [];
+      for (const predecessor of requiredBuiltInPhasePredecessors(entry.phase, requestedPhases)) {
+        const attempt = latestAttempts.get(predecessor);
+        const evidence = attempt?.terminal;
+        const exactTddEvidence =
+          (entry.phase === "RED" && predecessor === "TEST_DESIGN") ||
+          (entry.phase === "GREEN" && predecessor === "RED");
+        if (
+          attempt === undefined ||
+          evidence?.status !== "COMPLETED" ||
+          attempt.started.execution_request_hash !== entry.execution_request_hash ||
+          evidence.execution_request_hash !== entry.execution_request_hash ||
+          !exactJson(evidence.handler, attempt.started.handler) ||
+          (exactTddEvidence && !exactJson(evidence.skill, entry.skill))
+        ) {
+          integrity();
+        }
+        expectedPredecessors.push(evidence.document_hash);
+      }
       if (
         entry.output_hash !== null ||
         unmatched !== null ||
-        seenOperations.has(entry.operation_id)
+        seenOperations.has(entry.operation_id) ||
+        !exactJson(entry.predecessor_phase_hashes, expectedPredecessors)
       ) {
         integrity();
       }
       seenOperations.add(entry.operation_id);
       unmatched = entry;
+      requestedPhases.push(entry.phase);
+      latestAttempts.set(entry.phase, { started: entry, terminal: null });
       continue;
     }
     if (entry.status === "APPROVAL_PENDING") {
@@ -600,6 +978,15 @@ function validateHistory(runId: string, entries: readonly SuperpowersPhaseV1[]):
       continue;
     }
     if (unmatched === null || !samePhaseBinding(unmatched, entry)) integrity();
+    const latestAttempt = latestAttempts.get(entry.phase);
+    if (
+      latestAttempt === undefined ||
+      latestAttempt.started.operation_id !== entry.operation_id ||
+      latestAttempt.terminal !== null
+    ) {
+      integrity();
+    }
+    latestAttempt.terminal = entry;
     unmatched = null;
   }
 }
@@ -688,39 +1075,78 @@ function latestUnmatchedStart(entries: readonly SuperpowersPhaseV1[]): Superpowe
   return unmatched;
 }
 
-function completedEvidence(
+interface PhaseSkillBinding {
+  readonly name: string;
+  readonly version: string;
+  readonly snapshot_hash: `sha256:${string}`;
+}
+
+function predecessorEvidenceHashes(
   entries: readonly SuperpowersPhaseV1[],
   phase: SuperpowersPhaseName,
-): readonly SuperpowersPhaseV1[] {
-  return entries.filter((entry) => entry.phase === phase && entry.status === "COMPLETED");
+  skill: PhaseSkillBinding,
+  executionRequestHash: `sha256:${string}`,
+): readonly `sha256:${string}`[] | null {
+  if (
+    latestUnmatchedStart(entries) !== null ||
+    entries.some((entry) => entry.execution_request_hash !== executionRequestHash)
+  ) {
+    return null;
+  }
+  const requested = entries
+    .filter((entry) => entry.status === "STARTED")
+    .map((entry) => entry.phase);
+  const hashes: `sha256:${string}`[] = [];
+  for (const predecessor of requiredBuiltInPhasePredecessors(phase, requested)) {
+    const latest = entries
+      .filter((entry) => entry.phase === predecessor && entry.status === "STARTED")
+      .at(-1);
+    if (latest === undefined) return null;
+    const evidence = entries.find(
+      (entry) =>
+        entry.operation_id === latest.operation_id &&
+        entry.status !== "STARTED" &&
+        entry.status !== "APPROVAL_PENDING",
+    );
+    const exactTddEvidence =
+      (phase === "RED" && predecessor === "TEST_DESIGN") ||
+      (phase === "GREEN" && predecessor === "RED");
+    if (
+      evidence === undefined ||
+      evidence.status !== "COMPLETED" ||
+      latest.execution_request_hash !== executionRequestHash ||
+      evidence.execution_request_hash !== latest.execution_request_hash ||
+      !exactJson(evidence.handler, latest.handler) ||
+      (exactTddEvidence &&
+        (evidence.skill.name !== skill.name ||
+          evidence.skill.version !== skill.version ||
+          evidence.skill.snapshot_hash !== skill.snapshot_hash))
+    ) {
+      return null;
+    }
+    hashes.push(evidence.document_hash);
+  }
+  return Object.freeze(hashes);
 }
 
 function enforcePredecessors(
   entries: readonly SuperpowersPhaseV1[],
   phase: SuperpowersPhaseName,
   snapshot: SkillSnapshotV1,
-): void {
-  if (latestUnmatchedStart(entries) !== null) stale();
-  const requested = entries
-    .filter((entry) => entry.status === "STARTED")
-    .map((entry) => entry.phase);
-  for (const predecessor of requiredBuiltInPhasePredecessors(phase, requested)) {
-    const evidence = completedEvidence(entries, predecessor);
-    const exactTddEvidence =
-      (phase === "RED" && predecessor === "TEST_DESIGN") ||
-      (phase === "GREEN" && predecessor === "RED");
-    if (
-      !evidence.some(
-        (entry) =>
-          !exactTddEvidence ||
-          (entry.skill.name === snapshot.descriptor.name &&
-            entry.skill.version === snapshot.descriptor.version &&
-            entry.skill.snapshot_hash === snapshot.document_hash),
-      )
-    ) {
-      stale();
-    }
-  }
+  executionRequestHash: `sha256:${string}`,
+): readonly `sha256:${string}`[] {
+  const hashes = predecessorEvidenceHashes(
+    entries,
+    phase,
+    {
+      name: snapshot.descriptor.name,
+      version: snapshot.descriptor.version,
+      snapshot_hash: snapshot.document_hash,
+    },
+    executionRequestHash,
+  );
+  if (hashes === null) stale();
+  return hashes;
 }
 
 function validateLoadedSnapshot(selection: SkillSelection, snapshot: SkillSnapshotV1): void {
@@ -743,6 +1169,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
   const phasesPath = path.join(skillsPath, "phases");
   const quarantinePath = path.join(phasesPath, "quarantine");
   const isCurrentUser = options.isCurrentUser ?? defaultCurrentUser;
+  const isProcessAlive = options.isProcessAlive ?? defaultProcessLiveness;
   const hooks = options.historyHooks;
   const coordinatorKey = path.resolve(statePath);
   const pending = new Set<Promise<unknown>>();
@@ -866,14 +1293,275 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
     return names.sort((left, right) => Buffer.from(left).compare(Buffer.from(right)));
   };
 
-  const cleanupStages = (): void => {
+  const mutationLockPath = (runId: string): string => {
+    assertIdentifier(runId);
+    return path.join(
+      phasesPath,
+      `.phase-mutation-${rawHash(Buffer.from(runId)).slice("sha256:".length)}.lock`,
+    );
+  };
+
+  const parseMutationClaim = (runId: string | null, bytes: Uint8Array): PhaseMutationClaim => {
+    let value: JsonValue;
+    try {
+      value = parseJsonBytes(bytes, {
+        maxBytes: MAX_MUTATION_CLAIM_BYTES,
+        maxDepth: 3,
+        maxMembers: 8,
+      });
+    } catch {
+      integrity();
+    }
+    const claim = closedDataRecord(value, [
+      "schema_version",
+      "run_id",
+      "operation_id",
+      "owner_pid",
+      "created_at",
+    ]);
+    if (
+      claim.schema_version !== "superpowers-phase-mutation.v1" ||
+      typeof claim.run_id !== "string" ||
+      !IDENTIFIER_PATTERN.test(claim.run_id) ||
+      (runId !== null && claim.run_id !== runId) ||
+      typeof claim.operation_id !== "string" ||
+      !UUID_PATTERN.test(claim.operation_id) ||
+      typeof claim.owner_pid !== "number" ||
+      !Number.isSafeInteger(claim.owner_pid) ||
+      claim.owner_pid <= 0 ||
+      typeof claim.created_at !== "string"
+    ) {
+      integrity();
+    }
+    const createdAt = new Date(claim.created_at);
+    if (!Number.isFinite(createdAt.getTime()) || createdAt.toISOString() !== claim.created_at) {
+      integrity();
+    }
+    const parsed = claim as unknown as PhaseMutationClaim;
+    if (canonicalJson(parsed) !== Buffer.from(bytes).toString("utf8")) {
+      integrity();
+    }
+    return parsed;
+  };
+
+  const syncPhaseDirectory = (): void => {
+    const directories = openDirectoryChain(phasesPath, statePath, isCurrentUser);
+    try {
+      syncDirectoryChain(directories, statePath, isCurrentUser);
+    } finally {
+      closeDirectoryChain(directories);
+    }
+  };
+
+  const removeExactMutationArtifact = (candidate: string, expected: HistoryFileSnapshot): void => {
+    const directories = openDirectoryChain(phasesPath, statePath, isCurrentUser);
+    const descriptor = openSync(
+      candidate,
+      constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW,
+    );
+    try {
+      exactFile(candidate, descriptor, expected.identity, expected.bytes, isCurrentUser);
+      revalidateDirectoryChain(directories, statePath, isCurrentUser);
+      unlinkSync(candidate);
+      requireMissing(candidate);
+      syncDirectoryChain(directories, statePath, isCurrentUser);
+      requireMissing(candidate);
+    } finally {
+      closeSync(descriptor);
+      closeDirectoryChain(directories);
+    }
+  };
+
+  const cleanupMutationTombstones = async (runId: string): Promise<void> => {
+    const runHash = rawHash(Buffer.from(runId)).slice("sha256:".length);
+    const directories = openDirectoryChain(phasesPath, statePath, isCurrentUser);
+    try {
+      for (const name of scanNames(phasesPath, MAX_PHASE_HISTORY_FILES * 3 + 16)) {
+        const match = MUTATION_TOMBSTONE_PATTERN.exec(name);
+        if (match?.[2] !== runHash) continue;
+        const cleanerPid = Number(match[3]);
+        if (
+          !Number.isSafeInteger(cleanerPid) ||
+          cleanerPid <= 0 ||
+          match[4] === undefined ||
+          match[5] === undefined ||
+          !UUID_PATTERN.test(match[4])
+        ) {
+          integrity();
+        }
+        const candidate = path.join(phasesPath, name);
+        const exact = readExactFile(candidate, directories, MAX_MUTATION_CLAIM_BYTES);
+        parseMutationClaim(runId, exact.bytes);
+        if (rawHash(exact.bytes).slice("sha256:".length) !== match[5]) integrity();
+        const cleanerLiveness = safeProcessLiveness(isProcessAlive, cleanerPid);
+        if (cleanerLiveness === "alive") continue;
+        if (
+          cleanerLiveness !== "dead" ||
+          (await safeServiceListener(options.hasServiceListener)) !== "absent"
+        ) {
+          integrity();
+        }
+        try {
+          removeExactMutationArtifact(candidate, exact);
+        } catch (error) {
+          if (!isMissing(error)) throw error;
+        }
+      }
+    } finally {
+      closeDirectoryChain(directories);
+    }
+  };
+
+  const acquireMutationClaim = async (runId: string): Promise<() => void> => {
+    assertIdentifier(runId);
+    for (;;) {
+      ensureRoots();
+      await cleanupMutationTombstones(runId);
+      const candidate = mutationLockPath(runId);
+      const operationId = options.randomId();
+      if (!UUID_PATTERN.test(operationId)) integrity();
+      const occurredAt = options.now();
+      if (!(occurredAt instanceof Date) || !Number.isFinite(occurredAt.getTime())) integrity();
+      const claim: PhaseMutationClaim = Object.freeze({
+        schema_version: "superpowers-phase-mutation.v1",
+        run_id: runId,
+        operation_id: operationId,
+        owner_pid: process.pid,
+        created_at: occurredAt.toISOString(),
+      });
+      const bytes = Buffer.from(canonicalJson(claim as unknown as JsonValue), "utf8");
+      let descriptor: number | undefined;
+      try {
+        descriptor = openSync(
+          candidate,
+          constants.O_CREAT |
+            constants.O_EXCL |
+            constants.O_RDWR |
+            constants.O_NONBLOCK |
+            constants.O_NOFOLLOW,
+          0o600,
+        );
+        fchmodSync(descriptor, 0o600);
+        const metadata = fstatSync(descriptor, { bigint: true });
+        assertPrivateFile(metadata, candidate, isCurrentUser);
+        const claimIdentity = identity(metadata);
+        writeAll(descriptor, bytes);
+        fsyncSync(descriptor);
+        exactFile(candidate, descriptor, claimIdentity, bytes, isCurrentUser);
+        syncPhaseDirectory();
+        exactFile(candidate, descriptor, claimIdentity, bytes, isCurrentUser);
+        closeSync(descriptor);
+        descriptor = undefined;
+        let released = false;
+        return () => {
+          if (released) return;
+          released = true;
+          const held = openSync(
+            candidate,
+            constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW,
+          );
+          const tombstone = path.join(
+            phasesPath,
+            `.phase-mutation-release-${rawHash(Buffer.from(runId)).slice("sha256:".length)}.${process.pid}.${operationId}.${rawHash(bytes).slice("sha256:".length)}.tombstone`,
+          );
+          try {
+            exactFile(candidate, held, claimIdentity, bytes, isCurrentUser);
+            requireMissing(tombstone);
+            renameSync(candidate, tombstone);
+            requireMissing(candidate);
+            exactFile(tombstone, held, claimIdentity, bytes, isCurrentUser);
+            syncPhaseDirectory();
+            exactFile(tombstone, held, claimIdentity, bytes, isCurrentUser);
+            unlinkSync(tombstone);
+            requireMissing(tombstone);
+            syncPhaseDirectory();
+          } finally {
+            closeSync(held);
+          }
+        };
+      } catch (error) {
+        if (descriptor !== undefined) closeSync(descriptor);
+        if (!isExisting(error)) throw error;
+      }
+
+      const directories = openDirectoryChain(phasesPath, statePath, isCurrentUser);
+      let existing: HistoryFileSnapshot | undefined;
+      try {
+        try {
+          existing = readExactFile(candidate, directories, MAX_MUTATION_CLAIM_BYTES);
+        } catch (error) {
+          if (!isMissing(error)) throw error;
+        }
+      } finally {
+        closeDirectoryChain(directories);
+      }
+      if (existing === undefined) continue;
+      const existingClaim = parseMutationClaim(runId, existing.bytes);
+      const liveness = safeProcessLiveness(isProcessAlive, existingClaim.owner_pid);
+      if (liveness === "alive") {
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+        continue;
+      }
+      if (
+        liveness !== "dead" ||
+        (await safeServiceListener(options.hasServiceListener)) !== "absent"
+      ) {
+        integrity();
+      }
+      const recoveryId = options.randomId();
+      if (!UUID_PATTERN.test(recoveryId)) integrity();
+      const tombstone = path.join(
+        phasesPath,
+        `.phase-mutation-recovery-${rawHash(Buffer.from(runId)).slice("sha256:".length)}.${process.pid}.${recoveryId}.${rawHash(existing.bytes).slice("sha256:".length)}.tombstone`,
+      );
+      let held: number;
+      try {
+        held = openSync(
+          candidate,
+          constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW,
+        );
+      } catch (error) {
+        if (isMissing(error)) continue;
+        throw error;
+      }
+      try {
+        exactFile(candidate, held, existing.identity, existing.bytes, isCurrentUser);
+        requireMissing(tombstone);
+        try {
+          renameSync(candidate, tombstone);
+        } catch (error) {
+          if (isMissing(error)) continue;
+          throw error;
+        }
+        requireMissing(candidate);
+        exactFile(tombstone, held, existing.identity, existing.bytes, isCurrentUser);
+        syncPhaseDirectory();
+        exactFile(tombstone, held, existing.identity, existing.bytes, isCurrentUser);
+        unlinkSync(tombstone);
+        requireMissing(tombstone);
+        syncPhaseDirectory();
+      } finally {
+        closeSync(held);
+      }
+    }
+  };
+
+  const cleanupStages = (runId: string): void => {
+    assertIdentifier(runId);
     const phaseDirectories = openDirectoryChain(phasesPath, statePath, isCurrentUser);
     const quarantineDirectories = openDirectoryChain(quarantinePath, statePath, isCurrentUser);
     try {
-      const phaseNames = scanNames(phasesPath, MAX_PHASE_HISTORY_FILES * 2 + 1);
+      const phaseNames = scanNames(phasesPath, MAX_PHASE_HISTORY_FILES * 3 + 16);
       const finalIdentities = new Map<string, FileIdentity>();
       for (const name of phaseNames) {
-        if (name === "quarantine" || HISTORY_STAGE_PATTERN.test(name)) continue;
+        if (
+          name === "quarantine" ||
+          HISTORY_STAGE_PATTERN.test(name) ||
+          MUTATION_LOCK_PATTERN.test(name) ||
+          MUTATION_TOMBSTONE_PATTERN.test(name)
+        ) {
+          continue;
+        }
         const match = HISTORY_NAME_PATTERN.exec(name);
         if (match?.[1] === undefined) pathUnsafe();
         const candidate = path.join(phasesPath, name);
@@ -882,8 +1570,16 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
         assertPrivateFile(metadata, candidate, isCurrentUser, links);
         finalIdentities.set(candidate, identity(metadata));
       }
-      for (const name of phaseNames.filter((entry) => HISTORY_STAGE_PATTERN.test(entry))) {
-        unlinkOwnedStage(path.join(phasesPath, name), finalIdentities, phaseDirectories);
+      for (const name of phaseNames.filter(
+        (entry) => HISTORY_STAGE_PATTERN.exec(entry)?.[1] === runId,
+      )) {
+        const expectedFinal = historyPath(runId);
+        const expectedIdentity = finalIdentities.get(expectedFinal);
+        unlinkOwnedStage(
+          path.join(phasesPath, name),
+          expectedIdentity === undefined ? new Map() : new Map([[expectedFinal, expectedIdentity]]),
+          phaseDirectories,
+        );
       }
 
       const quarantineNames = scanNames(quarantinePath, MAX_PHASE_HISTORY_FILES);
@@ -901,7 +1597,9 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
         if (aggregateBytes > BigInt(MAX_QUARANTINE_BYTES)) limitExceeded();
         quarantineFinals.set(candidate, identity(metadata));
       }
-      for (const name of quarantineNames.filter((entry) => QUARANTINE_STAGE_PATTERN.test(entry))) {
+      for (const name of quarantineNames.filter(
+        (entry) => QUARANTINE_STAGE_PATTERN.exec(entry)?.[1] === runId,
+      )) {
         unlinkOwnedStage(path.join(quarantinePath, name), quarantineFinals, quarantineDirectories);
       }
       syncDirectoryChain(phaseDirectories, statePath, isCurrentUser);
@@ -912,9 +1610,20 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
     }
   };
 
+  const withMutationClaim = async <T>(runId: string, operation: () => Promise<T>): Promise<T> => {
+    const release = await acquireMutationClaim(runId);
+    try {
+      cleanupStages(runId);
+      return await operation();
+    } finally {
+      release();
+    }
+  };
+
   const publishStaged = async (
     directoryPath: string,
     stagePrefix: "create" | "quarantine",
+    runId: string,
     finalPath: string,
     bytes: Uint8Array,
     beforePublication?: (stagePath: string, finalPath: string) => void | Promise<void>,
@@ -924,8 +1633,8 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
     if (!UUID_PATTERN.test(randomId)) pathUnsafe();
     const stageName =
       stagePrefix === "create"
-        ? `.phase-create.${randomId}.stage`
-        : `.phase-quarantine.${randomId}.stage`;
+        ? `.phase-create.${runId}.${randomId}.stage`
+        : `.phase-quarantine.${runId}.${randomId}.stage`;
     const stagePath = path.join(directoryPath, stageName);
     const directories = openDirectoryChain(directoryPath, statePath, isCurrentUser);
     let descriptor: number | undefined;
@@ -1056,7 +1765,13 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
     } finally {
       closeDirectoryChain(directories);
     }
-    const publication = await publishStaged(quarantinePath, "quarantine", candidate, fragment);
+    const publication = await publishStaged(
+      quarantinePath,
+      "quarantine",
+      runId,
+      candidate,
+      fragment,
+    );
     if (publication === "existing") {
       const directories = openDirectoryChain(quarantinePath, statePath, isCurrentUser);
       try {
@@ -1079,7 +1794,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
     await quarantineFragment(runId, fragment);
     const randomId = options.randomId();
     if (!UUID_PATTERN.test(randomId)) pathUnsafe();
-    const stagePath = path.join(phasesPath, `.phase-recovery.${randomId}.stage`);
+    const stagePath = path.join(phasesPath, `.phase-recovery.${runId}.${randomId}.stage`);
     const finalPath = historyPath(runId);
     const directories = openDirectoryChain(phasesPath, statePath, isCurrentUser);
     let stage: number | undefined;
@@ -1180,6 +1895,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
     return publishStaged(
       phasesPath,
       "create",
+      runId,
       historyPath(runId),
       bytes,
       hooks?.beforeCreatePublication,
@@ -1282,6 +1998,28 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
     if (snapshot.document_hash !== expectedHash) conflict();
   };
 
+  const journalBarrier = async <T>(
+    runId: string,
+    operation: (snapshot: RunJournalSnapshot | null) => Promise<T>,
+  ): Promise<T> => {
+    try {
+      return await withRunJournalBarrier(options.journal, runId, operation);
+    } catch (error) {
+      if (error instanceof RuntimeSkillError) throw error;
+      if (error instanceof RuntimeJournalError) {
+        if (error.code === "RUNTIME_STATE_STALE") stale();
+        if (
+          error.code === "RUNTIME_JOURNAL_CORRUPT" ||
+          error.code === "RUNTIME_JOURNAL_PATH_UNSAFE"
+        ) {
+          integrity();
+        }
+        unavailable();
+      }
+      throw error;
+    }
+  };
+
   const startInternal = async (
     request: StartSuperpowersPhaseRequest,
     input: Uint8Array,
@@ -1325,52 +2063,59 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
     }
     const snapshot = await options.loader.load(request.selection);
     validateLoadedSnapshot(request.selection, snapshot);
-    enforcePredecessors(loaded.entries, request.phase, snapshot);
-    const contextBytes = SKILL_LIMITS.phaseInputBytes - input.byteLength;
+    enforcePredecessors(loaded.entries, request.phase, snapshot, request.execution_request_hash);
+    const contextBudget = builtInPhaseContextBudget(request.phase, input.byteLength);
     await options.loader.assembleContext(request.selection, {
       snapshot,
       snapshot_hash: snapshot.document_hash,
       phase: request.phase,
-      max_bytes: contextBytes,
-      max_tokens: Math.ceil(contextBytes / 4),
+      max_bytes: contextBudget.max_bytes,
+      max_tokens: contextBudget.max_tokens,
     });
-    const currentJournal = await options.journal.load(request.run_id);
-    if (
-      currentJournal === null ||
-      currentJournal.state !== "RUNNING" ||
-      !exactJournalHead(currentJournal.head, request.expected_journal_head)
-    ) {
-      stale();
-    }
-    loaded = await loadExisting(request.run_id);
-    if (latestOperation(loaded.entries, request.operation_id).length > 0) conflict();
-    enforcePredecessors(loaded.entries, request.phase, snapshot);
-    const latest = loaded.entries.at(-1);
-    const started = record({
-      protocol_version: "runtime-contract.v1",
-      schema_version: "superpowers-phase.v1",
-      document_type: "superpowers-phase",
-      run_id: request.run_id,
-      phase_revision: (latest?.phase_revision ?? 0) + 1,
-      previous_phase_hash: latest?.document_hash ?? ZERO_PHASE_HASH,
-      execution_request_hash: request.execution_request_hash,
-      observed_journal_head: Object.freeze({ ...request.expected_journal_head }),
-      skill: Object.freeze({
-        name: snapshot.descriptor.name,
-        version: snapshot.descriptor.version,
-        snapshot_hash: snapshot.document_hash,
-      }),
-      phase: request.phase,
-      handler: Object.freeze({ version: handler.version, hash: handler.hash }),
-      operation_id: request.operation_id,
-      status: "STARTED",
-      input_hash: inputHash,
-      output_hash: null,
-      occurred_at: options.now().toISOString(),
-      trace: copyTrace(request.trace),
+    return journalBarrier(request.run_id, async (currentJournal) => {
+      if (
+        currentJournal === null ||
+        currentJournal.state !== "RUNNING" ||
+        !exactJournalHead(currentJournal.head, request.expected_journal_head)
+      ) {
+        stale();
+      }
+      loaded = await loadExisting(request.run_id);
+      if (latestOperation(loaded.entries, request.operation_id).length > 0) conflict();
+      const predecessorPhaseHashes = enforcePredecessors(
+        loaded.entries,
+        request.phase,
+        snapshot,
+        request.execution_request_hash,
+      );
+      const latest = loaded.entries.at(-1);
+      const started = record({
+        protocol_version: "runtime-contract.v1",
+        schema_version: "superpowers-phase.v1",
+        document_type: "superpowers-phase",
+        run_id: request.run_id,
+        phase_revision: (latest?.phase_revision ?? 0) + 1,
+        previous_phase_hash: latest?.document_hash ?? ZERO_PHASE_HASH,
+        execution_request_hash: request.execution_request_hash,
+        observed_journal_head: Object.freeze({ ...request.expected_journal_head }),
+        skill: Object.freeze({
+          name: snapshot.descriptor.name,
+          version: snapshot.descriptor.version,
+          snapshot_hash: snapshot.document_hash,
+        }),
+        phase: request.phase,
+        handler: Object.freeze({ version: handler.version, hash: handler.hash }),
+        operation_id: request.operation_id,
+        status: "STARTED",
+        predecessor_phase_hashes: predecessorPhaseHashes,
+        input_hash: inputHash,
+        output_hash: null,
+        occurred_at: options.now().toISOString(),
+        trace: copyTrace(request.trace),
+      });
+      await appendRecord(request.run_id, loaded, started);
+      return phaseOutcome(started, false);
     });
-    await appendRecord(request.run_id, loaded, started);
-    return phaseOutcome(started, false);
   };
 
   const completeInternal = async (
@@ -1416,44 +2161,51 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
     const handler = builtInSuperpowersHandler(started.phase);
     if (started.handler.version !== handler.version || started.handler.hash !== handler.hash)
       stale();
-    const journal = await options.journal.load(request.run_id);
-    if (
-      journal === null ||
-      journal.state !== "RUNNING" ||
-      !exactJournalHead(journal.head, started.observed_journal_head)
-    ) {
-      stale();
-    }
-    if (request.phase === "BRAINSTORMING" && request.outcome === "COMPLETED") {
-      if (options.brainstormingApprovalHandoff === undefined) unavailable();
-      return options.brainstormingApprovalHandoff({
-        started,
-        completion: Object.freeze({ ...request, output: Buffer.from(output) }),
-        output_hash: outputHash,
+    return journalBarrier(request.run_id, async (journal) => {
+      if (
+        journal === null ||
+        journal.state !== "RUNNING" ||
+        !exactJournalHead(journal.head, started.observed_journal_head)
+      ) {
+        stale();
+      }
+      const current = await loadExisting(request.run_id);
+      if (current.entries.at(-1)?.document_hash !== started.document_hash) stale();
+      if (
+        handler.semantic.completion.approval === "REQUIRED" &&
+        request.outcome === handler.semantic.completion.success_status
+      ) {
+        if (options.brainstormingApprovalHandoff === undefined) unavailable();
+        return options.brainstormingApprovalHandoff({
+          started,
+          completion: Object.freeze({ ...request, output: Buffer.from(output) }),
+          output_hash: outputHash,
+        });
+      }
+      const latest = current.entries.at(-1)!;
+      const completed = record({
+        protocol_version: "runtime-contract.v1",
+        schema_version: "superpowers-phase.v1",
+        document_type: "superpowers-phase",
+        run_id: started.run_id,
+        phase_revision: latest.phase_revision + 1,
+        previous_phase_hash: latest.document_hash,
+        execution_request_hash: started.execution_request_hash,
+        observed_journal_head: started.observed_journal_head,
+        skill: started.skill,
+        phase: started.phase,
+        handler: started.handler,
+        operation_id: started.operation_id,
+        status: request.outcome,
+        predecessor_phase_hashes: started.predecessor_phase_hashes,
+        input_hash: started.input_hash,
+        output_hash: request.outcome === "COMPLETED" ? outputHash : null,
+        occurred_at: options.now().toISOString(),
+        trace: copyTrace(request.trace),
       });
-    }
-    const latest = loaded.entries.at(-1)!;
-    const completed = record({
-      protocol_version: "runtime-contract.v1",
-      schema_version: "superpowers-phase.v1",
-      document_type: "superpowers-phase",
-      run_id: started.run_id,
-      phase_revision: latest.phase_revision + 1,
-      previous_phase_hash: latest.document_hash,
-      execution_request_hash: started.execution_request_hash,
-      observed_journal_head: started.observed_journal_head,
-      skill: started.skill,
-      phase: started.phase,
-      handler: started.handler,
-      operation_id: started.operation_id,
-      status: request.outcome,
-      input_hash: started.input_hash,
-      output_hash: request.outcome === "COMPLETED" ? outputHash : null,
-      occurred_at: options.now().toISOString(),
-      trace: copyTrace(request.trace),
+      await appendRecord(request.run_id, current, completed);
+      return phaseOutcome(completed, false);
     });
-    await appendRecord(request.run_id, loaded, completed);
-    return phaseOutcome(completed, false);
   };
 
   return {
@@ -1461,16 +2213,58 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
       return accept(() =>
         schedule(async () => {
           ensureRoots();
-          cleanupStages();
-          const names = scanNames(phasesPath, MAX_PHASE_HISTORY_FILES * 2 + 1);
-          const runIds: string[] = [];
+          const names = scanNames(phasesPath, MAX_PHASE_HISTORY_FILES * 3 + 16);
+          const runIds = new Set<string>();
           for (const name of names) {
-            if (name === "quarantine" || HISTORY_STAGE_PATTERN.test(name)) continue;
+            if (name === "quarantine") continue;
+            const historyStage = HISTORY_STAGE_PATTERN.exec(name);
+            const lock = MUTATION_LOCK_PATTERN.exec(name);
+            const tombstone = MUTATION_TOMBSTONE_PATTERN.exec(name);
+            if (historyStage?.[1] !== undefined) {
+              runIds.add(historyStage[1]);
+              continue;
+            }
+            if (lock?.[1] !== undefined || tombstone?.[1] !== undefined) {
+              const directories = openDirectoryChain(phasesPath, statePath, isCurrentUser);
+              try {
+                const exact = readExactFile(
+                  path.join(phasesPath, name),
+                  directories,
+                  MAX_MUTATION_CLAIM_BYTES,
+                );
+                const claim = parseMutationClaim(null, exact.bytes);
+                const expectedRunHash = rawHash(Buffer.from(claim.run_id)).slice("sha256:".length);
+                if ((lock?.[1] ?? tombstone?.[2]) !== expectedRunHash) integrity();
+                if (
+                  tombstone?.[5] !== undefined &&
+                  rawHash(exact.bytes).slice("sha256:".length) !== tombstone[5]
+                ) {
+                  integrity();
+                }
+                runIds.add(claim.run_id);
+              } finally {
+                closeDirectoryChain(directories);
+              }
+              continue;
+            }
             const match = HISTORY_NAME_PATTERN.exec(name);
             if (match?.[1] === undefined) pathUnsafe();
-            runIds.push(match[1]);
+            runIds.add(match[1]);
           }
-          for (const runId of runIds) await loadExisting(runId);
+          if (privateDirectoryExists(quarantinePath, statePath, isCurrentUser)) {
+            for (const name of scanNames(quarantinePath, MAX_PHASE_HISTORY_FILES * 2 + 1)) {
+              const stage = QUARANTINE_STAGE_PATTERN.exec(name);
+              if (stage?.[1] !== undefined) runIds.add(stage[1]);
+              else if (!QUARANTINE_NAME_PATTERN.test(name)) pathUnsafe();
+            }
+          }
+          for (const runId of [...runIds].sort((left, right) =>
+            Buffer.from(left).compare(Buffer.from(right)),
+          )) {
+            await withMutationClaim(runId, async () => {
+              await loadExisting(runId);
+            });
+          }
         }),
       );
     },
@@ -1488,31 +2282,48 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
     },
     startPhase(request) {
       if (intakeStopped) return Promise.reject(new RuntimeSkillError("RUNTIME_SKILL_UNAVAILABLE"));
-      if (!(request.input instanceof Uint8Array))
-        return Promise.reject(new RuntimeSkillError("RUNTIME_SKILL_INVALID"));
-      if (request.input.byteLength > SKILL_LIMITS.phaseInputBytes) {
-        return Promise.reject(new RuntimeSkillError("RUNTIME_SKILL_LIMIT_EXCEEDED"));
+      let captured: CapturedStart;
+      try {
+        captured = captureStartRequest(request);
+      } catch (error) {
+        return Promise.reject(
+          error instanceof RuntimeSkillError
+            ? error
+            : new RuntimeSkillError("RUNTIME_SKILL_INVALID"),
+        );
       }
-      const input = Buffer.from(request.input);
-      const inputHash = rawHash(input);
-      return accept(() => schedule(() => startInternal(request, input, inputHash)));
+      return accept(() =>
+        schedule(() =>
+          withMutationClaim(captured.request.run_id, () =>
+            startInternal(captured.request, captured.input, captured.inputHash),
+          ),
+        ),
+      );
     },
     completePhase(request) {
       if (intakeStopped) return Promise.reject(new RuntimeSkillError("RUNTIME_SKILL_UNAVAILABLE"));
-      if (!(request.output instanceof Uint8Array))
-        return Promise.reject(new RuntimeSkillError("RUNTIME_SKILL_INVALID"));
-      if (request.output.byteLength > SKILL_LIMITS.phaseOutputBytes) {
-        return Promise.reject(new RuntimeSkillError("RUNTIME_SKILL_LIMIT_EXCEEDED"));
+      let captured: CapturedCompletion;
+      try {
+        captured = captureCompletionRequest(request);
+      } catch (error) {
+        return Promise.reject(
+          error instanceof RuntimeSkillError
+            ? error
+            : new RuntimeSkillError("RUNTIME_SKILL_INVALID"),
+        );
       }
-      if (request.outcome !== "COMPLETED" && request.output.byteLength !== 0) {
-        return Promise.reject(new RuntimeSkillError("RUNTIME_SKILL_INVALID"));
-      }
-      const output = Buffer.from(request.output);
-      const outputHash = rawHash(output);
-      return accept(() => schedule(() => completeInternal(request, output, outputHash)));
+      return accept(() =>
+        schedule(() =>
+          withMutationClaim(captured.request.run_id, () =>
+            completeInternal(captured.request, captured.output, captured.outputHash),
+          ),
+        ),
+      );
     },
     phaseHistory(runId) {
-      return accept(() => schedule(async () => (await loadExisting(runId)).entries));
+      return accept(() =>
+        schedule(() => withMutationClaim(runId, async () => (await loadExisting(runId)).entries)),
+      );
     },
     stopIntake() {
       intakeStopped = true;

@@ -18,6 +18,7 @@
     "handler",
     "operation_id",
     "status",
+    "predecessor_phase_hashes",
     "input_hash",
     "output_hash",
     "occurred_at",
@@ -38,6 +39,12 @@
     "handler": { "$ref": "#/$defs/handler" },
     "operation_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
     "status": { "enum": ["STARTED", "APPROVAL_PENDING", "COMPLETED", "FAILED", "BLOCKED"] },
+    "predecessor_phase_hashes": {
+      "type": "array",
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
+    },
     "input_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
     "output_hash": {
       "oneOf": [{ "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }, { "type": "null" }]

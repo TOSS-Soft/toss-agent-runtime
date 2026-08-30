@@ -109,6 +109,7 @@ export function validSuperpowersPhase() {
     handler: { version: "1.0.0", hash: HASH },
     operation_id: "operation-1",
     status: "COMPLETED" as const,
+    predecessor_phase_hashes: [],
     input_hash: OTHER_HASH,
     output_hash: HASH,
     occurred_at: "2026-08-30T12:00:00.000Z",

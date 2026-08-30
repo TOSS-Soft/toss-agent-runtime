@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import {
   BUILTIN_SUPERPOWERS_HANDLERS,
   BUILTIN_SUPERPOWERS_POLICY,
+  BUILTIN_SUPERPOWERS_SEMANTICS,
+  compileBuiltInSuperpowersSemantics,
   hashBuiltInPhasePolicy,
   requiredBuiltInPhasePredecessors,
 } from "../src/skills/phases.js";
@@ -49,6 +51,21 @@ describe("built-in Superpowers phase policy", () => {
         brainstorming: ["RED"],
       }),
     ).not.toBe(hashBuiltInPhasePolicy());
+  });
+
+  it("changes handler identity and interpreted ordering when semantic data changes", () => {
+    const changed = BUILTIN_SUPERPOWERS_SEMANTICS.map((descriptor) =>
+      descriptor.phase === "RED"
+        ? { ...descriptor, predecessors: { ...descriptor.predecessors, required: [] } }
+        : descriptor,
+    );
+    const compiled = compileBuiltInSuperpowersSemantics(changed);
+
+    expect(compiled.policy_hash).not.toBe(hashBuiltInPhasePolicy());
+    expect(compiled.handlers.find((handler) => handler.phase === "RED")?.hash).not.toBe(
+      BUILTIN_SUPERPOWERS_HANDLERS.find((handler) => handler.phase === "RED")?.hash,
+    );
+    expect(requiredBuiltInPhasePredecessors("RED", [], compiled)).toEqual([]);
   });
 
   it("derives the closed predecessor graph including requested optional work", () => {
