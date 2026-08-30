@@ -1138,11 +1138,14 @@ function approvalDecisionRecords(journal: RunJournalSnapshot): readonly Readonly
   entry: RunJournalEntryV1;
   metadata: ApprovalDecisionJournalMetadata;
 }>[] {
+  const entriesByHash = new Map<`sha256:${string}`, RunJournalEntryV1>();
+  for (const entry of journal.entries) {
+    if (entriesByHash.has(entry.entry_hash)) integrity();
+    entriesByHash.set(entry.entry_hash, entry);
+  }
   return Object.freeze(
     journal.entries.filter(claimsApprovalDecision).map((entry) => {
-      const pendingEntry = journal.entries.find(
-        (candidate) => candidate.entry_hash === entry.previous_entry_hash,
-      );
+      const pendingEntry = entriesByHash.get(entry.previous_entry_hash);
       if (pendingEntry === undefined) integrity();
       return Object.freeze({ entry, metadata: decisionMetadata(entry, pendingEntry) });
     }),
@@ -1164,13 +1167,93 @@ function approvalPendingRecords(journal: RunJournalSnapshot): readonly Readonly<
   );
 }
 
-function approvalJournalProjection(journal: RunJournalSnapshot): Readonly<{
+function approvalJournalProjection(
+  journal: RunJournalSnapshot | null,
+  phases: readonly SuperpowersPhaseV1[],
+): Readonly<{
   pending: ReturnType<typeof approvalPendingRecords>;
   decisions: ReturnType<typeof approvalDecisionRecords>;
 }> {
+  if (journal === null) {
+    if (phases.some((phase) => phase.status === "APPROVAL_PENDING")) integrity();
+    return Object.freeze({ pending: Object.freeze([]), decisions: Object.freeze([]) });
+  }
+  const pending = approvalPendingRecords(journal);
+  const decisions = approvalDecisionRecords(journal);
+  const phaseByHash = new Map<`sha256:${string}`, SuperpowersPhaseV1>();
+  const phasePendingByHash = new Map<`sha256:${string}`, SuperpowersPhaseV1>();
+  const terminalByPendingHash = new Map<`sha256:${string}`, SuperpowersPhaseV1>();
+  for (const phase of phases) {
+    if (phaseByHash.has(phase.document_hash)) integrity();
+    phaseByHash.set(phase.document_hash, phase);
+    if (phase.status === "APPROVAL_PENDING") {
+      phasePendingByHash.set(phase.document_hash, phase);
+      continue;
+    }
+    const predecessor = phaseByHash.get(phase.previous_phase_hash);
+    if (predecessor?.status === "APPROVAL_PENDING") {
+      if (terminalByPendingHash.has(predecessor.document_hash)) integrity();
+      terminalByPendingHash.set(predecessor.document_hash, phase);
+    }
+  }
+
+  const matchedPhasePending = new Set<`sha256:${string}`>();
+  const pendingJournalByHash = new Map<`sha256:${string}`, (typeof pending)[number]>();
+  for (const record of pending) {
+    const phaseHash = record.metadata.phase.document_hash;
+    const verifiedPhase = phasePendingByHash.get(phaseHash);
+    if (
+      verifiedPhase === undefined ||
+      matchedPhasePending.has(phaseHash) ||
+      pendingJournalByHash.has(record.entry.entry_hash)
+    ) {
+      integrity();
+    }
+    matchedPhasePending.add(phaseHash);
+    pendingJournalByHash.set(record.entry.entry_hash, record);
+  }
+
+  const matchedTerminals = new Set<`sha256:${string}`>();
+  const decidedPendingEntries = new Set<`sha256:${string}`>();
+  for (const record of decisions) {
+    const pendingRecord = pendingJournalByHash.get(record.entry.previous_entry_hash);
+    if (pendingRecord === undefined || decidedPendingEntries.has(pendingRecord.entry.entry_hash)) {
+      integrity();
+    }
+    decidedPendingEntries.add(pendingRecord.entry.entry_hash);
+    const phaseHash = pendingRecord.metadata.phase.document_hash;
+    const terminal = terminalByPendingHash.get(phaseHash);
+    if (terminal === undefined) {
+      if (phases.at(-1)?.document_hash !== phaseHash) integrity();
+      continue;
+    }
+    if (
+      terminal.document_hash !== record.metadata.phase.document_hash ||
+      matchedTerminals.has(terminal.document_hash)
+    ) {
+      integrity();
+    }
+    matchedTerminals.add(terminal.document_hash);
+  }
+
+  for (const [phaseHash, phase] of phasePendingByHash) {
+    if (matchedPhasePending.has(phaseHash)) continue;
+    if (
+      phases.at(-1)?.document_hash !== phaseHash ||
+      terminalByPendingHash.has(phaseHash) ||
+      journal.state !== "RUNNING" ||
+      !exactJournalHead(journal.head, phase.observed_journal_head)
+    ) {
+      integrity();
+    }
+  }
+  for (const terminal of terminalByPendingHash.values()) {
+    if (!matchedTerminals.has(terminal.document_hash)) integrity();
+  }
+
   return Object.freeze({
-    pending: approvalPendingRecords(journal),
-    decisions: approvalDecisionRecords(journal),
+    pending,
+    decisions,
   });
 }
 
@@ -2530,6 +2613,8 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
     if (!phaseBelongsToSkill(request.selection.descriptor.name, request.phase)) integrity();
     const handler = builtInSuperpowersHandler(request.phase);
     let loaded = await loadExisting(request.run_id);
+    const journal = await journalStore.load(request.run_id);
+    approvalJournalProjection(journal, loaded.entries);
     const replay = latestOperation(loaded.entries, request.operation_id);
     if (replay.length > 0) {
       const started = replay[0]!;
@@ -2551,7 +2636,6 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
       return phaseOutcome(replay.at(-1)!, true);
     }
 
-    const journal = await journalStore.load(request.run_id);
     if (
       journal === null ||
       journal.state !== "RUNNING" ||
@@ -2579,7 +2663,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
         stale();
       }
       loaded = await loadExisting(request.run_id);
-      const approval = approvalJournalProjection(currentJournal);
+      const approval = approvalJournalProjection(currentJournal, loaded.entries);
       if (
         loaded.entries.length === 0 &&
         (approval.pending.length > 0 || approval.decisions.length > 0)
@@ -2632,6 +2716,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
     assertHash(request.expected_phase_head_hash);
     assertHash(request.skill_snapshot_hash);
     const loaded = await loadExisting(request.run_id);
+    approvalJournalProjection(await journalStore.load(request.run_id), loaded.entries);
     const operation = latestOperation(loaded.entries, request.operation_id);
     const started = operation[0];
     if (started === undefined || started.status !== "STARTED") stale();
@@ -2654,7 +2739,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
         }
         return journalBarrier(request.run_id, (journal) => {
           if (journal === null) stale();
-          const matches = approvalJournalProjection(journal).decisions.filter(
+          const matches = approvalJournalProjection(journal, loaded.entries).decisions.filter(
             ({ metadata }) => metadata.phase.document_hash === terminal.document_hash,
           );
           if (matches.length !== 1) integrity();
@@ -2702,7 +2787,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
       }
       return journalBarrier(request.run_id, async (journal, transition) => {
         if (journal === null) stale();
-        const approval = approvalJournalProjection(journal);
+        const approval = approvalJournalProjection(journal, loaded.entries);
         let result: TransitionResult;
         if (
           journal.state === "RUNNING" &&
@@ -2798,8 +2883,8 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
   ): Promise<SuperpowersPhaseOutcome> => {
     return journalBarrier(request.run_id, async (journal, transition) => {
       if (journal === null) stale();
-      const approval = approvalJournalProjection(journal);
       let loaded = await loadExisting(request.run_id);
+      const approval = approvalJournalProjection(journal, loaded.entries);
       const pending = [...loaded.entries]
         .reverse()
         .find((entry) => entry.status === "APPROVAL_PENDING");
@@ -2948,7 +3033,8 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
             await withMutationClaim(runId, async () => {
               await journalBarrier(runId, async (journal, transition) => {
                 const loaded = await loadExisting(runId);
-                const approval = journal === null ? null : approvalJournalProjection(journal);
+                const projectedApproval = approvalJournalProjection(journal, loaded.entries);
+                const approval = journal === null ? null : projectedApproval;
                 const latest = loaded.entries.at(-1);
                 if (latest === undefined) {
                   if (
@@ -3111,7 +3197,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
           withMutationClaim(runId, () =>
             journalBarrier(runId, async (journal) => {
               const loaded = await loadExisting(runId);
-              if (journal !== null) approvalJournalProjection(journal);
+              approvalJournalProjection(journal, loaded.entries);
               return loaded.entries;
             }),
           ),

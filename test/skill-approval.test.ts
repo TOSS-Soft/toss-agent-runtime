@@ -29,8 +29,16 @@ import type {
   ResumeSuperpowersApprovalRequest,
   SuperpowersApprovalOutcome,
 } from "../src/skills/approval.js";
-import { decisionMetadata } from "../src/skills/approval.js";
-import type { SkillSnapshotV1 } from "../src/skills/types.js";
+import {
+  approvalDecision,
+  approvalDecisionCommand,
+  approvalPendingCommand,
+  approvalRequest,
+  approvalTerminalPhase,
+  decisionMetadata,
+  requestSuperpowersApproval,
+} from "../src/skills/approval.js";
+import type { SkillSnapshotV1, SuperpowersPhaseV1 } from "../src/skills/types.js";
 
 const roots: string[] = [];
 const TRACE = {
@@ -287,6 +295,141 @@ async function pendingApproval(options: {
   return { host, completion, pending: pending as SuperpowersApprovalOutcome };
 }
 
+function nextApprovalPhases(options: {
+  readonly previous: SuperpowersPhaseV1;
+  readonly observedHead: JournalHead;
+  readonly operationId: string;
+  readonly decisionOperationId: string;
+  readonly decision: "APPROVE" | "REJECT";
+}): Readonly<{
+  started: SuperpowersPhaseV1;
+  pending: SuperpowersPhaseV1;
+  terminal: SuperpowersPhaseV1;
+  decisionRequest: ResumeSuperpowersApprovalRequest;
+}> {
+  const started = resignDocument({
+    ...options.previous,
+    phase_revision: options.previous.phase_revision + 1,
+    previous_phase_hash: options.previous.document_hash,
+    observed_journal_head: options.observedHead,
+    operation_id: options.operationId,
+    status: "STARTED",
+    output_hash: null,
+    occurred_at: "2026-08-30T13:00:00.000Z",
+  }) as SuperpowersPhaseV1;
+  const pending = requestSuperpowersApproval({
+    started,
+    output_hash: rawHash(Buffer.from(`plan:${options.operationId}`, "utf8")),
+    occurred_at: "2026-08-30T13:00:01.000Z",
+    trace: TRACE,
+  });
+  const placeholderHead = Object.freeze({
+    journal_revision: options.observedHead.journal_revision + 1,
+    sequence: options.observedHead.sequence + 1,
+    entry_hash: `sha256:${"f".repeat(64)}` as const,
+  });
+  const challenge = approvalRequest(pending, placeholderHead);
+  const decisionRequest = {
+    run_id: challenge.run_id,
+    expected_journal_head: challenge.pending_journal_head,
+    phase: challenge.phase,
+    skill_name: challenge.skill_name,
+    skill_version: challenge.skill_version,
+    skill_snapshot_hash: challenge.skill_snapshot_hash,
+    approval_request_hash: challenge.document_hash,
+    operation_id: options.decisionOperationId,
+    decision: options.decision,
+    trace: TRACE,
+  } as const;
+  const decision = approvalDecision(challenge, decisionRequest);
+  return Object.freeze({
+    started,
+    pending,
+    terminal: approvalTerminalPhase({
+      pending,
+      decision,
+      occurred_at: "2026-08-30T13:00:02.000Z",
+    }),
+    decisionRequest,
+  });
+}
+
+async function appendUnlinkedJournalApproval(options: {
+  readonly journal: RunJournalStore;
+  readonly previous: SuperpowersPhaseV1;
+  readonly head: JournalHead;
+  readonly operationId: string;
+  readonly decisionOperationId: string;
+  readonly decision?: "APPROVE" | "REJECT";
+}): Promise<
+  Readonly<{ head: JournalHead; started: SuperpowersPhaseV1; pending: SuperpowersPhaseV1 }>
+> {
+  const phases = nextApprovalPhases({
+    previous: options.previous,
+    observedHead: options.head,
+    operationId: options.operationId,
+    decisionOperationId: options.decisionOperationId,
+    decision: options.decision ?? "APPROVE",
+  });
+  const pendingTransition = await options.journal.transition(
+    approvalPendingCommand(phases.pending),
+  );
+  if (options.decision === undefined) {
+    return Object.freeze({ ...phases, head: pendingTransition.head });
+  }
+  const request = approvalRequest(phases.pending, pendingTransition.head);
+  const decision = approvalDecision(request, {
+    ...phases.decisionRequest,
+    expected_journal_head: pendingTransition.head,
+    approval_request_hash: request.document_hash,
+  });
+  const terminal = approvalTerminalPhase({
+    pending: phases.pending,
+    decision,
+    occurred_at: "2026-08-30T13:00:02.000Z",
+  });
+  const decided = await options.journal.transition(
+    approvalDecisionCommand({ request, decision, terminal }),
+  );
+  return Object.freeze({ ...phases, head: decided.head });
+}
+
+async function expectGlobalApprovalIntegrityFailure(options: {
+  readonly statePath: string;
+  readonly journal: RunJournalStore;
+  readonly snapshot: SkillSnapshotV1;
+  readonly host: SkillsEngine;
+  readonly completion: CompleteSuperpowersPhaseRequest;
+  readonly resume: ResumeSuperpowersApprovalRequest;
+  readonly currentHead: JournalHead;
+}): Promise<void> {
+  const phasePath = path.join(options.statePath, "skills", "phases", "run-1.jsonl");
+  const journalPath = path.join(options.statePath, "journals", "run-1", "events.jsonl");
+  const before = [await readFile(phasePath), await readFile(journalPath)] as const;
+  const restarted = engine(options.statePath, options.journal, options.snapshot, {
+    idOffset: 1_300,
+  });
+  const operations = [
+    () => options.host.resumeApproval(options.resume),
+    () => options.host.completePhase(options.completion),
+    () => options.host.phaseHistory("run-1"),
+    () =>
+      options.host.startPhase({
+        ...startRequest(options.currentHead, options.snapshot),
+        operation_id: "fresh-after-unlinked-approval",
+      }),
+    () => restarted.recover(),
+  ] as const;
+
+  for (const operation of operations) {
+    await expect(operation()).rejects.toMatchObject({
+      code: "RUNTIME_SKILL_INTEGRITY",
+    });
+  }
+  expect(await readFile(phasePath)).toEqual(before[0]);
+  expect(await readFile(journalPath)).toEqual(before[1]);
+}
+
 afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
@@ -529,6 +672,205 @@ describe("durable Superpowers approval transaction", () => {
     }
     expect(await readFile(phasePath)).toEqual(before[0]);
     expect(await readFile(journalPath)).toEqual(before[1]);
+  });
+
+  it("rejects one extra canonical approval-pending journal projection with no phase record", async () => {
+    const { statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const snapshot = brainstormingSnapshot();
+    const { host, completion, pending } = await pendingApproval({
+      statePath,
+      journal,
+      head,
+      snapshot,
+    });
+    const resume = resumeRequest(pending);
+    const approved = await host.resumeApproval(resume);
+    const extra = await appendUnlinkedJournalApproval({
+      journal,
+      previous: approved.phase,
+      head: approved.journal_head,
+      operationId: "unlinked-pending-phase",
+      decisionOperationId: "a0000000-0000-4000-8000-000000000801",
+    });
+
+    await expectGlobalApprovalIntegrityFailure({
+      statePath,
+      journal,
+      snapshot,
+      host,
+      completion,
+      resume,
+      currentHead: extra.head,
+    });
+  });
+
+  it.each([
+    { decision: "APPROVE", successors: [] },
+    { decision: "APPROVE", successors: ["TOOL_PENDING", "RUNNING"] },
+    { decision: "REJECT", successors: [] },
+    { decision: "REJECT", successors: ["RUNNING", "TOOL_PENDING", "RUNNING"] },
+  ] as const)(
+    "rejects one extra canonical $decision projection with $successors.length later successors",
+    async ({ decision, successors }) => {
+      const { statePath } = await fixture();
+      const { journal, head } = await runningJournal(statePath);
+      const snapshot = brainstormingSnapshot();
+      const { host, completion, pending } = await pendingApproval({
+        statePath,
+        journal,
+        head,
+        snapshot,
+      });
+      const resume = resumeRequest(pending);
+      const approved = await host.resumeApproval(resume);
+      const extra = await appendUnlinkedJournalApproval({
+        journal,
+        previous: approved.phase,
+        head: approved.journal_head,
+        operationId: `unlinked-${decision.toLowerCase()}-phase`,
+        decisionOperationId:
+          decision === "APPROVE"
+            ? "a0000000-0000-4000-8000-000000000802"
+            : "a0000000-0000-4000-8000-000000000803",
+        decision,
+      });
+      let currentHead = extra.head;
+      for (const [index, state] of successors.entries()) {
+        currentHead = (
+          await journal.transition({
+            ...journalCommand("run-1", state, currentHead),
+            command_id: `unlinked-successor-${decision.toLowerCase()}-${index}`,
+          })
+        ).head;
+      }
+
+      await expectGlobalApprovalIntegrityFailure({
+        statePath,
+        journal,
+        snapshot,
+        host,
+        completion,
+        resume,
+        currentHead,
+      });
+    },
+    20_000,
+  );
+
+  it("rejects multiple distinct canonical approval roots that share no phase-history record", async () => {
+    const { statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const snapshot = brainstormingSnapshot();
+    const { host, completion, pending } = await pendingApproval({
+      statePath,
+      journal,
+      head,
+      snapshot,
+    });
+    const resume = resumeRequest(pending);
+    const approved = await host.resumeApproval(resume);
+    const first = await appendUnlinkedJournalApproval({
+      journal,
+      previous: approved.phase,
+      head: approved.journal_head,
+      operationId: "unlinked-root-one",
+      decisionOperationId: "a0000000-0000-4000-8000-000000000804",
+      decision: "APPROVE",
+    });
+    const second = await appendUnlinkedJournalApproval({
+      journal,
+      previous: approved.phase,
+      head: first.head,
+      operationId: "unlinked-root-two",
+      decisionOperationId: "a0000000-0000-4000-8000-000000000805",
+      decision: "APPROVE",
+    });
+
+    await expectGlobalApprovalIntegrityFailure({
+      statePath,
+      journal,
+      snapshot,
+      host,
+      completion,
+      resume,
+      currentHead: second.head,
+    });
+  });
+
+  it.each(["stale-pending", "terminal-without-decision"] as const)(
+    "rejects an orphan phase approval projection: $caseName",
+    async (caseName) => {
+      const { statePath } = await fixture();
+      const { journal, head } = await runningJournal(statePath);
+      const snapshot = brainstormingSnapshot();
+      const { host, completion, pending } = await pendingApproval({
+        statePath,
+        journal,
+        head,
+        snapshot,
+      });
+      const resume = resumeRequest(pending);
+      const approved = await host.resumeApproval(resume);
+      const orphan = nextApprovalPhases({
+        previous: approved.phase,
+        observedHead: approved.journal_head,
+        operationId: `orphan-${caseName}`,
+        decisionOperationId: "a0000000-0000-4000-8000-000000000806",
+        decision: "APPROVE",
+      });
+      let currentHead = approved.journal_head;
+      if (caseName === "stale-pending") {
+        currentHead = (
+          await journal.transition({
+            ...journalCommand("run-1", "REVIEW_PENDING", currentHead),
+            command_id: "orphan-pending-successor",
+          })
+        ).head;
+      }
+      const phasePath = path.join(statePath, "skills", "phases", "run-1.jsonl");
+      const currentBytes = await readFile(phasePath);
+      const orphanRecords =
+        caseName === "stale-pending"
+          ? [orphan.started, orphan.pending]
+          : [orphan.started, orphan.pending, orphan.terminal];
+      await writeFile(
+        phasePath,
+        Buffer.concat([
+          currentBytes,
+          Buffer.from(orphanRecords.map((record) => `${canonicalJson(record)}\n`).join(""), "utf8"),
+        ]),
+      );
+
+      await expectGlobalApprovalIntegrityFailure({
+        statePath,
+        journal,
+        snapshot,
+        host,
+        completion,
+        resume,
+        currentHead,
+      });
+    },
+  );
+
+  it("rejects approval phase records when their entire journal projection is absent", async () => {
+    const { statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const snapshot = brainstormingSnapshot();
+    const { host, pending } = await pendingApproval({ statePath, journal, head, snapshot });
+    await host.resumeApproval(resumeRequest(pending));
+    const phasePath = path.join(statePath, "skills", "phases", "run-1.jsonl");
+    const phaseBytes = await readFile(phasePath);
+    await rm(path.join(statePath, "journals", "run-1"), { recursive: true });
+
+    await expect(host.phaseHistory("run-1")).rejects.toMatchObject({
+      code: "RUNTIME_SKILL_INTEGRITY",
+    });
+    await expect(host.startPhase(startRequest(head, snapshot))).rejects.toMatchObject({
+      code: "RUNTIME_SKILL_INTEGRITY",
+    });
+    expect(await readFile(phasePath)).toEqual(phaseBytes);
   });
 
   it.each([
