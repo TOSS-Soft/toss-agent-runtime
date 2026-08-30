@@ -43,6 +43,20 @@ function createStore(statePath: string): RunJournalStore {
   return createRunJournalStore({ statePath, now: clock(), randomId: ids() });
 }
 
+async function within<T>(promise: Promise<T>, milliseconds = 1_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("operation timed out")), milliseconds);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 function command(
   runId: string,
   nextState: RunState,
@@ -249,6 +263,148 @@ describe("private append-only run journal store", () => {
 
     expect(settledWhenFlushReturned).toBe(true);
     expect((await store.load("run-fire-flush"))?.state).toBe("APPROVAL_PENDING");
+  });
+
+  it("rejects a direct same-run official barrier reacquisition before enqueue", async () => {
+    const { statePath } = await fixture();
+    const store = createStore(statePath);
+    await advance(store, "run-nested-direct", ["CREATED"]);
+
+    const nested = withRunJournalBarrier(store, "run-nested-direct", async () =>
+      withRunJournalBarrier(store, "run-nested-direct", () => Promise.resolve("unreachable")),
+    );
+
+    await expect(within(nested)).rejects.toMatchObject({
+      code: "RUNTIME_JOURNAL_UNAVAILABLE",
+    });
+  });
+
+  it("rejects same-run reacquisition across stores sharing the official run queue", async () => {
+    const { statePath } = await fixture();
+    const first = createStore(statePath);
+    const second = createStore(statePath);
+    await advance(first, "run-nested-shared", ["CREATED"]);
+
+    const nested = withRunJournalBarrier(first, "run-nested-shared", async () =>
+      withRunJournalBarrier(second, "run-nested-shared", () => Promise.resolve("unreachable")),
+    );
+
+    await expect(within(nested)).rejects.toMatchObject({
+      code: "RUNTIME_JOURNAL_UNAVAILABLE",
+    });
+  });
+
+  it("allows bounded different-run nesting but rejects a cyclic reacquisition", async () => {
+    const { statePath } = await fixture();
+    const store = createStore(statePath);
+    await advance(store, "run-nested-a", ["CREATED"]);
+    await advance(store, "run-nested-b", ["CREATED"]);
+
+    await expect(
+      within(
+        withRunJournalBarrier(store, "run-nested-a", async () =>
+          withRunJournalBarrier(store, "run-nested-b", () => Promise.resolve("different-run")),
+        ),
+      ),
+    ).resolves.toBe("different-run");
+
+    const cyclic = withRunJournalBarrier(store, "run-nested-a", async () =>
+      withRunJournalBarrier(store, "run-nested-b", async () =>
+        withRunJournalBarrier(store, "run-nested-a", () => Promise.resolve("unreachable")),
+      ),
+    );
+    await expect(within(cyclic)).rejects.toMatchObject({
+      code: "RUNTIME_JOURNAL_UNAVAILABLE",
+    });
+  });
+
+  it("breaks concurrent cross-run barrier cycles without deadlocking either queue", async () => {
+    const { statePath } = await fixture();
+    const store = createStore(statePath);
+    await advance(store, "run-cycle-a", ["CREATED"]);
+    await advance(store, "run-cycle-b", ["CREATED"]);
+    let entered = 0;
+    let release: (() => void) | undefined;
+    const bothEntered = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const cyclic = (outerRun: string, innerRun: string) =>
+      withRunJournalBarrier(store, outerRun, async () => {
+        entered += 1;
+        if (entered === 2) release?.();
+        await bothEntered;
+        return withRunJournalBarrier(store, innerRun, () =>
+          Promise.resolve(`${outerRun}:${innerRun}`),
+        );
+      });
+
+    const settled = await within(
+      Promise.allSettled([
+        cyclic("run-cycle-a", "run-cycle-b"),
+        cyclic("run-cycle-b", "run-cycle-a"),
+      ]),
+      2_000,
+    );
+
+    expect(settled.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    const rejected = settled.find((result) => result.status === "rejected");
+    expect(rejected).toMatchObject({
+      status: "rejected",
+      reason: { code: "RUNTIME_JOURNAL_UNAVAILABLE" },
+    });
+    store.stopIntake();
+    await expect(within(store.flush(new AbortController().signal))).resolves.toBeUndefined();
+  });
+
+  it("does not reject concurrent independent barriers on the same run", async () => {
+    const { statePath } = await fixture();
+    const store = createStore(statePath);
+    await advance(store, "run-independent", ["CREATED"]);
+    const order: string[] = [];
+
+    const first = withRunJournalBarrier(store, "run-independent", async () => {
+      order.push("first");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      return 1;
+    });
+    const second = withRunJournalBarrier(store, "run-independent", () => {
+      order.push("second");
+      return Promise.resolve(2);
+    });
+
+    await expect(within(Promise.all([first, second]))).resolves.toEqual([1, 2]);
+    expect(order).toEqual(["first", "second"]);
+  });
+
+  it("keeps callback failure precedence after a rejected nested barrier", async () => {
+    const { statePath } = await fixture();
+    const store = createStore(statePath);
+    await advance(store, "run-nested-error", ["CREATED"]);
+
+    const outer = withRunJournalBarrier(store, "run-nested-error", async () => {
+      await expect(
+        withRunJournalBarrier(store, "run-nested-error", () => Promise.resolve("unreachable")),
+      ).rejects.toMatchObject({ code: "RUNTIME_JOURNAL_UNAVAILABLE" });
+      throw new Error("outer-callback-failed");
+    });
+
+    await expect(within(outer)).rejects.toThrow("outer-callback-failed");
+  });
+
+  it("settles shutdown flush after rejecting a nested barrier", async () => {
+    const { statePath } = await fixture();
+    const store = createStore(statePath);
+    await advance(store, "run-nested-flush", ["CREATED"]);
+
+    const outer = withRunJournalBarrier(store, "run-nested-flush", async () => {
+      await expect(
+        withRunJournalBarrier(store, "run-nested-flush", () => Promise.resolve("unreachable")),
+      ).rejects.toMatchObject({ code: "RUNTIME_JOURNAL_UNAVAILABLE" });
+    });
+    await expect(within(outer)).resolves.toBeUndefined();
+
+    store.stopIntake();
+    await expect(within(store.flush(new AbortController().signal))).resolves.toBeUndefined();
   });
 
   it("rejects a scoped transition for another run without creating that run", async () => {

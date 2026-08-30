@@ -1117,20 +1117,35 @@ function metadataKind(entry: RunJournalEntryV1): JsonValue | undefined {
   return (metadata as Readonly<Record<string, JsonValue>>).kind;
 }
 
+function claimsApprovalDecision(entry: RunJournalEntryV1): boolean {
+  return (
+    metadataKind(entry) === "superpowers-approval-decision" ||
+    entry.command_id.startsWith("approval-decision:") ||
+    entry.reason_code === "SUPERPOWERS_APPROVAL_GRANTED" ||
+    entry.reason_code === "SUPERPOWERS_APPROVAL_REJECTED"
+  );
+}
+
+function claimsApprovalPending(entry: RunJournalEntryV1): boolean {
+  return (
+    metadataKind(entry) === "superpowers-approval-pending" ||
+    entry.command_id.startsWith("approval-pending:") ||
+    entry.reason_code === "SUPERPOWERS_APPROVAL_REQUIRED"
+  );
+}
+
 function approvalDecisionRecords(journal: RunJournalSnapshot): readonly Readonly<{
   entry: RunJournalEntryV1;
   metadata: ApprovalDecisionJournalMetadata;
 }>[] {
   return Object.freeze(
-    journal.entries
-      .filter((entry) => metadataKind(entry) === "superpowers-approval-decision")
-      .map((entry) => {
-        const pendingEntry = journal.entries.find(
-          (candidate) => candidate.entry_hash === entry.previous_entry_hash,
-        );
-        if (pendingEntry === undefined) integrity();
-        return Object.freeze({ entry, metadata: decisionMetadata(entry, pendingEntry) });
-      }),
+    journal.entries.filter(claimsApprovalDecision).map((entry) => {
+      const pendingEntry = journal.entries.find(
+        (candidate) => candidate.entry_hash === entry.previous_entry_hash,
+      );
+      if (pendingEntry === undefined) integrity();
+      return Object.freeze({ entry, metadata: decisionMetadata(entry, pendingEntry) });
+    }),
   );
 }
 
@@ -1139,9 +1154,13 @@ function approvalPendingRecords(journal: RunJournalSnapshot): readonly Readonly<
   metadata: ApprovalPendingJournalMetadata;
 }>[] {
   return Object.freeze(
-    journal.entries
-      .filter((entry) => metadataKind(entry) === "superpowers-approval-pending")
-      .map((entry) => Object.freeze({ entry, metadata: pendingMetadata(entry) })),
+    journal.entries.filter(claimsApprovalPending).map((entry) => {
+      try {
+        return Object.freeze({ entry, metadata: pendingMetadata(entry) });
+      } catch {
+        integrity();
+      }
+    }),
   );
 }
 
@@ -2550,6 +2569,14 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
         stale();
       }
       loaded = await loadExisting(request.run_id);
+      const pendingRecords = approvalPendingRecords(currentJournal);
+      const decisionRecords = approvalDecisionRecords(currentJournal);
+      if (
+        loaded.entries.length === 0 &&
+        (pendingRecords.length > 0 || decisionRecords.length > 0)
+      ) {
+        integrity();
+      }
       if (latestOperation(loaded.entries, request.operation_id).length > 0) conflict();
       const predecessorPhaseHashes = enforcePredecessors(
         loaded.entries,
@@ -2907,26 +2934,24 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
             await withMutationClaim(runId, async () => {
               await journalBarrier(runId, async (journal, transition) => {
                 const loaded = await loadExisting(runId);
+                const pendingRecords =
+                  journal === null ? Object.freeze([]) : approvalPendingRecords(journal);
+                const decisionRecords =
+                  journal === null ? Object.freeze([]) : approvalDecisionRecords(journal);
                 const latest = loaded.entries.at(-1);
                 if (latest === undefined) {
-                  if (journal?.state === "APPROVAL_PENDING") integrity();
+                  if (pendingRecords.length > 0 || decisionRecords.length > 0) integrity();
                   return;
                 }
                 const pending = [...loaded.entries]
                   .reverse()
                   .find((entry) => entry.status === "APPROVAL_PENDING");
                 if (pending === undefined) {
-                  if (
-                    journal !== null &&
-                    (approvalPendingRecords(journal).length > 0 ||
-                      approvalDecisionRecords(journal).length > 0)
-                  ) {
-                    integrity();
-                  }
+                  if (pendingRecords.length > 0 || decisionRecords.length > 0) integrity();
                   return;
                 }
                 if (journal === null) integrity();
-                const pendingMatches = approvalPendingRecords(journal).filter(
+                const pendingMatches = pendingRecords.filter(
                   ({ metadata }) => metadata.phase.document_hash === pending.document_hash,
                 );
                 if (pendingMatches.length === 0) {
@@ -2942,7 +2967,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
                 }
                 if (pendingMatches.length !== 1) integrity();
                 const pendingRecord = pendingMatches[0]!;
-                const decisions = approvalDecisionRecords(journal).filter(
+                const decisions = decisionRecords.filter(
                   ({ metadata }) => metadata.request.phase_document_hash === pending.document_hash,
                 );
                 if (decisions.length === 0) {

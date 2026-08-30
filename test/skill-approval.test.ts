@@ -378,9 +378,9 @@ describe("durable Superpowers approval transaction", () => {
       });
       const pendingEntry = (await journal.load("run-1"))?.entries.at(-1);
       expect(pendingEntry).toMatchObject({
-        command_id: expect.stringMatching(/^approval-pending:sha256:[0-9a-f]{64}$/u),
         operation_id: maximumOperationId,
       });
+      expect(pendingEntry?.command_id).toMatch(/^approval-pending:sha256:[0-9a-f]{64}$/u);
       expect(pendingEntry?.command_id).toHaveLength(88);
       expect(pendingEntry?.command_id).not.toContain(maximumOperationId);
       expect([(await lstat(phasePath)).size, (await lstat(journalPath)).size]).toEqual(before);
@@ -662,6 +662,161 @@ describe("durable Superpowers approval transaction", () => {
     });
     expect((await journal.load("run-1"))?.state).toBe("APPROVAL_PENDING");
   });
+
+  it.each([
+    { decision: "APPROVE", successors: [] },
+    { decision: "APPROVE", successors: ["REVIEW_PENDING"] },
+    { decision: "APPROVE", successors: ["TOOL_PENDING", "RUNNING", "REVIEW_PENDING"] },
+    { decision: "REJECT", successors: [] },
+    { decision: "REJECT", successors: ["RUNNING"] },
+    { decision: "REJECT", successors: ["RUNNING", "TOOL_PENDING", "RUNNING"] },
+  ] as const)(
+    "fails closed when all phase history is missing after $decision and $successors.length successors",
+    async ({ decision, successors }) => {
+      const { statePath } = await fixture();
+      const { journal, head } = await runningJournal(statePath);
+      const snapshot = brainstormingSnapshot();
+      const { host, pending } = await pendingApproval({ statePath, journal, head, snapshot });
+      const decided = await host.resumeApproval(resumeRequest(pending, decision));
+      let advancedHead = decided.journal_head;
+      for (const [index, state] of successors.entries()) {
+        advancedHead = (
+          await journal.transition({
+            ...journalCommand("run-1", state, advancedHead),
+            command_id: `missing-history-successor-${index}-${state.toLowerCase()}`,
+          })
+        ).head;
+      }
+      const phasePath = path.join(statePath, "skills", "phases", "run-1.jsonl");
+      const journalPath = path.join(statePath, "journals", "run-1", "events.jsonl");
+      const journalBytes = await readFile(journalPath);
+      await rm(phasePath);
+
+      const restarted = engine(statePath, journal, snapshot, { idOffset: 960 });
+      await expect(restarted.recover()).rejects.toMatchObject({
+        code: "RUNTIME_SKILL_INTEGRITY",
+      });
+      expect(await readFile(journalPath)).toEqual(journalBytes);
+      await expect(lstat(phasePath)).rejects.toMatchObject({ code: "ENOENT" });
+
+      if (decision === "APPROVE" && successors.length === 0) {
+        await expect(
+          restarted.startPhase({
+            ...startRequest(advancedHead, snapshot),
+            operation_id: "fresh-after-missing-history",
+          }),
+        ).rejects.toMatchObject({ code: "RUNTIME_SKILL_INTEGRITY" });
+        await expect(lstat(phasePath)).rejects.toMatchObject({ code: "ENOENT" });
+      }
+    },
+    20_000,
+  );
+
+  it("fails closed when a journal-first approval decision loses its phase history", async () => {
+    const { statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const snapshot = brainstormingSnapshot();
+    const initial = await pendingApproval({ statePath, journal, head, snapshot });
+    const crashing = engine(statePath, journal, snapshot, {
+      hooks: {
+        afterApprovalDecisionJournalSync: () => {
+          throw new Error("crash:journal-first-missing-history");
+        },
+      },
+      idOffset: 970,
+    });
+    await expect(crashing.resumeApproval(resumeRequest(initial.pending))).rejects.toThrow(
+      "crash:journal-first-missing-history",
+    );
+    const phasePath = path.join(statePath, "skills", "phases", "run-1.jsonl");
+    const journalPath = path.join(statePath, "journals", "run-1", "events.jsonl");
+    const journalBytes = await readFile(journalPath);
+    await rm(phasePath);
+
+    const restarted = engine(statePath, journal, snapshot, { idOffset: 980 });
+    await expect(restarted.recover()).rejects.toMatchObject({
+      code: "RUNTIME_SKILL_INTEGRITY",
+    });
+    expect(await readFile(journalPath)).toEqual(journalBytes);
+    await expect(lstat(phasePath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("allows empty phase history only when the verified journal has no approval evidence", async () => {
+    const { statePath } = await fixture();
+    const { journal } = await runningJournal(statePath);
+    const snapshot = brainstormingSnapshot();
+    const phasePath = path.join(statePath, "skills", "phases", "run-1.jsonl");
+
+    const restarted = engine(statePath, journal, snapshot, { idOffset: 985 });
+    await expect(restarted.recover()).resolves.toBeUndefined();
+    await expect(lstat(phasePath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each([
+    {
+      state: "APPROVAL_PENDING",
+      command_id: `approval-pending:sha256:${"a".repeat(64)}`,
+      reason_code: "MOVE_APPROVAL_PENDING",
+    },
+    {
+      state: "REVIEW_PENDING",
+      command_id: "approval-decision:a0000000-0000-4000-8000-000000000779",
+      reason_code: "SUPERPOWERS_APPROVAL_GRANTED",
+    },
+  ] as const)(
+    "rejects claimed approval journal evidence without closed canonical metadata",
+    async ({ state, command_id, reason_code }) => {
+      const { statePath } = await fixture();
+      const { journal, head } = await runningJournal(statePath);
+      const snapshot = brainstormingSnapshot();
+      await journal.transition({
+        ...journalCommand("run-1", state, head),
+        command_id,
+        reason_code,
+      });
+      const journalPath = path.join(statePath, "journals", "run-1", "events.jsonl");
+      const journalBytes = await readFile(journalPath);
+
+      const restarted = engine(statePath, journal, snapshot, { idOffset: 988 });
+      await expect(restarted.recover()).rejects.toMatchObject({
+        code: "RUNTIME_SKILL_INTEGRITY",
+      });
+      expect(await readFile(journalPath)).toEqual(journalBytes);
+    },
+  );
+
+  it.each(["truncated", "replaced"] as const)(
+    "fails closed when durable approval phase history is $caseName",
+    async (caseName) => {
+      const { statePath } = await fixture();
+      const { journal, head } = await runningJournal(statePath);
+      const snapshot = brainstormingSnapshot();
+      const { host, pending } = await pendingApproval({ statePath, journal, head, snapshot });
+      await host.resumeApproval(resumeRequest(pending));
+      const phasePath = path.join(statePath, "skills", "phases", "run-1.jsonl");
+      const original = await readFile(phasePath);
+      if (caseName === "truncated") {
+        const firstLineEnd = original.indexOf(0x0a);
+        await writeFile(phasePath, original.subarray(0, firstLineEnd + 1));
+      } else {
+        const first = JSON.parse(original.toString("utf8").split("\n")[0]!) as Record<
+          string,
+          unknown
+        >;
+        const replacement = resignDocument({
+          ...first,
+          operation_id: "replacement-phase",
+          input_hash: `sha256:${"9".repeat(64)}`,
+        });
+        await writeFile(phasePath, `${canonicalJson(replacement)}\n`);
+      }
+
+      const restarted = engine(statePath, journal, snapshot, { idOffset: 990 });
+      await expect(restarted.recover()).rejects.toMatchObject({
+        code: "RUNTIME_SKILL_INTEGRITY",
+      });
+    },
+  );
 
   it("rejects approval after the shutdown intake cut before reading mutable request fields", async () => {
     const { statePath } = await fixture();
