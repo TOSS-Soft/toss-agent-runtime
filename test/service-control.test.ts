@@ -2027,6 +2027,22 @@ describe("private service control socket", () => {
     ).resolves.toEqual(approvalData(request));
   });
 
+  it.each(["0", "a", "b", "c", "d", "e", "f"] as const)(
+    "round-trips a canonical %s-leading approval operation UUID over the private socket",
+    async (firstNibble) => {
+      const request = approvalRequest({
+        operation_id: `${firstNibble}0000000-0000-4000-8000-000000000777`,
+      });
+      await listenControl({
+        handleSkillRequest: (received) => Promise.resolve(approvalData(received)),
+      });
+
+      await expect(
+        requestSuperpowersApprovalDecision({ socketPath, request, idleTimeoutMs: 5_000 }),
+      ).resolves.toEqual(approvalData(request));
+    },
+  );
+
   it("rejects an approval response that skips the single decision journal transition", async () => {
     const request = approvalRequest();
     await listenControl({

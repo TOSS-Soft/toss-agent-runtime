@@ -178,18 +178,26 @@ describe("skill runtime contracts", () => {
     });
   });
 
-  it("accepts only a canonical UUID alternative for an approval decision operation id", () => {
+  it.each(["0", "a", "b", "c", "d", "e", "f"] as const)(
+    "accepts a canonical %s-leading UUID alternative exactly once for an approval decision",
+    (firstNibble) => {
+      const fixture = validSuperpowersApprovalDecision();
+      const canonical = resignDocument({
+        ...fixture,
+        operation_id: `${firstNibble}0000000-0000-4000-8000-000000000777`,
+      });
+
+      expect(parseSuperpowersApproval(canonicalJson(canonical))).toMatchObject({ ok: true });
+    },
+  );
+
+  it("rejects a noncanonical approval decision UUID alternative", () => {
     const fixture = validSuperpowersApprovalDecision();
-    const canonical = resignDocument({
-      ...fixture,
-      operation_id: "00000000-0000-4000-8000-000000000777",
-    });
     const uppercase = resignDocument({
       ...fixture,
-      operation_id: "00000000-0000-4000-8000-000000000ABC",
+      operation_id: "A0000000-0000-4000-8000-000000000ABC",
     });
 
-    expect(parseSuperpowersApproval(canonicalJson(canonical))).toMatchObject({ ok: true });
     expect(parseSuperpowersApproval(canonicalJson(uppercase))).toMatchObject({ ok: false });
   });
 

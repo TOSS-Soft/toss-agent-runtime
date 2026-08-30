@@ -418,7 +418,13 @@ export function createRunJournalStore(options: CreateRunJournalStoreOptions): Ru
       }
     },
   };
-  OFFICIAL_RUN_JOURNAL_BARRIERS.set(store, (runId, operation) => {
+  const officialBarrier = <T>(
+    runId: string,
+    operation: (
+      snapshot: RunJournalSnapshot | null,
+      transition: (command: TransitionCommand) => Promise<TransitionResult>,
+    ) => Promise<T>,
+  ): Promise<T> => {
     if (intakeStopped) {
       return Promise.reject(new RuntimeJournalError("RUNTIME_JOURNAL_UNAVAILABLE"));
     }
@@ -426,19 +432,41 @@ export function createRunJournalStore(options: CreateRunJournalStoreOptions): Ru
       const snapshot = await loadInternal(runId);
       let active = true;
       let used = false;
-      const transition = async (command: TransitionCommand): Promise<TransitionResult> => {
+      const issued: Promise<TransitionResult>[] = [];
+      const transition = (command: TransitionCommand): Promise<TransitionResult> => {
+        let result: Promise<TransitionResult>;
         if (!active || used || command.run_id !== runId) {
-          throw new RuntimeJournalError("RUNTIME_JOURNAL_UNAVAILABLE");
+          result = Promise.reject(new RuntimeJournalError("RUNTIME_JOURNAL_UNAVAILABLE"));
+        } else {
+          used = true;
+          result = appendInternal(command);
         }
-        used = true;
-        return appendInternal(command);
+        void result.catch(() => undefined);
+        if (active) {
+          issued.push(result);
+        }
+        return result;
       };
+      let operationResult: T | undefined;
+      let operationError: unknown;
+      let operationSucceeded = false;
       try {
-        return await operation(snapshot, transition);
+        operationResult = await operation(snapshot, transition);
+        operationSucceeded = true;
+      } catch (error) {
+        operationError = error;
       } finally {
         active = false;
       }
+      const settled = await Promise.allSettled(issued);
+      if (!operationSucceeded) throw operationError;
+      const failed = settled.find(
+        (result): result is PromiseRejectedResult => result.status === "rejected",
+      );
+      if (failed !== undefined) throw failed.reason;
+      return operationResult as T;
     });
-  });
+  };
+  OFFICIAL_RUN_JOURNAL_BARRIERS.set(store, officialBarrier);
   return store;
 }

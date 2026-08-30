@@ -1,14 +1,19 @@
 import { createHash } from "node:crypto";
-import { lstat, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { ZERO_JOURNAL_HASH } from "../src/journal/entry.js";
+import { hashRunJournalEntry, ZERO_JOURNAL_HASH } from "../src/journal/entry.js";
 import { createRunJournalStore, type RunJournalStore } from "../src/journal/store.js";
 import type { TransitionCommand } from "../src/journal/state-machine.js";
-import type { JournalHead, RunState } from "../src/journal/types.js";
-import { deepFreezeJson, sha256, type JsonValue } from "../src/protocol/json.js";
+import type {
+  HashableRunJournalEntryV1,
+  JournalHead,
+  RunJournalEntryV1,
+  RunState,
+} from "../src/journal/types.js";
+import { canonicalJson, deepFreezeJson, sha256, type JsonValue } from "../src/protocol/json.js";
 import type { SkillCatalog, SkillSelection } from "../src/skills/catalog.js";
 import { hashSkillPackage } from "../src/skills/contracts.js";
 import {
@@ -34,7 +39,7 @@ const TRACE = {
   trace_flags: 1,
 } as const;
 const EXECUTION_REQUEST_HASH = `sha256:${"e".repeat(64)}` as const;
-const APPROVAL_OPERATION_ID = "00000000-0000-4000-8000-000000000777";
+const APPROVAL_OPERATION_ID = "a0000000-0000-4000-8000-000000000777";
 
 function rawHash(bytes: Uint8Array): `sha256:${string}` {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
@@ -331,6 +336,72 @@ describe("durable Superpowers approval transaction", () => {
     });
   });
 
+  it("persists and recovers approval for the maximum phase operation identifier", async () => {
+    const maximumOperationId = `p${"x".repeat(127)}`;
+    for (const crashAfterPhase of [false, true]) {
+      const { statePath } = await fixture();
+      const { journal, head } = await runningJournal(statePath);
+      const snapshot = brainstormingSnapshot();
+      let crash = crashAfterPhase;
+      const host = engine(statePath, journal, snapshot, {
+        hooks: {
+          afterApprovalPendingPhaseSync: () => {
+            if (crash) throw new Error("crash:maximum-operation");
+          },
+        },
+      });
+      const started = await host.startPhase({
+        ...startRequest(head, snapshot),
+        operation_id: maximumOperationId,
+      });
+      const completion = completeRequest(started);
+      if (crashAfterPhase) {
+        await expect(host.completePhase(completion)).rejects.toThrow("crash:maximum-operation");
+        crash = false;
+      } else {
+        await expect(host.completePhase(completion)).resolves.toMatchObject({
+          state: "APPROVAL_PENDING",
+        });
+      }
+
+      const restarted = engine(statePath, journal, snapshot, { idOffset: 575 });
+      await restarted.recover();
+      const phasePath = path.join(statePath, "skills", "phases", "run-1.jsonl");
+      const journalPath = path.join(statePath, "journals", "run-1", "events.jsonl");
+      const before = [(await lstat(phasePath)).size, (await lstat(journalPath)).size] as const;
+      const replay = await restarted.completePhase(completion);
+
+      expect(replay).toMatchObject({
+        state: "APPROVAL_PENDING",
+        replayed: true,
+        phase: { operation_id: maximumOperationId },
+      });
+      const pendingEntry = (await journal.load("run-1"))?.entries.at(-1);
+      expect(pendingEntry).toMatchObject({
+        command_id: expect.stringMatching(/^approval-pending:sha256:[0-9a-f]{64}$/u),
+        operation_id: maximumOperationId,
+      });
+      expect(pendingEntry?.command_id).toHaveLength(88);
+      expect(pendingEntry?.command_id).not.toContain(maximumOperationId);
+      expect([(await lstat(phasePath)).size, (await lstat(journalPath)).size]).toEqual(before);
+    }
+  });
+
+  it.each([`p${"x".repeat(128)}`, `p${"x".repeat(126)}é`] as const)(
+    "rejects an over-bound or non-ASCII phase operation identifier before persistence",
+    async (operationId) => {
+      const { statePath } = await fixture();
+      const { journal, head } = await runningJournal(statePath);
+      const snapshot = brainstormingSnapshot();
+      const host = engine(statePath, journal, snapshot);
+
+      await expect(
+        host.startPhase({ ...startRequest(head, snapshot), operation_id: operationId }),
+      ).rejects.toMatchObject({ code: "RUNTIME_SKILL_INVALID" });
+      await expect(host.phaseHistory("run-1")).resolves.toEqual([]);
+    },
+  );
+
   it("reconstructs a byte-identical challenge after restart without growing either history", async () => {
     const { statePath } = await fixture();
     const { journal, head } = await runningJournal(statePath);
@@ -415,6 +486,54 @@ describe("durable Superpowers approval transaction", () => {
     expect([(await lstat(phasePath)).size, (await lstat(journalPath)).size]).toEqual(before);
     expect((await journal.load("run-1"))?.head).toEqual(advanced.head);
   });
+
+  it.each([
+    { decision: "APPROVE", successors: ["REVIEW_PENDING"] },
+    { decision: "APPROVE", successors: ["TOOL_PENDING", "RUNNING", "REVIEW_PENDING"] },
+    { decision: "REJECT", successors: ["RUNNING"] },
+    { decision: "REJECT", successors: ["RUNNING", "TOOL_PENDING", "RUNNING"] },
+  ] as const)(
+    "recovers historical $decision after $successors.length legitimate later journal transitions",
+    async ({ decision, successors }) => {
+      const { statePath } = await fixture();
+      const { journal, head } = await runningJournal(statePath);
+      const snapshot = brainstormingSnapshot();
+      const { host, completion, pending } = await pendingApproval({
+        statePath,
+        journal,
+        head,
+        snapshot,
+      });
+      const request = resumeRequest(pending, decision);
+      const decided = await host.resumeApproval(request);
+      let advancedHead = decided.journal_head;
+      for (const [index, state] of successors.entries()) {
+        advancedHead = (
+          await journal.transition({
+            ...journalCommand("run-1", state, advancedHead),
+            command_id: `approval-successor-${index}-${state.toLowerCase()}`,
+          })
+        ).head;
+      }
+      const phasePath = path.join(statePath, "skills", "phases", "run-1.jsonl");
+      const journalPath = path.join(statePath, "journals", "run-1", "events.jsonl");
+      const before = [(await lstat(phasePath)).size, (await lstat(journalPath)).size] as const;
+
+      const restarted = engine(statePath, journal, snapshot, { idOffset: 580 });
+      await restarted.recover();
+      await expect(restarted.resumeApproval(request)).resolves.toEqual({
+        ...decided,
+        replayed: true,
+      });
+      await expect(restarted.completePhase(completion)).resolves.toEqual({
+        ...decided,
+        replayed: true,
+      });
+      expect((await journal.load("run-1"))?.head).toEqual(advancedHead);
+      expect([(await lstat(phasePath)).size, (await lstat(journalPath)).size]).toEqual(before);
+    },
+    20_000,
+  );
 
   it("transitions an exact rejection to BLOCKED without a successful phase output", async () => {
     const { statePath } = await fixture();
@@ -592,12 +711,181 @@ describe("durable Superpowers approval transaction", () => {
     const metadata = entry.metadata as Record<string, unknown>;
     const decision = metadata.decision as Record<string, unknown>;
     const mutatedDecision = resignDocument({ ...decision, skill_version: "9.9.9" });
+    const pendingEntry = (await journal.load("run-1"))?.entries.at(-2);
+    if (pendingEntry === undefined) throw new Error("pending journal entry was not persisted");
 
     expect(() =>
-      decisionMetadata({
-        ...entry,
-        metadata: { ...metadata, decision: mutatedDecision },
-      }),
+      decisionMetadata(
+        {
+          ...entry,
+          metadata: { ...metadata, decision: mutatedDecision },
+        },
+        pendingEntry,
+      ),
     ).toThrowError(new RuntimeSkillError("RUNTIME_SKILL_INTEGRITY"));
+  });
+
+  it("rejects every re-signed terminal field that is not derived from pending and decision", async () => {
+    const { statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const snapshot = brainstormingSnapshot();
+    const { host, pending } = await pendingApproval({ statePath, journal, head, snapshot });
+    await host.resumeApproval(resumeRequest(pending));
+    const loaded = await journal.load("run-1");
+    const pendingEntry = loaded?.entries.at(-2);
+    const decisionEntry = loaded?.entries.at(-1);
+    if (
+      pendingEntry === undefined ||
+      decisionEntry === undefined ||
+      typeof decisionEntry.metadata !== "object" ||
+      decisionEntry.metadata === null
+    ) {
+      throw new Error("approval journal transaction was not persisted");
+    }
+    const metadata = decisionEntry.metadata as Record<string, unknown>;
+    const phase = metadata.phase as Record<string, unknown>;
+    const mutations: readonly Readonly<Record<string, unknown>>[] = [
+      { output_hash: `sha256:${"9".repeat(64)}` },
+      { input_hash: `sha256:${"8".repeat(64)}` },
+      { phase_revision: (phase.phase_revision as number) + 1 },
+      { previous_phase_hash: `sha256:${"7".repeat(64)}` },
+      { execution_request_hash: `sha256:${"6".repeat(64)}` },
+      {
+        observed_journal_head: {
+          ...(phase.observed_journal_head as Record<string, unknown>),
+          entry_hash: `sha256:${"5".repeat(64)}`,
+        },
+      },
+      {
+        skill: {
+          ...(phase.skill as Record<string, unknown>),
+          snapshot_hash: `sha256:${"4".repeat(64)}`,
+        },
+      },
+      {
+        handler: {
+          ...(phase.handler as Record<string, unknown>),
+          hash: `sha256:${"3".repeat(64)}`,
+        },
+      },
+      { predecessor_phase_hashes: [`sha256:${"2".repeat(64)}`] },
+      { trace: { ...TRACE, span_id: "3".repeat(16) } },
+      { occurred_at: "2026-08-30T23:59:59.999Z" },
+      { status: "BLOCKED", output_hash: null },
+    ];
+
+    for (const mutation of mutations) {
+      const mutatedPhase = resignDocument({ ...phase, ...mutation });
+      expect(() =>
+        decisionMetadata(
+          {
+            ...decisionEntry,
+            metadata: { ...metadata, phase: mutatedPhase } as JsonValue,
+          },
+          pendingEntry,
+        ),
+      ).toThrowError(new RuntimeSkillError("RUNTIME_SKILL_INTEGRITY"));
+    }
+    expect(() =>
+      decisionMetadata(
+        {
+          ...decisionEntry,
+          metadata: { ...metadata, occurred_at: "not-a-timestamp" },
+        },
+        pendingEntry,
+      ),
+    ).toThrowError(new RuntimeSkillError("RUNTIME_SKILL_INTEGRITY"));
+    const changedTimestamp = "2026-08-30T23:59:59.999Z";
+    const timestampPhase = resignDocument({ ...phase, occurred_at: changedTimestamp });
+    expect(() =>
+      decisionMetadata(
+        {
+          ...decisionEntry,
+          metadata: {
+            ...metadata,
+            occurred_at: changedTimestamp,
+            phase: timestampPhase,
+          },
+        },
+        pendingEntry,
+      ),
+    ).toThrowError(new RuntimeSkillError("RUNTIME_SKILL_INTEGRITY"));
+  });
+
+  it("preserves a forged journal-first terminal and never appends it during restart", async () => {
+    const { statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const snapshot = brainstormingSnapshot();
+    const initial = await pendingApproval({ statePath, journal, head, snapshot });
+    const crashing = engine(statePath, journal, snapshot, {
+      hooks: {
+        afterApprovalDecisionJournalSync: () => {
+          throw new Error("crash:journal-first-forgery");
+        },
+      },
+    });
+    await expect(crashing.resumeApproval(resumeRequest(initial.pending))).rejects.toThrow(
+      "crash:journal-first-forgery",
+    );
+    const phasePath = path.join(statePath, "skills", "phases", "run-1.jsonl");
+    const journalPath = path.join(statePath, "journals", "run-1", "events.jsonl");
+    const lines = (await readFile(journalPath, "utf8")).trimEnd().split("\n");
+    const decisionEntry = JSON.parse(lines.at(-1)!) as RunJournalEntryV1;
+    const metadata = decisionEntry.metadata as Record<string, unknown>;
+    const phase = metadata.phase as Record<string, unknown>;
+    const mutatedPhase = resignDocument({
+      ...phase,
+      output_hash: `sha256:${"9".repeat(64)}`,
+    });
+    const hashable = {
+      ...decisionEntry,
+      metadata: { ...metadata, phase: mutatedPhase },
+    } as RunJournalEntryV1;
+    const unsigned = { ...hashable } as Record<string, unknown>;
+    delete unsigned.entry_hash;
+    const resigned = {
+      ...unsigned,
+      entry_hash: hashRunJournalEntry(unsigned as HashableRunJournalEntryV1),
+    } as RunJournalEntryV1;
+    lines[lines.length - 1] = canonicalJson(resigned);
+    await writeFile(journalPath, `${lines.join("\n")}\n`);
+    const forgedJournalBytes = await readFile(journalPath);
+    const pendingPhaseBytes = await readFile(phasePath);
+
+    const restarted = engine(
+      statePath,
+      createRunJournalStore({ statePath, now: clock(), randomId: ids(990) }),
+      snapshot,
+      {
+        idOffset: 990,
+      },
+    );
+    await expect(restarted.recover()).rejects.toMatchObject({ code: "RUNTIME_SKILL_INTEGRITY" });
+    expect(await readFile(journalPath)).toEqual(forgedJournalBytes);
+    expect(await readFile(phasePath)).toEqual(pendingPhaseBytes);
+  });
+
+  it("preserves duplicate decision metadata in a later journal transition and fails closed", async () => {
+    const { statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const snapshot = brainstormingSnapshot();
+    const { host, pending } = await pendingApproval({ statePath, journal, head, snapshot });
+    const approved = await host.resumeApproval(resumeRequest(pending));
+    const decisionEntry = (await journal.load("run-1"))?.entries.at(-1);
+    if (decisionEntry === undefined) throw new Error("approval decision was not persisted");
+    await journal.transition({
+      ...journalCommand("run-1", "REVIEW_PENDING", approved.journal_head),
+      command_id: "duplicate-decision-metadata",
+      metadata: decisionEntry.metadata,
+    });
+    const phasePath = path.join(statePath, "skills", "phases", "run-1.jsonl");
+    const journalPath = path.join(statePath, "journals", "run-1", "events.jsonl");
+    const phaseBytes = await readFile(phasePath);
+    const journalBytes = await readFile(journalPath);
+
+    const restarted = engine(statePath, journal, snapshot, { idOffset: 995 });
+    await expect(restarted.recover()).rejects.toMatchObject({ code: "RUNTIME_SKILL_INTEGRITY" });
+    expect(await readFile(phasePath)).toEqual(phaseBytes);
+    expect(await readFile(journalPath)).toEqual(journalBytes);
   });
 });

@@ -148,6 +148,109 @@ describe("private append-only run journal store", () => {
     ).rejects.toMatchObject({ code: "RUNTIME_JOURNAL_UNAVAILABLE" });
   });
 
+  it("keeps a fire-and-forget scoped transition inside the run queue until it settles", async () => {
+    const { statePath } = await fixture();
+    const store = createStore(statePath);
+    const running = await advance(store, "run-fire-forget", ["CREATED", "ROUTED", "RUNNING"]);
+    const order: string[] = [];
+    let issued: Promise<TransitionResult> | undefined;
+
+    const barrier = withRunJournalBarrier(store, "run-fire-forget", (_snapshot, transition) => {
+      issued = transition(
+        command("run-fire-forget", "APPROVAL_PENDING", running.head, {
+          command_id: "fire-forget-pending",
+        }),
+      );
+      void issued.then(() => order.push("scoped"));
+      return Promise.resolve("callback-returned");
+    });
+    await barrier;
+    order.push("barrier");
+    if (issued === undefined) throw new Error("scoped transition was not issued");
+    const pending = await issued;
+
+    expect(order).toEqual(["scoped", "barrier"]);
+    await expect(
+      store.transition(
+        command("run-fire-forget", "RUNNING", pending.head, {
+          command_id: "after-fire-forget",
+        }),
+      ),
+    ).resolves.toMatchObject({ entry: { state: "RUNNING" } });
+  });
+
+  it("propagates a fire-and-forget scoped failure without an unhandled rejection", async () => {
+    const { statePath } = await fixture();
+    const store = createStore(statePath);
+    const running = await advance(store, "run-fire-failure", ["CREATED", "ROUTED", "RUNNING"]);
+    let issued: Promise<TransitionResult> | undefined;
+
+    const barrier = withRunJournalBarrier(store, "run-fire-failure", (_snapshot, transition) => {
+      issued = transition(command("run-fire-failure", "CREATED", running.head));
+      void issued.catch(() => undefined);
+      return Promise.resolve("callback-returned");
+    });
+
+    await expect(barrier).rejects.toMatchObject({ code: "RUNTIME_STATE_TRANSITION_INVALID" });
+    if (issued === undefined) throw new Error("scoped transition was not issued");
+    await expect(issued).rejects.toMatchObject({ code: "RUNTIME_STATE_TRANSITION_INVALID" });
+    expect((await store.load("run-fire-failure"))?.head).toEqual(running.head);
+  });
+
+  it("settles a scoped transition before propagating a callback failure", async () => {
+    const { statePath } = await fixture();
+    const store = createStore(statePath);
+    const running = await advance(store, "run-fire-callback", ["CREATED", "ROUTED", "RUNNING"]);
+    const order: string[] = [];
+    let issued: Promise<TransitionResult> | undefined;
+
+    const barrier = withRunJournalBarrier(store, "run-fire-callback", (_snapshot, transition) => {
+      issued = transition(
+        command("run-fire-callback", "APPROVAL_PENDING", running.head, {
+          command_id: "fire-callback-pending",
+        }),
+      );
+      void issued.then(() => order.push("scoped"));
+      throw new Error("callback-failed-after-transition");
+    });
+    await expect(barrier).rejects.toThrow("callback-failed-after-transition");
+    order.push("barrier");
+    if (issued === undefined) throw new Error("scoped transition was not issued");
+    await issued;
+
+    expect(order).toEqual(["scoped", "barrier"]);
+    expect((await store.load("run-fire-callback"))?.state).toBe("APPROVAL_PENDING");
+  });
+
+  it("keeps a fire-and-forget scoped transition visible to shutdown flush", async () => {
+    const { statePath } = await fixture();
+    const store = createStore(statePath);
+    const running = await advance(store, "run-fire-flush", ["CREATED", "ROUTED", "RUNNING"]);
+    let issued: Promise<TransitionResult> | undefined;
+    let settled = false;
+
+    const barrier = withRunJournalBarrier(store, "run-fire-flush", (_snapshot, transition) => {
+      issued = transition(
+        command("run-fire-flush", "APPROVAL_PENDING", running.head, {
+          command_id: "fire-flush-pending",
+        }),
+      );
+      void issued.then(() => {
+        settled = true;
+      });
+      return Promise.resolve();
+    });
+    store.stopIntake();
+    await store.flush(new AbortController().signal);
+    const settledWhenFlushReturned = settled;
+    await barrier;
+    if (issued === undefined) throw new Error("scoped transition was not issued");
+    await issued;
+
+    expect(settledWhenFlushReturned).toBe(true);
+    expect((await store.load("run-fire-flush"))?.state).toBe("APPROVAL_PENDING");
+  });
+
   it("rejects a scoped transition for another run without creating that run", async () => {
     const { statePath } = await fixture();
     const store = createStore(statePath);

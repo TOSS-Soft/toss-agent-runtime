@@ -50,6 +50,7 @@ import {
   requestSuperpowersApproval,
   approvalPendingCommand,
   type ApprovalDecisionJournalMetadata,
+  type ApprovalPendingJournalMetadata,
   type ResumeSuperpowersApprovalRequest,
 } from "./approval.js";
 import type {
@@ -1123,7 +1124,24 @@ function approvalDecisionRecords(journal: RunJournalSnapshot): readonly Readonly
   return Object.freeze(
     journal.entries
       .filter((entry) => metadataKind(entry) === "superpowers-approval-decision")
-      .map((entry) => Object.freeze({ entry, metadata: decisionMetadata(entry) })),
+      .map((entry) => {
+        const pendingEntry = journal.entries.find(
+          (candidate) => candidate.entry_hash === entry.previous_entry_hash,
+        );
+        if (pendingEntry === undefined) integrity();
+        return Object.freeze({ entry, metadata: decisionMetadata(entry, pendingEntry) });
+      }),
+  );
+}
+
+function approvalPendingRecords(journal: RunJournalSnapshot): readonly Readonly<{
+  entry: RunJournalEntryV1;
+  metadata: ApprovalPendingJournalMetadata;
+}>[] {
+  return Object.freeze(
+    journal.entries
+      .filter((entry) => metadataKind(entry) === "superpowers-approval-pending")
+      .map((entry) => Object.freeze({ entry, metadata: pendingMetadata(entry) })),
   );
 }
 
@@ -2701,9 +2719,10 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
           occurred_at: options.now().toISOString(),
           trace: request.trace,
         });
+        const pendingCommand = approvalPendingCommand(pending);
         await appendRecord(request.run_id, current, pending);
         await hooks?.afterApprovalPendingPhaseSync?.("RUNNING");
-        const result = await transition(approvalPendingCommand(pending));
+        const result = await transition(pendingCommand);
         await hooks?.afterApprovalPendingJournalSync?.("APPROVAL_PENDING");
         return pendingOutcome({ phase: pending, transition: result, replayed: false });
       }
@@ -2897,34 +2916,63 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
                   .reverse()
                   .find((entry) => entry.status === "APPROVAL_PENDING");
                 if (pending === undefined) {
-                  if (journal?.state === "APPROVAL_PENDING") integrity();
+                  if (
+                    journal !== null &&
+                    (approvalPendingRecords(journal).length > 0 ||
+                      approvalDecisionRecords(journal).length > 0)
+                  ) {
+                    integrity();
+                  }
                   return;
                 }
-                if (latest.status === "APPROVAL_PENDING") {
+                if (journal === null) integrity();
+                const pendingMatches = approvalPendingRecords(journal).filter(
+                  ({ metadata }) => metadata.phase.document_hash === pending.document_hash,
+                );
+                if (pendingMatches.length === 0) {
                   if (
-                    journal?.state === "RUNNING" &&
+                    latest.status === "APPROVAL_PENDING" &&
+                    journal.state === "RUNNING" &&
                     exactJournalHead(journal.head, pending.observed_journal_head)
                   ) {
                     await transition(approvalPendingCommand(pending));
                     return;
                   }
-                  if (journal?.state === "APPROVAL_PENDING") {
-                    const metadata = pendingMetadata(journal.entries.at(-1)!);
-                    if (metadata.phase.document_hash !== pending.document_hash) integrity();
-                    return;
-                  }
-                  if (journal?.state === "RUNNING" || journal?.state === "BLOCKED") {
-                    const metadata = decisionMetadata(journal.entries.at(-1)!);
-                    if (metadata.request.phase_document_hash !== pending.document_hash) integrity();
-                    await appendRecord(runId, loaded, metadata.phase);
-                    return;
-                  }
                   integrity();
                 }
-                if (latest.previous_phase_hash === pending.document_hash) {
-                  if (journal?.state !== "RUNNING" && journal?.state !== "BLOCKED") integrity();
-                  const metadata = decisionMetadata(journal.entries.at(-1)!);
-                  if (metadata.phase.document_hash !== latest.document_hash) integrity();
+                if (pendingMatches.length !== 1) integrity();
+                const pendingRecord = pendingMatches[0]!;
+                const decisions = approvalDecisionRecords(journal).filter(
+                  ({ metadata }) => metadata.request.phase_document_hash === pending.document_hash,
+                );
+                if (decisions.length === 0) {
+                  if (
+                    latest.status !== "APPROVAL_PENDING" ||
+                    journal.state !== "APPROVAL_PENDING" ||
+                    !exactJournalHead(journal.head, journalHeadForEntry(pendingRecord.entry))
+                  ) {
+                    integrity();
+                  }
+                  return;
+                }
+                if (decisions.length !== 1) integrity();
+                const decided = decisions[0]!;
+                const terminals = loaded.entries.filter(
+                  (entry) =>
+                    entry.previous_phase_hash === pending.document_hash &&
+                    entry.status !== "STARTED" &&
+                    entry.status !== "APPROVAL_PENDING",
+                );
+                if (terminals.length === 0) {
+                  if (latest.document_hash !== pending.document_hash) integrity();
+                  await appendRecord(runId, loaded, decided.metadata.phase);
+                  return;
+                }
+                if (
+                  terminals.length !== 1 ||
+                  terminals[0]!.document_hash !== decided.metadata.phase.document_hash
+                ) {
+                  integrity();
                 }
               });
             });
