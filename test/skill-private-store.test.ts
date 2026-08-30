@@ -525,4 +525,199 @@ describe.sequential("private skill object publication", () => {
     expect(await readFile(candidate)).toEqual(bytes);
     expect(await readFile(preserved)).toEqual(bytes);
   });
+
+  it("preserves a claim tombstone when its transaction final conflicts", async () => {
+    const statePath = await privateTemporaryDirectory("toss-skill-store-");
+    const objectsPath = path.join(statePath, "skills", "objects");
+    const expected = Buffer.from('{"record":"claim-expected"}', "utf8");
+    const conflicting = Buffer.from('{"record":"claim-conflict"}', "utf8");
+    const ownerPid = 998879;
+    const operationId = "77000000-0000-4000-8000-000000000003";
+    const claim = claimBytes(ownerPid, operationId, expected);
+    const tombstonePath = path.join(
+      objectsPath,
+      tombstoneName("claim", ownerPid, operationId, "claim", claim),
+    );
+    const finalPath = objectPath(statePath, HASH);
+    const store = createSkillPrivateStoreForTest(
+      storeOptions(statePath, {
+        isProcessAlive: () => "dead",
+        hasServiceListener: () => Promise.resolve("absent"),
+      }),
+    );
+    await store.ensureRoots();
+    await writeFile(tombstonePath, claim, { mode: 0o600 });
+    await writeFile(finalPath, conflicting, { mode: 0o600 });
+
+    await expectSkillError(store.publishObject(HASH, conflicting));
+    expect(await readFile(tombstonePath)).toEqual(claim);
+    expect(await readFile(finalPath)).toEqual(conflicting);
+  });
+
+  it("preserves a claim tombstone and a conflicting final that reappears during recovery", async () => {
+    const statePath = await privateTemporaryDirectory("toss-skill-store-");
+    const objectsPath = path.join(statePath, "skills", "objects");
+    const expected = Buffer.from('{"record":"claim-reappear-expected"}', "utf8");
+    const conflicting = Buffer.from('{"record":"claim-reappeared"}', "utf8");
+    const ownerPid = 998880;
+    const operationId = "77000000-0000-4000-8000-000000000004";
+    const claim = claimBytes(ownerPid, operationId, expected);
+    const tombstonePath = path.join(
+      objectsPath,
+      tombstoneName("claim", ownerPid, operationId, "claim", claim),
+    );
+    const finalPath = objectPath(statePath, HASH);
+    let reappeared = false;
+    const store = createSkillPrivateStoreForTest(
+      storeOptions(statePath, {
+        isProcessAlive: () => "dead",
+        async hasServiceListener() {
+          reappeared = true;
+          await writeFile(finalPath, conflicting, { mode: 0o600 });
+          return "absent";
+        },
+      }),
+    );
+    await store.ensureRoots();
+    await writeFile(tombstonePath, claim, { mode: 0o600 });
+
+    await expectSkillError(store.publishObject(HASH, expected));
+    expect(reappeared).toBe(true);
+    expect(await readFile(tombstonePath)).toEqual(claim);
+    expect(await readFile(finalPath)).toEqual(conflicting);
+  });
+
+  it("preserves a stage tombstone, its claim, and a conflicting transaction final", async () => {
+    const statePath = await privateTemporaryDirectory("toss-skill-store-");
+    const objectsPath = path.join(statePath, "skills", "objects");
+    const expected = Buffer.from('{"record":"stage-expected"}', "utf8");
+    const conflicting = Buffer.from('{"record":"stage-conflict"}', "utf8");
+    const ownerPid = 998881;
+    const operationId = "77000000-0000-4000-8000-000000000005";
+    const claim = claimBytes(ownerPid, operationId, expected);
+    const claimPath = path.join(objectsPath, `.object-${ownerPid}-${operationId}.claim`);
+    const tombstonePath = path.join(
+      objectsPath,
+      tombstoneName("stage", ownerPid, operationId, "stage", expected),
+    );
+    const finalPath = objectPath(statePath, HASH);
+    const store = createSkillPrivateStoreForTest(
+      storeOptions(statePath, {
+        isProcessAlive: () => "dead",
+        hasServiceListener: () => Promise.resolve("absent"),
+      }),
+    );
+    await store.ensureRoots();
+    await writeFile(claimPath, claim, { mode: 0o600 });
+    await writeFile(tombstonePath, expected, { mode: 0o600 });
+    await writeFile(finalPath, conflicting, { mode: 0o600 });
+
+    await expectSkillError(store.publishObject(HASH, expected));
+    expect(await readFile(claimPath)).toEqual(claim);
+    expect(await readFile(tombstonePath)).toEqual(expected);
+    expect(await readFile(finalPath)).toEqual(conflicting);
+  });
+
+  it("preserves a stage transaction when a conflicting final reappears during recovery", async () => {
+    const statePath = await privateTemporaryDirectory("toss-skill-store-");
+    const objectsPath = path.join(statePath, "skills", "objects");
+    const expected = Buffer.from('{"record":"stage-reappear-expected"}', "utf8");
+    const conflicting = Buffer.from('{"record":"stage-reappeared"}', "utf8");
+    const ownerPid = 998882;
+    const operationId = "77000000-0000-4000-8000-000000000006";
+    const claim = claimBytes(ownerPid, operationId, expected);
+    const claimPath = path.join(objectsPath, `.object-${ownerPid}-${operationId}.claim`);
+    const tombstonePath = path.join(
+      objectsPath,
+      tombstoneName("stage", ownerPid, operationId, "stage", expected),
+    );
+    const finalPath = objectPath(statePath, HASH);
+    let reappeared = false;
+    const store = createSkillPrivateStoreForTest(
+      storeOptions(statePath, {
+        isProcessAlive: () => "dead",
+        async hasServiceListener() {
+          reappeared = true;
+          await writeFile(finalPath, conflicting, { mode: 0o600 });
+          return "absent";
+        },
+      }),
+    );
+    await store.ensureRoots();
+    await writeFile(claimPath, claim, { mode: 0o600 });
+    await writeFile(tombstonePath, expected, { mode: 0o600 });
+
+    await expectSkillError(store.publishObject(HASH, expected));
+    expect(reappeared).toBe(true);
+    expect(await readFile(claimPath)).toEqual(claim);
+    expect(await readFile(tombstonePath)).toEqual(expected);
+    expect(await readFile(finalPath)).toEqual(conflicting);
+  });
+
+  it("preserves a stage tombstone, final, and conflicting paired claim", async () => {
+    const statePath = await privateTemporaryDirectory("toss-skill-store-");
+    const objectsPath = path.join(statePath, "skills", "objects");
+    const expected = Buffer.from('{"record":"paired-expected"}', "utf8");
+    const conflicting = Buffer.from('{"record":"paired-conflict"}', "utf8");
+    const ownerPid = 998883;
+    const operationId = "77000000-0000-4000-8000-000000000007";
+    const conflictingClaim = claimBytes(ownerPid, operationId, conflicting);
+    const claimPath = path.join(objectsPath, `.object-${ownerPid}-${operationId}.claim`);
+    const tombstonePath = path.join(
+      objectsPath,
+      tombstoneName("stage", ownerPid, operationId, "stage", expected),
+    );
+    const finalPath = objectPath(statePath, HASH);
+    const store = createSkillPrivateStoreForTest(
+      storeOptions(statePath, {
+        isProcessAlive: () => "dead",
+        hasServiceListener: () => Promise.resolve("absent"),
+      }),
+    );
+    await store.ensureRoots();
+    await writeFile(claimPath, conflictingClaim, { mode: 0o600 });
+    await writeFile(tombstonePath, expected, { mode: 0o600 });
+    await writeFile(finalPath, expected, { mode: 0o600 });
+
+    await expectSkillError(store.publishObject(HASH, expected));
+    expect(await readFile(claimPath)).toEqual(conflictingClaim);
+    expect(await readFile(tombstonePath)).toEqual(expected);
+    expect(await readFile(finalPath)).toEqual(expected);
+  });
+
+  it("preserves a stage tombstone and a paired claim replaced during recovery", async () => {
+    const statePath = await privateTemporaryDirectory("toss-skill-store-");
+    const objectsPath = path.join(statePath, "skills", "objects");
+    const expected = Buffer.from('{"record":"claim-replaced"}', "utf8");
+    const ownerPid = 998884;
+    const operationId = "77000000-0000-4000-8000-000000000008";
+    const claim = claimBytes(ownerPid, operationId, expected);
+    const claimPath = path.join(objectsPath, `.object-${ownerPid}-${operationId}.claim`);
+    const preservedClaimPath = `${claimPath}.preserved`;
+    const tombstonePath = path.join(
+      objectsPath,
+      tombstoneName("stage", ownerPid, operationId, "stage", expected),
+    );
+    let replaced = false;
+    const store = createSkillPrivateStoreForTest(
+      storeOptions(statePath, {
+        isProcessAlive: () => "dead",
+        async hasServiceListener() {
+          replaced = true;
+          await rename(claimPath, preservedClaimPath);
+          await writeFile(claimPath, claim, { mode: 0o600 });
+          return "absent";
+        },
+      }),
+    );
+    await store.ensureRoots();
+    await writeFile(claimPath, claim, { mode: 0o600 });
+    await writeFile(tombstonePath, expected, { mode: 0o600 });
+
+    await expectSkillError(store.publishObject(HASH, expected));
+    expect(replaced).toBe(true);
+    expect(await readFile(claimPath)).toEqual(claim);
+    expect(await readFile(preservedClaimPath)).toEqual(claim);
+    expect(await readFile(tombstonePath)).toEqual(expected);
+  });
 });

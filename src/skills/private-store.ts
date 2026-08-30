@@ -82,6 +82,24 @@ interface ExactObject {
   readonly identity: FileIdentity;
 }
 
+interface RecoveryArtifact {
+  readonly path: string;
+  readonly opened: OpenedFile;
+  readonly tombstone: TombstoneBinding | null;
+}
+
+interface OpenedRecoveryTransaction {
+  readonly key: string;
+  readonly ownerPid: number;
+  readonly operationId: string;
+  readonly claimDocument: OperationClaim;
+  readonly claim: RecoveryArtifact;
+  stage: RecoveryArtifact | undefined;
+  readonly finalPath: string;
+  readonly final: OpenedFile | null;
+  finalLinks: 1 | 2;
+}
+
 interface HeldDescriptor {
   readonly fd: number;
 }
@@ -579,16 +597,20 @@ async function cleanupOwnedEntry(
   directories: readonly OpenedDirectory[],
   operationId: string,
   hooks: SkillPrivateStoreOperationHooks | undefined,
+  validateParticipants?: () => void,
 ): Promise<void> {
   const objectsPath = path.dirname(candidate);
   const tombstone = tombstonePath(candidate, kind, operationId, expectedBytes);
   const exactHook = async (hook: () => void | Promise<void>): Promise<void> => {
+    validateParticipants?.();
     await invokeExactNamespaceHook(directories, isCurrentUser, objectsPath, hook);
+    validateParticipants?.();
   };
   try {
     if (hooks?.beforeCleanupRename !== undefined) {
       await exactHook(() => hooks.beforeCleanupRename!(kind, candidate));
     }
+    validateParticipants?.();
     revalidateDirectoryChain(directories, isCurrentUser);
     requireMissing(tombstone);
     exactFile(candidate, expectedHandle, expectedIdentity, expectedBytes, isCurrentUser, links);
@@ -621,12 +643,14 @@ async function cleanupOwnedEntry(
   );
 
   exactFile(tombstone, expectedHandle, expectedIdentity, expectedBytes, isCurrentUser, links);
+  validateParticipants?.();
   if (hooks?.beforeCleanupUnlink !== undefined) {
     await exactHook(() => hooks.beforeCleanupUnlink!(kind, tombstone));
   }
   try {
     revalidateDirectoryChain(directories, isCurrentUser);
     exactFile(tombstone, expectedHandle, expectedIdentity, expectedBytes, isCurrentUser, links);
+    validateParticipants?.();
     unlinkSync(tombstone);
     requireMissing(tombstone);
     revalidateDirectoryChain(directories, isCurrentUser);
@@ -661,6 +685,7 @@ async function cleanupOwnedEntry(
           }
         },
   );
+  validateParticipants?.();
 }
 
 function openExactFile(
@@ -714,6 +739,143 @@ function openRecoveryStage(
     if (error instanceof RuntimeSkillError) throw error;
     integrity();
   }
+}
+
+function openRecoveryFinal(candidate: string, isCurrentUser: CurrentUserCheck): OpenedFile | null {
+  try {
+    lstatSync(candidate, { bigint: true });
+  } catch (error) {
+    if (isMissing(error)) return null;
+    pathUnsafe();
+  }
+  const opened = openRecoveryStage(candidate, SKILL_LIMITS.storedObjectBytes, isCurrentUser);
+  if (opened.bytes.byteLength < 1) {
+    closeSync(opened.handle.fd);
+    integrity();
+  }
+  return opened;
+}
+
+function validateRecoveryArtifact(
+  artifact: RecoveryArtifact,
+  isCurrentUser: CurrentUserCheck,
+): void {
+  exactFile(
+    artifact.path,
+    artifact.opened.handle,
+    artifact.opened.identity,
+    artifact.opened.bytes,
+    isCurrentUser,
+    artifact.opened.links,
+  );
+  const binding = artifact.tombstone;
+  if (
+    binding !== null &&
+    (artifact.opened.bytes.byteLength !== binding.bytes ||
+      rawHash(artifact.opened.bytes) !== binding.hash)
+  ) {
+    integrity();
+  }
+}
+
+function validateRecoveryTransaction(
+  transaction: OpenedRecoveryTransaction,
+  isCurrentUser: CurrentUserCheck,
+): void {
+  validateRecoveryArtifact(transaction.claim, isCurrentUser);
+  const claim = parseClaim(transaction.claim.opened.bytes);
+  if (
+    claim.owner_pid !== transaction.ownerPid ||
+    claim.operation_id !== transaction.operationId ||
+    canonicalJson(claim) !== canonicalJson(transaction.claimDocument)
+  ) {
+    integrity();
+  }
+  const claimBinding = transaction.claim.tombstone;
+  if (
+    claimBinding !== null &&
+    (claimBinding.artifact !== "claim" ||
+      claimBinding.ownerPid !== transaction.ownerPid ||
+      claimBinding.operationId !== transaction.operationId)
+  ) {
+    integrity();
+  }
+
+  const stage = transaction.stage;
+  if (stage !== undefined) {
+    validateRecoveryArtifact(stage, isCurrentUser);
+    const stageBinding = stage.tombstone;
+    if (
+      stageBinding !== null &&
+      (stageBinding.artifact !== "stage" ||
+        stageBinding.ownerPid !== transaction.ownerPid ||
+        stageBinding.operationId !== transaction.operationId)
+    ) {
+      integrity();
+    }
+    if (
+      stage.opened.bytes.byteLength > claim.record_bytes ||
+      (stage.opened.bytes.byteLength === claim.record_bytes &&
+        rawHash(stage.opened.bytes) !== claim.record_hash)
+    ) {
+      integrity();
+    }
+  }
+
+  const final = transaction.final;
+  if (final === null) {
+    requireMissing(transaction.finalPath);
+    if (stage?.opened.links === 2) integrity();
+    return;
+  }
+  exactFile(
+    transaction.finalPath,
+    final.handle,
+    final.identity,
+    final.bytes,
+    isCurrentUser,
+    transaction.finalLinks,
+  );
+  if (final.bytes.byteLength !== claim.record_bytes || rawHash(final.bytes) !== claim.record_hash) {
+    integrity();
+  }
+  if (transaction.finalLinks === 2) {
+    if (
+      stage === undefined ||
+      stage.opened.links !== 2 ||
+      !identitiesMatch(stage.opened.identity, final.identity)
+    ) {
+      integrity();
+    }
+  } else if (stage?.opened.links === 2) {
+    integrity();
+  }
+}
+
+function validateRecoveryCleanupContext(
+  transaction: OpenedRecoveryTransaction,
+  cleanedArtifact: "claim" | "stage",
+  isCurrentUser: CurrentUserCheck,
+): void {
+  if (cleanedArtifact === "stage") {
+    validateRecoveryArtifact(transaction.claim, isCurrentUser);
+  }
+  const final = transaction.final;
+  if (final === null) {
+    requireMissing(transaction.finalPath);
+    return;
+  }
+  const held = fstatSync(final.handle.fd, { bigint: true });
+  const links: 1 | 2 = held.nlink === 2n ? 2 : 1;
+  exactFile(transaction.finalPath, final.handle, final.identity, final.bytes, isCurrentUser, links);
+  if (
+    final.bytes.byteLength !== transaction.claimDocument.record_bytes ||
+    rawHash(final.bytes) !== transaction.claimDocument.record_hash ||
+    (cleanedArtifact === "claim" && links !== 1)
+  ) {
+    integrity();
+  }
+  transaction.finalLinks = links;
 }
 
 function parseClaim(bytes: Uint8Array): OperationClaim {
@@ -993,7 +1155,14 @@ export function createSkillPrivateStoreForTest(
     const names = scanObjectNames(objectsPath);
     const claims = new Map<string, string>();
     const stages = new Map<string, string>();
-    const tombstones = new Map<string, Readonly<{ name: string; binding: TombstoneBinding }>>();
+    const claimTombstones = new Map<
+      string,
+      Readonly<{ name: string; binding: TombstoneBinding }>
+    >();
+    const stageTombstones = new Map<
+      string,
+      Readonly<{ name: string; binding: TombstoneBinding }>
+    >();
     for (const name of names) {
       const final = OBJECT_PATTERN.exec(name);
       if (final !== null) {
@@ -1007,9 +1176,10 @@ export function createSkillPrivateStoreForTest(
       }
       const tombstone = parseTombstoneName(name);
       if (tombstone !== null) {
-        const key = `${tombstone.ownerPid}:${tombstone.operationId}:${tombstone.artifact}`;
-        if (tombstones.has(key)) integrity();
-        tombstones.set(key, { name, binding: tombstone });
+        const key = `${tombstone.ownerPid}:${tombstone.operationId}`;
+        const destination = tombstone.artifact === "claim" ? claimTombstones : stageTombstones;
+        if (destination.has(key)) integrity();
+        destination.set(key, { name, binding: tombstone });
         continue;
       }
       const operation = OPERATION_PATTERN.exec(name);
@@ -1026,123 +1196,100 @@ export function createSkillPrivateStoreForTest(
       if (destination.has(key)) integrity();
       destination.set(key, name);
     }
-    for (const { binding } of tombstones.values()) {
-      const operationKey = `${binding.ownerPid}:${binding.operationId}`;
-      if (
-        (binding.artifact === "stage" && (stages.has(operationKey) || !claims.has(operationKey))) ||
-        (binding.artifact === "claim" && (claims.has(operationKey) || stages.has(operationKey)))
-      ) {
-        integrity();
-      }
-    }
-    for (const key of stages.keys()) if (!claims.has(key)) integrity();
-    for (const { name, binding } of tombstones.values()) {
-      const tombstonePath = path.join(objectsPath, name);
-      const operationKey = `${binding.ownerPid}:${binding.operationId}`;
-      const openedTombstone =
-        binding.artifact === "claim"
-          ? openExactFile(tombstonePath, MAX_OPERATION_BYTES, isCurrentUser)
-          : openRecoveryStage(tombstonePath, SKILL_LIMITS.storedObjectBytes, isCurrentUser);
-      const pairedClaimName = binding.artifact === "stage" ? claims.get(operationKey) : undefined;
-      const pairedClaim =
-        pairedClaimName === undefined
-          ? undefined
-          : openExactFile(
-              path.join(objectsPath, pairedClaimName),
-              MAX_OPERATION_BYTES,
-              isCurrentUser,
-            );
-      try {
+
+    const operationKeys = new Set([
+      ...claims.keys(),
+      ...stages.keys(),
+      ...claimTombstones.keys(),
+      ...stageTombstones.keys(),
+    ]);
+    const transactions: OpenedRecoveryTransaction[] = [];
+    const heldDescriptors: number[] = [];
+    const objectTransactions = new Map<string, string>();
+    try {
+      for (const key of operationKeys) {
+        const regularClaimName = claims.get(key);
+        const claimTombstone = claimTombstones.get(key);
+        const regularStageName = stages.get(key);
+        const stageTombstone = stageTombstones.get(key);
         if (
-          openedTombstone.bytes.byteLength !== binding.bytes ||
-          rawHash(openedTombstone.bytes) !== binding.hash
+          (regularClaimName === undefined) === (claimTombstone === undefined) ||
+          (regularStageName !== undefined && stageTombstone !== undefined) ||
+          (claimTombstone !== undefined &&
+            (regularStageName !== undefined || stageTombstone !== undefined)) ||
+          (stageTombstone !== undefined && regularClaimName === undefined)
         ) {
           integrity();
         }
-        if (binding.artifact === "claim") {
-          const claim = parseClaim(openedTombstone.bytes);
-          if (claim.owner_pid !== binding.ownerPid || claim.operation_id !== binding.operationId) {
-            integrity();
-          }
+        const [pidText, operationId] = key.split(":");
+        const ownerPid = Number(pidText);
+        if (
+          !Number.isSafeInteger(ownerPid) ||
+          ownerPid <= 0 ||
+          operationId === undefined ||
+          !UUID_PATTERN.test(operationId)
+        ) {
+          integrity();
         }
-        if (pairedClaim !== undefined) {
-          const claim = parseClaim(pairedClaim.bytes);
-          if (
-            claim.owner_pid !== binding.ownerPid ||
-            claim.operation_id !== binding.operationId ||
-            openedTombstone.bytes.byteLength > claim.record_bytes ||
-            (openedTombstone.bytes.byteLength === claim.record_bytes &&
-              rawHash(openedTombstone.bytes) !== claim.record_hash)
-          ) {
-            integrity();
-          }
-        }
-        if (safeLiveness(isProcessAlive, binding.ownerPid) !== "dead") integrity();
-        const listener = await invokeExactNamespaceHook(
-          directories,
-          isCurrentUser,
-          objectsPath,
-          () => safeListener(options.hasServiceListener),
-        );
-        if (listener !== "absent") integrity();
-        if (hooks?.beforeTombstoneRecovery !== undefined) {
-          await invokeExactNamespaceHook(directories, isCurrentUser, objectsPath, () =>
-            hooks.beforeTombstoneRecovery!(tombstonePath),
-          );
-        }
-        if (pairedClaim !== undefined && pairedClaimName !== undefined) {
-          exactFile(
-            path.join(objectsPath, pairedClaimName),
-            pairedClaim.handle,
-            pairedClaim.identity,
-            pairedClaim.bytes,
-            isCurrentUser,
-            1,
-          );
-        }
-        exactFile(
-          tombstonePath,
-          openedTombstone.handle,
-          openedTombstone.identity,
-          openedTombstone.bytes,
-          isCurrentUser,
-          openedTombstone.links,
-        );
-        revalidateDirectoryChain(directories, isCurrentUser);
-        unlinkSync(tombstonePath);
-        requireMissing(tombstonePath);
-        revalidateDirectoryChain(directories, isCurrentUser);
-        await syncDirectory(directories, isCurrentUser);
-        requireMissing(tombstonePath);
-      } catch (error) {
-        if (error instanceof RuntimeSkillError) throw error;
-        pathUnsafe();
-      } finally {
-        if (pairedClaim !== undefined) closeSync(pairedClaim.handle.fd);
-        closeSync(openedTombstone.handle.fd);
-      }
-    }
-    for (const [key, claimName] of claims) {
-      const [pidText, operationId] = key.split(":");
-      const ownerPid = Number(pidText);
-      if (!Number.isSafeInteger(ownerPid) || operationId === undefined) integrity();
-      const claimPath = path.join(objectsPath, claimName);
-      const openedClaim = openExactFile(claimPath, MAX_OPERATION_BYTES, isCurrentUser);
-      let openedStage: OpenedFile | undefined;
-      try {
-        const claim = parseClaim(openedClaim.bytes);
-        if (claim.owner_pid !== ownerPid || claim.operation_id !== operationId) integrity();
-        const stageName = stages.get(key);
+
+        const claimPath = path.join(objectsPath, regularClaimName ?? claimTombstone!.name);
+        const openedClaim = openExactFile(claimPath, MAX_OPERATION_BYTES, isCurrentUser);
+        heldDescriptors.push(openedClaim.handle.fd);
+        const claimDocument = parseClaim(openedClaim.bytes);
+        const claimArtifact: RecoveryArtifact = {
+          path: claimPath,
+          opened: openedClaim,
+          tombstone: claimTombstone?.binding ?? null,
+        };
+
+        let stageArtifact: RecoveryArtifact | undefined;
+        const stageName = regularStageName ?? stageTombstone?.name;
         if (stageName !== undefined) {
-          openedStage = openRecoveryStage(
-            path.join(objectsPath, stageName),
+          const stagePath = path.join(objectsPath, stageName);
+          const openedStage = openRecoveryStage(
+            stagePath,
             SKILL_LIMITS.storedObjectBytes,
             isCurrentUser,
           );
-          if (openedStage.bytes.byteLength > claim.record_bytes) integrity();
+          heldDescriptors.push(openedStage.handle.fd);
+          stageArtifact = {
+            path: stagePath,
+            opened: openedStage,
+            tombstone: stageTombstone?.binding ?? null,
+          };
         }
-        const liveness = safeLiveness(isProcessAlive, ownerPid);
-        if (liveness !== "dead") integrity();
+
+        const finalPath = objectPath(objectsPath, claimDocument.object_hash);
+        const openedFinal = openRecoveryFinal(finalPath, isCurrentUser);
+        if (openedFinal !== null) heldDescriptors.push(openedFinal.handle.fd);
+        const priorTransaction = objectTransactions.get(claimDocument.object_hash);
+        if (priorTransaction !== undefined && priorTransaction !== key) integrity();
+        objectTransactions.set(claimDocument.object_hash, key);
+        const transaction: OpenedRecoveryTransaction = {
+          key,
+          ownerPid,
+          operationId,
+          claimDocument,
+          claim: claimArtifact,
+          stage: stageArtifact,
+          finalPath,
+          final: openedFinal,
+          finalLinks: openedFinal?.links ?? 1,
+        };
+        validateRecoveryTransaction(transaction, isCurrentUser);
+        transactions.push(transaction);
+      }
+
+      const validateTransactions = (active: ReadonlySet<OpenedRecoveryTransaction>): void => {
+        revalidateDirectoryChain(directories, isCurrentUser);
+        for (const transaction of active) {
+          validateRecoveryTransaction(transaction, isCurrentUser);
+        }
+      };
+      const active = new Set(transactions);
+      const initialNamespace = namespaceSnapshot(objectsPath, isCurrentUser);
+      for (const transaction of transactions) {
+        if (safeLiveness(isProcessAlive, transaction.ownerPid) !== "dead") integrity();
         const listener = await invokeExactNamespaceHook(
           directories,
           isCurrentUser,
@@ -1150,71 +1297,115 @@ export function createSkillPrivateStoreForTest(
           () => safeListener(options.hasServiceListener),
         );
         if (listener !== "absent") integrity();
-        revalidateDirectoryChain(directories, isCurrentUser);
-        if (hooks?.beforeRecovery !== undefined) {
-          await invokeExactNamespaceHook(directories, isCurrentUser, objectsPath, () =>
-            hooks.beforeRecovery!(claimPath),
-          );
-        }
-        exactFile(
-          claimPath,
-          openedClaim.handle,
-          openedClaim.identity,
-          openedClaim.bytes,
-          isCurrentUser,
-          1,
-        );
-        const finalPath = objectPath(objectsPath, claim.object_hash);
-        if (openedStage?.links === 2) {
-          const published = lstatSync(finalPath, { bigint: true });
-          assertPrivateFile(published, finalPath, isCurrentUser, 2, openedStage.identity);
-          if (
-            openedStage.bytes.byteLength !== claim.record_bytes ||
-            rawHash(openedStage.bytes) !== claim.record_hash
-          ) {
-            integrity();
-          }
-        }
-        if (openedStage !== undefined) {
-          await cleanupOwnedEntry(
-            path.join(objectsPath, stages.get(key)!),
-            openedStage.handle,
-            openedStage.identity,
-            openedStage.bytes,
-            isCurrentUser,
-            openedStage.links,
-            "recovery-stage",
-            directories,
-            operationId,
-            hooks,
-          );
-          closeSync(openedStage.handle.fd);
-          openedStage = undefined;
-        }
-        const final = await readExactObject(claim.object_hash, directories);
-        if (
-          final !== null &&
-          (final.bytes.byteLength !== claim.record_bytes ||
-            rawHash(final.bytes) !== claim.record_hash)
-        ) {
+        validateTransactions(active);
+        if (!sameNamespace(initialNamespace, namespaceSnapshot(objectsPath, isCurrentUser))) {
           integrity();
         }
-        await cleanupOwnedEntry(
-          claimPath,
-          openedClaim.handle,
-          openedClaim.identity,
-          openedClaim.bytes,
-          isCurrentUser,
-          1,
-          "recovery-claim",
-          directories,
-          operationId,
-          hooks,
-        );
-      } finally {
-        if (openedStage !== undefined) closeSync(openedStage.handle.fd);
-        closeSync(openedClaim.handle.fd);
+        if (hooks?.beforeRecovery !== undefined && transaction.claim.tombstone === null) {
+          await invokeExactNamespaceHook(directories, isCurrentUser, objectsPath, () =>
+            hooks.beforeRecovery!(transaction.claim.path),
+          );
+          validateTransactions(active);
+        }
       }
+
+      let expectedNamespace = namespaceSnapshot(objectsPath, isCurrentUser);
+      const requireExpectedNamespace = (): void => {
+        if (!sameNamespace(expectedNamespace, namespaceSnapshot(objectsPath, isCurrentUser))) {
+          integrity();
+        }
+      };
+      const cleanupTombstone = async (
+        transaction: OpenedRecoveryTransaction,
+        artifact: RecoveryArtifact,
+      ): Promise<void> => {
+        if (artifact.tombstone === null) integrity();
+        requireExpectedNamespace();
+        validateTransactions(active);
+        if (hooks?.beforeTombstoneRecovery !== undefined) {
+          await invokeExactNamespaceHook(directories, isCurrentUser, objectsPath, () =>
+            hooks.beforeTombstoneRecovery!(artifact.path),
+          );
+          validateTransactions(active);
+          requireExpectedNamespace();
+        }
+        validateRecoveryTransaction(transaction, isCurrentUser);
+        revalidateDirectoryChain(directories, isCurrentUser);
+        unlinkSync(artifact.path);
+        requireMissing(artifact.path);
+        revalidateDirectoryChain(directories, isCurrentUser);
+        await syncDirectory(directories, isCurrentUser);
+        requireMissing(artifact.path);
+        expectedNamespace = namespaceSnapshot(objectsPath, isCurrentUser);
+      };
+
+      for (const transaction of transactions) {
+        requireExpectedNamespace();
+        validateTransactions(active);
+        const stage = transaction.stage;
+        if (stage !== undefined) {
+          if (stage.tombstone === null) {
+            await cleanupOwnedEntry(
+              stage.path,
+              stage.opened.handle,
+              stage.opened.identity,
+              stage.opened.bytes,
+              isCurrentUser,
+              stage.opened.links,
+              "recovery-stage",
+              directories,
+              transaction.operationId,
+              hooks,
+              () => validateRecoveryCleanupContext(transaction, "stage", isCurrentUser),
+            );
+            expectedNamespace = namespaceSnapshot(objectsPath, isCurrentUser);
+          } else {
+            await cleanupTombstone(transaction, stage);
+          }
+          if (transaction.final !== null && transaction.finalLinks === 2) {
+            transaction.finalLinks = 1;
+          }
+          transaction.stage = undefined;
+          validateTransactions(active);
+        }
+
+        requireExpectedNamespace();
+        validateRecoveryTransaction(transaction, isCurrentUser);
+        if (transaction.claim.tombstone === null) {
+          await cleanupOwnedEntry(
+            transaction.claim.path,
+            transaction.claim.opened.handle,
+            transaction.claim.opened.identity,
+            transaction.claim.opened.bytes,
+            isCurrentUser,
+            1,
+            "recovery-claim",
+            directories,
+            transaction.operationId,
+            hooks,
+            () => validateRecoveryCleanupContext(transaction, "claim", isCurrentUser),
+          );
+          expectedNamespace = namespaceSnapshot(objectsPath, isCurrentUser);
+        } else {
+          await cleanupTombstone(transaction, transaction.claim);
+        }
+        active.delete(transaction);
+        validateTransactions(active);
+        if (transaction.final !== null) {
+          exactFile(
+            transaction.finalPath,
+            transaction.final.handle,
+            transaction.final.identity,
+            transaction.final.bytes,
+            isCurrentUser,
+            1,
+          );
+        } else {
+          requireMissing(transaction.finalPath);
+        }
+      }
+    } finally {
+      for (const descriptor of [...heldDescriptors].reverse()) closeSync(descriptor);
     }
     revalidateDirectoryChain(directories, isCurrentUser);
     for (const name of scanObjectNames(objectsPath)) {
