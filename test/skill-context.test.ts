@@ -12,6 +12,8 @@ import {
 import { RuntimeSkillError } from "../src/skills/errors.js";
 import type { SkillResourceV1, SkillSnapshotV1 } from "../src/skills/types.js";
 
+const resourceBodies = new Map<string, string>();
+
 function hash(bytes: Uint8Array): `sha256:${string}` {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 }
@@ -24,6 +26,7 @@ function resource(
   body: string,
 ): SkillResourceV1 {
   const bytes = Buffer.from(body, "utf8");
+  resourceBodies.set(path, body);
   return {
     path,
     role,
@@ -87,34 +90,23 @@ function fixture(resources: readonly SkillResourceV1[]) {
       skill_markdown: skillMarkdown,
       resources: resources.map((entry) => ({
         path: entry.path,
-        bytes: Buffer.from(
-          entry.path === "references/green.md"
-            ? "green\n"
-            : entry.path === "references/optional-a.md"
-              ? "optional-a\n"
-              : entry.path === "references/optional-b.md"
-                ? "optional-b\n"
-                : entry.path === "references/unicode.md"
-                  ? "😀\n"
-                  : entry.path === "references/red.md"
-                    ? "red\n"
-                    : entry.path === "assets/private.bin"
-                      ? "asset\n"
-                      : "script\n",
-          "utf8",
-        ),
+        bytes: Buffer.from(resourceBodies.get(entry.path)!, "utf8"),
       })),
     } as SkillContextMaterial,
   };
 }
 
-function request(snapshot: SkillSnapshotV1, maxBytes = 256): SkillContextRequest {
+function request(
+  snapshot: SkillSnapshotV1,
+  maxBytes = 256,
+  maxTokens = Math.ceil(maxBytes / 4),
+): SkillContextRequest {
   return {
     snapshot,
     snapshot_hash: snapshot.document_hash,
     phase: "GREEN",
     max_bytes: maxBytes,
-    max_tokens: Math.ceil(maxBytes / 4),
+    max_tokens: maxTokens,
   };
 }
 
@@ -168,9 +160,8 @@ describe("bounded skill context", () => {
     expect(context.truncations).toEqual([
       {
         path: "references/optional-b.md",
-        hash: optionalB.hash,
-        bytes: optionalB.bytes,
-        reason: "budget",
+        original_bytes: optionalB.bytes,
+        included_bytes: 0,
       },
     ]);
     expect(context.remaining_bytes).toBe(0);
@@ -229,5 +220,80 @@ describe("bounded skill context", () => {
     expect(JSON.stringify(context)).not.toContain("/private/");
     expect(JSON.stringify(context)).not.toContain("SECRET");
     expect(Object.values(context).some((value) => typeof value === "function")).toBe(false);
+  });
+
+  it("partially includes the largest UTF-8-safe optional prefix and stops lower priorities", () => {
+    const first = resource("references/first.md", "reference", ["GREEN"], 1, "abcdef");
+    const later = resource("references/later.md", "reference", ["GREEN"], 2, "later");
+    const { snapshot, material } = fixture([later, first]);
+
+    const context = assembleSkillContext(request(snapshot, 11, 3), material);
+    const partial = context.segments[1]!;
+
+    expect(partial).toMatchObject({
+      path: first.path,
+      role: "reference",
+      source_hash: first.hash,
+      included_hash: hash(Buffer.from("abc")),
+      original_bytes: 6,
+      included_bytes: 3,
+      conservative_tokens: 1,
+      content: "abc",
+    });
+    expect(context.truncations).toEqual([
+      { path: first.path, original_bytes: 6, included_bytes: 3 },
+    ]);
+    expect(context.omitted_resource_hashes).toEqual([first.hash, later.hash]);
+  });
+
+  it("accounts conservative tokens per segment and accepts zero budgets as overflow", () => {
+    const first = resource("references/first.md", "reference", ["GREEN"], 1, "a");
+    const second = resource("references/second.md", "reference", ["GREEN"], 2, "b");
+    const { snapshot, material } = fixture([second, first]);
+
+    const context = assembleSkillContext(request(snapshot, 10, 4), material);
+
+    expect(context.included_tokens).toBe(4);
+    expect(context.remaining_tokens).toBe(0);
+    expect(() => assembleSkillContext(request(snapshot, 0, 0), material)).toThrowError(
+      new RuntimeSkillError("RUNTIME_SKILL_CONTEXT_OVERFLOW"),
+    );
+  });
+
+  it("uses the token budget independently and never splits a multibyte code point", () => {
+    const optional = resource("references/unicode-optional.md", "reference", ["GREEN"], 1, "😀a");
+    const { snapshot, material } = fixture([optional]);
+
+    const context = assembleSkillContext(request(snapshot, 64, 3), material);
+
+    expect(context.segments[1]).toMatchObject({
+      content: "😀",
+      included_bytes: 4,
+      conservative_tokens: 1,
+    });
+    expect(context.truncations).toEqual([
+      { path: optional.path, original_bytes: 5, included_bytes: 4 },
+    ]);
+  });
+
+  it("keeps an omitted digest when identical content is also included", () => {
+    const included = resource("references/included.md", "reference", ["GREEN"], null, "same");
+    const omittedFirst = resource("references/omitted-a.md", "reference", ["RED"], null, "same");
+    const { snapshot, material } = fixture([included, omittedFirst]);
+
+    const context = assembleSkillContext(request(snapshot), material);
+
+    expect(context.included_resource_hashes).toContain(included.hash);
+    expect(context.omitted_resource_hashes).toEqual([included.hash]);
+  });
+
+  it("deduplicates omitted hashes for multiple same-content resources", () => {
+    const omittedFirst = resource("references/omitted-a.md", "reference", ["RED"], null, "same");
+    const omittedSecond = resource("references/omitted-b.md", "reference", ["RED"], null, "same");
+    const { snapshot, material } = fixture([omittedSecond, omittedFirst]);
+
+    expect(assembleSkillContext(request(snapshot), material).omitted_resource_hashes).toEqual([
+      omittedFirst.hash,
+    ]);
   });
 });

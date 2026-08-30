@@ -73,6 +73,25 @@ describe("skill runtime contracts", () => {
     expect(parseSkillSnapshot(canonicalJson(unordered))).toMatchObject({ ok: false });
   });
 
+  it.each([
+    ["duplicate phases", { phases: ["GREEN", "GREEN"] }],
+    ["noncanonical phases", { phases: ["GREEN", "DEBUGGING"] }],
+    ["empty reference phases", { phases: [] }],
+    ["out-of-range reference priority", { priority: 256 }],
+    ["asset phase policy", { role: "asset", phases: ["GREEN"], priority: null }],
+    ["script priority policy", { role: "script", phases: [], priority: 0 }],
+  ])("rejects %s resource policy", (_name, mutation) => {
+    const fixture = validSkillSnapshot();
+    expect(
+      parseSkillSnapshot(
+        canonicalJson({
+          ...fixture,
+          resources: [{ ...fixture.resources[0], ...mutation }],
+        }),
+      ),
+    ).toMatchObject({ ok: false });
+  });
+
   it("rejects uppercase hashes and bad document hashes", () => {
     const fixture = validSkillDescriptor();
     expect(

@@ -21,17 +21,19 @@ export interface SkillContextMaterial {
 
 export interface SkillContextSegment {
   readonly path: string;
-  readonly hash: `sha256:${string}`;
-  readonly utf8_bytes: number;
-  readonly tokens: number;
-  readonly body: string;
+  readonly role: "skill_markdown" | "reference";
+  readonly source_hash: `sha256:${string}`;
+  readonly included_hash: `sha256:${string}`;
+  readonly original_bytes: number;
+  readonly included_bytes: number;
+  readonly conservative_tokens: number;
+  readonly content: string;
 }
 
 export interface SkillContextTruncation {
   readonly path: string;
-  readonly hash: `sha256:${string}`;
-  readonly bytes: number;
-  readonly reason: "budget";
+  readonly original_bytes: number;
+  readonly included_bytes: number;
 }
 
 export interface SkillContext {
@@ -74,12 +76,11 @@ function tokens(bytes: number): number {
 function validBudget(request: SkillContextRequest): boolean {
   return (
     Number.isSafeInteger(request.max_bytes) &&
-    request.max_bytes >= 1 &&
+    request.max_bytes >= 0 &&
     request.max_bytes <= SKILL_LIMITS.phaseInputBytes &&
     Number.isSafeInteger(request.max_tokens) &&
-    request.max_tokens >= 1 &&
-    request.max_tokens <= tokens(SKILL_LIMITS.phaseInputBytes) &&
-    request.max_tokens === tokens(request.max_bytes)
+    request.max_tokens >= 0 &&
+    request.max_tokens <= tokens(SKILL_LIMITS.phaseInputBytes)
   );
 }
 
@@ -131,9 +132,39 @@ function compareOptional(
   );
 }
 
-function segment(path: string, hash: `sha256:${string}`, bytes: Uint8Array): SkillContextSegment {
-  const body = decodeUtf8(bytes);
-  return { path, hash, utf8_bytes: bytes.byteLength, tokens: tokens(bytes.byteLength), body };
+function segment(
+  path: string,
+  role: SkillContextSegment["role"],
+  sourceHash: `sha256:${string}`,
+  originalBytes: number,
+  bytes: Uint8Array,
+): SkillContextSegment {
+  const content = decodeUtf8(bytes);
+  return {
+    path,
+    role,
+    source_hash: sourceHash,
+    included_hash: rawHash(bytes),
+    original_bytes: originalBytes,
+    included_bytes: bytes.byteLength,
+    conservative_tokens: tokens(bytes.byteLength),
+    content,
+  };
+}
+
+function segmentTokens(segments: readonly SkillContextSegment[]): number {
+  return segments.reduce((total, entry) => total + entry.conservative_tokens, 0);
+}
+
+function largestUtf8Prefix(bytes: Uint8Array, maxBytes: number, maxTokens: number): Uint8Array {
+  const content = decodeUtf8(bytes);
+  let includedBytes = 0;
+  for (const codePoint of content) {
+    const nextBytes = includedBytes + Buffer.byteLength(codePoint, "utf8");
+    if (nextBytes > maxBytes || tokens(nextBytes) > maxTokens) break;
+    includedBytes = nextBytes;
+  }
+  return bytes.subarray(0, includedBytes);
 }
 
 export function assembleSkillContext(
@@ -161,38 +192,65 @@ export function assembleSkillContext(
     )
     .sort(compareOptional);
   const selected = [
-    segment("SKILL.md", snapshot.skill_markdown_hash, material.skill_markdown),
+    segment(
+      "SKILL.md",
+      "skill_markdown",
+      snapshot.skill_markdown_hash,
+      snapshot.skill_markdown_bytes,
+      material.skill_markdown,
+    ),
     ...mandatory.map((resource) =>
-      segment(resource.path, resource.hash, bytes.get(resource.path)!),
+      segment(resource.path, "reference", resource.hash, resource.bytes, bytes.get(resource.path)!),
     ),
   ];
-  let includedBytes = selected.reduce((total, entry) => total + entry.utf8_bytes, 0);
-  if (includedBytes > request.max_bytes || tokens(includedBytes) > request.max_tokens) overflow();
+  let includedBytes = selected.reduce((total, entry) => total + entry.included_bytes, 0);
+  let includedTokens = segmentTokens(selected);
+  if (includedBytes > request.max_bytes || includedTokens > request.max_tokens) overflow();
   const truncations: SkillContextTruncation[] = [];
+  const includedResourcePaths = new Set<string>(mandatory.map((resource) => resource.path));
   for (const resource of optional) {
     const candidate = bytes.get(resource.path)!;
     const candidateBytes = includedBytes + candidate.byteLength;
-    if (candidateBytes <= request.max_bytes && tokens(candidateBytes) <= request.max_tokens) {
-      selected.push(segment(resource.path, resource.hash, candidate));
+    const candidateTokens = includedTokens + tokens(candidate.byteLength);
+    if (candidateBytes <= request.max_bytes && candidateTokens <= request.max_tokens) {
+      selected.push(segment(resource.path, "reference", resource.hash, resource.bytes, candidate));
       includedBytes = candidateBytes;
+      includedTokens = candidateTokens;
+      includedResourcePaths.add(resource.path);
     } else {
+      const prefix = largestUtf8Prefix(
+        candidate,
+        request.max_bytes - includedBytes,
+        request.max_tokens - includedTokens,
+      );
+      if (prefix.byteLength > 0) {
+        const partial = segment(resource.path, "reference", resource.hash, resource.bytes, prefix);
+        selected.push(partial);
+        includedBytes += partial.included_bytes;
+        includedTokens += partial.conservative_tokens;
+      }
       truncations.push({
         path: resource.path,
-        hash: resource.hash,
-        bytes: resource.bytes,
-        reason: "budget",
+        original_bytes: resource.bytes,
+        included_bytes: prefix.byteLength,
       });
+      break;
     }
   }
-  const includedResourceHashes = selected.slice(1).map((entry) => entry.hash);
-  const included = new Set(includedResourceHashes);
-  const omittedResourceHashes = snapshot.resources
-    .filter((resource) => !included.has(resource.hash))
-    .map((resource) => resource.hash);
+  const includedResourceHashes = [...new Set(selected.slice(1).map((entry) => entry.source_hash))];
+  const omittedResourceHashes = [
+    ...new Set(
+      snapshot.resources
+        .filter((resource) => !includedResourcePaths.has(resource.path))
+        .map((resource) => resource.hash),
+    ),
+  ];
   const originalBytes =
     material.skill_markdown.byteLength +
     [...mandatory, ...optional].reduce((total, resource) => total + resource.bytes, 0);
-  const includedTokens = tokens(includedBytes);
+  const originalTokens =
+    tokens(material.skill_markdown.byteLength) +
+    [...mandatory, ...optional].reduce((total, resource) => total + tokens(resource.bytes), 0);
   const hashable = {
     snapshot: {
       name: snapshot.descriptor.name,
@@ -206,7 +264,7 @@ export function assembleSkillContext(
     omitted_resource_hashes: omittedResourceHashes,
     original_utf8_bytes: originalBytes,
     included_utf8_bytes: includedBytes,
-    original_tokens: tokens(originalBytes),
+    original_tokens: originalTokens,
     included_tokens: includedTokens,
     remaining_bytes: request.max_bytes - includedBytes,
     remaining_tokens: request.max_tokens - includedTokens,
