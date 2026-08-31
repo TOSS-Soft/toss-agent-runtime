@@ -13,6 +13,7 @@ import {
   parseSkillDescriptor,
   parseSkillExecutionEvidence,
   parseSkillSnapshot,
+  SKILL_EVIDENCE_JSON_LIMITS,
 } from "./contracts.js";
 import type { SkillsEngine } from "./engine.js";
 import {
@@ -57,6 +58,22 @@ function integrity(): never {
 
 function limitExceeded(): never {
   throw new RuntimeSkillError("RUNTIME_SKILL_LIMIT_EXCEEDED");
+}
+
+function evidenceJson(value: unknown): string {
+  try {
+    return canonicalJson(value, SKILL_EVIDENCE_JSON_LIMITS);
+  } catch {
+    return limitExceeded();
+  }
+}
+
+function evidenceHash(value: unknown): `sha256:${string}` {
+  try {
+    return sha256(value, SKILL_EVIDENCE_JSON_LIMITS);
+  } catch {
+    return limitExceeded();
+  }
 }
 
 function exactKeys(value: object, keys: readonly string[]): boolean {
@@ -299,7 +316,7 @@ export function createSkillEvidenceBuilder(
         approvals,
         terminal_code: zeroPhaseCode ?? verified.phases.at(-1)?.terminal_code ?? null,
       };
-      let worstCaseBytes = Buffer.byteLength(canonicalJson(preflight), "utf8");
+      let worstCaseBytes = Buffer.byteLength(evidenceJson(preflight), "utf8");
       const packageHashes = [...phaseByPackage.keys()].sort((left, right) =>
         Buffer.from(left).compare(Buffer.from(right)),
       );
@@ -333,14 +350,21 @@ export function createSkillEvidenceBuilder(
       );
 
       const preimage = { ...preflight, catalogs, snapshots };
-      const withHandoff = { ...preimage, handoff_hash: hashSkillExecutionHandoff(preimage) };
-      const candidate = { ...withHandoff, document_hash: sha256(withHandoff) };
-      const bytes = canonicalJson(candidate);
+      let handoffHash: `sha256:${string}`;
+      try {
+        handoffHash = hashSkillExecutionHandoff(preimage);
+      } catch {
+        return limitExceeded();
+      }
+      const withHandoff = { ...preimage, handoff_hash: handoffHash };
+      const candidate = { ...withHandoff, document_hash: evidenceHash(withHandoff) };
+      const bytes = evidenceJson(candidate);
       if (Buffer.byteLength(bytes, "utf8") > SKILL_LIMITS.evidenceBytes) limitExceeded();
       const parsed = parseSkillExecutionEvidence(bytes);
       if (!parsed.ok) integrity();
       return deepFreezeJson(
         parsed.value as unknown as JsonValue,
+        SKILL_EVIDENCE_JSON_LIMITS,
       ) as unknown as SkillExecutionEvidenceV1;
     },
   });

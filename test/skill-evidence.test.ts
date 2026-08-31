@@ -11,11 +11,19 @@ import type { TransitionCommand } from "../src/journal/state-machine.js";
 import type { JournalHead, RunJournalEntryV1, RunState } from "../src/journal/types.js";
 import { createRunJournalStore } from "../src/journal/store.js";
 import { canonicalJson, parseJsonBytes, sha256 } from "../src/protocol/json.js";
-import { approvalPendingCommand, requestSuperpowersApproval } from "../src/skills/approval.js";
+import {
+  approvalDecision,
+  approvalDecisionCommand,
+  approvalPendingCommand,
+  approvalRequest,
+  approvalTerminalPhase,
+  requestSuperpowersApproval,
+} from "../src/skills/approval.js";
 import {
   hashSkillCatalog,
   hashSkillExecutionHandoff,
   parseSkillExecutionEvidence,
+  SKILL_EVIDENCE_JSON_LIMITS,
 } from "../src/skills/contracts.js";
 import { SKILL_LIMITS, type SkillsHost } from "../src/skills/index.js";
 import { createSkillEvidenceBuilder } from "../src/skills/evidence.js";
@@ -23,7 +31,11 @@ import type { SkillsEngine } from "../src/skills/engine.js";
 import { builtInSuperpowersHandler } from "../src/skills/phases.js";
 import { createSkillsRuntimeHostForTest } from "../src/skills/runtime-host.js";
 import type { SkillSelection } from "../src/skills/catalog.js";
-import type { SkillSnapshotV1, SuperpowersPhaseName } from "../src/skills/types.js";
+import type {
+  SkillSnapshotV1,
+  SuperpowersPhaseName,
+  SuperpowersPhaseV1,
+} from "../src/skills/types.js";
 import { validSuperpowersPhase } from "./support/skill-fixtures.js";
 
 const TRACE = {
@@ -143,6 +155,23 @@ function resignJournal(value: RunJournalEntryV1): RunJournalEntryV1 {
   return { ...hashable, entry_hash: hashRunJournalEntry(hashable) };
 }
 
+function resignJournalCommand(value: RunJournalEntryV1): RunJournalEntryV1 {
+  return resignJournal({
+    ...value,
+    command_input_hash: sha256({
+      run_id: value.run_id,
+      expected_revision: value.journal_revision - 1,
+      expected_head_hash: value.previous_entry_hash,
+      operation_id: value.operation_id,
+      next_state: value.state,
+      reason_code: value.reason_code,
+      trace: value.trace,
+      metadata: value.metadata,
+      side_effect: value.side_effect,
+    }),
+  });
+}
+
 describe("canonical Agent Skills evidence", () => {
   it("rejects the 129th approval in the first linear journal pass before object reads", async () => {
     const root = await realpath(
@@ -254,6 +283,212 @@ describe("canonical Agent Skills evidence", () => {
     expect(reads).toBe(0);
   });
 
+  it("builds and parses a real history with more than 24 approvals", async () => {
+    const root = await realpath(
+      await mkdtemp(path.join(tmpdir(), "toss-evidence-many-approvals-")),
+    );
+    roots.push(root);
+    const statePath = path.join(root, "state");
+    const now = clock();
+    const randomId = ids();
+    const journal = createRunJournalStore({ statePath, now, randomId });
+    let head: JournalHead | null = null;
+    for (const state of ["CREATED", "ROUTED", "RUNNING"] as const) {
+      head = (await journal.transition(journalCommand("run-many-approvals", state, head))).head;
+    }
+    if (head === null) throw new Error("many-approval journal fixture failed");
+    const host = createSkillsRuntimeHostForTest({
+      statePath,
+      socketPath: path.join(root, "runtime.sock"),
+      configuredRoots: [],
+      journal,
+      now,
+      randomId,
+      hasServiceListener: () => Promise.resolve("absent"),
+    });
+    const brainstorming = await selected(host, "brainstorming");
+    for (let index = 0; index < 25; index += 1) {
+      const started = await host.startPhase({
+        run_id: "run-many-approvals",
+        expected_journal_head: head,
+        execution_request_hash: EXECUTION_REQUEST_HASH,
+        selection: brainstorming.selection,
+        phase: "BRAINSTORMING",
+        input: Buffer.from(`brainstorming input ${index}`, "utf8"),
+        operation_id: `many-approval-phase-${index}`,
+        trace: TRACE,
+      });
+      const pending = await host.completePhase({
+        run_id: "run-many-approvals",
+        expected_phase_revision: started.phase.phase_revision,
+        expected_phase_head_hash: started.phase.document_hash,
+        phase: started.phase.phase,
+        skill_snapshot_hash: started.phase.skill.snapshot_hash,
+        operation_id: started.phase.operation_id,
+        outcome: "COMPLETED",
+        terminal_code: null,
+        output: Buffer.from(`approved plan ${index}`, "utf8"),
+        trace: TRACE,
+      });
+      if (pending.approval?.kind !== "REQUEST") throw new Error("approval request expected");
+      const approved = await host.resumeApproval({
+        run_id: "run-many-approvals",
+        expected_journal_head: pending.approval.pending_journal_head,
+        phase: pending.approval.phase,
+        skill_name: pending.approval.skill_name,
+        skill_version: pending.approval.skill_version,
+        skill_snapshot_hash: pending.approval.skill_snapshot_hash,
+        approval_request_hash: pending.approval.document_hash,
+        operation_id: `a0000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+        decision: "APPROVE",
+        trace: TRACE,
+      });
+      head = approved.journal_head;
+    }
+
+    const evidence = await host.evidence("run-many-approvals");
+    if (evidence === null) throw new Error("many-approval evidence expected");
+    const serialized = canonicalJson(evidence, SKILL_EVIDENCE_JSON_LIMITS);
+    const bytes = Buffer.byteLength(serialized, "utf8");
+    expect(evidence.approvals).toHaveLength(25);
+    expect(bytes).toBeGreaterThan(0);
+    expect(bytes).toBeLessThanOrEqual(SKILL_LIMITS.evidenceBytes);
+    expect(parseSkillExecutionEvidence(serialized)).toEqual({
+      ok: true,
+      value: evidence,
+    });
+  }, 75_000);
+
+  it("builds and parses a semantically closed near-byte-limit approval projection", async () => {
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-evidence-near-byte-")));
+    roots.push(root);
+    const statePath = path.join(root, "state");
+    const now = clock();
+    const randomId = ids();
+    const journal = createRunJournalStore({ statePath, now, randomId });
+    let officialHead: JournalHead | null = null;
+    for (const state of ["CREATED", "ROUTED", "RUNNING"] as const) {
+      officialHead = (
+        await journal.transition(journalCommand("run-near-byte", state, officialHead))
+      ).head;
+    }
+    if (officialHead === null) throw new Error("near-byte journal fixture failed");
+    const host = createSkillsRuntimeHostForTest({
+      statePath,
+      socketPath: path.join(root, "runtime.sock"),
+      configuredRoots: [],
+      journal,
+      now,
+      randomId,
+      hasServiceListener: () => Promise.resolve("absent"),
+    });
+    const brainstorming = await selected(host, "brainstorming");
+    const template = await host.startPhase({
+      run_id: "run-near-byte",
+      expected_journal_head: officialHead,
+      execution_request_hash: EXECUTION_REQUEST_HASH,
+      selection: brainstorming.selection,
+      phase: "BRAINSTORMING",
+      input: Buffer.from("near-byte template", "utf8"),
+      operation_id: "near-byte-template",
+      trace: TRACE,
+    });
+    const official = await journal.load("run-near-byte");
+    if (official === null) throw new Error("near-byte official journal missing");
+    const journalEntries = [...official.entries];
+    const phases: SuperpowersPhaseV1[] = [];
+    let journalHead = official.head;
+    let previousPhaseHash: `sha256:${string}` = `sha256:${"0".repeat(64)}`;
+    for (let index = 0; index < 96; index += 1) {
+      const started = resign({
+        ...template.phase,
+        phase_revision: index * 3 + 1,
+        previous_phase_hash: previousPhaseHash,
+        observed_journal_head: journalHead,
+        operation_id: `near-byte-phase-${index}`,
+        input_hash: sha256({ index, kind: "input" }),
+      });
+      const pending = requestSuperpowersApproval({
+        started,
+        output_hash: sha256({ index, kind: "output" }),
+        occurred_at: now().toISOString(),
+        trace: TRACE,
+      });
+      const pendingTransition = decideRunTransition(
+        journalEntries,
+        approvalPendingCommand(pending),
+        now,
+      );
+      if (pendingTransition.kind !== "append") throw new Error("pending transition must append");
+      journalEntries.push(pendingTransition.entry);
+      const request = approvalRequest(pending, {
+        journal_revision: pendingTransition.entry.journal_revision,
+        sequence: pendingTransition.entry.sequence,
+        entry_hash: pendingTransition.entry.entry_hash,
+      });
+      const decision = approvalDecision(request, {
+        run_id: request.run_id,
+        expected_journal_head: request.pending_journal_head,
+        phase: request.phase,
+        skill_name: request.skill_name,
+        skill_version: request.skill_version,
+        skill_snapshot_hash: request.skill_snapshot_hash,
+        approval_request_hash: request.document_hash,
+        operation_id: `b0000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+        decision: "APPROVE",
+        trace: TRACE,
+      });
+      const terminal = approvalTerminalPhase({
+        pending,
+        decision,
+        occurred_at: now().toISOString(),
+      });
+      const decisionTransition = decideRunTransition(
+        journalEntries,
+        approvalDecisionCommand({ request, decision, terminal }),
+        now,
+      );
+      if (decisionTransition.kind !== "append") throw new Error("decision must append");
+      journalEntries.push(decisionTransition.entry);
+      phases.push(started, pending, terminal);
+      journalHead = {
+        journal_revision: decisionTransition.entry.journal_revision,
+        sequence: decisionTransition.entry.sequence,
+        entry_hash: decisionTransition.entry.entry_hash,
+      };
+      previousPhaseHash = terminal.document_hash;
+    }
+    const engine = {
+      evidenceHistory: () =>
+        Promise.resolve({
+          phases,
+          journal: {
+            run_id: "run-near-byte",
+            state: "RUNNING" as const,
+            head: journalHead,
+            entries: journalEntries,
+            unresolved_side_effects: [],
+          },
+        }),
+    } as unknown as SkillsEngine;
+    const builder = createSkillEvidenceBuilder({
+      statePath,
+      engine,
+      now,
+      randomId,
+      hasServiceListener: () => Promise.resolve("absent"),
+    });
+
+    const evidence = await builder.evidence("run-near-byte");
+    if (evidence === null) throw new Error("near-byte evidence expected");
+    const serialized = canonicalJson(evidence, SKILL_EVIDENCE_JSON_LIMITS);
+    const bytes = Buffer.byteLength(serialized, "utf8");
+    expect(evidence.approvals).toHaveLength(96);
+    expect(bytes).toBeGreaterThan(Math.floor((SKILL_LIMITS.evidenceBytes * 3) / 4));
+    expect(bytes).toBeLessThanOrEqual(SKILL_LIMITS.evidenceBytes);
+    expect(parseSkillExecutionEvidence(serialized)).toEqual({ ok: true, value: evidence });
+  }, 20_000);
+
   it("binds the complete governed phase, approval, context, resource, and handoff history", async () => {
     const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-skill-evidence-")));
     roots.push(root);
@@ -318,6 +553,181 @@ describe("canonical Agent Skills evidence", () => {
     if (approvalEvidence === null) throw new Error("approved evidence expected");
     const approvalProjection = approvalEvidence.approvals[0]!;
     const approvedTerminal = approvalEvidence.phases.at(-1)!;
+    const lifecycleMutations = [
+      resignEvidence({
+        ...approvalEvidence,
+        approvals: [
+          {
+            ...approvalProjection,
+            decision: null,
+            decision_journal_entry: null,
+          },
+        ],
+      }),
+      resignEvidence({
+        ...approvalEvidence,
+        run_state: "BLOCKED",
+        terminal_code: null,
+        terminal_journal_entry: null,
+      }),
+    ];
+    for (const mutation of lifecycleMutations) {
+      expect(parseSkillExecutionEvidence(canonicalJson(mutation))).toMatchObject({
+        ok: false,
+        code: "RUNTIME_DOCUMENT_INVALID",
+      });
+    }
+
+    const forgedReasonEntry = resignJournalCommand({
+      ...approvalProjection.decision_journal_entry!,
+      reason_code: "FORGED_REASON",
+    });
+    const forgedReason = resignEvidence({
+      ...approvalEvidence,
+      approvals: [
+        {
+          ...approvalProjection,
+          decision_journal_entry: forgedReasonEntry,
+        },
+      ],
+      journal_head: {
+        journal_revision: forgedReasonEntry.journal_revision,
+        sequence: forgedReasonEntry.sequence,
+        entry_hash: forgedReasonEntry.entry_hash,
+      },
+    });
+    expect(parseSkillExecutionEvidence(canonicalJson(forgedReason))).toMatchObject({
+      ok: false,
+      code: "RUNTIME_DOCUMENT_INVALID",
+    });
+
+    const traceDriftRequest = resign({
+      ...approvalProjection.request,
+      trace: { ...TRACE, trace_id: "9".repeat(32) },
+    });
+    const traceDriftDecision = resign({
+      ...approvalProjection.decision!,
+      approval_request_hash: traceDriftRequest.document_hash,
+    });
+    const traceDriftEntry = resignJournalCommand({
+      ...approvalProjection.decision_journal_entry!,
+      metadata: parseJsonBytes(
+        canonicalJson({
+          kind: "superpowers-approval-decision",
+          request: traceDriftRequest,
+          decision: traceDriftDecision,
+          occurred_at: approvedTerminal.occurred_at,
+          phase: approvedTerminal,
+        }),
+      ),
+    });
+    const traceDrift = resignEvidence({
+      ...approvalEvidence,
+      approvals: [
+        {
+          ...approvalProjection,
+          request: traceDriftRequest,
+          decision: traceDriftDecision,
+          decision_journal_entry: traceDriftEntry,
+        },
+      ],
+      journal_head: {
+        journal_revision: traceDriftEntry.journal_revision,
+        sequence: traceDriftEntry.sequence,
+        entry_hash: traceDriftEntry.entry_hash,
+      },
+    });
+    expect(parseSkillExecutionEvidence(canonicalJson(traceDrift))).toMatchObject({
+      ok: false,
+      code: "RUNTIME_DOCUMENT_INVALID",
+    });
+
+    const decisionTrace = resign({
+      ...approvalProjection.decision!,
+      trace: { ...TRACE, span_id: "8".repeat(16) },
+    });
+    const decisionTraceEntry = resignJournalCommand({
+      ...approvalProjection.decision_journal_entry!,
+      metadata: parseJsonBytes(
+        canonicalJson({
+          kind: "superpowers-approval-decision",
+          request: approvalProjection.request,
+          decision: decisionTrace,
+          occurred_at: approvedTerminal.occurred_at,
+          phase: approvedTerminal,
+        }),
+      ),
+    });
+    const decisionTraceDrift = resignEvidence({
+      ...approvalEvidence,
+      approvals: [
+        {
+          ...approvalProjection,
+          decision: decisionTrace,
+          decision_journal_entry: decisionTraceEntry,
+        },
+      ],
+      journal_head: {
+        journal_revision: decisionTraceEntry.journal_revision,
+        sequence: decisionTraceEntry.sequence,
+        entry_hash: decisionTraceEntry.entry_hash,
+      },
+    });
+    expect(parseSkillExecutionEvidence(canonicalJson(decisionTraceDrift))).toMatchObject({
+      ok: false,
+      code: "RUNTIME_DOCUMENT_INVALID",
+    });
+
+    const decisionEntry = approvalProjection.decision_journal_entry!;
+    const decisionCommandMutations: readonly RunJournalEntryV1[] = [
+      resignJournalCommand({ ...decisionEntry, command_id: "forged-command" }),
+      resignJournal({ ...decisionEntry, command_input_hash: `sha256:${"7".repeat(64)}` }),
+      resignJournalCommand({
+        ...decisionEntry,
+        operation_id: "c0000000-0000-4000-8000-000000000001",
+      }),
+      resignJournalCommand({ ...decisionEntry, state: "BLOCKED" }),
+      forgedReasonEntry,
+      resignJournalCommand({
+        ...decisionEntry,
+        trace: { ...TRACE, span_id: "7".repeat(16) },
+      }),
+      resignJournalCommand({
+        ...decisionEntry,
+        metadata: parseJsonBytes(canonicalJson({ kind: "forged-decision-metadata" })),
+      }),
+      resignJournalCommand({
+        ...decisionEntry,
+        side_effect: {
+          identity: decisionEntry.operation_id!,
+          phase: "INTENT",
+          input_hash: `sha256:${"6".repeat(64)}`,
+          output_hash: null,
+        },
+      }),
+      resignJournal({ ...decisionEntry, timestamp: "2026-08-30T11:59:00.000Z" }),
+    ];
+    for (const mutatedEntry of decisionCommandMutations) {
+      const mutation = resignEvidence({
+        ...approvalEvidence,
+        run_state: mutatedEntry.state,
+        approvals: [
+          {
+            ...approvalProjection,
+            decision_journal_entry: mutatedEntry,
+          },
+        ],
+        journal_head: {
+          journal_revision: mutatedEntry.journal_revision,
+          sequence: mutatedEntry.sequence,
+          entry_hash: mutatedEntry.entry_hash,
+        },
+      });
+      expect(parseSkillExecutionEvidence(canonicalJson(mutation))).toMatchObject({
+        ok: false,
+        code: "RUNTIME_DOCUMENT_INVALID",
+      });
+    }
     const outputDriftTerminal = resign({
       ...approvedTerminal,
       output_hash: sha256({ false_output: true }),
@@ -405,6 +815,82 @@ describe("canonical Agent Skills evidence", () => {
       ok: false,
       code: "RUNTIME_DOCUMENT_INVALID",
     });
+
+    const pendingEntry = approvalProjection.request_journal_entry;
+    const pendingCommandMutations: readonly RunJournalEntryV1[] = [
+      resignJournalCommand({ ...pendingEntry, command_id: "forged-pending-command" }),
+      resignJournal({ ...pendingEntry, command_input_hash: `sha256:${"5".repeat(64)}` }),
+      resignJournalCommand({ ...pendingEntry, operation_id: "forged-pending-operation" }),
+      resignJournalCommand({ ...pendingEntry, state: "TOOL_PENDING" }),
+      resignJournalCommand({ ...pendingEntry, reason_code: "FORGED_PENDING_REASON" }),
+      resignJournalCommand({
+        ...pendingEntry,
+        trace: { ...TRACE, span_id: "5".repeat(16) },
+      }),
+      resignJournalCommand({
+        ...pendingEntry,
+        metadata: parseJsonBytes(canonicalJson({ kind: "forged-pending-metadata" })),
+      }),
+      resignJournalCommand({
+        ...pendingEntry,
+        side_effect: {
+          identity: pendingEntry.operation_id!,
+          phase: "INTENT",
+          input_hash: `sha256:${"4".repeat(64)}`,
+          output_hash: null,
+        },
+      }),
+      resignJournal({ ...pendingEntry, timestamp: "2026-08-30T11:59:00.000Z" }),
+    ];
+    for (const mutatedEntry of pendingCommandMutations) {
+      const mutatedHead = {
+        journal_revision: mutatedEntry.journal_revision,
+        sequence: mutatedEntry.sequence,
+        entry_hash: mutatedEntry.entry_hash,
+      };
+      const mutatedRequest = resign({
+        ...approvalProjection.request,
+        pending_journal_head: mutatedHead,
+      });
+      const mutatedDecision = resign({
+        ...approvalProjection.decision!,
+        pending_journal_head: mutatedHead,
+        approval_request_hash: mutatedRequest.document_hash,
+      });
+      const mutatedDecisionEntry = resignJournalCommand({
+        ...approvalProjection.decision_journal_entry!,
+        previous_entry_hash: mutatedEntry.entry_hash,
+        metadata: parseJsonBytes(
+          canonicalJson({
+            kind: "superpowers-approval-decision",
+            request: mutatedRequest,
+            decision: mutatedDecision,
+            occurred_at: approvedTerminal.occurred_at,
+            phase: approvedTerminal,
+          }),
+        ),
+      });
+      const mutation = resignEvidence({
+        ...approvalEvidence,
+        approvals: [
+          {
+            request: mutatedRequest,
+            request_journal_entry: mutatedEntry,
+            decision: mutatedDecision,
+            decision_journal_entry: mutatedDecisionEntry,
+          },
+        ],
+        journal_head: {
+          journal_revision: mutatedDecisionEntry.journal_revision,
+          sequence: mutatedDecisionEntry.sequence,
+          entry_hash: mutatedDecisionEntry.entry_hash,
+        },
+      });
+      expect(parseSkillExecutionEvidence(canonicalJson(mutation))).toMatchObject({
+        ok: false,
+        code: "RUNTIME_DOCUMENT_INVALID",
+      });
+    }
 
     const phases = [
       ["test-driven-development", "TEST_DESIGN"],
@@ -603,6 +1089,11 @@ describe("canonical Agent Skills evidence", () => {
       ok: true,
       value: missingEvidence,
     });
+    expect(
+      parseSkillExecutionEvidence(
+        canonicalJson(resignEvidence({ ...missingEvidence, terminal_journal_entry: null })),
+      ),
+    ).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
 
     let mixedHead: JournalHead | null = null;
     for (const state of ["CREATED", "ROUTED", "RUNNING"] as const) {
@@ -652,6 +1143,30 @@ describe("canonical Agent Skills evidence", () => {
       ok: true,
       value: mixedEvidence,
     });
+    expect(
+      parseSkillExecutionEvidence(
+        canonicalJson(resignEvidence({ ...mixedEvidence, terminal_journal_entry: null })),
+      ),
+    ).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
+    const forgedTerminalEntry = resignJournal({
+      ...mixedEvidence.terminal_journal_entry!,
+      previous_entry_hash: `sha256:${"3".repeat(64)}`,
+    });
+    expect(
+      parseSkillExecutionEvidence(
+        canonicalJson(
+          resignEvidence({
+            ...mixedEvidence,
+            journal_head: {
+              journal_revision: forgedTerminalEntry.journal_revision,
+              sequence: forgedTerminalEntry.sequence,
+              entry_hash: forgedTerminalEntry.entry_hash,
+            },
+            terminal_journal_entry: forgedTerminalEntry,
+          }),
+        ),
+      ),
+    ).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
 
     const configuredRoot = path.join(root, "configured-skills");
     const packageRoot = path.join(configuredRoot, "test-driven-development");

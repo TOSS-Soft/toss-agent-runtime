@@ -6,8 +6,10 @@ import {
   type JsonValue,
 } from "../protocol/json.js";
 import { parseRunJournalEntry } from "../journal/entry.js";
+import type { RunState } from "../journal/types.js";
 import type {
   RuntimeDocument,
+  TraceContext,
   ValidationFailure,
   ValidationIssue,
   ValidationResult,
@@ -23,6 +25,8 @@ import type {
   SkillDescriptorV1,
   SkillExecutionEvidenceV1,
   SkillSnapshotV1,
+  SuperpowersApprovalDecisionV1,
+  SuperpowersApprovalRequestV1,
   SuperpowersApprovalV1,
   SuperpowersPhaseName,
   SuperpowersPhaseV1,
@@ -40,10 +44,10 @@ const DOCUMENT_LIMITS: JsonLimits = Object.freeze({
   maxMembers: 10_000,
 });
 
-const EVIDENCE_LIMITS: JsonLimits = Object.freeze({
+export const SKILL_EVIDENCE_JSON_LIMITS: JsonLimits = Object.freeze({
   maxBytes: SKILL_LIMITS.evidenceBytes,
   maxDepth: SKILL_LIMITS.nestingDepth + 8,
-  maxMembers: 20_000,
+  maxMembers: SKILL_LIMITS.evidenceBytes,
 });
 
 type JsonRecord = { readonly [key: string]: JsonValue };
@@ -120,13 +124,16 @@ export function hashSuperpowersApproval(value: SuperpowersApprovalV1): `sha256:$
 }
 
 export function hashSkillExecutionEvidence(value: SkillExecutionEvidenceV1): `sha256:${string}` {
-  return sha256(hashable(value, EVIDENCE_LIMITS), EVIDENCE_LIMITS);
+  return sha256(hashable(value, SKILL_EVIDENCE_JSON_LIMITS), SKILL_EVIDENCE_JSON_LIMITS);
 }
 
 export function hashSkillExecutionHandoff(
   value: Omit<SkillExecutionEvidenceV1, "handoff_hash" | "document_hash">,
 ): `sha256:${string}` {
-  return sha256({ schema_version: "skill-execution-handoff.v1", evidence: value }, EVIDENCE_LIMITS);
+  return sha256(
+    { schema_version: "skill-execution-handoff.v1", evidence: value },
+    SKILL_EVIDENCE_JSON_LIMITS,
+  );
 }
 
 export function hashSkillPackage(
@@ -415,6 +422,84 @@ function sameEvidencePhaseBinding(left: SuperpowersPhaseV1, right: SuperpowersPh
   );
 }
 
+function evidenceCommandInputHash(command: {
+  readonly run_id: string;
+  readonly expected_revision: number;
+  readonly expected_head_hash: `sha256:${string}`;
+  readonly operation_id: string | null;
+  readonly next_state: RunState;
+  readonly reason_code: string;
+  readonly trace: TraceContext;
+  readonly metadata: JsonValue;
+  readonly side_effect: null;
+}): `sha256:${string}` {
+  return sha256({
+    run_id: command.run_id,
+    expected_revision: command.expected_revision,
+    expected_head_hash: command.expected_head_hash,
+    operation_id: command.operation_id,
+    next_state: command.next_state,
+    reason_code: command.reason_code,
+    trace: command.trace,
+    metadata: command.metadata,
+    side_effect: command.side_effect,
+  });
+}
+
+function pendingEvidenceCommand(phase: SuperpowersPhaseV1) {
+  const operationHash = sha256({
+    kind: "superpowers-approval-pending",
+    run_id: phase.run_id,
+    operation_id: phase.operation_id,
+  });
+  return {
+    run_id: phase.run_id,
+    expected_revision: phase.observed_journal_head.journal_revision,
+    expected_head_hash: phase.observed_journal_head.entry_hash,
+    command_id: `approval-pending:${operationHash}`,
+    operation_id: phase.operation_id,
+    next_state: "APPROVAL_PENDING" as const,
+    reason_code: "SUPERPOWERS_APPROVAL_REQUIRED",
+    trace: phase.trace,
+    metadata: { kind: "superpowers-approval-pending", phase } as unknown as JsonValue,
+    side_effect: null,
+  };
+}
+
+function decisionEvidenceCommand(
+  request: SuperpowersApprovalRequestV1,
+  decision: SuperpowersApprovalDecisionV1,
+  terminal: SuperpowersPhaseV1,
+) {
+  return {
+    run_id: request.run_id,
+    expected_revision: request.pending_journal_head.journal_revision,
+    expected_head_hash: request.pending_journal_head.entry_hash,
+    command_id: `approval-decision:${decision.operation_id}`,
+    operation_id: decision.operation_id,
+    next_state: decision.decision === "APPROVE" ? ("RUNNING" as const) : ("BLOCKED" as const),
+    reason_code:
+      decision.decision === "APPROVE"
+        ? "SUPERPOWERS_APPROVAL_GRANTED"
+        : "SUPERPOWERS_APPROVAL_REJECTED",
+    trace: decision.trace,
+    metadata: {
+      kind: "superpowers-approval-decision",
+      request,
+      decision,
+      occurred_at: terminal.occurred_at,
+      phase: terminal,
+    } as unknown as JsonValue,
+    side_effect: null,
+  };
+}
+
+function orderedTimestamp(left: string, right: string): boolean {
+  const leftTime = Date.parse(left);
+  const rightTime = Date.parse(right);
+  return Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime <= rightTime;
+}
+
 function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   const catalogHashes = value.catalogs.map((catalog) => catalog.catalog_hash);
@@ -644,6 +729,7 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
     const phase = phasesByHash.get(approval.request.phase_document_hash);
     const requestEntryResult = parseRunJournalEntry(canonicalJson(approval.request_journal_entry));
     const requestEntry = approval.request_journal_entry;
+    const pendingCommand = phase === undefined ? null : pendingEvidenceCommand(phase);
     if (
       !requestResult.ok ||
       approval.request.kind !== "REQUEST" ||
@@ -655,6 +741,7 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
       approval.request.skill_version !== phase.skill.version ||
       approval.request.skill_snapshot_hash !== phase.skill.snapshot_hash ||
       approval.request.phase_operation_id !== phase.operation_id ||
+      !exactJson(approval.request.trace, phase.trace) ||
       !requestEntryResult.ok ||
       requestEntry.run_id !== value.run_id ||
       requestEntry.previous_entry_hash !== phase.observed_journal_head.entry_hash ||
@@ -662,7 +749,15 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
       requestEntry.sequence !== phase.observed_journal_head.sequence + 1 ||
       requestEntry.previous_state !== "RUNNING" ||
       requestEntry.state !== "APPROVAL_PENDING" ||
-      !exactJson(requestEntry.metadata, { kind: "superpowers-approval-pending", phase }) ||
+      pendingCommand === null ||
+      requestEntry.command_id !== pendingCommand.command_id ||
+      requestEntry.command_input_hash !== evidenceCommandInputHash(pendingCommand) ||
+      requestEntry.operation_id !== pendingCommand.operation_id ||
+      requestEntry.reason_code !== pendingCommand.reason_code ||
+      !exactJson(requestEntry.trace, pendingCommand.trace) ||
+      !exactJson(requestEntry.metadata, pendingCommand.metadata) ||
+      requestEntry.side_effect !== null ||
+      !orderedTimestamp(phase.occurred_at, requestEntry.timestamp) ||
       !exactJson(approval.request.pending_journal_head, {
         journal_revision: requestEntry.journal_revision,
         sequence: requestEntry.sequence,
@@ -677,7 +772,9 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
     requests.add(approval.request.document_hash);
     if (phase !== undefined) pendingPhaseHashes.delete(phase.document_hash);
     if (approval.decision === null) {
-      if (approval.decision_journal_entry !== null) {
+      const terminal =
+        phase === undefined ? undefined : phaseByPreviousHash.get(phase.document_hash);
+      if (approval.decision_journal_entry !== null || terminal !== undefined) {
         issues.push(
           issue(`/approvals/${index}`, "decisionEntry", "missing decision has no journal entry"),
         );
@@ -691,6 +788,10 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
       const decisionEntry = approval.decision_journal_entry;
       const decisionEntryResult =
         decisionEntry === null ? null : parseRunJournalEntry(canonicalJson(decisionEntry));
+      const decisionCommand =
+        terminal === undefined
+          ? null
+          : decisionEvidenceCommand(approval.request, approval.decision, terminal);
       if (
         decisionResult === null ||
         !decisionResult.ok ||
@@ -704,6 +805,7 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
         approval.decision.skill_version !== approval.request.skill_version ||
         approval.decision.skill_snapshot_hash !== approval.request.skill_snapshot_hash ||
         approval.decision.phase_operation_id !== approval.request.phase_operation_id ||
+        !exactJson(approval.decision.trace, terminal?.trace) ||
         terminal?.status !== expectedStatus ||
         terminal.terminal_code !== expectedCode ||
         terminal.output_hash !==
@@ -718,13 +820,16 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
         decisionEntry.previous_state !== "APPROVAL_PENDING" ||
         decisionEntry.state !==
           (approval.decision.decision === "APPROVE" ? "RUNNING" : "BLOCKED") ||
-        !exactJson(decisionEntry.metadata, {
-          kind: "superpowers-approval-decision",
-          request: approval.request,
-          decision: approval.decision,
-          occurred_at: terminal?.occurred_at,
-          phase: terminal,
-        }) ||
+        decisionCommand === null ||
+        decisionEntry.command_id !== decisionCommand.command_id ||
+        decisionEntry.command_input_hash !== evidenceCommandInputHash(decisionCommand) ||
+        decisionEntry.operation_id !== decisionCommand.operation_id ||
+        decisionEntry.reason_code !== decisionCommand.reason_code ||
+        !exactJson(decisionEntry.trace, decisionCommand.trace) ||
+        !exactJson(decisionEntry.metadata, decisionCommand.metadata) ||
+        decisionEntry.side_effect !== null ||
+        !orderedTimestamp(requestEntry.timestamp, terminal.occurred_at) ||
+        !orderedTimestamp(terminal.occurred_at, decisionEntry.timestamp) ||
         decisions.has(approval.decision.document_hash)
       ) {
         issues.push(
@@ -793,6 +898,65 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
       issue("/terminal_journal_entry", "binding", "terminal journal entry is inconsistent"),
     );
   }
+  const finalApprovalEntry = value.approvals
+    .map((approval) => approval.decision_journal_entry ?? approval.request_journal_entry)
+    .find((entry) => entry.entry_hash === value.journal_head.entry_hash);
+  const finalApprovalReject =
+    finalApprovalEntry !== undefined &&
+    finalApprovalEntry.state === "BLOCKED" &&
+    value.run_state === "BLOCKED";
+  let terminalPredecessor:
+    | Readonly<{
+        journal_revision: number;
+        sequence: number;
+        entry_hash: `sha256:${string}`;
+        state: RunState;
+      }>
+    | undefined =
+    latest === undefined
+      ? undefined
+      : { ...latest.observed_journal_head, state: "RUNNING" as const };
+  for (const approval of value.approvals) {
+    for (const entry of [approval.request_journal_entry, approval.decision_journal_entry]) {
+      if (
+        entry !== null &&
+        (terminalPredecessor === undefined || entry.sequence > terminalPredecessor.sequence)
+      ) {
+        terminalPredecessor = entry;
+      }
+    }
+  }
+  if (
+    (finalApprovalEntry !== undefined && finalApprovalEntry.state !== value.run_state) ||
+    (terminalEntry !== null && value.run_state !== "FAILED" && value.run_state !== "BLOCKED") ||
+    ((value.run_state === "FAILED" || value.run_state === "BLOCKED") &&
+      !finalApprovalReject &&
+      terminalEntry === null)
+  ) {
+    issues.push(
+      issue(
+        "/terminal_journal_entry",
+        "presence",
+        "final journal proof is not present exactly once",
+      ),
+    );
+  }
+  if (
+    terminalEntry !== null &&
+    terminalPredecessor !== undefined &&
+    (terminalEntry.previous_entry_hash !== terminalPredecessor.entry_hash ||
+      terminalEntry.journal_revision !== terminalPredecessor.journal_revision + 1 ||
+      terminalEntry.sequence !== terminalPredecessor.sequence + 1 ||
+      terminalEntry.previous_state !== terminalPredecessor.state)
+  ) {
+    issues.push(
+      issue(
+        "/terminal_journal_entry",
+        "predecessor",
+        "terminal journal entry is not the exact next verified journal record",
+      ),
+    );
+  }
   if (value.phases.length > 0 && (value.run_state === "CREATED" || value.run_state === "ROUTED")) {
     issues.push(issue("/run_state", "state", "run state cannot precede retained skill phases"));
   }
@@ -855,7 +1019,12 @@ export function parseSuperpowersApproval(
 export function parseSkillExecutionEvidence(
   input: string | Uint8Array,
 ): ValidationResult<SkillExecutionEvidenceV1> {
-  return parseDocument(input, "skill-execution-evidence", EVIDENCE_LIMITS, evidenceIssues);
+  return parseDocument(
+    input,
+    "skill-execution-evidence",
+    SKILL_EVIDENCE_JSON_LIMITS,
+    evidenceIssues,
+  );
 }
 
 export type {
