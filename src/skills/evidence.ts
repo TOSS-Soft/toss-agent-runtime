@@ -1,19 +1,14 @@
 import type { RunJournalEntryV1 } from "../journal/types.js";
-import {
-  canonicalJson,
-  deepFreezeJson,
-  parseJsonBytes,
-  sha256,
-  type JsonValue,
-} from "../protocol/json.js";
+import { canonicalJson, deepFreezeJson, parseJsonBytes, type JsonValue } from "../protocol/json.js";
 import { approvalRequest, decisionMetadata, pendingMetadata } from "./approval.js";
 import {
+  canonicalSkillEvidenceJson,
   hashSkillCatalog,
+  hashSkillExecutionEvidence,
   hashSkillExecutionHandoff,
   parseSkillDescriptor,
   parseSkillExecutionEvidence,
   parseSkillSnapshot,
-  SKILL_EVIDENCE_JSON_LIMITS,
 } from "./contracts.js";
 import type { SkillsEngine } from "./engine.js";
 import {
@@ -62,15 +57,7 @@ function limitExceeded(): never {
 
 function evidenceJson(value: unknown): string {
   try {
-    return canonicalJson(value, SKILL_EVIDENCE_JSON_LIMITS);
-  } catch {
-    return limitExceeded();
-  }
-}
-
-function evidenceHash(value: unknown): `sha256:${string}` {
-  try {
-    return sha256(value, SKILL_EVIDENCE_JSON_LIMITS);
+    return canonicalSkillEvidenceJson(value);
   } catch {
     return limitExceeded();
   }
@@ -357,15 +344,17 @@ export function createSkillEvidenceBuilder(
         return limitExceeded();
       }
       const withHandoff = { ...preimage, handoff_hash: handoffHash };
-      const candidate = { ...withHandoff, document_hash: evidenceHash(withHandoff) };
+      const candidate = {
+        ...withHandoff,
+        document_hash: hashSkillExecutionEvidence(
+          withHandoff as unknown as SkillExecutionEvidenceV1,
+        ),
+      };
       const bytes = evidenceJson(candidate);
       if (Buffer.byteLength(bytes, "utf8") > SKILL_LIMITS.evidenceBytes) limitExceeded();
       const parsed = parseSkillExecutionEvidence(bytes);
       if (!parsed.ok) integrity();
-      return deepFreezeJson(
-        parsed.value as unknown as JsonValue,
-        SKILL_EVIDENCE_JSON_LIMITS,
-      ) as unknown as SkillExecutionEvidenceV1;
+      return parsed.value;
     },
   });
 }

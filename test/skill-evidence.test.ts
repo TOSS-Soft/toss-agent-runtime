@@ -21,6 +21,7 @@ import {
 } from "../src/skills/approval.js";
 import {
   hashSkillCatalog,
+  hashSkillExecutionEvidence,
   hashSkillExecutionHandoff,
   parseSkillExecutionEvidence,
   SKILL_EVIDENCE_JSON_LIMITS,
@@ -173,6 +174,69 @@ function resignJournalCommand(value: RunJournalEntryV1): RunJournalEntryV1 {
 }
 
 describe("canonical Agent Skills evidence", () => {
+  it("rejects evidence structure before AST construction and closes public hash limits", () => {
+    const denseMembers = SKILL_EVIDENCE_JSON_LIMITS.maxMembers + 1;
+    const dense = `[${"0,".repeat(denseMembers - 1)}0]`;
+    const denseResult = parseSkillExecutionEvidence(dense);
+    expect(denseResult).toMatchObject({
+      ok: false,
+      code: "RUNTIME_DOCUMENT_INVALID",
+      issues: [{ keyword: "evidencePreflight" }],
+    });
+
+    const tooDeep = `${"[".repeat(SKILL_EVIDENCE_JSON_LIMITS.maxDepth + 2)}0${"]".repeat(
+      SKILL_EVIDENCE_JSON_LIMITS.maxDepth + 2,
+    )}`;
+    expect(parseSkillExecutionEvidence(tooDeep)).toMatchObject({
+      ok: false,
+      code: "RUNTIME_DOCUMENT_INVALID",
+      issues: [{ keyword: "evidencePreflight" }],
+    });
+
+    const denseUnderByteLimit = `[${"0,".repeat(
+      Math.floor((SKILL_LIMITS.evidenceBytes - 3) / 2),
+    )}0]`;
+    expect(Buffer.byteLength(denseUnderByteLimit, "utf8")).toBeLessThanOrEqual(
+      SKILL_LIMITS.evidenceBytes,
+    );
+    expect(parseSkillExecutionEvidence(denseUnderByteLimit)).toMatchObject({
+      ok: false,
+      code: "RUNTIME_DOCUMENT_INVALID",
+      issues: [{ keyword: "evidencePreflight" }],
+    });
+
+    const overByte = {
+      run_id: "x".repeat(SKILL_LIMITS.evidenceBytes),
+    };
+    expect(() => hashSkillExecutionHandoff(overByte as never)).toThrow(
+      expect.objectContaining({ code: "RUNTIME_SKILL_LIMIT_EXCEEDED" }),
+    );
+    expect(() => hashSkillExecutionEvidence(overByte as never)).toThrow(
+      expect.objectContaining({ code: "RUNTIME_SKILL_LIMIT_EXCEEDED" }),
+    );
+    const overMember = Array(SKILL_EVIDENCE_JSON_LIMITS.maxMembers + 1).fill(0);
+    expect(() => hashSkillExecutionHandoff(overMember as never)).toThrow(
+      expect.objectContaining({ code: "RUNTIME_SKILL_LIMIT_EXCEEDED" }),
+    );
+    expect(() => hashSkillExecutionEvidence(overMember as never)).toThrow(
+      expect.objectContaining({ code: "RUNTIME_SKILL_LIMIT_EXCEEDED" }),
+    );
+    let overDepth: unknown = 0;
+    for (let depth = 0; depth < SKILL_EVIDENCE_JSON_LIMITS.maxDepth + 2; depth += 1) {
+      overDepth = [overDepth];
+    }
+    expect(() => hashSkillExecutionHandoff(overDepth as never)).toThrow(
+      expect.objectContaining({ code: "RUNTIME_SKILL_LIMIT_EXCEEDED" }),
+    );
+    expect(() => hashSkillExecutionEvidence(overDepth as never)).toThrow(
+      expect.objectContaining({ code: "RUNTIME_SKILL_LIMIT_EXCEEDED" }),
+    );
+    expect(parseSkillExecutionEvidence(" ".repeat(SKILL_LIMITS.evidenceBytes + 1))).toMatchObject({
+      ok: false,
+      code: "RUNTIME_DOCUMENT_INVALID",
+    });
+  });
+
   it("rejects the 129th approval in the first linear journal pass before object reads", async () => {
     const root = await realpath(
       await mkdtemp(path.join(tmpdir(), "toss-evidence-approval-limit-")),
@@ -553,6 +617,90 @@ describe("canonical Agent Skills evidence", () => {
     if (approvalEvidence === null) throw new Error("approved evidence expected");
     const approvalProjection = approvalEvidence.approvals[0]!;
     const approvedTerminal = approvalEvidence.phases.at(-1)!;
+    const requestEntry = approvalProjection.request_journal_entry;
+    const advancedWithoutDecision = resignJournalCommand({
+      ...approvalProjection.decision_journal_entry!,
+      command_id: "resume-without-approval-decision",
+      operation_id: null,
+      reason_code: "UNBOUND_RESUME",
+      metadata: {},
+    });
+    const unresolvedAfterAdvance = resignEvidence({
+      ...approvalEvidence,
+      phases: approvalEvidence.phases.slice(0, -1),
+      approvals: [
+        {
+          ...approvalProjection,
+          decision: null,
+          decision_journal_entry: null,
+        },
+      ],
+      run_state: "RUNNING",
+      journal_head: {
+        journal_revision: advancedWithoutDecision.journal_revision,
+        sequence: advancedWithoutDecision.sequence,
+        entry_hash: advancedWithoutDecision.entry_hash,
+      },
+      terminal_journal_entry: null,
+      terminal_code: null,
+    });
+    expect(parseSkillExecutionEvidence(canonicalJson(unresolvedAfterAdvance))).toMatchObject({
+      ok: false,
+      code: "RUNTIME_DOCUMENT_INVALID",
+    });
+
+    const unequalAttemptDecisionEntry = resignJournalCommand({
+      ...approvalProjection.decision_journal_entry!,
+      run_attempt: requestEntry.run_attempt + 1,
+    });
+    const unequalAttempts = resignEvidence({
+      ...approvalEvidence,
+      approvals: [
+        {
+          ...approvalProjection,
+          decision_journal_entry: unequalAttemptDecisionEntry,
+        },
+      ],
+      journal_head: {
+        journal_revision: unequalAttemptDecisionEntry.journal_revision,
+        sequence: unequalAttemptDecisionEntry.sequence,
+        entry_hash: unequalAttemptDecisionEntry.entry_hash,
+      },
+    });
+    expect(parseSkillExecutionEvidence(canonicalJson(unequalAttempts))).toMatchObject({
+      ok: false,
+      code: "RUNTIME_DOCUMENT_INVALID",
+    });
+
+    const contradictoryGapTerminal = resignJournalCommand({
+      ...approvalProjection.decision_journal_entry!,
+      journal_revision: approvalProjection.decision_journal_entry!.journal_revision + 2,
+      sequence: approvalProjection.decision_journal_entry!.sequence + 2,
+      previous_entry_hash: requestEntry.entry_hash,
+      command_id: "terminal-after-omitted-ordinary-entry",
+      operation_id: null,
+      previous_state: "RUNNING",
+      state: "BLOCKED",
+      reason_code: "BLOCKED_SUPERPOWERS_MISSING",
+      timestamp: "2026-08-30T12:59:00.000Z",
+      metadata: {},
+    });
+    const contradictoryGap = resignEvidence({
+      ...approvalEvidence,
+      run_state: "BLOCKED",
+      journal_head: {
+        journal_revision: contradictoryGapTerminal.journal_revision,
+        sequence: contradictoryGapTerminal.sequence,
+        entry_hash: contradictoryGapTerminal.entry_hash,
+      },
+      terminal_journal_entry: contradictoryGapTerminal,
+      terminal_code: "BLOCKED_SUPERPOWERS_MISSING",
+    });
+    expect(parseSkillExecutionEvidence(canonicalJson(contradictoryGap))).toMatchObject({
+      ok: false,
+      code: "RUNTIME_DOCUMENT_INVALID",
+    });
+
     const lifecycleMutations = [
       resignEvidence({
         ...approvalEvidence,
@@ -892,6 +1040,30 @@ describe("canonical Agent Skills evidence", () => {
       });
     }
 
+    head = (
+      await journal.transition({
+        ...journalCommand("run-1", "TOOL_PENDING", head),
+        command_id: "run-1-tool-after-approved-skill",
+      })
+    ).head;
+    head = (
+      await journal.transition({
+        ...journalCommand("run-1", "RUNNING", head),
+        command_id: "run-1-running-after-approved-skill",
+      })
+    ).head;
+    const laterActivityEvidence = await host.evidence("run-1");
+    if (laterActivityEvidence === null) throw new Error("later activity evidence expected");
+    expect(laterActivityEvidence).toMatchObject({
+      journal_head: head,
+      run_state: "RUNNING",
+      terminal_journal_entry: null,
+    });
+    expect(parseSkillExecutionEvidence(canonicalJson(laterActivityEvidence))).toEqual({
+      ok: true,
+      value: laterActivityEvidence,
+    });
+
     const phases = [
       ["test-driven-development", "TEST_DESIGN"],
       ["test-driven-development", "RED"],
@@ -1124,6 +1296,15 @@ describe("canonical Agent Skills evidence", () => {
       output: Buffer.from("completed output", "utf8"),
       trace: TRACE,
     });
+    mixedHead = (
+      await journal.transition(journalCommand("run-mixed-terminal", "TOOL_PENDING", mixedHead))
+    ).head;
+    mixedHead = (
+      await journal.transition({
+        ...journalCommand("run-mixed-terminal", "RUNNING", mixedHead),
+        command_id: "run-mixed-terminal-running-after-tool",
+      })
+    ).head;
     const blockedCommand = journalCommand("run-mixed-terminal", "BLOCKED", mixedHead);
     mixedHead = (
       await journal.transition({
@@ -1148,9 +1329,62 @@ describe("canonical Agent Skills evidence", () => {
         canonicalJson(resignEvidence({ ...mixedEvidence, terminal_journal_entry: null })),
       ),
     ).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
+
+    let ordinaryHead: JournalHead | null = null;
+    for (const state of ["CREATED", "ROUTED", "RUNNING"] as const) {
+      ordinaryHead = (
+        await journal.transition(journalCommand("run-ordinary-terminal", state, ordinaryHead))
+      ).head;
+    }
+    if (ordinaryHead === null) throw new Error("ordinary terminal journal fixture failed");
+    const ordinarySkill = await selected(host, "test-driven-development");
+    const ordinaryStarted = await host.startPhase({
+      run_id: "run-ordinary-terminal",
+      expected_journal_head: ordinaryHead,
+      execution_request_hash: EXECUTION_REQUEST_HASH,
+      selection: ordinarySkill.selection,
+      phase: "TEST_DESIGN",
+      input: Buffer.from("completed before ordinary terminal", "utf8"),
+      operation_id: "ordinary-terminal-phase",
+      trace: TRACE,
+    });
+    await host.completePhase({
+      run_id: "run-ordinary-terminal",
+      expected_phase_revision: ordinaryStarted.phase.phase_revision,
+      expected_phase_head_hash: ordinaryStarted.phase.document_hash,
+      phase: ordinaryStarted.phase.phase,
+      skill_snapshot_hash: ordinaryStarted.phase.skill.snapshot_hash,
+      operation_id: ordinaryStarted.phase.operation_id,
+      outcome: "COMPLETED",
+      terminal_code: null,
+      output: Buffer.from("completed output", "utf8"),
+      trace: TRACE,
+    });
+    ordinaryHead = (
+      await journal.transition({
+        ...journalCommand("run-ordinary-terminal", "BLOCKED", ordinaryHead),
+        reason_code: "ORDINARY_POLICY_BLOCK",
+      })
+    ).head;
+    const ordinaryEvidence = await host.evidence("run-ordinary-terminal");
+    expect(ordinaryEvidence).toMatchObject({
+      journal_head: ordinaryHead,
+      run_state: "BLOCKED",
+      terminal_journal_entry: null,
+      terminal_code: null,
+    });
+    if (ordinaryEvidence === null) throw new Error("ordinary terminal evidence expected");
+    expect(parseSkillExecutionEvidence(canonicalJson(ordinaryEvidence))).toEqual({
+      ok: true,
+      value: ordinaryEvidence,
+    });
+
+    const { document_hash: evidenceDocumentHash, ...evidenceHashable } = evidence;
+    expect(hashSkillExecutionEvidence(evidence)).toBe(evidenceDocumentHash);
+    expect(evidenceDocumentHash).toBe(sha256(evidenceHashable));
     const forgedTerminalEntry = resignJournal({
       ...mixedEvidence.terminal_journal_entry!,
-      previous_entry_hash: `sha256:${"3".repeat(64)}`,
+      previous_state: "COMPLETED",
     });
     expect(
       parseSkillExecutionEvidence(

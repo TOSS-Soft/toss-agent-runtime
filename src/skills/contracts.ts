@@ -1,3 +1,10 @@
+import { createHash } from "node:crypto";
+
+import { createScanner } from "jsonc-parser";
+
+import { parseRunJournalEntry } from "../journal/entry.js";
+import { RUN_TRANSITION_MATRIX } from "../journal/state-machine.js";
+import type { RunJournalEntryV1, RunState } from "../journal/types.js";
 import {
   canonicalJson,
   parseJsonBytes,
@@ -5,8 +12,6 @@ import {
   type JsonLimits,
   type JsonValue,
 } from "../protocol/json.js";
-import { parseRunJournalEntry } from "../journal/entry.js";
-import type { RunState } from "../journal/types.js";
 import type {
   RuntimeDocument,
   TraceContext,
@@ -33,7 +38,7 @@ import type {
 } from "./types.js";
 import { SKILL_LIMITS } from "./types.js";
 import { builtInSuperpowersHandler, requiredBuiltInPhasePredecessors } from "./phases.js";
-import { isRuntimeSkillErrorCode } from "./errors.js";
+import { isRuntimeSkillErrorCode, RuntimeSkillError } from "./errors.js";
 import { assertSkillRelativePath } from "./paths.js";
 
 const VALIDATOR = createProtocolValidator();
@@ -47,8 +52,257 @@ const DOCUMENT_LIMITS: JsonLimits = Object.freeze({
 export const SKILL_EVIDENCE_JSON_LIMITS: JsonLimits = Object.freeze({
   maxBytes: SKILL_LIMITS.evidenceBytes,
   maxDepth: SKILL_LIMITS.nestingDepth + 8,
-  maxMembers: SKILL_LIMITS.evidenceBytes,
+  // The shortest schema-admitted member consumes at least four canonical UTF-8
+  // bytes including framing. This ceiling therefore admits every valid document
+  // below evidenceBytes while stopping scalar-dense JSON before an AST exists.
+  maxMembers: Math.ceil(SKILL_LIMITS.evidenceBytes / 4),
 });
+
+type EvidenceContainer =
+  | { readonly kind: "array"; state: "valueOrEnd" | "commaOrEnd" }
+  | { readonly kind: "object"; state: "keyOrEnd" | "colon" | "value" | "commaOrEnd" };
+
+const EVIDENCE_TOKEN = Object.freeze({
+  OPEN_BRACE: 1,
+  CLOSE_BRACE: 2,
+  OPEN_BRACKET: 3,
+  CLOSE_BRACKET: 4,
+  COMMA: 5,
+  COLON: 6,
+  NULL: 7,
+  TRUE: 8,
+  FALSE: 9,
+  STRING: 10,
+  NUMBER: 11,
+  LINE_COMMENT: 12,
+  BLOCK_COMMENT: 13,
+  LINE_BREAK: 14,
+  TRIVIA: 15,
+  EOF: 17,
+});
+
+function evidenceInputText(input: string | Uint8Array): string {
+  const bytes = typeof input === "string" ? Buffer.byteLength(input, "utf8") : input.byteLength;
+  if (bytes > SKILL_EVIDENCE_JSON_LIMITS.maxBytes) throw new Error("byte limit");
+  if (typeof input === "string") return input;
+  return new TextDecoder("utf-8", { fatal: true }).decode(input);
+}
+
+function preflightEvidenceStructure(input: string | Uint8Array): void {
+  const scanner = createScanner(evidenceInputText(input), false);
+  const containers: EvidenceContainer[] = [];
+  let rootState: "value" | "end" = "value";
+  let members = 0;
+
+  const countMember = () => {
+    members += 1;
+    if (members > SKILL_EVIDENCE_JSON_LIMITS.maxMembers) throw new Error("member limit");
+  };
+  const beginValue = (token: number): void => {
+    if (token === EVIDENCE_TOKEN.OPEN_BRACKET || token === EVIDENCE_TOKEN.OPEN_BRACE) {
+      if (token === EVIDENCE_TOKEN.OPEN_BRACKET) {
+        containers.push({ kind: "array", state: "valueOrEnd" });
+      } else {
+        containers.push({ kind: "object", state: "keyOrEnd" });
+      }
+      if (containers.length > SKILL_EVIDENCE_JSON_LIMITS.maxDepth + 1) {
+        throw new Error("depth limit");
+      }
+      return;
+    }
+    if (
+      token !== EVIDENCE_TOKEN.NULL &&
+      token !== EVIDENCE_TOKEN.TRUE &&
+      token !== EVIDENCE_TOKEN.FALSE &&
+      token !== EVIDENCE_TOKEN.STRING &&
+      token !== EVIDENCE_TOKEN.NUMBER
+    ) {
+      throw new Error("invalid value");
+    }
+  };
+
+  for (;;) {
+    const token: number = Number(scanner.scan());
+    if (Number(scanner.getTokenError()) !== 0) throw new Error("invalid token");
+    if (token === EVIDENCE_TOKEN.TRIVIA || token === EVIDENCE_TOKEN.LINE_BREAK) continue;
+    if (token === EVIDENCE_TOKEN.EOF) break;
+    if (token === EVIDENCE_TOKEN.LINE_COMMENT || token === EVIDENCE_TOKEN.BLOCK_COMMENT) {
+      throw new Error("comments unavailable");
+    }
+
+    const container = containers.at(-1);
+    if (container === undefined) {
+      if (rootState !== "value") throw new Error("trailing value");
+      rootState = "end";
+      beginValue(token);
+      continue;
+    }
+
+    if (container.kind === "array") {
+      if (container.state === "valueOrEnd") {
+        if (token === EVIDENCE_TOKEN.CLOSE_BRACKET) {
+          containers.pop();
+          continue;
+        }
+        countMember();
+        container.state = "commaOrEnd";
+        beginValue(token);
+        continue;
+      }
+      if (token === EVIDENCE_TOKEN.COMMA) {
+        container.state = "valueOrEnd";
+        continue;
+      }
+      if (token === EVIDENCE_TOKEN.CLOSE_BRACKET) {
+        containers.pop();
+        continue;
+      }
+      throw new Error("invalid array");
+    }
+
+    if (container.state === "keyOrEnd") {
+      if (token === EVIDENCE_TOKEN.CLOSE_BRACE) {
+        containers.pop();
+        continue;
+      }
+      if (token !== EVIDENCE_TOKEN.STRING) throw new Error("invalid object key");
+      countMember();
+      container.state = "colon";
+      continue;
+    }
+    if (container.state === "colon") {
+      if (token !== EVIDENCE_TOKEN.COLON) throw new Error("missing colon");
+      container.state = "value";
+      continue;
+    }
+    if (container.state === "value") {
+      container.state = "commaOrEnd";
+      beginValue(token);
+      continue;
+    }
+    if (token === EVIDENCE_TOKEN.COMMA) {
+      container.state = "keyOrEnd";
+      continue;
+    }
+    if (token === EVIDENCE_TOKEN.CLOSE_BRACE) {
+      containers.pop();
+      continue;
+    }
+    throw new Error("invalid object");
+  }
+  if (rootState !== "end" || containers.length !== 0) throw new Error("incomplete JSON");
+}
+
+interface EvidenceSerializationState {
+  readonly chunks: string[];
+  bytes: number;
+  members: number;
+}
+
+function evidenceLimit(): never {
+  throw new RuntimeSkillError("RUNTIME_SKILL_LIMIT_EXCEEDED");
+}
+
+function appendEvidenceChunk(state: EvidenceSerializationState, chunk: string): void {
+  const bytes = Buffer.byteLength(chunk, "utf8");
+  if (state.bytes + bytes > SKILL_EVIDENCE_JSON_LIMITS.maxBytes) evidenceLimit();
+  state.bytes += bytes;
+  state.chunks.push(chunk);
+}
+
+function appendEvidenceString(state: EvidenceSerializationState, value: string): void {
+  if (state.bytes + Buffer.byteLength(value, "utf8") + 2 > SKILL_EVIDENCE_JSON_LIMITS.maxBytes) {
+    evidenceLimit();
+  }
+  appendEvidenceChunk(state, JSON.stringify(value));
+}
+
+function countEvidenceMembers(state: EvidenceSerializationState, count: number): void {
+  if (state.members + count > SKILL_EVIDENCE_JSON_LIMITS.maxMembers) evidenceLimit();
+  state.members += count;
+}
+
+function serializeEvidenceValue(
+  value: unknown,
+  state: EvidenceSerializationState,
+  depth: number,
+  omittedRootKey: string | null,
+): void {
+  if (depth > SKILL_EVIDENCE_JSON_LIMITS.maxDepth) evidenceLimit();
+  if (value === null) return appendEvidenceChunk(state, "null");
+  if (typeof value === "string") return appendEvidenceString(state, value);
+  if (typeof value === "boolean") return appendEvidenceChunk(state, value ? "true" : "false");
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) evidenceLimit();
+    return appendEvidenceChunk(state, Object.is(value, -0) ? "0" : JSON.stringify(value));
+  }
+  if (typeof value !== "object") evidenceLimit();
+  if (Object.getOwnPropertySymbols(value).length !== 0) evidenceLimit();
+
+  if (Array.isArray(value)) {
+    countEvidenceMembers(state, value.length);
+    const ownNames = Object.getOwnPropertyNames(value);
+    if (ownNames.length !== value.length + 1) evidenceLimit();
+    appendEvidenceChunk(state, "[");
+    for (let index = 0; index < value.length; index += 1) {
+      if (index > 0) appendEvidenceChunk(state, ",");
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (
+        descriptor === undefined ||
+        descriptor.get !== undefined ||
+        descriptor.set !== undefined
+      ) {
+        evidenceLimit();
+      }
+      serializeEvidenceValue(descriptor.value, state, depth + 1, null);
+    }
+    return appendEvidenceChunk(state, "]");
+  }
+
+  const prototype = Object.getPrototypeOf(value) as object | null;
+  if (prototype !== Object.prototype && prototype !== null) evidenceLimit();
+  let enumerableCount = 0;
+  for (const key in value) {
+    if (!Object.hasOwn(value, key) || (depth === 0 && key === omittedRootKey)) continue;
+    enumerableCount += 1;
+    if (state.members + enumerableCount > SKILL_EVIDENCE_JSON_LIMITS.maxMembers) evidenceLimit();
+  }
+  countEvidenceMembers(state, enumerableCount);
+  const keys = Object.keys(value)
+    .filter((key) => depth !== 0 || key !== omittedRootKey)
+    .sort();
+  const ownNames = Object.getOwnPropertyNames(value).filter(
+    (key) => depth !== 0 || key !== omittedRootKey,
+  );
+  if (keys.length !== enumerableCount || ownNames.length !== keys.length) evidenceLimit();
+  appendEvidenceChunk(state, "{");
+  for (const [index, key] of keys.entries()) {
+    if (index > 0) appendEvidenceChunk(state, ",");
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (
+      descriptor === undefined ||
+      !descriptor.enumerable ||
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined
+    ) {
+      evidenceLimit();
+    }
+    appendEvidenceString(state, key);
+    appendEvidenceChunk(state, ":");
+    serializeEvidenceValue(descriptor.value, state, depth + 1, null);
+  }
+  appendEvidenceChunk(state, "}");
+}
+
+function boundedEvidenceJson(value: unknown, omittedRootKey: string | null = null): string {
+  const state: EvidenceSerializationState = { chunks: [], bytes: 0, members: 0 };
+  serializeEvidenceValue(value, state, 0, omittedRootKey);
+  return state.chunks.join("");
+}
+
+export function canonicalSkillEvidenceJson(value: unknown): string {
+  return boundedEvidenceJson(value);
+}
 
 type JsonRecord = { readonly [key: string]: JsonValue };
 
@@ -124,16 +378,18 @@ export function hashSuperpowersApproval(value: SuperpowersApprovalV1): `sha256:$
 }
 
 export function hashSkillExecutionEvidence(value: SkillExecutionEvidenceV1): `sha256:${string}` {
-  return sha256(hashable(value, SKILL_EVIDENCE_JSON_LIMITS), SKILL_EVIDENCE_JSON_LIMITS);
+  const bytes = boundedEvidenceJson(value, "document_hash");
+  return `sha256:${createHash("sha256").update(bytes, "utf8").digest("hex")}`;
 }
 
 export function hashSkillExecutionHandoff(
   value: Omit<SkillExecutionEvidenceV1, "handoff_hash" | "document_hash">,
 ): `sha256:${string}` {
-  return sha256(
-    { schema_version: "skill-execution-handoff.v1", evidence: value },
-    SKILL_EVIDENCE_JSON_LIMITS,
-  );
+  const bytes = boundedEvidenceJson({
+    schema_version: "skill-execution-handoff.v1",
+    evidence: value,
+  });
+  return `sha256:${createHash("sha256").update(bytes, "utf8").digest("hex")}`;
 }
 
 export function hashSkillPackage(
@@ -500,6 +756,22 @@ function orderedTimestamp(left: string, right: string): boolean {
   return Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime <= rightTime;
 }
 
+function projectedRunAttempt(
+  previous: Readonly<Pick<RunJournalEntryV1, "state" | "run_attempt">>,
+  nextState: RunState,
+): number {
+  return nextState === "RUNNING" &&
+    (previous.state === "FAILED" ||
+      previous.state === "BLOCKED" ||
+      previous.state === "INTERRUPTED")
+    ? previous.run_attempt + 1
+    : previous.run_attempt;
+}
+
+function projectedTransitionAllowed(previous: RunState, next: RunState): boolean {
+  return (RUN_TRANSITION_MATRIX[previous] as readonly RunState[]).includes(next);
+}
+
 function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   const catalogHashes = value.catalogs.map((catalog) => catalog.catalog_hash);
@@ -720,6 +992,7 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
   );
   const requests = new Set<string>();
   const decisions = new Set<string>();
+  const projectedJournalEntries = new Map<`sha256:${string}`, RunJournalEntryV1>();
   for (const [index, approval] of value.approvals.entries()) {
     const requestResult = parseSuperpowersApproval(canonicalJson(approval.request));
     const decisionResult =
@@ -770,6 +1043,7 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
       );
     }
     requests.add(approval.request.document_hash);
+    projectedJournalEntries.set(requestEntry.entry_hash, requestEntry);
     if (phase !== undefined) pendingPhaseHashes.delete(phase.document_hash);
     if (approval.decision === null) {
       const terminal =
@@ -817,6 +1091,7 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
         decisionEntry.previous_entry_hash !== requestEntry.entry_hash ||
         decisionEntry.journal_revision !== requestEntry.journal_revision + 1 ||
         decisionEntry.sequence !== requestEntry.sequence + 1 ||
+        decisionEntry.run_attempt !== requestEntry.run_attempt ||
         decisionEntry.previous_state !== "APPROVAL_PENDING" ||
         decisionEntry.state !==
           (approval.decision.decision === "APPROVE" ? "RUNNING" : "BLOCKED") ||
@@ -837,6 +1112,21 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
         );
       }
       decisions.add(approval.decision.document_hash);
+      if (decisionEntry !== null) {
+        projectedJournalEntries.set(decisionEntry.entry_hash, decisionEntry);
+      }
+    }
+  }
+  for (const entry of projectedJournalEntries.values()) {
+    const previous = projectedJournalEntries.get(entry.previous_entry_hash);
+    if (
+      previous !== undefined &&
+      (entry.journal_revision !== previous.journal_revision + 1 ||
+        entry.sequence !== previous.sequence + 1 ||
+        entry.previous_state !== previous.state ||
+        entry.run_attempt !== projectedRunAttempt(previous, entry.state))
+    ) {
+      issues.push(issue("/approvals", "runAttempt", "projected journal attempts are inconsistent"));
     }
   }
   if (pendingPhaseHashes.size !== 0) {
@@ -873,7 +1163,8 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
     });
   if (
     (value.run_state === "APPROVAL_PENDING") !== approvalPendingTruth ||
-    unresolvedApprovals.length > 1
+    unresolvedApprovals.length > 1 ||
+    (unresolvedApprovals.length !== 0 && !approvalPendingTruth)
   ) {
     issues.push(
       issue("/run_state", "approvalState", "approval-pending state is not current journal truth"),
@@ -911,6 +1202,8 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
         sequence: number;
         entry_hash: `sha256:${string}`;
         state: RunState;
+        run_attempt?: number;
+        timestamp?: string;
       }>
     | undefined =
     latest === undefined
@@ -929,9 +1222,10 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
   if (
     (finalApprovalEntry !== undefined && finalApprovalEntry.state !== value.run_state) ||
     (terminalEntry !== null && value.run_state !== "FAILED" && value.run_state !== "BLOCKED") ||
-    ((value.run_state === "FAILED" || value.run_state === "BLOCKED") &&
+    (latest === undefined && terminalEntry === null) ||
+    (terminalEntry === null &&
       !finalApprovalReject &&
-      terminalEntry === null)
+      value.terminal_code !== (latest?.terminal_code ?? null))
   ) {
     issues.push(
       issue(
@@ -941,21 +1235,45 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
       ),
     );
   }
-  if (
-    terminalEntry !== null &&
-    terminalPredecessor !== undefined &&
-    (terminalEntry.previous_entry_hash !== terminalPredecessor.entry_hash ||
-      terminalEntry.journal_revision !== terminalPredecessor.journal_revision + 1 ||
-      terminalEntry.sequence !== terminalPredecessor.sequence + 1 ||
-      terminalEntry.previous_state !== terminalPredecessor.state)
-  ) {
-    issues.push(
-      issue(
-        "/terminal_journal_entry",
-        "predecessor",
-        "terminal journal entry is not the exact next verified journal record",
-      ),
-    );
+  if (terminalEntry !== null && terminalPredecessor !== undefined) {
+    const sequenceGap = terminalEntry.sequence - terminalPredecessor.sequence;
+    const revisionGap = terminalEntry.journal_revision - terminalPredecessor.journal_revision;
+    const adjacent = sequenceGap === 1;
+    const knownAttempt = terminalPredecessor.run_attempt;
+    const attemptInvalid =
+      knownAttempt !== undefined &&
+      (adjacent
+        ? terminalEntry.run_attempt !==
+          projectedRunAttempt(
+            { state: terminalPredecessor.state, run_attempt: knownAttempt },
+            terminalEntry.state,
+          )
+        : terminalEntry.run_attempt < knownAttempt ||
+          terminalEntry.run_attempt > knownAttempt + sequenceGap);
+    const invalid = adjacent
+      ? terminalEntry.previous_entry_hash !== terminalPredecessor.entry_hash ||
+        revisionGap !== 1 ||
+        terminalEntry.previous_state !== terminalPredecessor.state ||
+        attemptInvalid
+      : sequenceGap <= 1 ||
+        revisionGap <= 1 ||
+        sequenceGap !== revisionGap ||
+        terminalEntry.previous_entry_hash === terminalPredecessor.entry_hash ||
+        projectedJournalEntries.has(terminalEntry.previous_entry_hash) ||
+        terminalEntry.previous_state === null ||
+        !projectedTransitionAllowed(terminalEntry.previous_state, terminalEntry.state) ||
+        attemptInvalid ||
+        (terminalPredecessor.timestamp !== undefined &&
+          !orderedTimestamp(terminalPredecessor.timestamp, terminalEntry.timestamp));
+    if (invalid) {
+      issues.push(
+        issue(
+          "/terminal_journal_entry",
+          "predecessor",
+          "terminal journal projection is inconsistent with retained journal truth",
+        ),
+      );
+    }
   }
   if (value.phases.length > 0 && (value.run_state === "CREATED" || value.run_state === "ROUTED")) {
     issues.push(issue("/run_state", "state", "run state cannot precede retained skill phases"));
@@ -1019,6 +1337,11 @@ export function parseSuperpowersApproval(
 export function parseSkillExecutionEvidence(
   input: string | Uint8Array,
 ): ValidationResult<SkillExecutionEvidenceV1> {
+  try {
+    preflightEvidenceStructure(input);
+  } catch {
+    return failure([issue("", "evidencePreflight", "evidence JSON exceeds its structural budget")]);
+  }
   return parseDocument(
     input,
     "skill-execution-evidence",
