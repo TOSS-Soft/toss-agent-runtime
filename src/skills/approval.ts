@@ -246,7 +246,9 @@ export function requestSuperpowersApproval(options: {
     predecessor_phase_hashes: options.started.predecessor_phase_hashes,
     input_hash: options.started.input_hash,
     context_hash: options.started.context_hash,
+    context_accounting: options.started.context_accounting,
     output_hash: options.output_hash,
+    terminal_code: null,
     occurred_at: options.occurred_at,
     trace: copyTrace(options.trace),
   });
@@ -346,7 +348,10 @@ export function approvalTerminalPhase(options: {
     predecessor_phase_hashes: options.pending.predecessor_phase_hashes,
     input_hash: options.pending.input_hash,
     context_hash: options.pending.context_hash,
+    context_accounting: options.pending.context_accounting,
     output_hash: options.decision.decision === "APPROVE" ? options.pending.output_hash : null,
+    terminal_code:
+      options.decision.decision === "APPROVE" ? null : "RUNTIME_SKILL_APPROVAL_REJECTED",
     occurred_at: options.occurred_at,
     trace: options.decision.trace,
   });

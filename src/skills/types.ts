@@ -1,4 +1,4 @@
-import type { JournalHead } from "../journal/types.js";
+import type { JournalHead, RunState } from "../journal/types.js";
 import type { RuntimeDocument, TraceContext } from "../protocol/types.js";
 import type { RuntimeSkillErrorCode } from "./errors.js";
 
@@ -71,6 +71,19 @@ export interface SkillSnapshotV1 extends RuntimeDocument {
   readonly document_hash: `sha256:${string}`;
 }
 
+export interface SkillContextAccounting {
+  readonly included_resource_hashes: readonly `sha256:${string}`[];
+  readonly omitted_resource_hashes: readonly `sha256:${string}`[];
+  readonly original_utf8_bytes: number;
+  readonly included_utf8_bytes: number;
+  readonly original_conservative_units: number;
+  readonly included_conservative_units: number;
+  readonly remaining_bytes: number;
+  readonly remaining_conservative_units: number;
+  readonly segment_count: number;
+  readonly truncation_count: number;
+}
+
 export interface SuperpowersPhaseV1 extends RuntimeDocument {
   readonly protocol_version: "runtime-contract.v1";
   readonly schema_version: "superpowers-phase.v1";
@@ -89,7 +102,9 @@ export interface SuperpowersPhaseV1 extends RuntimeDocument {
   readonly predecessor_phase_hashes: readonly `sha256:${string}`[];
   readonly input_hash: `sha256:${string}`;
   readonly context_hash: `sha256:${string}`;
+  readonly context_accounting: SkillContextAccounting;
   readonly output_hash: `sha256:${string}` | null;
+  readonly terminal_code: RuntimeSkillErrorCode | null;
   readonly occurred_at: string;
   readonly trace: TraceContext;
   readonly document_hash: `sha256:${string}`;
@@ -140,22 +155,15 @@ export interface SkillExecutionEvidenceV1 extends RuntimeDocument {
   readonly schema_version: "skill-execution-evidence.v1";
   readonly document_type: "skill-execution-evidence";
   readonly run_id: string;
-  readonly catalog_hash: `sha256:${string}`;
-  readonly skill: SkillDescriptorReference & Readonly<{ snapshot_hash: `sha256:${string}` }>;
-  readonly resource_hashes: readonly `sha256:${string}`[];
-  readonly phases: readonly Readonly<{
-    phase: SuperpowersPhaseName;
-    handler_hash: `sha256:${string}`;
-    phase_hash: `sha256:${string}`;
-    input_hash: `sha256:${string}`;
-    output_hash: `sha256:${string}` | null;
-  }>[];
+  readonly journal_head: JournalHead;
+  readonly run_state: RunState;
+  readonly snapshots: readonly SkillSnapshotV1[];
+  readonly phases: readonly SuperpowersPhaseV1[];
   readonly approvals: readonly Readonly<{
-    request_hash: `sha256:${string}`;
-    decision_hash: `sha256:${string}` | null;
-    journal_head: JournalHead;
+    request: SuperpowersApprovalRequestV1;
+    decision: SuperpowersApprovalDecisionV1 | null;
+    decision_journal_head: JournalHead | null;
   }>[];
-  readonly context_hashes: readonly `sha256:${string}`[];
   readonly handoff_hash: `sha256:${string}`;
   readonly terminal_code: RuntimeSkillErrorCode | null;
   readonly document_hash: `sha256:${string}`;

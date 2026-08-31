@@ -682,6 +682,34 @@ async function socketHasListener(socketPath: string): Promise<boolean> {
   });
 }
 
+export async function probePrivateServiceSocketListener(options: {
+  readonly socketPath: string;
+}): Promise<"present" | "absent" | "unknown"> {
+  let expected: FileIdentity | undefined;
+  try {
+    expected = await privateSocketIdentity(options.socketPath);
+  } catch {
+    return "unknown";
+  }
+  if (expected === undefined) return "absent";
+
+  let listening: boolean;
+  try {
+    listening = await socketHasListener(options.socketPath);
+  } catch {
+    return "unknown";
+  }
+
+  let current: FileIdentity | undefined;
+  try {
+    current = await privateSocketIdentity(options.socketPath);
+  } catch {
+    return "unknown";
+  }
+  if (current === undefined || !sameIdentity(current, expected)) return "unknown";
+  return listening ? "present" : "absent";
+}
+
 async function assertRuntimeDirectoryHandle(options: {
   readonly handle: FileHandle;
   readonly socketPath: string;

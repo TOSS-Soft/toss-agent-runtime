@@ -62,7 +62,11 @@ import type {
 } from "./catalog.js";
 import type { SkillContext, SkillContextRequest } from "./context.js";
 import { parseSkillDescriptor, parseSkillSnapshot, parseSuperpowersPhase } from "./contracts.js";
-import { RuntimeSkillError } from "./errors.js";
+import {
+  isRuntimeSkillErrorCode,
+  RuntimeSkillError,
+  type RuntimeSkillErrorCode,
+} from "./errors.js";
 import type { SkillLoader } from "./loader.js";
 import {
   builtInPhaseContextBudget,
@@ -71,6 +75,7 @@ import {
 } from "./phases.js";
 import {
   SKILL_LIMITS,
+  type SkillContextAccounting,
   type SkillSnapshotV1,
   type SuperpowersApprovalV1,
   type SuperpowersPhaseName,
@@ -210,6 +215,7 @@ export interface CompleteSuperpowersPhaseRequest {
   readonly skill_snapshot_hash: `sha256:${string}`;
   readonly operation_id: string;
   readonly outcome: "COMPLETED" | "FAILED" | "BLOCKED";
+  readonly terminal_code: RuntimeSkillErrorCode | null;
   readonly output: Uint8Array;
   readonly trace: TraceContext;
 }
@@ -607,6 +613,7 @@ function captureCompletionRequest(value: unknown): CapturedCompletion {
     "skill_snapshot_hash",
     "operation_id",
     "outcome",
+    "terminal_code",
     "output",
     "trace",
   ]);
@@ -626,6 +633,9 @@ function captureCompletionRequest(value: unknown): CapturedCompletion {
     (source.outcome !== "COMPLETED" &&
       source.outcome !== "FAILED" &&
       source.outcome !== "BLOCKED") ||
+    (source.outcome === "COMPLETED"
+      ? source.terminal_code !== null
+      : !isRuntimeSkillErrorCode(source.terminal_code)) ||
     !(source.output instanceof Uint8Array) ||
     source.output.byteLength > SKILL_LIMITS.phaseOutputBytes
   ) {
@@ -660,6 +670,7 @@ function captureCompletionRequest(value: unknown): CapturedCompletion {
     skill_snapshot_hash: source.skill_snapshot_hash as `sha256:${string}`,
     operation_id: source.operation_id,
     outcome: source.outcome,
+    terminal_code: source.terminal_code as RuntimeSkillErrorCode | null,
     output,
     trace,
   });
@@ -966,8 +977,24 @@ function samePhaseBinding(left: SuperpowersPhaseV1, right: SuperpowersPhaseV1): 
     exactJson(left.predecessor_phase_hashes, right.predecessor_phase_hashes) &&
     left.operation_id === right.operation_id &&
     left.input_hash === right.input_hash &&
-    left.context_hash === right.context_hash
+    left.context_hash === right.context_hash &&
+    exactJson(left.context_accounting, right.context_accounting)
   );
+}
+
+function contextAccounting(context: SkillContext): SkillContextAccounting {
+  return deepFreezeJson({
+    included_resource_hashes: [...context.included_resource_hashes],
+    omitted_resource_hashes: [...context.omitted_resource_hashes],
+    original_utf8_bytes: context.original_utf8_bytes,
+    included_utf8_bytes: context.included_utf8_bytes,
+    original_conservative_units: context.original_tokens,
+    included_conservative_units: context.included_tokens,
+    remaining_bytes: context.remaining_bytes,
+    remaining_conservative_units: context.remaining_tokens,
+    segment_count: context.segments.length,
+    truncation_count: context.truncations.length,
+  });
 }
 
 function validateHistory(runId: string, entries: readonly SuperpowersPhaseV1[]): void {
@@ -2107,7 +2134,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
         );
       } catch (error) {
         if (isMissing(error)) continue;
-        throw error;
+        unavailable();
       }
       try {
         exactFile(candidate, held, existing.identity, existing.bytes, isCurrentUser);
@@ -2604,7 +2631,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
         ) {
           integrity();
         }
-        unavailable();
+        throw error;
       }
       throw error;
     }
@@ -2631,8 +2658,12 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
         started.status !== "STARTED" ||
         started.execution_request_hash !== request.execution_request_hash ||
         !exactJournalHead(started.observed_journal_head, request.expected_journal_head) ||
+        started.catalog_hash !== request.selection.catalog_hash ||
         started.skill.name !== request.selection.descriptor.name ||
         started.skill.version !== request.selection.descriptor.version ||
+        !exactJson(started.skill.source, request.selection.descriptor.source) ||
+        started.skill.package_hash !== request.selection.descriptor.package_hash ||
+        started.skill.document_hash !== request.selection.descriptor.document_hash ||
         started.phase !== request.phase ||
         started.handler.version !== handler.version ||
         started.handler.hash !== handler.hash ||
@@ -2712,7 +2743,9 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
         predecessor_phase_hashes: predecessorPhaseHashes,
         input_hash: inputHash,
         context_hash: context.context_hash,
+        context_accounting: contextAccounting(context),
         output_hash: null,
+        terminal_code: null,
         occurred_at: options.now().toISOString(),
         trace: copyTrace(request.trace),
       });
@@ -2729,6 +2762,12 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
     assertIdentifier(request.operation_id);
     assertHash(request.expected_phase_head_hash);
     assertHash(request.skill_snapshot_hash);
+    if (
+      (request.outcome === "COMPLETED" && request.terminal_code !== null) ||
+      (request.outcome !== "COMPLETED" && !isRuntimeSkillErrorCode(request.terminal_code))
+    ) {
+      invalid();
+    }
     const loaded = await loadExisting(request.run_id);
     approvalJournalProjection(await journalStore.load(request.run_id), loaded.entries);
     const operation = latestOperation(loaded.entries, request.operation_id);
@@ -2746,6 +2785,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
           request.phase !== pending.phase ||
           request.skill_snapshot_hash !== pending.skill.snapshot_hash ||
           request.outcome !== "COMPLETED" ||
+          request.terminal_code !== null ||
           pending.output_hash !== outputHash ||
           !exactJson(request.trace, pending.trace)
         ) {
@@ -2779,6 +2819,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
         request.phase !== terminal.phase ||
         request.skill_snapshot_hash !== terminal.skill.snapshot_hash ||
         request.outcome !== terminal.status ||
+        request.terminal_code !== terminal.terminal_code ||
         expectedOutput !== terminal.output_hash ||
         !exactJson(request.trace, terminal.trace)
       ) {
@@ -2793,6 +2834,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
         request.phase !== pending.phase ||
         request.skill_snapshot_hash !== pending.skill.snapshot_hash ||
         request.outcome !== "COMPLETED" ||
+        request.terminal_code !== null ||
         pending.output_hash !== outputHash ||
         !exactJson(request.trace, pending.trace) ||
         loaded.entries.at(-1)?.document_hash !== pending.document_hash
@@ -2885,7 +2927,9 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
         predecessor_phase_hashes: started.predecessor_phase_hashes,
         input_hash: started.input_hash,
         context_hash: started.context_hash,
+        context_accounting: started.context_accounting,
         output_hash: request.outcome === "COMPLETED" ? outputHash : null,
+        terminal_code: request.terminal_code,
         occurred_at: options.now().toISOString(),
         trace: copyTrace(request.trace),
       });

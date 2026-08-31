@@ -31,6 +31,11 @@ const ERROR_DETAILS = {
     retryable: false,
     safe_message: "Skill context exceeds its configured limit",
   },
+  RUNTIME_SKILL_APPROVAL_REJECTED: {
+    category: "policy-denied",
+    retryable: false,
+    safe_message: "Skill approval was rejected",
+  },
   RUNTIME_SKILL_SCRIPT_UNAVAILABLE: {
     category: "unsupported-capability",
     retryable: false,
@@ -57,6 +62,10 @@ const ERROR_DETAILS = {
 >;
 
 export type RuntimeSkillErrorCode = keyof typeof ERROR_DETAILS;
+
+export function isRuntimeSkillErrorCode(value: unknown): value is RuntimeSkillErrorCode {
+  return typeof value === "string" && Object.hasOwn(ERROR_DETAILS, value);
+}
 
 export class RuntimeSkillError extends Error implements RuntimeError {
   readonly category: RuntimeError["category"];

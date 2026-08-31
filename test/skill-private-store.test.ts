@@ -230,6 +230,36 @@ describe.sequential("private skill object publication", () => {
     },
   );
 
+  it("recovers a dead object transaction explicitly before any object read or publication", async () => {
+    const statePath = await privateTemporaryDirectory("toss-skill-store-");
+    const bytes = Buffer.from('{"recovery":"startup"}', "utf8");
+    let interrupted = false;
+    const failing = createSkillPrivateStoreForTest(
+      storeOptions(statePath, {
+        operationHooks: {
+          afterCleanupRename(kind) {
+            if (kind !== "claim" || interrupted) return Promise.resolve();
+            interrupted = true;
+            return Promise.reject(new Error("simulated startup crash cut"));
+          },
+        },
+      }),
+    );
+    await expect(failing.publishObject(HASH, bytes)).rejects.toBeInstanceOf(RuntimeSkillError);
+    const objectsPath = path.join(statePath, "skills", "objects");
+    expect((await readdir(objectsPath)).some((name) => name.endsWith(".tombstone"))).toBe(true);
+
+    const recovering = createSkillPrivateStoreForTest(
+      storeOptions(statePath, {
+        isProcessAlive: () => "dead",
+        hasServiceListener: () => Promise.resolve("absent"),
+      }),
+    );
+    await recovering.recover();
+
+    expect(await readdir(objectsPath)).toEqual([`${HASH}.json`]);
+  });
+
   it("rebinds the final object after awaited claim cleanup and preserves a replacement", async () => {
     const statePath = await privateTemporaryDirectory("toss-skill-store-");
     const bytes = Buffer.from('{"record":"cleanup-replacement"}', "utf8");

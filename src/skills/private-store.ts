@@ -160,7 +160,9 @@ export interface CreateSkillPrivateStoreForTestOptions extends CreateSkillPrivat
 
 export interface SkillPrivateStore {
   ensureRoots(): Promise<void>;
+  recover(): Promise<void>;
   publishObject(hash: `sha256:${string}`, bytes: Uint8Array): Promise<Uint8Array>;
+  objectBytes(hash: `sha256:${string}`): Promise<number | null>;
   readObject(hash: `sha256:${string}`): Promise<Uint8Array | null>;
 }
 
@@ -1502,6 +1504,49 @@ export function createSkillPrivateStoreForTest(
     }
   };
 
+  const objectBytes = async (hash: `sha256:${string}`): Promise<number | null> => {
+    await ensureRoots();
+    const directories = openDirectoryChain(objectsPath, statePath, isCurrentUser);
+    const operationDirectory = directories.at(-1);
+    if (operationDirectory === undefined) pathUnsafe();
+    const releaseOperation = await acquireDirectoryOperation(operationDirectory.identity);
+    try {
+      await recoverOperations(directories);
+      const candidate = objectPath(objectsPath, hash);
+      let before: BigIntStats;
+      try {
+        before = lstatSync(candidate, { bigint: true });
+      } catch (error) {
+        if (isMissing(error)) return null;
+        pathUnsafe();
+      }
+      const identity = assertPrivateFile(before, candidate, isCurrentUser, 1);
+      if (before.size < 1n || before.size > BigInt(SKILL_LIMITS.storedObjectBytes)) limitExceeded();
+      await syncDirectory(directories, isCurrentUser);
+      const after = lstatSync(candidate, { bigint: true });
+      assertPrivateFile(after, candidate, isCurrentUser, 1, identity);
+      if (after.size !== before.size) integrity();
+      return Number(after.size);
+    } finally {
+      releaseOperation();
+      closeDirectoryChain(directories);
+    }
+  };
+
+  const recover = async (): Promise<void> => {
+    await ensureRoots();
+    const directories = openDirectoryChain(objectsPath, statePath, isCurrentUser);
+    const operationDirectory = directories.at(-1);
+    if (operationDirectory === undefined) pathUnsafe();
+    const releaseOperation = await acquireDirectoryOperation(operationDirectory.identity);
+    try {
+      await recoverOperations(directories);
+    } finally {
+      releaseOperation();
+      closeDirectoryChain(directories);
+    }
+  };
+
   const publishObject = async (
     hash: `sha256:${string}`,
     bytes: Uint8Array,
@@ -1805,7 +1850,7 @@ export function createSkillPrivateStoreForTest(
     }
   };
 
-  return { ensureRoots, publishObject, readObject };
+  return { ensureRoots, recover, publishObject, objectBytes, readObject };
 }
 
 export function createSkillPrivateStore(

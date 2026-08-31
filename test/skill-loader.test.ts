@@ -28,6 +28,7 @@ import {
 import type { BundledCatalogTestOverride } from "../src/skills/bundled.js";
 import { RuntimeSkillError } from "../src/skills/errors.js";
 import { createSkillLoaderForTest, type SkillLoaderTestHooks } from "../src/skills/loader.js";
+import type { SkillPrivateStoreOperationHooks } from "../src/skills/private-store.js";
 import { SKILL_LIMITS, type SkillResourceV1 } from "../src/skills/types.js";
 
 const temporaryDirectories: string[] = [];
@@ -145,6 +146,8 @@ async function fixture(
     readonly skillMarkdown?: Uint8Array;
     readonly resources?: readonly (SkillResourceV1 & { readonly content: Uint8Array })[];
     readonly hooks?: SkillLoaderTestHooks;
+    readonly privateStoreOperationHooks?: SkillPrivateStoreOperationHooks;
+    readonly isProcessAlive?: (pid: number) => "alive" | "dead" | "unknown";
   } = {},
 ): Promise<{
   readonly root: string;
@@ -187,6 +190,10 @@ async function fixture(
     randomId: ids(),
     hasServiceListener: () => Promise.resolve("absent"),
     ...(options.hooks === undefined ? {} : { hooks: options.hooks }),
+    ...(options.privateStoreOperationHooks === undefined
+      ? {}
+      : { privateStoreOperationHooks: options.privateStoreOperationHooks }),
+    ...(options.isProcessAlive === undefined ? {} : { isProcessAlive: options.isProcessAlive }),
   });
   return { root, statePath, directory: written.directory, catalog, selection, loader };
 }
@@ -213,6 +220,12 @@ afterEach(async () => {
 });
 
 describe("immutable skill loading", () => {
+  it("exposes explicit startup recovery without forcing a source or object read", async () => {
+    const loaded = await fixture();
+    await expect(loaded.loader.recover()).resolves.toBeUndefined();
+    expect(await readdir(path.join(loaded.statePath, "skills", "objects"))).toEqual([]);
+  });
+
   it("loads SKILL.md and every declared role in bytewise path order and freezes the snapshot", async () => {
     const resources = [
       resource("scripts/check.mjs", "script", "text/javascript", Buffer.from("export {};\n")),

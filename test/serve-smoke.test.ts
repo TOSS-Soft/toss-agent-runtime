@@ -1,5 +1,6 @@
 import {
   chmod,
+  link,
   lstat,
   mkdir,
   mkdtemp,
@@ -7,10 +8,12 @@ import {
   readdir,
   realpath,
   rm,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { createServer } from "node:net";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -20,13 +23,14 @@ import { ZERO_JOURNAL_HASH } from "../src/journal/entry.js";
 import { createRunJournalStore } from "../src/journal/store.js";
 import type { TransitionCommand } from "../src/journal/state-machine.js";
 import type { JournalHead, RunState } from "../src/journal/types.js";
+import { canonicalJson } from "../src/protocol/json.js";
 import {
   requestProjectOperation,
   requestSuperpowersApprovalDecision,
 } from "../src/service/control.js";
 import type { InstanceLock } from "../src/service/instance-lock.js";
 import { runSupervisor } from "../src/service/supervisor.js";
-import { createSkillsHost } from "../src/skills/index.js";
+import { createSkillsRuntimeHostForTest } from "../src/skills/runtime-host.js";
 import { FakeSignals } from "./support/fake-signals.js";
 
 const temporaryDirectories: string[] = [];
@@ -74,6 +78,67 @@ afterEach(async () => {
 });
 
 describe("serve command lifecycle integration", () => {
+  it("recovers a dead phase artifact before readiness despite a private stale socket", async () => {
+    const root = await realpath(await mkdtemp(path.join(await realpath("/tmp"), "toss-restart-")));
+    temporaryDirectories.push(root);
+    await chmod(root, 0o700);
+    const config = defaultConfig("darwin", root);
+    const phasesPath = path.join(config.paths.state, "skills", "phases");
+    await mkdir(phasesPath, { recursive: true, mode: 0o700 });
+    const operationId = "00000000-0000-4000-8000-999999999991";
+    const staleStage = path.join(
+      phasesPath,
+      `.phase-mutation-stage.run-stale.999991.${operationId}.stage`,
+    );
+    await writeFile(
+      staleStage,
+      canonicalJson({
+        schema_version: "superpowers-phase-mutation.v1",
+        run_id: "run-stale",
+        operation_id: operationId,
+        owner_pid: 999_991,
+        created_at: "2026-08-19T11:59:59.000Z",
+      }),
+      { mode: 0o600 },
+    );
+    const runtimePath = path.dirname(config.paths.socket);
+    await mkdir(runtimePath, { recursive: true, mode: 0o700 });
+    const sourceSocket = path.join(runtimePath, "crash-source.sock");
+    const crashed = createServer();
+    await new Promise<void>((resolve, reject) => {
+      crashed.once("error", reject);
+      crashed.listen(sourceSocket, resolve);
+    });
+    await chmod(sourceSocket, 0o600);
+    await link(sourceSocket, config.paths.socket);
+    await unlink(sourceSocket);
+    await new Promise<void>((resolve) => crashed.close(() => resolve()));
+
+    const signals = new FakeSignals();
+    let resolveReady: (() => void) | undefined;
+    const ready = new Promise<void>((resolve) => {
+      resolveReady = resolve;
+    });
+    const services = createMainServices({
+      platform: { os: "darwin", arch: "arm64", node: "24.20.0" },
+      env: {},
+      home: root,
+      signals,
+      pid: process.pid,
+      now: () => new Date("2026-08-19T12:00:00.000Z"),
+      createServiceInstanceId: () => "018f0f64-7b21-7d4f-8c3d-4a30413d5f42",
+      resolveExecutableHash: () => Promise.resolve("a".repeat(64)),
+      sendReady: () => resolveReady?.(),
+    });
+
+    const running = services.serve?.({});
+    await ready;
+    await expect(lstat(staleStage)).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await lstat(config.paths.socket)).isSocket()).toBe(true);
+    signals.emit("SIGTERM");
+    await expect(running).resolves.toMatchObject({ forced: false });
+  });
+
   it("changes executable identity when bytes change at the same paths and keeps read failures safe", async () => {
     const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-runtime-identity-")));
     temporaryDirectories.push(root);
@@ -147,8 +212,9 @@ describe("serve command lifecycle integration", () => {
       head = (await journal.transition(journalCommand("run-production-skills", state, head))).head;
     }
     if (head === null) throw new Error("journal setup failed");
-    const externalSkills = createSkillsHost({
+    const externalSkills = createSkillsRuntimeHostForTest({
       statePath: config.paths.state,
+      socketPath: config.paths.socket,
       configuredRoots: [],
       journal,
       now: () => new Date("2026-08-19T12:00:02.000Z"),
@@ -181,6 +247,7 @@ describe("serve command lifecycle integration", () => {
       skill_snapshot_hash: snapshot.document_hash,
       operation_id: started.phase.operation_id,
       outcome: "COMPLETED",
+      terminal_code: null,
       output: Buffer.from("production plan", "utf8"),
       trace: TRACE,
     });

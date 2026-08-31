@@ -34,6 +34,7 @@ import { RuntimeProjectError } from "../src/service/project/errors.js";
 import { RuntimeSkillError } from "../src/skills/errors.js";
 import {
   createServiceControlServer,
+  probePrivateServiceSocketListener,
   probeServiceIdentity,
   requestProjectOperation,
   requestServiceStatus,
@@ -1066,6 +1067,20 @@ describe("private service control socket", () => {
       expect(await readdir(runtimePath)).toEqual([]);
     },
   );
+
+  it("proves listener presence and stale absence only for an exact private socket", async () => {
+    await leaveClosedSocketLinks(socketPath);
+    await expect(probePrivateServiceSocketListener({ socketPath })).resolves.toBe("absent");
+
+    await unlink(socketPath);
+    await listenNative(socketPath);
+    await chmod(socketPath, 0o600);
+    await expect(probePrivateServiceSocketListener({ socketPath })).resolves.toBe("present");
+
+    await closeNative(nativeServers.pop()!);
+    await writeFile(socketPath, "not a socket", { mode: 0o600 });
+    await expect(probePrivateServiceSocketListener({ socketPath })).resolves.toBe("unknown");
+  });
 
   it.each([legacyStagedSocket, previousStagedSocket, currentStagedSocket])(
     "reclaims a crash between hard-link publication and staged unlink: %s",

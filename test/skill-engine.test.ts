@@ -117,6 +117,7 @@ function fakeLoader(snapshots: ReadonlyMap<string, SkillSnapshotV1>): SkillLoade
     return value;
   };
   return {
+    recover: () => Promise.resolve(),
     load: (selected) => Promise.resolve(exact(selected)),
     assembleContext: (selected, request) => {
       const value = exact(selected);
@@ -268,6 +269,12 @@ function completeRequest(
     skill_snapshot_hash: started.phase.skill.snapshot_hash,
     operation_id: started.phase.operation_id,
     outcome,
+    terminal_code:
+      outcome === "COMPLETED"
+        ? null
+        : outcome === "FAILED"
+          ? "RUNTIME_SKILL_UNAVAILABLE"
+          : "RUNTIME_SKILL_INVALID",
     output,
     trace: TRACE,
     ...overrides,
@@ -329,8 +336,27 @@ describe("hash-chained Superpowers phase history", () => {
       output_hash: rawHash(Buffer.from("phase output")),
       catalog_hash: started.phase.catalog_hash,
       context_hash: started.phase.context_hash,
+      context_accounting: started.phase.context_accounting,
+      terminal_code: null,
       skill: started.phase.skill,
     });
+    expect(started.phase).toMatchObject({
+      terminal_code: null,
+    });
+    expect(Array.isArray(started.phase.context_accounting.included_resource_hashes)).toBe(true);
+    expect(Array.isArray(started.phase.context_accounting.omitted_resource_hashes)).toBe(true);
+    for (const value of [
+      started.phase.context_accounting.original_utf8_bytes,
+      started.phase.context_accounting.included_utf8_bytes,
+      started.phase.context_accounting.original_conservative_units,
+      started.phase.context_accounting.included_conservative_units,
+      started.phase.context_accounting.remaining_bytes,
+      started.phase.context_accounting.remaining_conservative_units,
+      started.phase.context_accounting.segment_count,
+      started.phase.context_accounting.truncation_count,
+    ]) {
+      expect(Number.isSafeInteger(value)).toBe(true);
+    }
     expect(history).toEqual([started.phase, completed.phase]);
     expect((await lstat(statePath)).mode & 0o777).toBe(0o700);
     expect((await lstat(path.dirname(historyPath))).mode & 0o777).toBe(0o700);
@@ -351,6 +377,23 @@ describe("hash-chained Superpowers phase history", () => {
     expect((await lstat(historyPath)).size).toBe(size);
     await expect(
       host.startPhase({ ...request, input: Buffer.from("different") }),
+    ).rejects.toMatchObject({ code: "RUNTIME_SKILL_OPERATION_CONFLICT" });
+  });
+
+  it("rejects replay under a different catalog authority before accepting the old operation", async () => {
+    const { statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const tdd = snapshot("test-driven-development");
+    const host = engine(statePath, journal, [tdd]);
+    const request = startRequest(head, tdd, "TEST_DESIGN", "operation-catalog-drift");
+    await host.startPhase(request);
+
+    const changedSelection = deepFreezeJson({
+      ...request.selection,
+      catalog_hash: `sha256:${"d".repeat(64)}`,
+    } as unknown as JsonValue) as unknown as SkillSelection;
+    await expect(
+      host.startPhase({ ...request, selection: changedSelection }),
     ).rejects.toMatchObject({ code: "RUNTIME_SKILL_OPERATION_CONFLICT" });
   });
 
@@ -1075,6 +1118,7 @@ describe("governed phase execution", () => {
     });
     const baseLoader = fakeLoader(new Map([[tdd.descriptor.name, tdd]]));
     const loader: SkillLoader = {
+      recover: () => Promise.resolve(),
       load: (selected) => baseLoader.load(selected),
       assembleContext: async (selected, request) => {
         entered?.();
@@ -1151,6 +1195,7 @@ describe("governed phase execution", () => {
     };
     const tdd = snapshot("test-driven-development");
     const loader: SkillLoader = {
+      recover: () => Promise.resolve(),
       load: () => {
         effects.push("snapshot-load");
         return Promise.reject(new Error("must not load"));
@@ -1383,6 +1428,7 @@ describe("governed phase execution", () => {
     });
     const baseLoader = fakeLoader(new Map([[tdd.descriptor.name, tdd]]));
     const guardedLoader: SkillLoader = {
+      recover: () => Promise.resolve(),
       load: (selected) => baseLoader.load(selected),
       assembleContext: async (selected, request) => {
         entered?.();

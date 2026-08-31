@@ -38,7 +38,7 @@ describe("skill runtime contracts", () => {
     ["evidence", parseSkillExecutionEvidence, validSkillExecutionEvidence()],
   ])("parses and recursively freezes canonical %s documents", (_name, parse, fixture) => {
     const parsed = parse(canonicalJson(fixture));
-    expect(parsed.ok).toBe(true);
+    expect(parsed.ok, JSON.stringify(parsed)).toBe(true);
     if (parsed.ok) expectDeepFrozen(parsed.value);
   });
 
@@ -201,13 +201,13 @@ describe("skill runtime contracts", () => {
     expect(parseSuperpowersApproval(canonicalJson(uppercase))).toMatchObject({ ok: false });
   });
 
-  it("rejects evidence with duplicate resource and phase hashes", () => {
+  it("rejects evidence with duplicate snapshots and phase hashes", () => {
     const fixture = validSkillExecutionEvidence();
     expect(
       parseSkillExecutionEvidence(
         canonicalJson({
           ...fixture,
-          resource_hashes: [fixture.resource_hashes[0], fixture.resource_hashes[0]],
+          snapshots: [fixture.snapshots[0], fixture.snapshots[0]],
         }),
       ),
     ).toMatchObject({ ok: false });

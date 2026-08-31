@@ -1,4 +1,5 @@
 import { sha256 } from "../../src/protocol/json.js";
+import { builtInSuperpowersHandler } from "../../src/skills/phases.js";
 
 const HASH = `sha256:${"a".repeat(64)}` as const;
 const OTHER_HASH = `sha256:${"b".repeat(64)}` as const;
@@ -45,10 +46,10 @@ export function validSkillDescriptor() {
     protocol_version: "runtime-contract.v1" as const,
     schema_version: "skill-descriptor.v1" as const,
     document_type: "skill-descriptor" as const,
-    name: "superpowers",
+    name: "test-driven-development",
     description: "Guides a disciplined development workflow.",
     version: "1.0.0",
-    source: { kind: "bundled" as const, identity: "superpowers" },
+    source: { kind: "bundled" as const, identity: "test-driven-development" },
     package_hash: HASH,
     resource_count: 1,
     total_bytes: 13,
@@ -95,7 +96,9 @@ const TRACE = { trace_id: "1".repeat(32), span_id: "2".repeat(16), trace_flags: 
 const JOURNAL_HEAD = { journal_revision: 1, sequence: 1, entry_hash: ZERO_HASH } as const;
 
 export function validSuperpowersPhase() {
-  const descriptor = validSkillDescriptor();
+  const snapshot = validSkillSnapshot();
+  const descriptor = snapshot.descriptor;
+  const handler = builtInSuperpowersHandler("TEST_DESIGN");
   return document({
     protocol_version: "runtime-contract.v1" as const,
     schema_version: "superpowers-phase.v1" as const,
@@ -112,16 +115,29 @@ export function validSuperpowersPhase() {
       source: descriptor.source,
       package_hash: descriptor.package_hash,
       document_hash: descriptor.document_hash,
-      snapshot_hash: OTHER_HASH,
+      snapshot_hash: snapshot.document_hash,
     },
-    phase: "GREEN" as const,
-    handler: { version: "1.0.0", hash: HASH },
+    phase: "TEST_DESIGN" as const,
+    handler: { version: handler.version, hash: handler.hash },
     operation_id: "operation-1",
     status: "COMPLETED" as const,
     predecessor_phase_hashes: [],
     input_hash: OTHER_HASH,
     context_hash: ZERO_HASH,
+    context_accounting: {
+      included_resource_hashes: [OTHER_HASH],
+      omitted_resource_hashes: [],
+      original_utf8_bytes: 13,
+      included_utf8_bytes: 13,
+      original_conservative_units: 4,
+      included_conservative_units: 4,
+      remaining_bytes: 10,
+      remaining_conservative_units: 2,
+      segment_count: 2,
+      truncation_count: 0,
+    },
     output_hash: HASH,
+    terminal_code: null,
     occurred_at: "2026-08-30T12:00:00.000Z",
     trace: TRACE,
   });
@@ -168,32 +184,28 @@ export function validSuperpowersApprovalDecision() {
 }
 
 export function validSkillExecutionEvidence() {
+  const snapshot = validSkillSnapshot();
+  const terminal = validSuperpowersPhase();
+  const started = document({
+    ...terminal,
+    status: "STARTED" as const,
+    output_hash: null,
+  });
+  const completed = document({
+    ...terminal,
+    phase_revision: 2,
+    previous_phase_hash: started.document_hash,
+  });
   const hashable = {
     protocol_version: "runtime-contract.v1" as const,
     schema_version: "skill-execution-evidence.v1" as const,
     document_type: "skill-execution-evidence" as const,
     run_id: "run-1",
-    catalog_hash: HASH,
-    skill: {
-      name: "superpowers",
-      version: "1.0.0",
-      source: { kind: "bundled" as const, identity: "superpowers" },
-      package_hash: HASH,
-      document_hash: OTHER_HASH,
-      snapshot_hash: ZERO_HASH,
-    },
-    resource_hashes: [HASH, OTHER_HASH],
-    phases: [
-      {
-        phase: "GREEN" as const,
-        handler_hash: HASH,
-        phase_hash: OTHER_HASH,
-        input_hash: HASH,
-        output_hash: OTHER_HASH,
-      },
-    ],
-    approvals: [{ request_hash: HASH, decision_hash: null, journal_head: JOURNAL_HEAD }],
-    context_hashes: [OTHER_HASH],
+    journal_head: JOURNAL_HEAD,
+    run_state: "RUNNING" as const,
+    snapshots: [snapshot],
+    phases: [started, completed],
+    approvals: [],
     terminal_code: null,
   };
   return document({

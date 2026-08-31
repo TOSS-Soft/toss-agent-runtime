@@ -10,7 +10,6 @@ import * as rootApi from "../src/index.js";
 import * as skillApi from "../src/skills/index.js";
 import type {
   CompleteSuperpowersPhaseRequest,
-  CreateSkillsHostOptions,
   HashableSkillDescriptorV1,
   HashableSkillExecutionEvidenceV1,
   HashableSkillSnapshotV1,
@@ -33,6 +32,7 @@ import type {
   SkillSelection,
   SkillSelectionRequest,
   SkillsHost,
+  SkillsHostConfig,
   SkillSnapshotV1,
   SkillSourceKind,
   StartSuperpowersPhaseRequest,
@@ -84,7 +84,6 @@ const PRIVATE_SKILL_NAMES = [
 
 type PublicSkillTypeSurface = readonly [
   CompleteSuperpowersPhaseRequest,
-  CreateSkillsHostOptions,
   HashableSkillDescriptorV1,
   HashableSkillExecutionEvidenceV1,
   HashableSkillSnapshotV1,
@@ -107,6 +106,7 @@ type PublicSkillTypeSurface = readonly [
   SkillSelection,
   SkillSelectionRequest,
   SkillsHost,
+  SkillsHostConfig,
   SkillSnapshotV1,
   SkillSourceKind,
   StartSuperpowersPhaseRequest,
@@ -156,19 +156,12 @@ describe("Agent Skills public API", () => {
     const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-skills-public-")));
     roots.push(root);
     const statePath = path.join(root, "state");
-    const journal = rootApi.createRunJournalStore({
-      statePath,
-      now: () => new Date("2026-08-30T12:00:00.000Z"),
-      randomId: () => "00000000-0000-4000-8000-000000000001",
+    const config: SkillsHostConfig = Object.freeze({
+      state_path: statePath,
+      socket_path: path.join(root, "runtime.sock"),
+      skill_roots: Object.freeze([]),
     });
-    const host = rootApi.createSkillsHost({
-      statePath,
-      configuredRoots: [],
-      journal,
-      now: () => new Date("2026-08-30T12:00:00.000Z"),
-      randomId: () => "00000000-0000-4000-8000-000000000002",
-      hasServiceListener: () => Promise.resolve("absent"),
-    });
+    const host = rootApi.createSkillsHost(config);
 
     expect(Object.keys(host).sort()).toEqual([
       "assembleContext",
@@ -207,14 +200,25 @@ describe("Agent Skills public API", () => {
         ],
         { cwd: process.cwd(), stdio: "pipe" },
       );
-      const publicDeclarations = ["src/index.d.ts", "src/skills/index.d.ts"]
-        .map((candidate) => readFileSync(path.join(declarationRoot, candidate), "utf8"))
-        .join("\n");
+      const skillsDeclaration = readFileSync(
+        path.join(declarationRoot, "src/skills/index.d.ts"),
+        "utf8",
+      );
+      const publicDeclarations = [
+        readFileSync(path.join(declarationRoot, "src/index.d.ts"), "utf8"),
+        skillsDeclaration,
+      ].join("\n");
       for (const privateName of PRIVATE_SKILL_NAMES) {
         expect(publicDeclarations).not.toContain(privateName);
       }
       expect(publicDeclarations).not.toMatch(
         /absoluteDirectory|absolutePath|manifestPath|skill_markdown_base64/u,
+      );
+      expect(skillsDeclaration).toMatch(
+        /createSkillsHost\(config: SkillsHostConfig\): SkillsHost/u,
+      );
+      expect(skillsDeclaration).not.toMatch(
+        /RunJournalStore|hasServiceListener|randomId|readonly now|operationHooks|ForTest/u,
       );
     } finally {
       rmSync(declarationRoot, { recursive: true, force: true });

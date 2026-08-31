@@ -22,7 +22,9 @@
     "predecessor_phase_hashes",
     "input_hash",
     "context_hash",
+    "context_accounting",
     "output_hash",
+    "terminal_code",
     "occurred_at",
     "trace",
     "document_hash"
@@ -50,8 +52,12 @@
     },
     "input_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
     "context_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+    "context_accounting": { "$ref": "#/$defs/context_accounting" },
     "output_hash": {
       "oneOf": [{ "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }, { "type": "null" }]
+    },
+    "terminal_code": {
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/terminal_code" }]
     },
     "occurred_at": { "$ref": "runtime-common.v1.schema.json#/$defs/utc_timestamp" },
     "trace": { "$ref": "runtime-common.v1.schema.json#/$defs/trace_context" },
@@ -59,6 +65,60 @@
   },
   "$defs": {
     "positive_integer": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "nonnegative_integer": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "context_accounting": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "included_resource_hashes",
+        "omitted_resource_hashes",
+        "original_utf8_bytes",
+        "included_utf8_bytes",
+        "original_conservative_units",
+        "included_conservative_units",
+        "remaining_bytes",
+        "remaining_conservative_units",
+        "segment_count",
+        "truncation_count"
+      ],
+      "properties": {
+        "included_resource_hashes": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
+        },
+        "omitted_resource_hashes": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
+        },
+        "original_utf8_bytes": { "$ref": "#/$defs/nonnegative_integer" },
+        "included_utf8_bytes": { "$ref": "#/$defs/nonnegative_integer" },
+        "original_conservative_units": { "$ref": "#/$defs/nonnegative_integer" },
+        "included_conservative_units": { "$ref": "#/$defs/nonnegative_integer" },
+        "remaining_bytes": { "$ref": "#/$defs/nonnegative_integer" },
+        "remaining_conservative_units": { "$ref": "#/$defs/nonnegative_integer" },
+        "segment_count": { "$ref": "#/$defs/nonnegative_integer" },
+        "truncation_count": { "$ref": "#/$defs/nonnegative_integer" }
+      }
+    },
+    "terminal_code": {
+      "enum": [
+        "BLOCKED_SUPERPOWERS_MISSING",
+        "RUNTIME_SKILL_INVALID",
+        "RUNTIME_SKILL_PATH_UNSAFE",
+        "RUNTIME_SKILL_INTEGRITY",
+        "RUNTIME_SKILL_LIMIT_EXCEEDED",
+        "RUNTIME_SKILL_CONTEXT_OVERFLOW",
+        "RUNTIME_SKILL_APPROVAL_REJECTED",
+        "RUNTIME_SKILL_SCRIPT_UNAVAILABLE",
+        "RUNTIME_SKILL_STALE_STATE",
+        "RUNTIME_SKILL_OPERATION_CONFLICT",
+        "RUNTIME_SKILL_UNAVAILABLE"
+      ]
+    },
     "journal_head": {
       "type": "object",
       "additionalProperties": false,

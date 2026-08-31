@@ -13,26 +13,22 @@ import {
   parseSkillSnapshot,
 } from "./contracts.js";
 import type { SkillsEngine } from "./engine.js";
-import { RuntimeSkillError } from "./errors.js";
-import { createSkillPrivateStore, type CreateSkillPrivateStoreOptions } from "./private-store.js";
+import {
+  isRuntimeSkillErrorCode,
+  RuntimeSkillError,
+  type RuntimeSkillErrorCode,
+} from "./errors.js";
+import {
+  createSkillPrivateStoreForTest,
+  type CreateSkillPrivateStoreForTestOptions,
+} from "./private-store.js";
 import {
   SKILL_LIMITS,
   type SkillDescriptorReference,
   type SkillExecutionEvidenceV1,
   type SkillSnapshotV1,
-  type SuperpowersPhaseName,
   type SuperpowersPhaseV1,
 } from "./types.js";
-
-const PHASE_ORDER: readonly SuperpowersPhaseName[] = Object.freeze([
-  "BRAINSTORMING",
-  "TEST_DESIGN",
-  "RED",
-  "GREEN",
-  "DEBUGGING",
-  "REVIEW",
-  "VERIFICATION",
-]);
 
 interface StoredPublicSnapshotRecord {
   readonly schema_version: "skill-private-object.v1";
@@ -43,7 +39,7 @@ export interface SkillEvidenceBuilder {
   evidence(runId: string): Promise<SkillExecutionEvidenceV1 | null>;
 }
 
-export interface CreateSkillEvidenceBuilderOptions extends CreateSkillPrivateStoreOptions {
+export interface CreateSkillEvidenceBuilderOptions extends CreateSkillPrivateStoreForTestOptions {
   readonly engine: SkillsEngine;
 }
 
@@ -124,56 +120,32 @@ function journalHead(entry: RunJournalEntryV1) {
   });
 }
 
-function terminalPhases(phases: readonly SuperpowersPhaseV1[]): readonly SuperpowersPhaseV1[] {
-  const latest = new Map<SuperpowersPhaseName, SuperpowersPhaseV1>();
-  for (const phase of phases) {
-    if (phase.status !== "STARTED") latest.set(phase.phase, phase);
+function terminalFromJournal(entry: RunJournalEntryV1 | undefined): RuntimeSkillErrorCode | null {
+  if (
+    entry !== undefined &&
+    (entry.state === "FAILED" || entry.state === "BLOCKED") &&
+    isRuntimeSkillErrorCode(entry.reason_code)
+  ) {
+    return entry.reason_code;
   }
-  return Object.freeze(
-    PHASE_ORDER.flatMap((phase) => {
-      const record = latest.get(phase);
-      return record === undefined ? [] : [record];
-    }),
-  );
+  return null;
 }
 
 export function createSkillEvidenceBuilder(
   options: CreateSkillEvidenceBuilderOptions,
 ): SkillEvidenceBuilder {
-  const store = createSkillPrivateStore(options);
+  const store = createSkillPrivateStoreForTest(options);
   return Object.freeze({
     async evidence(runId: string): Promise<SkillExecutionEvidenceV1 | null> {
       const verified = await options.engine.evidenceHistory(runId);
-      if (verified.phases.length === 0) return null;
-      if (verified.journal === null) integrity();
+      if (verified.journal === null) return null;
+      const finalJournal = verified.journal.entries.at(-1);
+      if (finalJournal === undefined) integrity();
 
-      const catalogHash = verified.phases.at(-1)!.catalog_hash;
-      const snapshots = new Map<`sha256:${string}`, SkillSnapshotV1>();
-      for (const phase of verified.phases) {
-        const existing = snapshots.get(phase.skill.package_hash);
-        if (existing !== undefined) {
-          if (
-            existing.document_hash !== phase.skill.snapshot_hash ||
-            !exactReference(descriptorReference(existing), phase.skill)
-          ) {
-            integrity();
-          }
-          continue;
-        }
-        const bytes = await store.readObject(phase.skill.package_hash);
-        if (bytes === null) integrity();
-        snapshots.set(phase.skill.package_hash, publicSnapshot(bytes, phase).snapshot);
-      }
+      const zeroPhaseCode = terminalFromJournal(finalJournal);
+      if (verified.phases.length === 0 && zeroPhaseCode === null) return null;
+      if (verified.phases.length > 512) limitExceeded();
 
-      const projectedPhases = terminalPhases(verified.phases).map((phase) =>
-        Object.freeze({
-          phase: phase.phase,
-          handler_hash: phase.handler.hash,
-          phase_hash: phase.document_hash,
-          input_hash: phase.input_hash,
-          output_hash: phase.output_hash,
-        }),
-      );
       const approvals = verified.journal.entries
         .filter((entry) => {
           const metadata = entry.metadata;
@@ -200,41 +172,63 @@ export function createSkillEvidenceBuilder(
           const decision =
             successor === undefined ? null : decisionMetadata(successor, entry).decision;
           return Object.freeze({
-            request_hash: request.document_hash,
-            decision_hash: decision?.document_hash ?? null,
-            journal_head: request.pending_journal_head,
+            request,
+            decision,
+            decision_journal_head: successor === undefined ? null : journalHead(successor),
           });
         });
-      const resourceHashes = [
-        ...new Set(
-          [...snapshots.values()].flatMap((snapshot) =>
-            snapshot.resources.map((resource) => resource.hash),
-          ),
-        ),
-      ].sort((left, right) => Buffer.from(left).compare(Buffer.from(right)));
-      const contextHashes = [
-        ...new Set(
-          verified.phases
-            .filter((phase) => phase.status === "STARTED")
-            .map((phase) => phase.context_hash),
-        ),
-      ].sort((left, right) => Buffer.from(left).compare(Buffer.from(right)));
-      const finalPhase = terminalPhases(verified.phases).at(-1) ?? verified.phases.at(-1)!;
-      const skill = Object.freeze({ ...finalPhase.skill });
-      const terminalCode = null;
-      const preimage = {
+      if (approvals.length > 128) limitExceeded();
+
+      const phaseByPackage = new Map<`sha256:${string}`, SuperpowersPhaseV1>();
+      for (const phase of verified.phases) {
+        const existing = phaseByPackage.get(phase.skill.package_hash);
+        if (
+          existing !== undefined &&
+          (existing.skill.snapshot_hash !== phase.skill.snapshot_hash ||
+            !exactReference(existing.skill, phase.skill))
+        ) {
+          integrity();
+        }
+        phaseByPackage.set(phase.skill.package_hash, existing ?? phase);
+      }
+      if (phaseByPackage.size > 256) limitExceeded();
+
+      const preflight = {
         protocol_version: "runtime-contract.v1" as const,
         schema_version: "skill-execution-evidence.v1" as const,
         document_type: "skill-execution-evidence" as const,
         run_id: runId,
-        catalog_hash: catalogHash,
-        skill,
-        resource_hashes: resourceHashes,
-        phases: projectedPhases,
+        journal_head: verified.journal.head,
+        run_state: verified.journal.state,
+        snapshots: [] as readonly SkillSnapshotV1[],
+        phases: verified.phases,
         approvals,
-        context_hashes: contextHashes,
-        terminal_code: terminalCode,
+        terminal_code: verified.phases.at(-1)?.terminal_code ?? zeroPhaseCode,
       };
+      let worstCaseBytes = Buffer.byteLength(canonicalJson(preflight), "utf8");
+      const packageHashes = [...phaseByPackage.keys()].sort((left, right) =>
+        Buffer.from(left).compare(Buffer.from(right)),
+      );
+      for (const packageHash of packageHashes) {
+        const bytes = await store.objectBytes(packageHash);
+        if (bytes === null) integrity();
+        worstCaseBytes += bytes;
+        if (worstCaseBytes > SKILL_LIMITS.evidenceBytes) limitExceeded();
+      }
+
+      const snapshots: SkillSnapshotV1[] = [];
+      for (const packageHash of packageHashes) {
+        const bytes = await store.readObject(packageHash);
+        if (bytes === null) integrity();
+        const phase = phaseByPackage.get(packageHash);
+        if (phase === undefined) integrity();
+        snapshots.push(publicSnapshot(bytes, phase).snapshot);
+      }
+      snapshots.sort((left, right) =>
+        Buffer.from(left.document_hash).compare(Buffer.from(right.document_hash)),
+      );
+
+      const preimage = { ...preflight, snapshots };
       const withHandoff = { ...preimage, handoff_hash: hashSkillExecutionHandoff(preimage) };
       const candidate = { ...withHandoff, document_hash: sha256(withHandoff) };
       const bytes = canonicalJson(candidate);

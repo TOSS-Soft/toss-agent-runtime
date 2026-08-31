@@ -1,6 +1,8 @@
-import type { RunJournalStore } from "../journal/store.js";
+import { randomUUID } from "node:crypto";
+import path from "node:path";
+
+import { createRunJournalStore } from "../journal/store.js";
 import {
-  createSkillCatalog,
   type SkillCatalogSnapshot,
   type SkillDiscoveryRequest,
   type SkillSelection,
@@ -8,16 +10,14 @@ import {
 } from "./catalog.js";
 import type { SkillContext, SkillContextRequest } from "./context.js";
 import {
-  createSkillsEngine,
   type CompleteSuperpowersPhaseRequest,
   type StartSuperpowersPhaseRequest,
   type SuperpowersPhaseOutcome,
 } from "./engine.js";
-import { createSkillEvidenceBuilder } from "./evidence.js";
-import { RuntimeSkillError } from "./errors.js";
-import { createSkillLoader } from "./loader.js";
 import type { ResumeSuperpowersApprovalRequest } from "./approval.js";
-import type { SkillExecutionEvidenceV1, SkillSnapshotV1 } from "./types.js";
+import { assertConfiguredSkillRootPath } from "./paths.js";
+import { createSkillsRuntimeHost } from "./runtime-host.js";
+import { SKILL_LIMITS, type SkillExecutionEvidenceV1, type SkillSnapshotV1 } from "./types.js";
 
 export {
   hashSkillCatalog,
@@ -34,15 +34,12 @@ export {
   parseSuperpowersPhase,
 } from "./contracts.js";
 export { RuntimeSkillError, type RuntimeSkillErrorCode } from "./errors.js";
-export { SKILL_LIMITS } from "./types.js";
+export { SKILL_LIMITS };
 
-export interface CreateSkillsHostOptions {
-  readonly statePath: string;
-  readonly configuredRoots: readonly string[];
-  readonly journal: RunJournalStore;
-  readonly now: () => Date;
-  readonly randomId: () => string;
-  readonly hasServiceListener: () => Promise<"present" | "absent" | "unknown">;
+export interface SkillsHostConfig {
+  readonly state_path: string;
+  readonly socket_path: string;
+  readonly skill_roots: readonly string[];
 }
 
 export interface SkillHostContextRequest extends SkillContextRequest {
@@ -63,84 +60,59 @@ export interface SkillsHost {
   flush(signal: AbortSignal): Promise<void>;
 }
 
-export function createSkillsHost(options: CreateSkillsHostOptions): SkillsHost {
-  const catalog = createSkillCatalog({ configuredRoots: options.configuredRoots });
-  const loader = createSkillLoader({
-    statePath: options.statePath,
-    catalog,
-    now: options.now,
-    randomId: options.randomId,
-    hasServiceListener: options.hasServiceListener,
-  });
-  const engine = createSkillsEngine({
-    statePath: options.statePath,
-    journal: options.journal,
-    catalog,
-    loader,
-    now: options.now,
-    randomId: options.randomId,
-    hasServiceListener: options.hasServiceListener,
-  });
-  const evidence = createSkillEvidenceBuilder({
-    statePath: options.statePath,
-    engine,
-    now: options.now,
-    randomId: options.randomId,
-    hasServiceListener: options.hasServiceListener,
-  });
-  const pending = new Set<Promise<unknown>>();
-  let stopped = false;
+function isStringArray(value: unknown): value is readonly string[] {
+  return (
+    Array.isArray(value) &&
+    (value as readonly unknown[]).every((entry) => typeof entry === "string")
+  );
+}
 
-  const accept = <T>(operation: () => Promise<T>): Promise<T> => {
-    if (stopped) return Promise.reject(new RuntimeSkillError("RUNTIME_SKILL_UNAVAILABLE"));
-    const accepted = Promise.resolve().then(operation);
-    pending.add(accepted);
-    void accepted.finally(() => pending.delete(accepted)).catch(() => undefined);
-    return accepted;
-  };
-
-  const host: SkillsHost = {
-    recover: () => accept(() => engine.recover()),
-    discover: (request) => accept(() => engine.discover(request)),
-    select: (request) =>
-      accept(async () => {
-        const snapshot = await engine.discover({
-          query: request.query,
-          allowed_capabilities: request.allowed_capabilities,
-        });
-        return engine.select(snapshot, request);
+export function createSkillsHost(config: SkillsHostConfig): SkillsHost {
+  const keys = Object.keys(config).sort();
+  if (
+    Object.getPrototypeOf(config) !== Object.prototype ||
+    keys.join("\u0000") !== ["skill_roots", "socket_path", "state_path"].join("\u0000") ||
+    !path.isAbsolute(config.state_path) ||
+    path.normalize(config.state_path) !== config.state_path ||
+    !path.isAbsolute(config.socket_path) ||
+    path.normalize(config.socket_path) !== config.socket_path ||
+    /[\u0000-\u001f\u007f]/u.test(config.state_path) ||
+    /[\u0000-\u001f\u007f]/u.test(config.socket_path) ||
+    !isStringArray(config.skill_roots)
+  ) {
+    throw new Error("Invalid SkillsHostConfig");
+  }
+  const roots = [...config.skill_roots];
+  for (const root of roots) assertConfiguredSkillRootPath(root);
+  if (
+    roots.length > SKILL_LIMITS.roots ||
+    roots.some(
+      (root, index) =>
+        index > 0 && Buffer.from(roots[index - 1]!, "utf8").compare(Buffer.from(root, "utf8")) >= 0,
+    ) ||
+    roots.some((root, index) =>
+      roots.slice(index + 1).some((candidate) => {
+        const relative = path.relative(root, candidate);
+        return (
+          relative !== "" && !path.isAbsolute(relative) && !relative.startsWith(`..${path.sep}`)
+        );
       }),
-    load: (selection) => accept(() => engine.load(selection)),
-    assembleContext: (request) => {
-      const { selection, ...contextRequest } = request;
-      return accept(() => engine.assembleContext(selection, contextRequest));
-    },
-    startPhase: (request) => accept(() => engine.startPhase(request)),
-    completePhase: (request) => accept(() => engine.completePhase(request)),
-    resumeApproval: (request) => accept(() => engine.resumeApproval(request)),
-    evidence: (runId) => accept(() => evidence.evidence(runId)),
-    stopIntake() {
-      if (stopped) return;
-      stopped = true;
-      engine.stopIntake();
-    },
-    async flush(signal) {
-      while (!signal.aborted && pending.size > 0) {
-        let listener: (() => void) | undefined;
-        const aborted = new Promise<void>((resolve) => {
-          listener = () => resolve();
-          signal.addEventListener("abort", listener, { once: true });
-        });
-        try {
-          await Promise.race([Promise.allSettled([...pending]).then(() => undefined), aborted]);
-        } finally {
-          if (listener !== undefined) signal.removeEventListener("abort", listener);
-        }
-      }
-      await engine.flush(signal);
-    },
-  };
-  return Object.freeze(host);
+    )
+  ) {
+    throw new Error("Invalid SkillsHostConfig");
+  }
+  const statePath = config.state_path;
+  const socketPath = config.socket_path;
+  const now = () => new Date();
+  const journal = createRunJournalStore({ statePath, now, randomId: randomUUID });
+  return createSkillsRuntimeHost({
+    statePath,
+    socketPath,
+    configuredRoots: Object.freeze(roots),
+    journal,
+    now,
+    randomId: randomUUID,
+  });
 }
 
 export type {

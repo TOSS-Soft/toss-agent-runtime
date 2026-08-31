@@ -67,6 +67,7 @@ export interface CreateSkillLoaderForTestOptions extends CreateSkillLoaderOption
 }
 
 export interface SkillLoader {
+  recover(): Promise<void>;
   load(selection: SkillSelection): Promise<SkillSnapshotV1>;
   assembleContext(selection: SkillSelection, request: SkillContextRequest): Promise<SkillContext>;
 }
@@ -874,6 +875,7 @@ function createLoader(
     );
   };
   return {
+    recover: () => store.recover(),
     async load(selection: SkillSelection): Promise<SkillSnapshotV1> {
       const record = await exactRecord(selection);
       return deepFreezeJson(record.snapshot as unknown as JsonValue) as unknown as SkillSnapshotV1;

@@ -552,6 +552,45 @@ describe("runtime service supervisor", () => {
     ]);
   });
 
+  it("flushes accepted dependent work while its journal participant remains writable", async () => {
+    const events: string[] = [];
+    let journalWritable = true;
+    const journal: RecoveryParticipant = {
+      recover: () => Promise.resolve(),
+      stopIntake: () => {
+        events.push("stop-journal");
+        journalWritable = false;
+      },
+      flush: () => {
+        events.push("flush-journal");
+        return Promise.resolve();
+      },
+    };
+    const skills: RecoveryParticipant = {
+      recover: () => Promise.resolve(),
+      stopIntake: () => events.push("stop-skills"),
+      flush: () => {
+        events.push(journalWritable ? "persist-approval" : "journal-unavailable");
+        return Promise.resolve();
+      },
+    };
+    const running = runSupervisor({
+      ...shutdownOptions(events),
+      recoveryParticipants: [journal, skills],
+      journalParticipant: journal,
+    });
+    await readyObserved;
+
+    signals.emit("SIGTERM");
+    await running;
+
+    expect(events).toContain("persist-approval");
+    expect(events).not.toContain("journal-unavailable");
+    expect(events.indexOf("stop-skills")).toBeLessThan(events.indexOf("persist-approval"));
+    expect(events.indexOf("persist-approval")).toBeLessThan(events.indexOf("stop-journal"));
+    expect(events.indexOf("flush-journal")).toBeLessThan(events.indexOf("drain-control"));
+  });
+
   it("coalesces duplicate signals and a requested stop into one shutdown", async () => {
     const events: string[] = [];
     let requestStop: (() => void) | undefined;

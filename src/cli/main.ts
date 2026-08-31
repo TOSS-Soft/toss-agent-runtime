@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { lstat, realpath } from "node:fs/promises";
+import { realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
@@ -48,7 +48,8 @@ import { createProjectIntake } from "../service/project/intake.js";
 import { RuntimeProjectError, type RuntimeProjectErrorCode } from "../service/project/errors.js";
 import { createProjectRegistry } from "../service/project/registry.js";
 import { createProjectWatcher } from "../service/project/watcher.js";
-import { createSkillsHost, RuntimeSkillError } from "../skills/index.js";
+import { RuntimeSkillError } from "../skills/index.js";
+import { createSkillsRuntimeHost } from "../skills/runtime-host.js";
 import { PACKAGE_VERSION } from "../version.js";
 import { CliUsageError, parseCli, type BaselineCommand, type ServiceAction } from "./grammar.js";
 import {
@@ -347,33 +348,13 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
         intake,
         runtimeStatePath: loaded.config.paths.state,
       });
-      const hasServiceListener = async (): Promise<"present" | "absent" | "unknown"> => {
-        try {
-          if (!(await lstat(loaded.config.paths.socket)).isSocket()) return "unknown";
-        } catch (error) {
-          return typeof error === "object" &&
-            error !== null &&
-            "code" in error &&
-            error.code === "ENOENT"
-            ? "absent"
-            : "unknown";
-        }
-        try {
-          return (await probeRuntimeServiceIdentity({ socketPath: loaded.config.paths.socket })) ===
-            null
-            ? "unknown"
-            : "present";
-        } catch {
-          return "unknown";
-        }
-      };
-      const skills = createSkillsHost({
+      const skills = createSkillsRuntimeHost({
         statePath: loaded.config.paths.state,
+        socketPath: loaded.config.paths.socket,
         configuredRoots: loaded.config.skill_roots,
         journal,
         now: options.now,
         randomId: randomUUID,
-        hasServiceListener,
       });
       return runSupervisor({
         loaded,
@@ -387,6 +368,7 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
           identify: (socketPath) => probeRuntimeServiceIdentity({ socketPath }),
         },
         recoveryParticipants: [journal, skills, projects],
+        journalParticipant: journal,
         interruptionRecorder: journal,
         handleSkillRequest: async (request) => {
           const traceHash = createHash("sha256")

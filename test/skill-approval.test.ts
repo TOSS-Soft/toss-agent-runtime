@@ -125,6 +125,7 @@ function fakeLoader(snapshot: SkillSnapshotV1): SkillLoader {
     return snapshot;
   };
   return {
+    recover: () => Promise.resolve(),
     load: (selected) => Promise.resolve(exact(selected)),
     assembleContext: (selected, request) => {
       const value = exact(selected);
@@ -249,6 +250,7 @@ function completeRequest(
     skill_snapshot_hash: started.phase.skill.snapshot_hash,
     operation_id: started.phase.operation_id,
     outcome: "COMPLETED",
+    terminal_code: null,
     output: Buffer.from("approved plan", "utf8"),
     trace: TRACE,
   };
@@ -1398,6 +1400,14 @@ describe("durable Superpowers approval transaction", () => {
       { execution_request_hash: `sha256:${"6".repeat(64)}` },
       { catalog_hash: `sha256:${"5".repeat(64)}` },
       { context_hash: `sha256:${"4".repeat(64)}` },
+      {
+        context_accounting: {
+          ...(phase.context_accounting as Record<string, unknown>),
+          remaining_bytes:
+            ((phase.context_accounting as Record<string, unknown>).remaining_bytes as number) + 1,
+        },
+      },
+      { terminal_code: "RUNTIME_SKILL_UNAVAILABLE" },
       {
         observed_journal_head: {
           ...(phase.observed_journal_head as Record<string, unknown>),
