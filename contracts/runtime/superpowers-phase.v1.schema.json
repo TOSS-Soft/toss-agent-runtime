@@ -70,8 +70,8 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "included_resource_hashes",
-        "omitted_resource_hashes",
+        "skill_markdown",
+        "resources",
         "original_utf8_bytes",
         "included_utf8_bytes",
         "original_conservative_units",
@@ -82,17 +82,19 @@
         "truncation_count"
       ],
       "properties": {
-        "included_resource_hashes": {
-          "type": "array",
-          "maxItems": 256,
-          "uniqueItems": true,
-          "items": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
+        "skill_markdown": {
+          "allOf": [
+            { "$ref": "#/$defs/context_resource" },
+            {
+              "type": "object",
+              "properties": { "path": { "const": "SKILL.md" }, "state": { "const": "INCLUDED" } }
+            }
+          ]
         },
-        "omitted_resource_hashes": {
+        "resources": {
           "type": "array",
           "maxItems": 256,
-          "uniqueItems": true,
-          "items": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
+          "items": { "$ref": "#/$defs/context_resource" }
         },
         "original_utf8_bytes": { "$ref": "#/$defs/nonnegative_integer" },
         "included_utf8_bytes": { "$ref": "#/$defs/nonnegative_integer" },
@@ -102,6 +104,32 @@
         "remaining_conservative_units": { "$ref": "#/$defs/nonnegative_integer" },
         "segment_count": { "$ref": "#/$defs/nonnegative_integer" },
         "truncation_count": { "$ref": "#/$defs/nonnegative_integer" }
+      }
+    },
+    "context_resource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "source_hash",
+        "state",
+        "original_bytes",
+        "included_bytes",
+        "included_hash",
+        "original_conservative_units",
+        "included_conservative_units"
+      ],
+      "properties": {
+        "path": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "source_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+        "state": { "enum": ["INCLUDED", "PARTIAL", "OMITTED"] },
+        "original_bytes": { "$ref": "#/$defs/nonnegative_integer" },
+        "included_bytes": { "$ref": "#/$defs/nonnegative_integer" },
+        "included_hash": {
+          "oneOf": [{ "type": "null" }, { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }]
+        },
+        "original_conservative_units": { "$ref": "#/$defs/nonnegative_integer" },
+        "included_conservative_units": { "$ref": "#/$defs/nonnegative_integer" }
       }
     },
     "terminal_code": {

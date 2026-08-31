@@ -1,4 +1,4 @@
-import type { JournalHead, RunState } from "../journal/types.js";
+import type { JournalHead, RunJournalEntryV1, RunState } from "../journal/types.js";
 import type { RuntimeDocument, TraceContext } from "../protocol/types.js";
 import type { RuntimeSkillErrorCode } from "./errors.js";
 
@@ -48,6 +48,11 @@ export interface SkillDescriptorV1 extends RuntimeDocument {
   readonly document_hash: `sha256:${string}`;
 }
 
+export interface SkillCatalogRoot {
+  readonly descriptors: readonly SkillDescriptorV1[];
+  readonly catalog_hash: `sha256:${string}`;
+}
+
 export interface SkillResourceV1 {
   readonly path: string;
   readonly role: SkillResourceRole;
@@ -71,9 +76,20 @@ export interface SkillSnapshotV1 extends RuntimeDocument {
   readonly document_hash: `sha256:${string}`;
 }
 
+export interface SkillContextResourceAccounting {
+  readonly path: string;
+  readonly source_hash: `sha256:${string}`;
+  readonly state: "INCLUDED" | "PARTIAL" | "OMITTED";
+  readonly original_bytes: number;
+  readonly included_bytes: number;
+  readonly included_hash: `sha256:${string}` | null;
+  readonly original_conservative_units: number;
+  readonly included_conservative_units: number;
+}
+
 export interface SkillContextAccounting {
-  readonly included_resource_hashes: readonly `sha256:${string}`[];
-  readonly omitted_resource_hashes: readonly `sha256:${string}`[];
+  readonly skill_markdown: SkillContextResourceAccounting & Readonly<{ path: "SKILL.md" }>;
+  readonly resources: readonly SkillContextResourceAccounting[];
   readonly original_utf8_bytes: number;
   readonly included_utf8_bytes: number;
   readonly original_conservative_units: number;
@@ -157,12 +173,15 @@ export interface SkillExecutionEvidenceV1 extends RuntimeDocument {
   readonly run_id: string;
   readonly journal_head: JournalHead;
   readonly run_state: RunState;
+  readonly terminal_journal_entry: RunJournalEntryV1 | null;
+  readonly catalogs: readonly SkillCatalogRoot[];
   readonly snapshots: readonly SkillSnapshotV1[];
   readonly phases: readonly SuperpowersPhaseV1[];
   readonly approvals: readonly Readonly<{
     request: SuperpowersApprovalRequestV1;
+    request_journal_entry: RunJournalEntryV1;
     decision: SuperpowersApprovalDecisionV1 | null;
-    decision_journal_head: JournalHead | null;
+    decision_journal_entry: RunJournalEntryV1 | null;
   }>[];
   readonly handoff_hash: `sha256:${string}`;
   readonly terminal_code: RuntimeSkillErrorCode | null;

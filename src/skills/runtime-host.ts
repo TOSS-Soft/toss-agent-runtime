@@ -55,7 +55,14 @@ function createHost(options: CreateSkillsRuntimeHostTestOptions): SkillsHost {
 
   const accept = <T>(operation: () => Promise<T>): Promise<T> => {
     if (stopped) return Promise.reject(new RuntimeSkillError("RUNTIME_SKILL_UNAVAILABLE"));
-    const accepted = Promise.resolve().then(operation);
+    let accepted: Promise<T>;
+    try {
+      accepted = operation();
+    } catch (error) {
+      accepted = Promise.reject(
+        error instanceof Error ? error : new RuntimeSkillError("RUNTIME_SKILL_INTEGRITY"),
+      );
+    }
     pending.add(accepted);
     void accepted.finally(() => pending.delete(accepted)).catch(() => undefined);
     return accepted;

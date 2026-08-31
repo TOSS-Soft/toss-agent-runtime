@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lstat, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -13,9 +13,15 @@ import type {
   RunJournalEntryV1,
   RunState,
 } from "../src/journal/types.js";
-import { canonicalJson, deepFreezeJson, sha256, type JsonValue } from "../src/protocol/json.js";
+import {
+  canonicalJson,
+  deepFreezeJson,
+  parseJsonBytes,
+  sha256,
+  type JsonValue,
+} from "../src/protocol/json.js";
 import type { SkillCatalog, SkillSelection } from "../src/skills/catalog.js";
-import { hashSkillPackage } from "../src/skills/contracts.js";
+import { hashSkillCatalog, hashSkillPackage } from "../src/skills/contracts.js";
 import {
   createSkillsEngineForTest,
   type CompleteSuperpowersPhaseRequest,
@@ -25,6 +31,7 @@ import {
 } from "../src/skills/engine.js";
 import { RuntimeSkillError } from "../src/skills/errors.js";
 import type { SkillLoader } from "../src/skills/loader.js";
+import { createSkillsRuntimeHostForTest } from "../src/skills/runtime-host.js";
 import type {
   ResumeSuperpowersApprovalRequest,
   SuperpowersApprovalOutcome,
@@ -101,9 +108,20 @@ function brainstormingSnapshot(version = "1.0.0"): SkillSnapshotV1 {
 }
 
 function selection(snapshot: SkillSnapshotV1): SkillSelection {
+  const descriptors = [snapshot.descriptor];
+  const catalogHash = hashSkillCatalog(
+    descriptors.map((descriptor) => ({
+      name: descriptor.name,
+      version: descriptor.version,
+      source: descriptor.source,
+      package_hash: descriptor.package_hash,
+      document_hash: descriptor.document_hash,
+    })),
+  );
   return deepFreezeJson({
     descriptor: snapshot.descriptor,
-    catalog_hash: `sha256:${"c".repeat(64)}`,
+    catalog_hash: catalogHash,
+    catalog_root: parseJsonBytes(canonicalJson({ descriptors, catalog_hash: catalogHash })),
     package_handle: sha256({ name: snapshot.descriptor.name }),
   } as unknown as JsonValue) as unknown as SkillSelection;
 }
@@ -126,6 +144,7 @@ function fakeLoader(snapshot: SkillSnapshotV1): SkillLoader {
   };
   return {
     recover: () => Promise.resolve(),
+    retainCatalogRoot: () => Promise.resolve(),
     load: (selected) => Promise.resolve(exact(selected)),
     assembleContext: (selected, request) => {
       const value = exact(selected);
@@ -141,16 +160,28 @@ function fakeLoader(snapshot: SkillSnapshotV1): SkillLoader {
             snapshot_hash: value.document_hash,
           }),
           phase: request.phase,
-          segments: [],
+          segments: [
+            {
+              path: "SKILL.md",
+              role: "skill" as const,
+              source_hash: value.skill_markdown_hash,
+              included_hash: value.skill_markdown_hash,
+              original_bytes: value.skill_markdown_bytes,
+              included_bytes: value.skill_markdown_bytes,
+              conservative_tokens: Math.ceil(value.skill_markdown_bytes / 4),
+              content: "",
+            },
+          ],
           included_resource_hashes: [],
           omitted_resource_hashes: [],
-          original_utf8_bytes: 0,
-          included_utf8_bytes: 0,
-          original_tokens: 0,
-          included_tokens: 0,
-          remaining_bytes: request.max_bytes,
-          remaining_tokens: request.max_tokens,
+          original_utf8_bytes: value.skill_markdown_bytes,
+          included_utf8_bytes: value.skill_markdown_bytes,
+          original_tokens: Math.ceil(value.skill_markdown_bytes / 4),
+          included_tokens: Math.ceil(value.skill_markdown_bytes / 4),
+          remaining_bytes: request.max_bytes - value.skill_markdown_bytes,
+          remaining_tokens: request.max_tokens - Math.ceil(value.skill_markdown_bytes / 4),
           truncations: [],
+          resource_accounting: [],
           context_hash: sha256({ phase: request.phase }),
         }),
       );
@@ -1329,6 +1360,70 @@ describe("durable Superpowers approval transaction", () => {
       code: "RUNTIME_SKILL_UNAVAILABLE",
     });
     expect(reads).toBe(0);
+  });
+
+  it("durably completes approval accepted in the same turn as the host intake cut", async () => {
+    const { statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const host = createSkillsRuntimeHostForTest({
+      statePath,
+      socketPath: path.join(statePath, "runtime.sock"),
+      configuredRoots: [],
+      journal,
+      now: clock(),
+      randomId: ids(1_300),
+      hasServiceListener: () => Promise.resolve("absent"),
+    });
+    const selected = await host.select({
+      mode: "implicit",
+      capability: "brainstorming",
+      allowed_capabilities: ["brainstorming"],
+      query: null,
+      descriptor: null,
+    });
+    const snapshot = await host.load(selected);
+    const started = await host.startPhase({
+      run_id: "run-1",
+      expected_journal_head: head,
+      execution_request_hash: EXECUTION_REQUEST_HASH,
+      selection: selected,
+      phase: "BRAINSTORMING",
+      input: Buffer.from("same-turn shutdown", "utf8"),
+      operation_id: "same-turn-brainstorming",
+      trace: TRACE,
+    });
+    const pending = await host.completePhase({
+      ...completeRequest(started),
+      skill_snapshot_hash: snapshot.document_hash,
+    });
+    if (pending.approval === null) throw new Error("approval request expected");
+    const request = resumeRequest(pending as SuperpowersApprovalOutcome);
+
+    const accepted = host.resumeApproval(request);
+    host.stopIntake();
+    await expect(accepted).resolves.toMatchObject({ state: "RUNNING", replayed: false });
+    await host.flush(new AbortController().signal);
+    expect((await journal.load("run-1"))?.state).toBe("RUNNING");
+
+    const restarted = createSkillsRuntimeHostForTest({
+      statePath,
+      socketPath: path.join(statePath, "runtime.sock"),
+      configuredRoots: [],
+      journal,
+      now: clock(),
+      randomId: ids(1_400),
+      hasServiceListener: () => Promise.resolve("absent"),
+    });
+    await restarted.recover();
+    await expect(restarted.resumeApproval(request)).resolves.toMatchObject({
+      state: "RUNNING",
+      replayed: true,
+    });
+    expect(
+      (await readdir(path.join(statePath, "skills"), { recursive: true })).filter((entry) =>
+        /(?:\.stage|\.claim|\.lock|\.tombstone)(?:\.|$)/u.test(entry),
+      ),
+    ).toEqual([]);
   });
 
   it("keeps exact canonical approval and phase bytes private and bounded", async () => {

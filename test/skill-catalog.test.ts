@@ -924,15 +924,16 @@ describe("skill selection", () => {
       { name: "testing", description: "TOSS test first discipline", capabilities: ["testing"] },
     ]);
     const snapshot = await catalog.discover({ query: null, allowed_capabilities: ["testing"] });
-    expect(
-      catalog.select(snapshot, {
-        mode: "implicit",
-        capability: "testing",
-        allowed_capabilities: ["testing"],
-        query: "test first",
-        descriptor: null,
-      }).descriptor.name,
-    ).toBe("testing");
+    const selected = catalog.select(snapshot, {
+      mode: "implicit",
+      capability: "testing",
+      allowed_capabilities: ["testing"],
+      query: "test first",
+      descriptor: null,
+    });
+    expect(selected.descriptor.name).toBe("testing");
+    expect(selected.catalog_root).toEqual(snapshot);
+    expect(Object.isFrozen(selected.catalog_root)).toBe(true);
     expect(() =>
       catalog.select(snapshot, {
         mode: "implicit",

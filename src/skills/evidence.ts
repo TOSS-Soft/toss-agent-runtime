@@ -8,7 +8,9 @@ import {
 } from "../protocol/json.js";
 import { approvalRequest, decisionMetadata, pendingMetadata } from "./approval.js";
 import {
+  hashSkillCatalog,
   hashSkillExecutionHandoff,
+  parseSkillDescriptor,
   parseSkillExecutionEvidence,
   parseSkillSnapshot,
 } from "./contracts.js";
@@ -24,6 +26,7 @@ import {
 } from "./private-store.js";
 import {
   SKILL_LIMITS,
+  type SkillCatalogRoot,
   type SkillDescriptorReference,
   type SkillExecutionEvidenceV1,
   type SkillSnapshotV1,
@@ -33,6 +36,11 @@ import {
 interface StoredPublicSnapshotRecord {
   readonly schema_version: "skill-private-object.v1";
   readonly snapshot: SkillSnapshotV1;
+}
+
+interface StoredCatalogRootRecord {
+  readonly schema_version: "skill-private-catalog-root.v1";
+  readonly catalog_root: SkillCatalogRoot;
 }
 
 export interface SkillEvidenceBuilder {
@@ -57,7 +65,7 @@ function exactKeys(value: object, keys: readonly string[]): boolean {
   return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
 }
 
-function isRecord(value: JsonValue): value is { readonly [key: string]: JsonValue } {
+function isRecord(value: unknown): value is { readonly [key: string]: JsonValue } {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -112,6 +120,80 @@ function publicSnapshot(bytes: Uint8Array, phase: SuperpowersPhaseV1): StoredPub
   return Object.freeze({ schema_version: "skill-private-object.v1", snapshot: parsed.value });
 }
 
+function descriptorOrder(
+  left: SkillCatalogRoot["descriptors"][number],
+  right: SkillCatalogRoot["descriptors"][number],
+): number {
+  for (const [leftField, rightField] of [
+    [left.name, right.name],
+    [left.version, right.version],
+    [left.source.kind, right.source.kind],
+    [left.source.identity, right.source.identity],
+    [left.package_hash, right.package_hash],
+    [left.document_hash, right.document_hash],
+  ] as const) {
+    const order = Buffer.from(leftField, "utf8").compare(Buffer.from(rightField, "utf8"));
+    if (order !== 0) return order;
+  }
+  return 0;
+}
+
+function publicCatalogRoot(
+  bytes: Uint8Array,
+  expectedHash: `sha256:${string}`,
+): StoredCatalogRootRecord {
+  let value: JsonValue;
+  try {
+    value = parseJsonBytes(bytes, {
+      maxBytes: SKILL_LIMITS.storedObjectBytes,
+      maxDepth: SKILL_LIMITS.nestingDepth + 8,
+      maxMembers: 10_000,
+    });
+  } catch {
+    return integrity();
+  }
+  if (
+    !isRecord(value) ||
+    !exactKeys(value, ["schema_version", "catalog_root"]) ||
+    value.schema_version !== "skill-private-catalog-root.v1" ||
+    !isRecord(value.catalog_root) ||
+    !exactKeys(value.catalog_root, ["descriptors", "catalog_hash"]) ||
+    !Array.isArray(value.catalog_root.descriptors) ||
+    value.catalog_root.descriptors.length > SKILL_LIMITS.packagesPerRoot ||
+    value.catalog_root.catalog_hash !== expectedHash
+  ) {
+    return integrity();
+  }
+  const descriptors = value.catalog_root.descriptors.map((descriptor) => {
+    const parsed = parseSkillDescriptor(canonicalJson(descriptor));
+    if (!parsed.ok) return integrity();
+    return parsed.value;
+  });
+  if (
+    descriptors.some((descriptor, index) =>
+      index === 0 ? false : descriptorOrder(descriptors[index - 1]!, descriptor) >= 0,
+    ) ||
+    hashSkillCatalog(
+      descriptors.map((descriptor) => ({
+        name: descriptor.name,
+        version: descriptor.version,
+        source: descriptor.source,
+        package_hash: descriptor.package_hash,
+        document_hash: descriptor.document_hash,
+      })),
+    ) !== expectedHash
+  ) {
+    return integrity();
+  }
+  return Object.freeze({
+    schema_version: "skill-private-catalog-root.v1",
+    catalog_root: deepFreezeJson({
+      descriptors,
+      catalog_hash: expectedHash,
+    } as unknown as JsonValue) as unknown as SkillCatalogRoot,
+  });
+}
+
 function journalHead(entry: RunJournalEntryV1) {
   return Object.freeze({
     journal_revision: entry.journal_revision,
@@ -146,41 +228,50 @@ export function createSkillEvidenceBuilder(
       if (verified.phases.length === 0 && zeroPhaseCode === null) return null;
       if (verified.phases.length > 512) limitExceeded();
 
-      const approvals = verified.journal.entries
-        .filter((entry) => {
-          const metadata = entry.metadata;
-          return (
-            typeof metadata === "object" &&
-            metadata !== null &&
-            !Array.isArray(metadata) &&
-            (metadata as Readonly<Record<string, JsonValue>>).kind ===
-              "superpowers-approval-pending"
-          );
-        })
-        .map((entry) => {
+      const approvalProjections: Array<{
+        request: ReturnType<typeof approvalRequest>;
+        request_journal_entry: RunJournalEntryV1;
+        decision: ReturnType<typeof decisionMetadata>["decision"] | null;
+        decision_journal_entry: RunJournalEntryV1 | null;
+      }> = [];
+      const pendingByHead = new Map<
+        `sha256:${string}`,
+        {
+          readonly entry: RunJournalEntryV1;
+          readonly projection: (typeof approvalProjections)[number];
+        }
+      >();
+      for (const entry of verified.journal.entries) {
+        const metadata = entry.metadata;
+        const kind =
+          typeof metadata === "object" && metadata !== null && !Array.isArray(metadata)
+            ? (metadata as Readonly<Record<string, JsonValue>>).kind
+            : undefined;
+        if (kind === "superpowers-approval-pending") {
+          if (approvalProjections.length === 128) limitExceeded();
           const pending = pendingMetadata(entry);
-          const request = approvalRequest(pending.phase, journalHead(entry));
-          const successor = verified.journal!.entries.find(
-            (candidate) =>
-              candidate.previous_entry_hash === entry.entry_hash &&
-              typeof candidate.metadata === "object" &&
-              candidate.metadata !== null &&
-              !Array.isArray(candidate.metadata) &&
-              (candidate.metadata as Readonly<Record<string, JsonValue>>).kind ===
-                "superpowers-approval-decision",
-          );
-          const decision =
-            successor === undefined ? null : decisionMetadata(successor, entry).decision;
-          return Object.freeze({
-            request,
-            decision,
-            decision_journal_head: successor === undefined ? null : journalHead(successor),
-          });
-        });
-      if (approvals.length > 128) limitExceeded();
+          const projection = {
+            request: approvalRequest(pending.phase, journalHead(entry)),
+            request_journal_entry: entry,
+            decision: null,
+            decision_journal_entry: null,
+          };
+          approvalProjections.push(projection);
+          if (pendingByHead.has(entry.entry_hash)) integrity();
+          pendingByHead.set(entry.entry_hash, { entry, projection });
+        } else if (kind === "superpowers-approval-decision") {
+          const pending = pendingByHead.get(entry.previous_entry_hash);
+          if (pending === undefined || pending.projection.decision !== null) integrity();
+          pending.projection.decision = decisionMetadata(entry, pending.entry).decision;
+          pending.projection.decision_journal_entry = entry;
+        }
+      }
+      const approvals = approvalProjections.map((projection) => Object.freeze(projection));
 
       const phaseByPackage = new Map<`sha256:${string}`, SuperpowersPhaseV1>();
+      const catalogHashes = new Set<`sha256:${string}`>();
       for (const phase of verified.phases) {
+        catalogHashes.add(phase.catalog_hash);
         const existing = phaseByPackage.get(phase.skill.package_hash);
         if (
           existing !== undefined &&
@@ -192,6 +283,7 @@ export function createSkillEvidenceBuilder(
         phaseByPackage.set(phase.skill.package_hash, existing ?? phase);
       }
       if (phaseByPackage.size > 256) limitExceeded();
+      if (catalogHashes.size > 256) limitExceeded();
 
       const preflight = {
         protocol_version: "runtime-contract.v1" as const,
@@ -200,22 +292,34 @@ export function createSkillEvidenceBuilder(
         run_id: runId,
         journal_head: verified.journal.head,
         run_state: verified.journal.state,
+        terminal_journal_entry: zeroPhaseCode === null ? null : finalJournal,
+        catalogs: [] as readonly SkillCatalogRoot[],
         snapshots: [] as readonly SkillSnapshotV1[],
         phases: verified.phases,
         approvals,
-        terminal_code: verified.phases.at(-1)?.terminal_code ?? zeroPhaseCode,
+        terminal_code: zeroPhaseCode ?? verified.phases.at(-1)?.terminal_code ?? null,
       };
       let worstCaseBytes = Buffer.byteLength(canonicalJson(preflight), "utf8");
       const packageHashes = [...phaseByPackage.keys()].sort((left, right) =>
         Buffer.from(left).compare(Buffer.from(right)),
       );
-      for (const packageHash of packageHashes) {
-        const bytes = await store.objectBytes(packageHash);
+      const orderedCatalogHashes = [...catalogHashes].sort((left, right) =>
+        Buffer.from(left).compare(Buffer.from(right)),
+      );
+      const objectHashes = [...new Set([...orderedCatalogHashes, ...packageHashes])];
+      for (const objectHash of objectHashes) {
+        const bytes = await store.objectBytes(objectHash);
         if (bytes === null) integrity();
         worstCaseBytes += bytes;
         if (worstCaseBytes > SKILL_LIMITS.evidenceBytes) limitExceeded();
       }
 
+      const catalogs: SkillCatalogRoot[] = [];
+      for (const catalogHash of orderedCatalogHashes) {
+        const bytes = await store.readObject(catalogHash);
+        if (bytes === null) integrity();
+        catalogs.push(publicCatalogRoot(bytes, catalogHash).catalog_root);
+      }
       const snapshots: SkillSnapshotV1[] = [];
       for (const packageHash of packageHashes) {
         const bytes = await store.readObject(packageHash);
@@ -228,7 +332,7 @@ export function createSkillEvidenceBuilder(
         Buffer.from(left.document_hash).compare(Buffer.from(right.document_hash)),
       );
 
-      const preimage = { ...preflight, snapshots };
+      const preimage = { ...preflight, catalogs, snapshots };
       const withHandoff = { ...preimage, handoff_hash: hashSkillExecutionHandoff(preimage) };
       const candidate = { ...withHandoff, document_hash: sha256(withHandoff) };
       const bytes = canonicalJson(candidate);

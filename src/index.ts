@@ -325,6 +325,7 @@ export {
   type HashableSuperpowersPhaseV1,
   type ResumeSuperpowersApprovalRequest,
   type RuntimeSkillErrorCode,
+  type SkillCatalogRoot,
   type SkillCatalogSnapshot,
   type SkillContext,
   type SkillContextRequest,

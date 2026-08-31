@@ -68,6 +68,7 @@ export interface CreateSkillLoaderForTestOptions extends CreateSkillLoaderOption
 
 export interface SkillLoader {
   recover(): Promise<void>;
+  retainCatalogRoot(selection: SkillSelection): Promise<void>;
   load(selection: SkillSelection): Promise<SkillSnapshotV1>;
   assembleContext(selection: SkillSelection, request: SkillContextRequest): Promise<SkillContext>;
 }
@@ -874,8 +875,25 @@ function createLoader(
       selection,
     );
   };
+  const retainCatalogRoot = async (selection: SkillSelection): Promise<void> => {
+    resolveSkillSelectionForLoader(options.catalog, selection);
+    const record = {
+      schema_version: "skill-private-catalog-root.v1" as const,
+      catalog_root: selection.catalog_root,
+    };
+    const canonical = Buffer.from(canonicalJson(record as unknown as JsonValue), "utf8");
+    if (canonical.byteLength > SKILL_LIMITS.storedObjectBytes) limitExceeded();
+    const replay = await store.readObject(selection.catalog_hash);
+    if (replay !== null) {
+      if (!Buffer.from(replay).equals(canonical)) integrity();
+      return;
+    }
+    const published = await store.publishObject(selection.catalog_hash, canonical);
+    if (!Buffer.from(published).equals(canonical)) integrity();
+  };
   return {
     recover: () => store.recover(),
+    retainCatalogRoot,
     async load(selection: SkillSelection): Promise<SkillSnapshotV1> {
       const record = await exactRecord(selection);
       return deepFreezeJson(record.snapshot as unknown as JsonValue) as unknown as SkillSnapshotV1;

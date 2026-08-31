@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   chmod,
   link,
@@ -40,6 +41,55 @@ const TRACE = {
   trace_flags: 1,
 } as const;
 
+function rawHash(bytes: Uint8Array): `sha256:${string}` {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+function skillStoreClaim(
+  ownerPid: number,
+  operationId: string,
+  objectHash: `sha256:${string}`,
+  record: Uint8Array,
+): Uint8Array {
+  return Buffer.from(
+    canonicalJson({
+      schema_version: "skill-store-operation.v1",
+      operation_id: operationId,
+      owner_pid: ownerPid,
+      created_at: "2026-08-19T11:59:59.000Z",
+      object_hash: objectHash,
+      record_bytes: record.byteLength,
+      record_hash: rawHash(record),
+    }),
+    "utf8",
+  );
+}
+
+function skillStoreTombstone(
+  kind: "claim" | "stage",
+  ownerPid: number,
+  operationId: string,
+  artifact: "claim" | "stage",
+  bytes: Uint8Array,
+): string {
+  return `.delete-${kind}-${ownerPid}-${operationId}-${artifact}-${bytes.byteLength}-${rawHash(bytes).slice("sha256:".length)}.tombstone`;
+}
+
+async function privateStaleSocket(socketPath: string): Promise<void> {
+  const runtimePath = path.dirname(socketPath);
+  await mkdir(runtimePath, { recursive: true, mode: 0o700 });
+  const sourceSocket = path.join(runtimePath, "crash-source.sock");
+  const crashed = createServer();
+  await new Promise<void>((resolve, reject) => {
+    crashed.once("error", reject);
+    crashed.listen(sourceSocket, resolve);
+  });
+  await chmod(sourceSocket, 0o600);
+  await link(sourceSocket, socketPath);
+  await unlink(sourceSocket);
+  await new Promise<void>((resolve) => crashed.close(() => resolve()));
+}
+
 function journalCommand(
   runId: string,
   state: RunState,
@@ -78,6 +128,177 @@ afterEach(async () => {
 });
 
 describe("serve command lifecycle integration", () => {
+  it("recovers every observable private-object publication and cleanup cut before readiness", async () => {
+    const root = await realpath(
+      await mkdtemp(path.join(await realpath("/tmp"), "toss-object-cuts-")),
+    );
+    temporaryDirectories.push(root);
+    await chmod(root, 0o700);
+    const config = defaultConfig("darwin", root);
+    const objectsPath = path.join(config.paths.state, "skills", "objects");
+    await mkdir(objectsPath, { recursive: true, mode: 0o700 });
+    const ownerPid = 999_991;
+
+    const cuts = [
+      "claim-created",
+      "stage-created",
+      "stage-partial",
+      "stage-full",
+      "publication-linked-and-dirsynced",
+      "stage-cleaned",
+      "stage-cleanup-tombstone",
+      "claim-cleanup-tombstone",
+    ] as const;
+    for (const [index, cut] of cuts.entries()) {
+      const digit = String(index + 1);
+      const objectHash = `sha256:${digit.repeat(64)}` as const;
+      const operationId = `70000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`;
+      const record = Buffer.from(canonicalJson({ cut, index }), "utf8");
+      const claim = skillStoreClaim(ownerPid, operationId, objectHash, record);
+      const claimPath = path.join(objectsPath, `.object-${ownerPid}-${operationId}.claim`);
+      const stagePath = path.join(objectsPath, `.object-${ownerPid}-${operationId}.stage`);
+      const finalPath = path.join(objectsPath, `${objectHash}.json`);
+
+      if (cut === "claim-cleanup-tombstone") {
+        await writeFile(finalPath, record, { mode: 0o600 });
+        await writeFile(
+          path.join(
+            objectsPath,
+            skillStoreTombstone("claim", ownerPid, operationId, "claim", claim),
+          ),
+          claim,
+          { mode: 0o600 },
+        );
+        continue;
+      }
+      await writeFile(claimPath, claim, { mode: 0o600 });
+      if (cut === "claim-created" || cut === "stage-cleaned") {
+        if (cut === "stage-cleaned") await writeFile(finalPath, record, { mode: 0o600 });
+        continue;
+      }
+      if (cut === "stage-cleanup-tombstone") {
+        await writeFile(finalPath, record, { mode: 0o600 });
+        await link(
+          finalPath,
+          path.join(
+            objectsPath,
+            skillStoreTombstone("stage", ownerPid, operationId, "stage", record),
+          ),
+        );
+        continue;
+      }
+      const stage =
+        cut === "stage-created"
+          ? Buffer.alloc(0)
+          : cut === "stage-partial"
+            ? record.subarray(0, Math.max(1, record.byteLength - 1))
+            : record;
+      await writeFile(stagePath, stage, { mode: 0o600 });
+      if (cut === "publication-linked-and-dirsynced") await link(stagePath, finalPath);
+    }
+    await privateStaleSocket(config.paths.socket);
+
+    const signals = new FakeSignals();
+    let resolveReady: (() => void) | undefined;
+    const ready = new Promise<void>((resolve) => {
+      resolveReady = resolve;
+    });
+    const services = createMainServices({
+      platform: { os: "darwin", arch: "arm64", node: "24.20.0" },
+      env: {},
+      home: root,
+      signals,
+      pid: process.pid,
+      now: () => new Date("2026-08-19T12:00:00.000Z"),
+      createServiceInstanceId: () => "018f0f64-7b21-7d4f-8c3d-4a30413d5f42",
+      resolveExecutableHash: () => Promise.resolve("a".repeat(64)),
+      sendReady: () => resolveReady?.(),
+    });
+
+    const running = services.serve?.({});
+    await ready;
+    expect(await transientSkillArtifacts(path.join(config.paths.state, "skills"))).toEqual([]);
+    expect((await readdir(objectsPath)).sort()).toEqual(
+      cuts
+        .filter((cut) =>
+          [
+            "publication-linked-and-dirsynced",
+            "stage-cleaned",
+            "stage-cleanup-tombstone",
+            "claim-cleanup-tombstone",
+          ].includes(cut),
+        )
+        .map((cut) => `${`sha256:${String(cuts.indexOf(cut) + 1).repeat(64)}`}.json`)
+        .sort(),
+    );
+    signals.emit("SIGTERM");
+    await expect(running).resolves.toMatchObject({ forced: false });
+  });
+
+  it.each(["live-listener", "unknown-socket", "conflicting-final"] as const)(
+    "withholds readiness and preserves object recovery state for %s authority",
+    async (authority) => {
+      const root = await realpath(
+        await mkdtemp(path.join(await realpath("/tmp"), `toss-object-${authority}-`)),
+      );
+      temporaryDirectories.push(root);
+      await chmod(root, 0o700);
+      const config = defaultConfig("darwin", root);
+      const objectsPath = path.join(config.paths.state, "skills", "objects");
+      await mkdir(objectsPath, { recursive: true, mode: 0o700 });
+      const ownerPid = 999_991;
+      const operationId = "70000000-0000-4000-8000-000000000099";
+      const objectHash = `sha256:${"9".repeat(64)}` as const;
+      const record = Buffer.from(canonicalJson({ authority }), "utf8");
+      const claim = skillStoreClaim(ownerPid, operationId, objectHash, record);
+      const claimPath = path.join(objectsPath, `.object-${ownerPid}-${operationId}.claim`);
+      await writeFile(claimPath, claim, { mode: 0o600 });
+      if (authority === "conflicting-final") {
+        await writeFile(
+          path.join(objectsPath, `${objectHash}.json`),
+          Buffer.from(canonicalJson({ replacement: true }), "utf8"),
+          { mode: 0o600 },
+        );
+      }
+
+      await mkdir(path.dirname(config.paths.socket), { recursive: true, mode: 0o700 });
+      let listener: ReturnType<typeof createServer> | undefined;
+      if (authority === "live-listener") {
+        listener = createServer();
+        await new Promise<void>((resolve, reject) => {
+          listener!.once("error", reject);
+          listener!.listen(config.paths.socket, resolve);
+        });
+        await chmod(config.paths.socket, 0o600);
+      } else if (authority === "unknown-socket") {
+        await writeFile(config.paths.socket, "not a socket", { mode: 0o600 });
+      }
+
+      const signals = new FakeSignals();
+      let ready = false;
+      const services = createMainServices({
+        platform: { os: "darwin", arch: "arm64", node: "24.20.0" },
+        env: {},
+        home: root,
+        signals,
+        pid: process.pid,
+        now: () => new Date("2026-08-19T12:00:00.000Z"),
+        createServiceInstanceId: () => "018f0f64-7b21-7d4f-8c3d-4a30413d5f42",
+        resolveExecutableHash: () => Promise.resolve("a".repeat(64)),
+        sendReady: () => {
+          ready = true;
+        },
+      });
+
+      await expect(services.serve?.({})).rejects.toBeDefined();
+      expect(ready).toBe(false);
+      await expect(readFile(claimPath)).resolves.toEqual(claim);
+      if (listener !== undefined) {
+        await new Promise<void>((resolve) => listener.close(() => resolve()));
+      }
+    },
+  );
+
   it("recovers a dead phase artifact before readiness despite a private stale socket", async () => {
     const root = await realpath(await mkdtemp(path.join(await realpath("/tmp"), "toss-restart-")));
     temporaryDirectories.push(root);
@@ -101,18 +322,7 @@ describe("serve command lifecycle integration", () => {
       }),
       { mode: 0o600 },
     );
-    const runtimePath = path.dirname(config.paths.socket);
-    await mkdir(runtimePath, { recursive: true, mode: 0o700 });
-    const sourceSocket = path.join(runtimePath, "crash-source.sock");
-    const crashed = createServer();
-    await new Promise<void>((resolve, reject) => {
-      crashed.once("error", reject);
-      crashed.listen(sourceSocket, resolve);
-    });
-    await chmod(sourceSocket, 0o600);
-    await link(sourceSocket, config.paths.socket);
-    await unlink(sourceSocket);
-    await new Promise<void>((resolve) => crashed.close(() => resolve()));
+    await privateStaleSocket(config.paths.socket);
 
     const signals = new FakeSignals();
     let resolveReady: (() => void) | undefined;

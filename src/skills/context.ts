@@ -3,7 +3,12 @@ import { createHash } from "node:crypto";
 import { canonicalJson, deepFreezeJson, sha256, type JsonValue } from "../protocol/json.js";
 import { parseSkillSnapshot } from "./contracts.js";
 import { RuntimeSkillError } from "./errors.js";
-import { SKILL_LIMITS, type SkillSnapshotV1, type SuperpowersPhaseName } from "./types.js";
+import {
+  SKILL_LIMITS,
+  type SkillContextResourceAccounting,
+  type SkillSnapshotV1,
+  type SuperpowersPhaseName,
+} from "./types.js";
 
 export interface SkillContextRequest {
   readonly snapshot: SkillSnapshotV1;
@@ -54,6 +59,7 @@ export interface SkillContext {
   readonly remaining_bytes: number;
   readonly remaining_tokens: number;
   readonly truncations: readonly SkillContextTruncation[];
+  readonly resource_accounting: readonly SkillContextResourceAccounting[];
   readonly context_hash: `sha256:${string}`;
 }
 
@@ -251,6 +257,23 @@ export function assembleSkillContext(
   const originalTokens =
     tokens(material.skill_markdown.byteLength) +
     [...mandatory, ...optional].reduce((total, resource) => total + tokens(resource.bytes), 0);
+  const segmentByPath = new Map(selected.slice(1).map((entry) => [entry.path, entry]));
+  const resourceAccounting = snapshot.resources.map((resource) => {
+    const included = segmentByPath.get(resource.path);
+    const includedBytes = included?.included_bytes ?? 0;
+    const state: SkillContextResourceAccounting["state"] =
+      includedBytes === 0 ? "OMITTED" : includedBytes === resource.bytes ? "INCLUDED" : "PARTIAL";
+    return {
+      path: resource.path,
+      source_hash: resource.hash,
+      state,
+      original_bytes: resource.bytes,
+      included_bytes: includedBytes,
+      included_hash: included?.included_hash ?? null,
+      original_conservative_units: tokens(resource.bytes),
+      included_conservative_units: tokens(includedBytes),
+    };
+  });
   const hashable = {
     snapshot: {
       name: snapshot.descriptor.name,
@@ -269,6 +292,7 @@ export function assembleSkillContext(
     remaining_bytes: request.max_bytes - includedBytes,
     remaining_tokens: request.max_tokens - includedTokens,
     truncations,
+    resource_accounting: resourceAccounting,
   };
   return deepFreezeJson({
     ...hashable,

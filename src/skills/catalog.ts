@@ -28,6 +28,7 @@ import { RuntimeSkillError } from "./errors.js";
 import { assertConfiguredSkillRootPath, assertSkillRelativePath } from "./paths.js";
 import {
   SKILL_LIMITS,
+  type SkillCatalogRoot,
   type SkillDescriptorReference,
   type SkillDescriptorV1,
   type SkillResourceRole,
@@ -76,10 +77,7 @@ export interface SkillDiscoveryRequest {
   readonly allowed_capabilities: readonly string[];
 }
 
-export interface SkillCatalogSnapshot {
-  readonly descriptors: readonly SkillDescriptorV1[];
-  readonly catalog_hash: `sha256:${string}`;
-}
+export type SkillCatalogSnapshot = SkillCatalogRoot;
 
 export interface SkillSelectionRequest {
   readonly mode: "explicit" | "implicit";
@@ -92,6 +90,7 @@ export interface SkillSelectionRequest {
 export interface SkillSelection {
   readonly descriptor: SkillDescriptorV1;
   readonly catalog_hash: `sha256:${string}`;
+  readonly catalog_root: SkillCatalogRoot;
   readonly package_handle: `sha256:${string}`;
 }
 
@@ -1401,6 +1400,7 @@ const INTERNAL_RESOLVE: unique symbol = Symbol("skill-catalog-loader-resolver");
 interface RetainedSkillSelection {
   readonly entry: PrivateCatalogEntry;
   readonly catalogHash: `sha256:${string}`;
+  readonly catalogRoot: SkillCatalogRoot;
   readonly packageHandle: `sha256:${string}`;
 }
 
@@ -1519,14 +1519,19 @@ class FileSystemSkillCatalog implements SkillCatalog {
       descriptor: referenceOf(entry.descriptor),
       manifest_identity: entry.manifestIdentity,
     });
+    const catalogRoot = deepFreezeJson(
+      parseJsonBytes(canonicalJson(snapshot)),
+    ) as unknown as SkillCatalogRoot;
     const selection = deepFreezeJson({
       descriptor: entry.descriptor,
       catalog_hash: snapshot.catalog_hash,
+      catalog_root: catalogRoot,
       package_handle: packageHandle,
     } as unknown as JsonValue) as unknown as SkillSelection;
     this.selections.set(selection, {
       entry,
       catalogHash: snapshot.catalog_hash,
+      catalogRoot,
       packageHandle,
     });
     return selection;
@@ -1534,7 +1539,12 @@ class FileSystemSkillCatalog implements SkillCatalog {
 
   [INTERNAL_RESOLVE](selection: SkillSelection): InternalSkillPackageSource {
     if (
-      !isClosedDataObject(selection, ["descriptor", "catalog_hash", "package_handle"]) ||
+      !isClosedDataObject(selection, [
+        "descriptor",
+        "catalog_hash",
+        "catalog_root",
+        "package_handle",
+      ]) ||
       typeof selection.catalog_hash !== "string" ||
       !HASH_PATTERN.test(selection.catalog_hash) ||
       typeof selection.package_handle !== "string" ||
@@ -1559,6 +1569,7 @@ class FileSystemSkillCatalog implements SkillCatalog {
     });
     if (
       selection.catalog_hash !== retained.catalogHash ||
+      selection.catalog_root !== retained.catalogRoot ||
       selection.package_handle !== retained.packageHandle ||
       selection.package_handle !== expectedHandle ||
       canonicalJson(parsed.value) !== canonicalJson(entry.descriptor)

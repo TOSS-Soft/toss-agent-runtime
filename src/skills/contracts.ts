@@ -5,6 +5,7 @@ import {
   type JsonLimits,
   type JsonValue,
 } from "../protocol/json.js";
+import { parseRunJournalEntry } from "../journal/entry.js";
 import type {
   RuntimeDocument,
   ValidationFailure,
@@ -28,6 +29,8 @@ import type {
 } from "./types.js";
 import { SKILL_LIMITS } from "./types.js";
 import { builtInSuperpowersHandler, requiredBuiltInPhasePredecessors } from "./phases.js";
+import { isRuntimeSkillErrorCode } from "./errors.js";
+import { assertSkillRelativePath } from "./paths.js";
 
 const VALIDATOR = createProtocolValidator();
 
@@ -35,6 +38,12 @@ const DOCUMENT_LIMITS: JsonLimits = Object.freeze({
   maxBytes: SKILL_LIMITS.storedObjectBytes,
   maxDepth: SKILL_LIMITS.nestingDepth,
   maxMembers: 10_000,
+});
+
+const EVIDENCE_LIMITS: JsonLimits = Object.freeze({
+  maxBytes: SKILL_LIMITS.evidenceBytes,
+  maxDepth: SKILL_LIMITS.nestingDepth + 8,
+  maxMembers: 20_000,
 });
 
 type JsonRecord = { readonly [key: string]: JsonValue };
@@ -71,8 +80,9 @@ function orderedUnique(values: readonly string[]): boolean {
 
 function hashable<T extends { readonly document_hash: `sha256:${string}` }>(
   value: T,
+  limits: JsonLimits = DOCUMENT_LIMITS,
 ): Omit<T, "document_hash"> {
-  const normalized = parseJsonBytes(canonicalJson(value, DOCUMENT_LIMITS), DOCUMENT_LIMITS);
+  const normalized = parseJsonBytes(canonicalJson(value, limits), limits);
   if (!isRecord(normalized)) throw new TypeError("skill document must be an object");
   const result = { ...normalized };
   delete result.document_hash;
@@ -110,13 +120,13 @@ export function hashSuperpowersApproval(value: SuperpowersApprovalV1): `sha256:$
 }
 
 export function hashSkillExecutionEvidence(value: SkillExecutionEvidenceV1): `sha256:${string}` {
-  return documentHash(value);
+  return sha256(hashable(value, EVIDENCE_LIMITS), EVIDENCE_LIMITS);
 }
 
 export function hashSkillExecutionHandoff(
   value: Omit<SkillExecutionEvidenceV1, "handoff_hash" | "document_hash">,
 ): `sha256:${string}` {
-  return sha256({ schema_version: "skill-execution-handoff.v1", evidence: value }, DOCUMENT_LIMITS);
+  return sha256({ schema_version: "skill-execution-handoff.v1", evidence: value }, EVIDENCE_LIMITS);
 }
 
 export function hashSkillPackage(
@@ -290,13 +300,69 @@ function phaseIssues(value: SuperpowersPhaseV1): readonly ValidationIssue[] {
     );
   }
   const accounting = value.context_accounting;
+  const members = [accounting.skill_markdown, ...accounting.resources];
+  const invalidMember = members.some((resource, index) => {
+    if (index > 0) {
+      try {
+        assertSkillRelativePath(resource.path);
+      } catch {
+        return true;
+      }
+    }
+    const originalUnits = Math.ceil(resource.original_bytes / 4);
+    const includedUnits = Math.ceil(resource.included_bytes / 4);
+    if (
+      resource.original_conservative_units !== originalUnits ||
+      resource.included_conservative_units !== includedUnits ||
+      resource.included_bytes > resource.original_bytes
+    ) {
+      return true;
+    }
+    if (resource.state === "INCLUDED") {
+      return (
+        resource.included_bytes !== resource.original_bytes ||
+        resource.included_hash === null ||
+        resource.included_hash !== resource.source_hash
+      );
+    }
+    if (resource.state === "PARTIAL") {
+      return (
+        resource.included_bytes <= 0 ||
+        resource.included_bytes >= resource.original_bytes ||
+        resource.included_hash === null
+      );
+    }
+    return (
+      resource.included_bytes !== 0 ||
+      resource.included_hash !== null ||
+      resource.included_conservative_units !== 0
+    );
+  });
+  const originalBytes = members.reduce((total, resource) => total + resource.original_bytes, 0);
+  const includedBytes = members.reduce((total, resource) => total + resource.included_bytes, 0);
+  const originalUnits = members.reduce(
+    (total, resource) => total + resource.original_conservative_units,
+    0,
+  );
+  const includedUnits = members.reduce(
+    (total, resource) => total + resource.included_conservative_units,
+    0,
+  );
   if (
-    accounting.included_utf8_bytes > accounting.original_utf8_bytes ||
-    accounting.included_conservative_units > accounting.original_conservative_units ||
-    accounting.segment_count < accounting.included_resource_hashes.length ||
-    new Set([...accounting.included_resource_hashes, ...accounting.omitted_resource_hashes])
-      .size !==
-      accounting.included_resource_hashes.length + accounting.omitted_resource_hashes.length
+    invalidMember ||
+    !orderedUnique(accounting.resources.map((resource) => resource.path)) ||
+    accounting.resources.some((resource) => resource.path === "SKILL.md") ||
+    accounting.original_utf8_bytes !== originalBytes ||
+    accounting.included_utf8_bytes !== includedBytes ||
+    accounting.original_conservative_units !== originalUnits ||
+    accounting.included_conservative_units !== includedUnits ||
+    accounting.segment_count !==
+      members.filter((resource) => resource.state !== "OMITTED").length ||
+    accounting.truncation_count !==
+      accounting.resources.filter((resource) => resource.state === "PARTIAL").length ||
+    accounting.included_utf8_bytes + accounting.remaining_bytes > SKILL_LIMITS.phaseInputBytes ||
+    accounting.included_conservative_units + accounting.remaining_conservative_units >
+      Math.ceil(SKILL_LIMITS.phaseInputBytes / 4)
   ) {
     issues.push(issue("/context_accounting", "accounting", "context accounting is inconsistent"));
   }
@@ -315,6 +381,21 @@ function approvalIssues(value: SuperpowersApprovalV1): readonly ValidationIssue[
 
 function exactJson(left: unknown, right: unknown): boolean {
   return canonicalJson(left) === canonicalJson(right);
+}
+
+function catalogDescriptorOrder(left: SkillDescriptorV1, right: SkillDescriptorV1): number {
+  for (const [leftField, rightField] of [
+    [left.name, right.name],
+    [left.version, right.version],
+    [left.source.kind, right.source.kind],
+    [left.source.identity, right.source.identity],
+    [left.package_hash, right.package_hash],
+    [left.document_hash, right.document_hash],
+  ] as const) {
+    const order = bytewiseCompare(leftField, rightField);
+    if (order !== 0) return order;
+  }
+  return 0;
 }
 
 function sameEvidencePhaseBinding(left: SuperpowersPhaseV1, right: SuperpowersPhaseV1): boolean {
@@ -336,11 +417,47 @@ function sameEvidencePhaseBinding(left: SuperpowersPhaseV1, right: SuperpowersPh
 
 function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIssue[] {
   const issues: ValidationIssue[] = [];
+  const catalogHashes = value.catalogs.map((catalog) => catalog.catalog_hash);
+  if (!orderedUnique(catalogHashes)) {
+    issues.push(issue("/catalogs", "order", "catalog roots must be hash-sorted and unique"));
+  }
+  const catalogs = new Map(value.catalogs.map((catalog) => [catalog.catalog_hash, catalog]));
+  const catalogMembers = new Map<
+    `sha256:${string}`,
+    ReadonlyMap<`sha256:${string}`, SkillDescriptorV1>
+  >();
+  for (const [index, catalog] of value.catalogs.entries()) {
+    const descriptors = catalog.descriptors;
+    const references = descriptors.map((descriptor) => ({
+      name: descriptor.name,
+      version: descriptor.version,
+      source: descriptor.source,
+      package_hash: descriptor.package_hash,
+      document_hash: descriptor.document_hash,
+    }));
+    if (
+      descriptors.some((descriptor) => !parseSkillDescriptor(canonicalJson(descriptor)).ok) ||
+      descriptors.some(
+        (descriptor, descriptorIndex) =>
+          descriptorIndex > 0 &&
+          catalogDescriptorOrder(descriptors[descriptorIndex - 1]!, descriptor) >= 0,
+      ) ||
+      hashSkillCatalog(references) !== catalog.catalog_hash
+    ) {
+      issues.push(issue(`/catalogs/${index}`, "binding", "catalog root is inconsistent"));
+    }
+    catalogMembers.set(
+      catalog.catalog_hash,
+      new Map(descriptors.map((descriptor) => [descriptor.document_hash, descriptor])),
+    );
+  }
   const snapshotHashes = value.snapshots.map((snapshot) => snapshot.document_hash);
   if (!orderedUnique(snapshotHashes)) {
     issues.push(issue("/snapshots", "order", "snapshots must be hash-sorted and unique"));
   }
   const snapshots = new Map(value.snapshots.map((snapshot) => [snapshot.document_hash, snapshot]));
+  const usedSnapshots = new Set<`sha256:${string}`>();
+  const usedCatalogs = new Set<`sha256:${string}`>();
   for (const [index, snapshot] of value.snapshots.entries()) {
     if (!parseSkillSnapshot(canonicalJson(snapshot)).ok) {
       issues.push(issue(`/snapshots/${index}`, "innerDocument", "snapshot is not self-verifying"));
@@ -368,10 +485,30 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
             package_hash: snapshot.descriptor.package_hash,
             document_hash: snapshot.descriptor.document_hash,
           };
+    const contextMatchesSnapshot =
+      snapshot !== undefined &&
+      phase.context_accounting.skill_markdown.source_hash === snapshot.skill_markdown_hash &&
+      phase.context_accounting.skill_markdown.original_bytes === snapshot.skill_markdown_bytes &&
+      phase.context_accounting.resources.length === snapshot.resources.length &&
+      phase.context_accounting.resources.every((accounted, resourceIndex) => {
+        const resource = snapshot.resources[resourceIndex];
+        if (
+          resource === undefined ||
+          accounted.path !== resource.path ||
+          accounted.source_hash !== resource.hash ||
+          accounted.original_bytes !== resource.bytes
+        ) {
+          return false;
+        }
+        const applicable = resource.role === "reference" && resource.phases.includes(phase.phase);
+        if (!applicable) return accounted.state === "OMITTED";
+        return resource.priority !== null || accounted.state === "INCLUDED";
+      });
     if (!parseSuperpowersPhase(canonicalJson(phase)).ok) {
       issues.push(issue(`/phases/${index}`, "innerDocument", "phase is not self-verifying"));
     }
     const handler = builtInSuperpowersHandler(phase.phase);
+    const catalogMember = catalogMembers.get(phase.catalog_hash)?.get(phase.skill.document_hash);
     if (
       phase.run_id !== value.run_id ||
       phase.phase_revision !== index + 1 ||
@@ -380,6 +517,24 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
       phase.skill.name !== handler.capability ||
       phase.handler.version !== handler.version ||
       phase.handler.hash !== handler.hash ||
+      !contextMatchesSnapshot ||
+      catalogMember === undefined ||
+      !exactJson(
+        {
+          name: catalogMember.name,
+          version: catalogMember.version,
+          source: catalogMember.source,
+          package_hash: catalogMember.package_hash,
+          document_hash: catalogMember.document_hash,
+        },
+        {
+          name: phase.skill.name,
+          version: phase.skill.version,
+          source: phase.skill.source,
+          package_hash: phase.skill.package_hash,
+          document_hash: phase.skill.document_hash,
+        },
+      ) ||
       reference === null ||
       canonicalJson(reference) !==
         canonicalJson({
@@ -392,6 +547,8 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
     ) {
       issues.push(issue(`/phases/${index}`, "binding", "phase history binding is inconsistent"));
     }
+    usedSnapshots.add(phase.skill.snapshot_hash);
+    usedCatalogs.add(phase.catalog_hash);
     if (executionRequestHash === null) executionRequestHash = phase.execution_request_hash;
     else if (executionRequestHash !== phase.execution_request_hash) {
       issues.push(
@@ -454,7 +611,28 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
       unmatched = null;
     }
   }
+  if (
+    usedSnapshots.size !== snapshots.size ||
+    usedCatalogs.size !== catalogs.size ||
+    [...usedSnapshots].some((snapshotHash) => !snapshots.has(snapshotHash)) ||
+    [...snapshots.keys()].some((snapshotHash) => !usedSnapshots.has(snapshotHash)) ||
+    [...usedCatalogs].some((catalogHash) => !catalogs.has(catalogHash)) ||
+    [...catalogs.keys()].some((catalogHash) => !usedCatalogs.has(catalogHash))
+  ) {
+    issues.push(
+      issue("/snapshots", "projection", "snapshot and catalog roots must be used exactly once"),
+    );
+  }
 
+  const phasesByHash = new Map(value.phases.map((phase) => [phase.document_hash, phase]));
+  const phaseByPreviousHash = new Map(
+    value.phases.slice(1).map((phase) => [phase.previous_phase_hash, phase]),
+  );
+  const pendingPhaseHashes = new Set(
+    value.phases
+      .filter((phase) => phase.status === "APPROVAL_PENDING")
+      .map((phase) => phase.document_hash),
+  );
   const requests = new Set<string>();
   const decisions = new Set<string>();
   for (const [index, approval] of value.approvals.entries()) {
@@ -463,9 +641,9 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
       approval.decision === null
         ? null
         : parseSuperpowersApproval(canonicalJson(approval.decision));
-    const phase = value.phases.find(
-      (candidate) => candidate.document_hash === approval.request.phase_document_hash,
-    );
+    const phase = phasesByHash.get(approval.request.phase_document_hash);
+    const requestEntryResult = parseRunJournalEntry(canonicalJson(approval.request_journal_entry));
+    const requestEntry = approval.request_journal_entry;
     if (
       !requestResult.ok ||
       approval.request.kind !== "REQUEST" ||
@@ -477,6 +655,19 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
       approval.request.skill_version !== phase.skill.version ||
       approval.request.skill_snapshot_hash !== phase.skill.snapshot_hash ||
       approval.request.phase_operation_id !== phase.operation_id ||
+      !requestEntryResult.ok ||
+      requestEntry.run_id !== value.run_id ||
+      requestEntry.previous_entry_hash !== phase.observed_journal_head.entry_hash ||
+      requestEntry.journal_revision !== phase.observed_journal_head.journal_revision + 1 ||
+      requestEntry.sequence !== phase.observed_journal_head.sequence + 1 ||
+      requestEntry.previous_state !== "RUNNING" ||
+      requestEntry.state !== "APPROVAL_PENDING" ||
+      !exactJson(requestEntry.metadata, { kind: "superpowers-approval-pending", phase }) ||
+      !exactJson(approval.request.pending_journal_head, {
+        journal_revision: requestEntry.journal_revision,
+        sequence: requestEntry.sequence,
+        entry_hash: requestEntry.entry_hash,
+      }) ||
       requests.has(approval.request.document_hash)
     ) {
       issues.push(
@@ -484,19 +675,22 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
       );
     }
     requests.add(approval.request.document_hash);
+    if (phase !== undefined) pendingPhaseHashes.delete(phase.document_hash);
     if (approval.decision === null) {
-      if (approval.decision_journal_head !== null) {
+      if (approval.decision_journal_entry !== null) {
         issues.push(
-          issue(`/approvals/${index}`, "decisionHead", "missing decision has no journal head"),
+          issue(`/approvals/${index}`, "decisionEntry", "missing decision has no journal entry"),
         );
       }
     } else {
-      const terminal = value.phases.find(
-        (candidate) => candidate.previous_phase_hash === phase?.document_hash,
-      );
+      const terminal =
+        phase === undefined ? undefined : phaseByPreviousHash.get(phase.document_hash);
       const expectedStatus = approval.decision.decision === "APPROVE" ? "COMPLETED" : "BLOCKED";
       const expectedCode =
         approval.decision.decision === "APPROVE" ? null : "RUNTIME_SKILL_APPROVAL_REJECTED";
+      const decisionEntry = approval.decision_journal_entry;
+      const decisionEntryResult =
+        decisionEntry === null ? null : parseRunJournalEntry(canonicalJson(decisionEntry));
       if (
         decisionResult === null ||
         !decisionResult.ok ||
@@ -512,8 +706,25 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
         approval.decision.phase_operation_id !== approval.request.phase_operation_id ||
         terminal?.status !== expectedStatus ||
         terminal.terminal_code !== expectedCode ||
-        approval.decision_journal_head === null ||
-        approval.decision_journal_head.sequence <= approval.request.pending_journal_head.sequence ||
+        terminal.output_hash !==
+          (approval.decision.decision === "APPROVE" ? phase?.output_hash : null) ||
+        decisionEntry === null ||
+        decisionEntryResult === null ||
+        !decisionEntryResult.ok ||
+        decisionEntry.run_id !== value.run_id ||
+        decisionEntry.previous_entry_hash !== requestEntry.entry_hash ||
+        decisionEntry.journal_revision !== requestEntry.journal_revision + 1 ||
+        decisionEntry.sequence !== requestEntry.sequence + 1 ||
+        decisionEntry.previous_state !== "APPROVAL_PENDING" ||
+        decisionEntry.state !==
+          (approval.decision.decision === "APPROVE" ? "RUNNING" : "BLOCKED") ||
+        !exactJson(decisionEntry.metadata, {
+          kind: "superpowers-approval-decision",
+          request: approval.request,
+          decision: approval.decision,
+          occurred_at: terminal?.occurred_at,
+          phase: terminal,
+        }) ||
         decisions.has(approval.decision.document_hash)
       ) {
         issues.push(
@@ -522,6 +733,9 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
       }
       decisions.add(approval.decision.document_hash);
     }
+  }
+  if (pendingPhaseHashes.size !== 0) {
+    issues.push(issue("/approvals", "projection", "every pending phase requires one approval"));
   }
   if (
     value.approvals.some(
@@ -532,7 +746,7 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
     ) ||
     value.approvals.some(
       (approval) =>
-        (approval.decision_journal_head ?? approval.request.pending_journal_head).sequence >
+        (approval.decision_journal_entry?.sequence ?? approval.request_journal_entry.sequence) >
         value.journal_head.sequence,
     )
   ) {
@@ -540,7 +754,52 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
   }
 
   const latest = value.phases.at(-1);
-  const expectedTerminal = latest?.terminal_code ?? null;
+  const unresolvedApprovals = value.approvals.filter((approval) => approval.decision === null);
+  const unresolvedApproval = unresolvedApprovals[0];
+  const approvalPendingTruth =
+    unresolvedApprovals.length === 1 &&
+    unresolvedApproval !== undefined &&
+    latest?.status === "APPROVAL_PENDING" &&
+    latest.document_hash === unresolvedApproval.request.phase_document_hash &&
+    exactJson(value.journal_head, {
+      journal_revision: unresolvedApproval.request_journal_entry.journal_revision,
+      sequence: unresolvedApproval.request_journal_entry.sequence,
+      entry_hash: unresolvedApproval.request_journal_entry.entry_hash,
+    });
+  if (
+    (value.run_state === "APPROVAL_PENDING") !== approvalPendingTruth ||
+    unresolvedApprovals.length > 1
+  ) {
+    issues.push(
+      issue("/run_state", "approvalState", "approval-pending state is not current journal truth"),
+    );
+  }
+  const terminalEntry = value.terminal_journal_entry;
+  const terminalEntryResult =
+    terminalEntry === null ? null : parseRunJournalEntry(canonicalJson(terminalEntry));
+  if (
+    terminalEntry !== null &&
+    (terminalEntryResult === null ||
+      !terminalEntryResult.ok ||
+      terminalEntry.run_id !== value.run_id ||
+      terminalEntry.entry_hash !== value.journal_head.entry_hash ||
+      terminalEntry.journal_revision !== value.journal_head.journal_revision ||
+      terminalEntry.sequence !== value.journal_head.sequence ||
+      terminalEntry.state !== value.run_state ||
+      (terminalEntry.state !== "FAILED" && terminalEntry.state !== "BLOCKED") ||
+      !isRuntimeSkillErrorCode(terminalEntry.reason_code))
+  ) {
+    issues.push(
+      issue("/terminal_journal_entry", "binding", "terminal journal entry is inconsistent"),
+    );
+  }
+  if (value.phases.length > 0 && (value.run_state === "CREATED" || value.run_state === "ROUTED")) {
+    issues.push(issue("/run_state", "state", "run state cannot precede retained skill phases"));
+  }
+  const expectedTerminal =
+    terminalEntry !== null && isRuntimeSkillErrorCode(terminalEntry.reason_code)
+      ? terminalEntry.reason_code
+      : (latest?.terminal_code ?? null);
   if (
     (latest === undefined &&
       (value.terminal_code === null ||
@@ -549,7 +808,7 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
   ) {
     issues.push(issue("/terminal_code", "state", "terminal code does not match current execution"));
   }
-  if (!hashMatches(value))
+  if (value.document_hash !== hashSkillExecutionEvidence(value))
     issues.push(
       issue("/document_hash", "canonicalHash", "document hash does not match canonical content"),
     );
@@ -596,12 +855,7 @@ export function parseSuperpowersApproval(
 export function parseSkillExecutionEvidence(
   input: string | Uint8Array,
 ): ValidationResult<SkillExecutionEvidenceV1> {
-  return parseDocument(
-    input,
-    "skill-execution-evidence",
-    { ...DOCUMENT_LIMITS, maxBytes: SKILL_LIMITS.evidenceBytes },
-    evidenceIssues,
-  );
+  return parseDocument(input, "skill-execution-evidence", EVIDENCE_LIMITS, evidenceIssues);
 }
 
 export type {

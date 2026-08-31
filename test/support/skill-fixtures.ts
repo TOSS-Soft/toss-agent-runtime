@@ -1,4 +1,5 @@
 import { sha256 } from "../../src/protocol/json.js";
+import { hashSkillCatalog } from "../../src/skills/contracts.js";
 import { builtInSuperpowersHandler } from "../../src/skills/phases.js";
 
 const HASH = `sha256:${"a".repeat(64)}` as const;
@@ -125,15 +126,35 @@ export function validSuperpowersPhase() {
     input_hash: OTHER_HASH,
     context_hash: ZERO_HASH,
     context_accounting: {
-      included_resource_hashes: [OTHER_HASH],
-      omitted_resource_hashes: [],
+      skill_markdown: {
+        path: "SKILL.md" as const,
+        source_hash: HASH,
+        state: "INCLUDED" as const,
+        original_bytes: 8,
+        included_bytes: 8,
+        included_hash: HASH,
+        original_conservative_units: 2,
+        included_conservative_units: 2,
+      },
+      resources: [
+        {
+          path: "references/guide.md",
+          source_hash: OTHER_HASH,
+          state: "OMITTED" as const,
+          original_bytes: 5,
+          included_bytes: 0,
+          included_hash: null,
+          original_conservative_units: 2,
+          included_conservative_units: 0,
+        },
+      ],
       original_utf8_bytes: 13,
-      included_utf8_bytes: 13,
+      included_utf8_bytes: 8,
       original_conservative_units: 4,
-      included_conservative_units: 4,
+      included_conservative_units: 2,
       remaining_bytes: 10,
       remaining_conservative_units: 2,
-      segment_count: 2,
+      segment_count: 1,
       truncation_count: 0,
     },
     output_hash: HASH,
@@ -185,16 +206,33 @@ export function validSuperpowersApprovalDecision() {
 
 export function validSkillExecutionEvidence() {
   const snapshot = validSkillSnapshot();
+  const catalogs = [
+    {
+      descriptors: [snapshot.descriptor],
+      catalog_hash: hashSkillCatalog([
+        {
+          name: snapshot.descriptor.name,
+          version: snapshot.descriptor.version,
+          source: snapshot.descriptor.source,
+          package_hash: snapshot.descriptor.package_hash,
+          document_hash: snapshot.descriptor.document_hash,
+        },
+      ]),
+    },
+  ];
   const terminal = validSuperpowersPhase();
   const started = document({
     ...terminal,
+    catalog_hash: catalogs[0]!.catalog_hash,
     status: "STARTED" as const,
     output_hash: null,
   });
   const completed = document({
-    ...terminal,
+    ...started,
     phase_revision: 2,
     previous_phase_hash: started.document_hash,
+    status: "COMPLETED" as const,
+    output_hash: terminal.output_hash,
   });
   const hashable = {
     protocol_version: "runtime-contract.v1" as const,
@@ -203,6 +241,8 @@ export function validSkillExecutionEvidence() {
     run_id: "run-1",
     journal_head: JOURNAL_HEAD,
     run_state: "RUNNING" as const,
+    terminal_journal_entry: null,
+    catalogs,
     snapshots: [snapshot],
     phases: [started, completed],
     approvals: [],

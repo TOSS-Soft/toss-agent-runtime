@@ -11,6 +11,8 @@
     "run_id",
     "journal_head",
     "run_state",
+    "terminal_journal_entry",
+    "catalogs",
     "snapshots",
     "phases",
     "approvals",
@@ -39,6 +41,14 @@
         "INTERRUPTED"
       ]
     },
+    "terminal_journal_entry": {
+      "oneOf": [{ "type": "null" }, { "$ref": "run-journal-entry.v1.schema.json" }]
+    },
+    "catalogs": {
+      "type": "array",
+      "maxItems": 256,
+      "items": { "$ref": "#/$defs/catalog_root" }
+    },
     "snapshots": {
       "type": "array",
       "maxItems": 256,
@@ -62,6 +72,19 @@
   },
   "$defs": {
     "positive_integer": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "catalog_root": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["descriptors", "catalog_hash"],
+      "properties": {
+        "descriptors": {
+          "type": "array",
+          "maxItems": 256,
+          "items": { "$ref": "skill-descriptor.v1.schema.json" }
+        },
+        "catalog_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
+      }
+    },
     "journal_head": {
       "type": "object",
       "additionalProperties": false,
@@ -75,14 +98,15 @@
     "approval": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["request", "decision", "decision_journal_head"],
+      "required": ["request", "request_journal_entry", "decision", "decision_journal_entry"],
       "properties": {
         "request": { "$ref": "superpowers-approval.v1.schema.json" },
+        "request_journal_entry": { "$ref": "run-journal-entry.v1.schema.json" },
         "decision": {
           "oneOf": [{ "type": "null" }, { "$ref": "superpowers-approval.v1.schema.json" }]
         },
-        "decision_journal_head": {
-          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/journal_head" }]
+        "decision_journal_entry": {
+          "oneOf": [{ "type": "null" }, { "$ref": "run-journal-entry.v1.schema.json" }]
         }
       }
     },

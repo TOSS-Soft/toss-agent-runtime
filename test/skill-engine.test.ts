@@ -22,9 +22,15 @@ import { ZERO_JOURNAL_HASH } from "../src/journal/entry.js";
 import { createRunJournalStore, type RunJournalStore } from "../src/journal/store.js";
 import type { TransitionCommand } from "../src/journal/state-machine.js";
 import type { JournalHead, RunState } from "../src/journal/types.js";
-import { canonicalJson, deepFreezeJson, sha256, type JsonValue } from "../src/protocol/json.js";
+import {
+  canonicalJson,
+  deepFreezeJson,
+  parseJsonBytes,
+  sha256,
+  type JsonValue,
+} from "../src/protocol/json.js";
 import type { SkillCatalog, SkillSelection } from "../src/skills/catalog.js";
-import { hashSkillPackage } from "../src/skills/contracts.js";
+import { hashSkillCatalog, hashSkillPackage } from "../src/skills/contracts.js";
 import {
   createSkillsEngineForTest,
   ZERO_PHASE_HASH,
@@ -94,9 +100,20 @@ function snapshot(name: string, version = "1.0.0"): SkillSnapshotV1 {
 }
 
 function selection(value: SkillSnapshotV1): SkillSelection {
+  const descriptors = [value.descriptor];
+  const catalogHash = hashSkillCatalog(
+    descriptors.map((descriptor) => ({
+      name: descriptor.name,
+      version: descriptor.version,
+      source: descriptor.source,
+      package_hash: descriptor.package_hash,
+      document_hash: descriptor.document_hash,
+    })),
+  );
   return deepFreezeJson({
     descriptor: value.descriptor,
-    catalog_hash: `sha256:${"c".repeat(64)}`,
+    catalog_hash: catalogHash,
+    catalog_root: parseJsonBytes(canonicalJson({ descriptors, catalog_hash: catalogHash })),
     package_handle: sha256({ name: value.descriptor.name }),
   } as unknown as JsonValue) as unknown as SkillSelection;
 }
@@ -118,6 +135,7 @@ function fakeLoader(snapshots: ReadonlyMap<string, SkillSnapshotV1>): SkillLoade
   };
   return {
     recover: () => Promise.resolve(),
+    retainCatalogRoot: () => Promise.resolve(),
     load: (selected) => Promise.resolve(exact(selected)),
     assembleContext: (selected, request) => {
       const value = exact(selected);
@@ -133,16 +151,28 @@ function fakeLoader(snapshots: ReadonlyMap<string, SkillSnapshotV1>): SkillLoade
             snapshot_hash: value.document_hash,
           }),
           phase: request.phase,
-          segments: [],
+          segments: [
+            {
+              path: "SKILL.md",
+              role: "skill" as const,
+              source_hash: value.skill_markdown_hash,
+              included_hash: value.skill_markdown_hash,
+              original_bytes: value.skill_markdown_bytes,
+              included_bytes: value.skill_markdown_bytes,
+              conservative_tokens: Math.ceil(value.skill_markdown_bytes / 4),
+              content: "",
+            },
+          ],
           included_resource_hashes: [],
           omitted_resource_hashes: [],
-          original_utf8_bytes: 0,
-          included_utf8_bytes: 0,
-          original_tokens: 0,
-          included_tokens: 0,
-          remaining_bytes: request.max_bytes,
-          remaining_tokens: request.max_tokens,
+          original_utf8_bytes: value.skill_markdown_bytes,
+          included_utf8_bytes: value.skill_markdown_bytes,
+          original_tokens: Math.ceil(value.skill_markdown_bytes / 4),
+          included_tokens: Math.ceil(value.skill_markdown_bytes / 4),
+          remaining_bytes: request.max_bytes - value.skill_markdown_bytes,
+          remaining_tokens: request.max_tokens - Math.ceil(value.skill_markdown_bytes / 4),
           truncations: [],
+          resource_accounting: [],
           context_hash: sha256({ phase: request.phase }),
         }),
       );
@@ -343,8 +373,11 @@ describe("hash-chained Superpowers phase history", () => {
     expect(started.phase).toMatchObject({
       terminal_code: null,
     });
-    expect(Array.isArray(started.phase.context_accounting.included_resource_hashes)).toBe(true);
-    expect(Array.isArray(started.phase.context_accounting.omitted_resource_hashes)).toBe(true);
+    expect(started.phase.context_accounting.skill_markdown).toMatchObject({
+      path: "SKILL.md",
+      state: "INCLUDED",
+    });
+    expect(Array.isArray(started.phase.context_accounting.resources)).toBe(true);
     for (const value of [
       started.phase.context_accounting.original_utf8_bytes,
       started.phase.context_accounting.included_utf8_bytes,
@@ -388,13 +421,59 @@ describe("hash-chained Superpowers phase history", () => {
     const request = startRequest(head, tdd, "TEST_DESIGN", "operation-catalog-drift");
     await host.startPhase(request);
 
+    const changedDescriptors = [snapshot("brainstorming").descriptor, tdd.descriptor];
+    const changedCatalogHash = hashSkillCatalog(
+      changedDescriptors.map((descriptor) => ({
+        name: descriptor.name,
+        version: descriptor.version,
+        source: descriptor.source,
+        package_hash: descriptor.package_hash,
+        document_hash: descriptor.document_hash,
+      })),
+    );
     const changedSelection = deepFreezeJson({
       ...request.selection,
-      catalog_hash: `sha256:${"d".repeat(64)}`,
+      catalog_hash: changedCatalogHash,
+      catalog_root: parseJsonBytes(
+        canonicalJson({ descriptors: changedDescriptors, catalog_hash: changedCatalogHash }),
+      ),
     } as unknown as JsonValue) as unknown as SkillSelection;
     await expect(
       host.startPhase({ ...request, selection: changedSelection }),
     ).rejects.toMatchObject({ code: "RUNTIME_SKILL_OPERATION_CONFLICT" });
+  });
+
+  it("rejects a non-deterministically ordered catalog root before phase intake", async () => {
+    const { statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const tdd = snapshot("test-driven-development");
+    const brainstorming = snapshot("brainstorming");
+    const host = engine(statePath, journal, [tdd, brainstorming]);
+    const descriptors = [tdd.descriptor, brainstorming.descriptor];
+    const catalogHash = hashSkillCatalog(
+      descriptors.map((descriptor) => ({
+        name: descriptor.name,
+        version: descriptor.version,
+        source: descriptor.source,
+        package_hash: descriptor.package_hash,
+        document_hash: descriptor.document_hash,
+      })),
+    );
+    const invalidSelection = deepFreezeJson({
+      descriptor: tdd.descriptor,
+      catalog_hash: catalogHash,
+      catalog_root: parseJsonBytes(canonicalJson({ descriptors, catalog_hash: catalogHash })),
+      package_handle: sha256({ name: tdd.descriptor.name }),
+    } as unknown as JsonValue) as unknown as SkillSelection;
+
+    await expect(
+      host.startPhase(
+        startRequest(head, tdd, "TEST_DESIGN", "unordered-catalog", {
+          selection: invalidSelection,
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "RUNTIME_SKILL_INVALID" });
+    expect(await host.phaseHistory("run-1")).toEqual([]);
   });
 
   it("replays an exact completion and rejects changed output without growing history", async () => {
@@ -1119,6 +1198,7 @@ describe("governed phase execution", () => {
     const baseLoader = fakeLoader(new Map([[tdd.descriptor.name, tdd]]));
     const loader: SkillLoader = {
       recover: () => Promise.resolve(),
+      retainCatalogRoot: () => Promise.resolve(),
       load: (selected) => baseLoader.load(selected),
       assembleContext: async (selected, request) => {
         entered?.();
@@ -1196,6 +1276,7 @@ describe("governed phase execution", () => {
     const tdd = snapshot("test-driven-development");
     const loader: SkillLoader = {
       recover: () => Promise.resolve(),
+      retainCatalogRoot: () => Promise.resolve(),
       load: () => {
         effects.push("snapshot-load");
         return Promise.reject(new Error("must not load"));
@@ -1429,6 +1510,7 @@ describe("governed phase execution", () => {
     const baseLoader = fakeLoader(new Map([[tdd.descriptor.name, tdd]]));
     const guardedLoader: SkillLoader = {
       recover: () => Promise.resolve(),
+      retainCatalogRoot: () => Promise.resolve(),
       load: (selected) => baseLoader.load(selected),
       assembleContext: async (selected, request) => {
         entered?.();

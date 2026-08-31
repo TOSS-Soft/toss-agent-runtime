@@ -141,6 +141,7 @@ export type {
   HashableSuperpowersPhaseV1,
   SkillDescriptorReference,
   SkillDescriptorV1,
+  SkillCatalogRoot,
   SkillExecutionEvidenceV1,
   SkillResourceRole,
   SkillResourceV1,

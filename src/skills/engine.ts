@@ -61,7 +61,12 @@ import type {
   SkillSelectionRequest,
 } from "./catalog.js";
 import type { SkillContext, SkillContextRequest } from "./context.js";
-import { parseSkillDescriptor, parseSkillSnapshot, parseSuperpowersPhase } from "./contracts.js";
+import {
+  hashSkillCatalog,
+  parseSkillDescriptor,
+  parseSkillSnapshot,
+  parseSuperpowersPhase,
+} from "./contracts.js";
 import {
   isRuntimeSkillErrorCode,
   RuntimeSkillError,
@@ -76,6 +81,7 @@ import {
 import {
   SKILL_LIMITS,
   type SkillContextAccounting,
+  type SkillDescriptorV1,
   type SkillSnapshotV1,
   type SuperpowersApprovalV1,
   type SuperpowersPhaseName,
@@ -468,8 +474,28 @@ function assertDeepFrozenData(
   }
 }
 
+function catalogDescriptorOrder(left: SkillDescriptorV1, right: SkillDescriptorV1): number {
+  for (const [leftField, rightField] of [
+    [left.name, right.name],
+    [left.version, right.version],
+    [left.source.kind, right.source.kind],
+    [left.source.identity, right.source.identity],
+    [left.package_hash, right.package_hash],
+    [left.document_hash, right.document_hash],
+  ] as const) {
+    const order = Buffer.from(leftField, "utf8").compare(Buffer.from(rightField, "utf8"));
+    if (order !== 0) return order;
+  }
+  return 0;
+}
+
 function exactSelectionAuthority(value: unknown): SkillSelection {
-  const selection = closedDataRecord(value, ["descriptor", "catalog_hash", "package_handle"]);
+  const selection = closedDataRecord(value, [
+    "descriptor",
+    "catalog_hash",
+    "catalog_root",
+    "package_handle",
+  ]);
   assertDeepFrozenData(value);
   if (
     typeof selection.catalog_hash !== "string" ||
@@ -486,6 +512,39 @@ function exactSelectionAuthority(value: unknown): SkillSelection {
     invalid();
   }
   if (!parsed.ok || canonicalJson(parsed.value) !== canonicalJson(selection.descriptor)) invalid();
+  const root = closedDataRecord(selection.catalog_root, ["descriptors", "catalog_hash"]);
+  if (
+    !Array.isArray(root.descriptors) ||
+    root.descriptors.length === 0 ||
+    root.descriptors.length > SKILL_LIMITS.packagesPerRoot ||
+    root.catalog_hash !== selection.catalog_hash
+  ) {
+    invalid();
+  }
+  const descriptors = root.descriptors.map((descriptor) => {
+    const result = parseSkillDescriptor(canonicalJson(descriptor));
+    if (!result.ok || canonicalJson(result.value) !== canonicalJson(descriptor)) invalid();
+    return result.value;
+  });
+  const references = descriptors.map((descriptor) => ({
+    name: descriptor.name,
+    version: descriptor.version,
+    source: descriptor.source,
+    package_hash: descriptor.package_hash,
+    document_hash: descriptor.document_hash,
+  }));
+  if (
+    descriptors.some(
+      (descriptor, index) =>
+        index > 0 && catalogDescriptorOrder(descriptors[index - 1]!, descriptor) >= 0,
+    ) ||
+    hashSkillCatalog(references) !== selection.catalog_hash ||
+    !descriptors.some(
+      (descriptor) => canonicalJson(descriptor) === canonicalJson(selection.descriptor),
+    )
+  ) {
+    invalid();
+  }
   return value as SkillSelection;
 }
 
@@ -983,18 +1042,42 @@ function samePhaseBinding(left: SuperpowersPhaseV1, right: SuperpowersPhaseV1): 
 }
 
 function contextAccounting(context: SkillContext): SkillContextAccounting {
+  const skill = context.segments[0];
+  if (skill === undefined || skill.path !== "SKILL.md" || skill.role !== "skill") integrity();
+  const resources = context.resource_accounting;
+  const originalUtf8Bytes =
+    skill.original_bytes +
+    resources.reduce((total, resource) => total + resource.original_bytes, 0);
+  const includedUtf8Bytes =
+    skill.included_bytes +
+    resources.reduce((total, resource) => total + resource.included_bytes, 0);
+  const originalConservativeUnits =
+    Math.ceil(skill.original_bytes / 4) +
+    resources.reduce((total, resource) => total + resource.original_conservative_units, 0);
+  const includedConservativeUnits =
+    skill.conservative_tokens +
+    resources.reduce((total, resource) => total + resource.included_conservative_units, 0);
   return deepFreezeJson({
-    included_resource_hashes: [...context.included_resource_hashes],
-    omitted_resource_hashes: [...context.omitted_resource_hashes],
-    original_utf8_bytes: context.original_utf8_bytes,
-    included_utf8_bytes: context.included_utf8_bytes,
-    original_conservative_units: context.original_tokens,
-    included_conservative_units: context.included_tokens,
+    skill_markdown: {
+      path: "SKILL.md",
+      source_hash: skill.source_hash,
+      state: "INCLUDED",
+      original_bytes: skill.original_bytes,
+      included_bytes: skill.included_bytes,
+      included_hash: skill.included_hash,
+      original_conservative_units: Math.ceil(skill.original_bytes / 4),
+      included_conservative_units: skill.conservative_tokens,
+    },
+    resources,
+    original_utf8_bytes: originalUtf8Bytes,
+    included_utf8_bytes: includedUtf8Bytes,
+    original_conservative_units: originalConservativeUnits,
+    included_conservative_units: includedConservativeUnits,
     remaining_bytes: context.remaining_bytes,
     remaining_conservative_units: context.remaining_tokens,
     segment_count: context.segments.length,
-    truncation_count: context.truncations.length,
-  });
+    truncation_count: resources.filter((resource) => resource.state === "PARTIAL").length,
+  } as unknown as JsonValue) as unknown as SkillContextAccounting;
 }
 
 function validateHistory(runId: string, entries: readonly SuperpowersPhaseV1[]): void {
@@ -2717,6 +2800,7 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
         snapshot,
         request.execution_request_hash,
       );
+      await options.loader.retainCatalogRoot(request.selection);
       const latest = loaded.entries.at(-1);
       const started = record({
         protocol_version: "runtime-contract.v1",
