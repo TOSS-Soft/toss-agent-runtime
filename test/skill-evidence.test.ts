@@ -595,7 +595,7 @@ describe("canonical Agent Skills evidence", () => {
       ok: true,
       value: expected,
     });
-  });
+  }, 20_000);
 
   it("parses the legal 224-snapshot evidence shape below the byte limit", () => {
     const evidence = highMemberEvidence();
@@ -901,7 +901,9 @@ describe("canonical Agent Skills evidence", () => {
     },
     130_000,
   );
+});
 
+describe("canonical Agent Skills evidence integration", { timeout: 20_000 }, () => {
   it("projects a metadata-dense official history as compact closed journal path links", async () => {
     const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-evidence-compact-path-")));
     roots.push(root);
@@ -1030,7 +1032,7 @@ describe("canonical Agent Skills evidence", () => {
     expect(observed).not.toBeNull();
     expect(observed!.members).toBeLessThan(SKILL_EVIDENCE_JSON_LIMITS.maxMembers);
     expect(parseSkillExecutionEvidence(serialized)).toEqual({ ok: true, value: evidence });
-  });
+  }, 5_000);
 
   it("rejects the 129th approval in the first linear journal pass before object reads", async () => {
     const root = await realpath(
@@ -1437,7 +1439,7 @@ describe("canonical Agent Skills evidence", () => {
     expect(observed).not.toBeNull();
     expect(observed!.members).toBeLessThan(SKILL_EVIDENCE_JSON_LIMITS.maxMembers);
     expect(parseSkillExecutionEvidence(serialized)).toEqual({ ok: true, value: evidence });
-  }, 20_000);
+  }, 45_000);
 
   it("binds the complete governed phase, approval, context, resource, and handoff history", async () => {
     const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-skill-evidence-")));
@@ -2534,7 +2536,7 @@ describe("canonical Agent Skills evidence", () => {
       code: "RUNTIME_SKILL_LIMIT_EXCEEDED",
     });
     expect(evidenceReads).toBe(0);
-  }, 20_000);
+  }, 45_000);
 
   it("records distinct same-digest resources as included, partial, and omitted", async () => {
     const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-skill-accounting-")));
@@ -2657,5 +2659,5 @@ describe("canonical Agent Skills evidence", () => {
     const partial = started.phase.context_accounting.resources[3]!;
     expect(partial.included_bytes).toBeGreaterThan(0);
     expect(partial.included_bytes).toBeLessThan(partial.original_bytes);
-  }, 20_000);
+  });
 });

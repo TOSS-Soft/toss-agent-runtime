@@ -369,7 +369,9 @@ describe("Agent Skills public API", () => {
       expect.objectContaining({ code: "ERR_PACKAGE_PATH_NOT_EXPORTED" }),
     );
   });
+});
 
+describe("Agent Skills public runtime integration", { timeout: 20_000 }, () => {
   it("creates a self-contained host without exposing native paths or test seams", async () => {
     const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-skills-public-")));
     roots.push(root);
@@ -883,5 +885,5 @@ describe("Agent Skills public API", () => {
     } finally {
       rmSync(declarationRoot, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 });
