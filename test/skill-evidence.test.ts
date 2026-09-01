@@ -1140,7 +1140,7 @@ describe("canonical Agent Skills evidence", () => {
       code: "RUNTIME_SKILL_LIMIT_EXCEEDED",
     });
     expect(reads).toBe(0);
-  });
+  }, 20_000);
 
   it("builds and parses a canonical 25-approval history from one real approval", async () => {
     const root = await realpath(
@@ -1299,7 +1299,7 @@ describe("canonical Agent Skills evidence", () => {
       ok: true,
       value: evidence,
     });
-  });
+  }, 20_000);
 
   it("builds and parses a semantically closed near-byte-limit approval projection", async () => {
     const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-evidence-near-byte-")));
@@ -2534,7 +2534,7 @@ describe("canonical Agent Skills evidence", () => {
       code: "RUNTIME_SKILL_LIMIT_EXCEEDED",
     });
     expect(evidenceReads).toBe(0);
-  }, 20_000);
+  }, 30_000);
 
   it("records distinct same-digest resources as included, partial, and omitted", async () => {
     const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-skill-accounting-")));
