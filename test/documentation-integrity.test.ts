@@ -15,6 +15,11 @@ import {
   hashPromptTemplate,
   hashRoutingPolicy,
   hashRoutingState,
+  hashSkillDescriptor,
+  hashSkillExecutionEvidence,
+  hashSkillSnapshot,
+  hashSuperpowersApproval,
+  hashSuperpowersPhase,
   parseAgentDefinition,
   parseAgentRegistryEntry,
   parseCompiledContext,
@@ -28,6 +33,11 @@ import {
   parseRoutingPolicy,
   parseRoutingState,
   parseRuntimeCapabilities,
+  parseSkillDescriptor,
+  parseSkillExecutionEvidence,
+  parseSkillSnapshot,
+  parseSuperpowersApproval,
+  parseSuperpowersPhase,
   validateExecutionChain,
 } from "../src/index.js";
 
@@ -253,6 +263,27 @@ describe("published protocol artifacts", () => {
     }
   });
 
+  it("loads all five Agent Skills examples through their public hash-bound parsers", async () => {
+    const descriptor = parseSkillDescriptor(await readExample("skill-descriptor"));
+    const snapshot = parseSkillSnapshot(await readExample("skill-snapshot"));
+    const phase = parseSuperpowersPhase(await readExample("superpowers-phase"));
+    const approval = parseSuperpowersApproval(await readExample("superpowers-approval"));
+    const evidence = parseSkillExecutionEvidence(await readExample("skill-execution-evidence"));
+
+    expect(descriptor.ok && snapshot.ok && phase.ok && approval.ok && evidence.ok).toBe(true);
+    if (descriptor.ok && snapshot.ok && phase.ok && approval.ok && evidence.ok) {
+      expect(hashSkillDescriptor(descriptor.value)).toBe(descriptor.value.document_hash);
+      expect(hashSkillSnapshot(snapshot.value)).toBe(snapshot.value.document_hash);
+      expect(hashSuperpowersPhase(phase.value)).toBe(phase.value.document_hash);
+      expect(hashSuperpowersApproval(approval.value)).toBe(approval.value.document_hash);
+      expect(hashSkillExecutionEvidence(evidence.value)).toBe(evidence.value.document_hash);
+      expect(snapshot.value.descriptor).toEqual(descriptor.value);
+      expect(phase.value.catalog_hash).toBe(evidence.value.catalogs[0]?.catalog_hash);
+      expect(phase.value.context_accounting).toEqual(evidence.value.phases[0]?.context_accounting);
+      expect(evidence.value.journal_path).toHaveLength(3);
+    }
+  });
+
   it("loads the accepted agent-context examples through the package-root parsers with exact bindings", async () => {
     const request = parseExecutionRequest(await readExample("agent-context-execution-request"));
     const prompt = parsePromptTemplate(await readExample("prompt-template"));
@@ -412,6 +443,41 @@ describe("published protocol artifacts", () => {
     expect(combinedProse).toMatch(/Issue #8.*?owns.*?(?:Agent Skills|skill)/iu);
     expect(combinedProse).toMatch(/Issue #9.*?owns.*?(?:MCP|tool)/iu);
     expect(combinedProse).toMatch(/Issue #10.*?owns.*?(?:provider|agent loop)/iu);
+  });
+
+  it("documents the complete Agent Skills trust, approval, evidence, and release boundary", async () => {
+    const protocol = await readFile("docs/contracts/runtime-contract-protocol-v1.md", "utf8");
+    const control = await readFile("docs/contracts/local-service-control-v1.md", "utf8");
+    const compatibility = await readFile("docs/contracts/toss-cli-v2.2-compatibility.md", "utf8");
+    const architecture = await readFile(
+      "docs/superpowers/specs/2026-08-19-v1-runtime-architecture-design.md",
+      "utf8",
+    );
+    const readme = await readFile("README.md", "utf8");
+    const changelog = await readFile("CHANGELOG.md", "utf8");
+    const combined = [protocol, control, compatibility, architecture, readme, changelog]
+      .join("\n")
+      .replaceAll(/\s+/gu, " ");
+
+    for (const requirement of [
+      /metadata-only discovery/iu,
+      /explicit(?:ly configured)? private per-user skill roots/iu,
+      /project-local `?\.agents\/skills`?.*?(?:never|not).*?auto-discover/iu,
+      /full `?SKILL\.md`?.*?only after.*?exact.*?selection/iu,
+      /canonical.*?containment/iu,
+      /private same-user.*?local.*?socket.*?exact.*?binding/iu,
+      /restart.*?replay/iu,
+      /skill scripts.*?(?:never executed|not executed)/iu,
+      /BLOCKED_SUPERPOWERS_MISSING/u,
+      /journal_path.*?catalog.*?snapshot.*?phase.*?approval/iu,
+      /latest Node\.js LTS.*?macOS/iu,
+    ]) {
+      expect(combined).toMatch(requirement);
+    }
+    expect(architecture).not.toMatch(/Development execution may use an[\s\S]*?allowlist/iu);
+    expect(changelog).not.toContain(
+      "Agent Skills and Superpowers execution remain pending Issue #8",
+    );
   });
 
   it("documents the complete governed routing boundary without claiming later execution", async () => {

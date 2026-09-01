@@ -269,8 +269,27 @@ The service check in `doctor` follows these rules:
 
 `doctor` exits `5` when any check is `FAIL`, otherwise `0`. The independent
 execution-capabilities check remains a warning in development and a failure in
-production because provider, skill, MCP, and orchestration execution are not
-implemented yet.
+production while any capability required by the selected task is unavailable.
+Agent Skills is available; MCP and agent-loop orchestration are not yet
+release-complete.
+
+## Superpowers approval control
+
+`superpowers-approve` is the only local control command that can carry a human
+Agent Skills decision. It is accepted only on the private `0600`, same-user Unix
+socket after the listener identity is verified. The request binds one canonical
+UUID operation ID to the exact run ID, expected journal revision and head hash,
+phase, skill name/version, snapshot hash, approval-request hash, and
+`APPROVE`/`REJECT` decision. Model output, prompt text, repository content,
+environment variables, and unauthenticated IPC cannot satisfy this boundary.
+
+The approval handler durably verifies and appends the phase-first/journal
+transition before acknowledging the request. An exact operation replay returns
+the original canonical response across restart; stale or conflicting bindings
+fail closed. Readiness recovers the private Agent Skills objects, phase history,
+approval linkage, and run journal before the control socket accepts requests.
+Shutdown stops approval intake with other control intake and flushes accepted
+skill work before the journal, socket, or lock is released.
 
 ## Readiness and bounded shutdown
 

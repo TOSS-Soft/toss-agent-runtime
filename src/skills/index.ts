@@ -2,22 +2,22 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 
 import { createRunJournalStore } from "../journal/store.js";
-import {
-  type SkillCatalogSnapshot,
-  type SkillDiscoveryRequest,
-  type SkillSelection,
-  type SkillSelectionRequest,
-} from "./catalog.js";
-import type { SkillContext, SkillContextRequest } from "./context.js";
-import {
-  type CompleteSuperpowersPhaseRequest,
-  type StartSuperpowersPhaseRequest,
-  type SuperpowersPhaseOutcome,
-} from "./engine.js";
-import type { ResumeSuperpowersApprovalRequest } from "./approval.js";
+import type { JournalHead } from "../journal/types.js";
+import type { TraceContext } from "../protocol/types.js";
 import { assertConfiguredSkillRootPath } from "./paths.js";
 import { createSkillsRuntimeHost } from "./runtime-host.js";
-import { SKILL_LIMITS, type SkillExecutionEvidenceV1, type SkillSnapshotV1 } from "./types.js";
+import type { RuntimeSkillErrorCode } from "./errors.js";
+import {
+  SKILL_LIMITS,
+  type SkillCatalogRoot,
+  type SkillDescriptorReference,
+  type SkillDescriptorV1,
+  type SkillExecutionEvidenceV1,
+  type SkillSnapshotV1,
+  type SuperpowersApprovalV1,
+  type SuperpowersPhaseName,
+  type SuperpowersPhaseV1,
+} from "./types.js";
 
 export {
   hashSkillCatalog,
@@ -42,8 +42,131 @@ export interface SkillsHostConfig {
   readonly skill_roots: readonly string[];
 }
 
+export interface SkillDiscoveryRequest {
+  readonly query: string | null;
+  readonly allowed_capabilities: readonly string[];
+}
+
+export type SkillCatalogSnapshot = SkillCatalogRoot;
+
+export interface SkillSelectionRequest {
+  readonly mode: "explicit" | "implicit";
+  readonly capability: string;
+  readonly allowed_capabilities: readonly string[];
+  readonly query: string | null;
+  readonly descriptor: SkillDescriptorReference | null;
+}
+
+export interface SkillSelection {
+  readonly descriptor: SkillDescriptorV1;
+  readonly catalog_hash: `sha256:${string}`;
+  readonly catalog_root: SkillCatalogRoot;
+  readonly package_handle: `sha256:${string}`;
+}
+
+export interface SkillContextRequest {
+  readonly snapshot: SkillSnapshotV1;
+  readonly snapshot_hash: `sha256:${string}`;
+  readonly phase: SuperpowersPhaseName;
+  readonly max_bytes: number;
+  readonly max_tokens: number;
+}
+
+export interface SkillContextSegment {
+  readonly path: string;
+  readonly role: "skill" | "reference" | "asset";
+  readonly source_hash: `sha256:${string}`;
+  readonly included_hash: `sha256:${string}`;
+  readonly original_bytes: number;
+  readonly included_bytes: number;
+  readonly conservative_tokens: number;
+  readonly content: string;
+}
+
+export interface SkillContextTruncation {
+  readonly path: string;
+  readonly original_bytes: number;
+  readonly included_bytes: number;
+}
+
+export interface SkillContext {
+  readonly snapshot: Readonly<{
+    name: string;
+    version: string;
+    package_hash: `sha256:${string}`;
+    snapshot_hash: `sha256:${string}`;
+  }>;
+  readonly phase: SuperpowersPhaseName;
+  readonly segments: readonly SkillContextSegment[];
+  readonly included_resource_hashes: readonly `sha256:${string}`[];
+  readonly omitted_resource_hashes: readonly `sha256:${string}`[];
+  readonly original_utf8_bytes: number;
+  readonly included_utf8_bytes: number;
+  readonly original_tokens: number;
+  readonly included_tokens: number;
+  readonly remaining_bytes: number;
+  readonly remaining_tokens: number;
+  readonly truncations: readonly SkillContextTruncation[];
+  readonly resource_accounting: readonly Readonly<{
+    path: string;
+    source_hash: `sha256:${string}`;
+    state: "INCLUDED" | "PARTIAL" | "OMITTED";
+    original_bytes: number;
+    included_bytes: number;
+    included_hash: `sha256:${string}` | null;
+    original_conservative_units: number;
+    included_conservative_units: number;
+  }>[];
+  readonly context_hash: `sha256:${string}`;
+}
+
 export interface SkillHostContextRequest extends SkillContextRequest {
   readonly selection: SkillSelection;
+}
+
+export interface StartSuperpowersPhaseRequest {
+  readonly run_id: string;
+  readonly expected_journal_head: JournalHead;
+  readonly execution_request_hash: `sha256:${string}`;
+  readonly selection: SkillSelection;
+  readonly phase: SuperpowersPhaseName;
+  readonly input: Uint8Array;
+  readonly operation_id: string;
+  readonly trace: TraceContext;
+}
+
+export interface CompleteSuperpowersPhaseRequest {
+  readonly run_id: string;
+  readonly expected_phase_revision: number;
+  readonly expected_phase_head_hash: `sha256:${string}`;
+  readonly phase: SuperpowersPhaseName;
+  readonly skill_snapshot_hash: `sha256:${string}`;
+  readonly operation_id: string;
+  readonly outcome: "COMPLETED" | "FAILED" | "BLOCKED";
+  readonly terminal_code: RuntimeSkillErrorCode | null;
+  readonly output: Uint8Array;
+  readonly trace: TraceContext;
+}
+
+export interface ResumeSuperpowersApprovalRequest {
+  readonly run_id: string;
+  readonly expected_journal_head: JournalHead;
+  readonly phase: SuperpowersPhaseName;
+  readonly skill_name: string;
+  readonly skill_version: string;
+  readonly skill_snapshot_hash: `sha256:${string}`;
+  readonly approval_request_hash: `sha256:${string}`;
+  readonly operation_id: string;
+  readonly decision: "APPROVE" | "REJECT";
+  readonly trace: TraceContext;
+}
+
+export interface SuperpowersPhaseOutcome {
+  readonly state: "RUNNING" | "APPROVAL_PENDING" | "BLOCKED";
+  readonly phase: SuperpowersPhaseV1;
+  readonly journal_head: JournalHead;
+  readonly approval: SuperpowersApprovalV1 | null;
+  readonly replayed: boolean;
 }
 
 export interface SkillsHost {
@@ -115,24 +238,6 @@ export function createSkillsHost(config: SkillsHostConfig): SkillsHost {
   });
 }
 
-export type {
-  SkillCatalogSnapshot,
-  SkillDiscoveryRequest,
-  SkillSelection,
-  SkillSelectionRequest,
-} from "./catalog.js";
-export type {
-  SkillContext,
-  SkillContextRequest,
-  SkillContextSegment,
-  SkillContextTruncation,
-} from "./context.js";
-export type {
-  CompleteSuperpowersPhaseRequest,
-  StartSuperpowersPhaseRequest,
-  SuperpowersPhaseOutcome,
-} from "./engine.js";
-export type { ResumeSuperpowersApprovalRequest } from "./approval.js";
 export type {
   HashableSkillDescriptorV1,
   HashableSkillExecutionEvidenceV1,

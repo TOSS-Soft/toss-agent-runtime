@@ -1,0 +1,66 @@
+{
+  "protocol_version": "runtime-contract.v1",
+  "schema_version": "superpowers-phase.v1",
+  "document_type": "superpowers-phase",
+  "run_id": "run-agent-skills-example",
+  "phase_revision": 2,
+  "previous_phase_hash": "sha256:12e6b62eb51707943baff048e044bbc6b67c6fd57dc03447d0d1719efd443cab",
+  "execution_request_hash": "sha256:62d7fb34a7feca556e7ff797cc06bcf68e3448df6fe00f4a76c86d3ffbf9e18e",
+  "observed_journal_head": {
+    "journal_revision": 3,
+    "sequence": 3,
+    "entry_hash": "sha256:dfbd2098fbadc9b7f33d15a19b4d54d054deed11fc5cc0e5c8eab9852437d58b"
+  },
+  "catalog_hash": "sha256:11860fe5cb458882b4c44d811608ffc61b4134635f4ac67ee643acf6fe839aa7",
+  "skill": {
+    "name": "test-driven-development",
+    "version": "1.0.0",
+    "source": {
+      "identity": "sha256:f10088565ee4d9cd7f02356804cf5b943a56e41209a8a5dd8a2f8d79feb3ab97",
+      "kind": "bundled"
+    },
+    "package_hash": "sha256:cc07f50ea5136dccbd3484238607f4c4578d38b05bb37c8605e40910f35dcbe3",
+    "document_hash": "sha256:afd8b9d9e9ab0166502d8e8fd1a72c4a76200547f193c0d428df0c3d27b44e8e",
+    "snapshot_hash": "sha256:9a95e52c081ea3637bcfdbc769aa983ac5de371c16f43ddc9393f975997129fa"
+  },
+  "phase": "TEST_DESIGN",
+  "handler": {
+    "version": "agent-skills.v1",
+    "hash": "sha256:5aa2e63500719cee5f8e1cc463a503c9d8b4c2903a1ab59e3a49858d1464c797"
+  },
+  "operation_id": "example-test-design",
+  "status": "COMPLETED",
+  "predecessor_phase_hashes": [],
+  "input_hash": "sha256:3f2974ee094605782ca4d1e636c9a765653f64d9f2ab7b0f9312bbc950366ccd",
+  "context_hash": "sha256:7376f9fe5e7a8c10a40cadfe0b0bb6a7deba1732146dc7cd0b1c3081a9d2f895",
+  "context_accounting": {
+    "skill_markdown": {
+      "path": "SKILL.md",
+      "source_hash": "sha256:ebbe76626e1677f1873a13f87001d2d4171ad1e292bbe4e2df14e558d942910d",
+      "state": "INCLUDED",
+      "original_bytes": 467,
+      "included_bytes": 467,
+      "included_hash": "sha256:ebbe76626e1677f1873a13f87001d2d4171ad1e292bbe4e2df14e558d942910d",
+      "original_conservative_units": 117,
+      "included_conservative_units": 117
+    },
+    "resources": [],
+    "original_utf8_bytes": 467,
+    "included_utf8_bytes": 467,
+    "original_conservative_units": 117,
+    "included_conservative_units": 117,
+    "remaining_bytes": 1581,
+    "remaining_conservative_units": 395,
+    "segment_count": 1,
+    "truncation_count": 0
+  },
+  "output_hash": "sha256:92b6e22734271169f0c338c881a7d32d93517d9b0a34525cf47a3e04a7203a5a",
+  "terminal_code": null,
+  "occurred_at": "2026-08-30T12:00:04.000Z",
+  "trace": {
+    "trace_id": "11111111111111111111111111111111",
+    "span_id": "2222222222222222",
+    "trace_flags": 1
+  },
+  "document_hash": "sha256:e310a95d404ca2f7d12360aa1383ea48974cb07e67805466e5b1d204c4d3cbaa"
+}

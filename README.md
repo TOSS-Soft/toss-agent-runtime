@@ -1,8 +1,8 @@
 # TOSS Agent Runtime
 
-`@toss-software/agent-runtime` is the governed, provider-neutral execution runtime for TOSS. This development baseline publishes Runtime Contract Protocol v1, strict configuration loading, a truthful capability handshake, an immutable agent-definition registry and provenance-aware context compiler, authenticated agentgateway transport, deterministic governed model-routing and budget planning, immutable append-only run journals, private structured operational logs, and the explicit per-user `toss-runtime` service-supervision foundation.
+`@toss-software/agent-runtime` is the governed, provider-neutral execution runtime for TOSS. This development baseline publishes Runtime Contract Protocol v1, strict configuration loading, a truthful capability handshake, an immutable agent-definition registry and provenance-aware context compiler, the private Agent Skills host and built-in Superpowers phase engine, authenticated agentgateway transport, deterministic governed model-routing and budget planning, immutable append-only run journals, private structured operational logs, and the explicit per-user `toss-runtime` service-supervision foundation.
 
-> Status: the package remains `0.0.0-development` until all v1 release waves and protected live-provider gates pass. Immutable run-journal persistence, explicit project intake, structured operational logging, the immutable agent registry/context compiler, authenticated agentgateway transport, and the pure governed routing boundary are implemented; issue #28 still requires its separate real macOS login/native crash-loop acceptance, and protected live-provider/agentgateway smoke remains issue #15. npm `1.0.0` remains incomplete. The supervised runtime does not yet execute agents, run tools, or expose remote control.
+> Status: the package remains `0.0.0-development` until all v1 release waves and protected live-provider gates pass. Immutable run-journal persistence, explicit project intake, structured operational logging, the immutable agent registry/context compiler, Agent Skills/Superpowers execution, authenticated agentgateway transport, and the pure governed routing boundary are implemented; issue #28 still requires its separate real macOS login/native crash-loop acceptance, and protected live-provider/agentgateway smoke remains issue #15. npm `1.0.0` remains incomplete. The supervised runtime does not yet execute the complete agent loop, run MCP tools, or expose remote control.
 
 ## Requirements
 
@@ -141,14 +141,41 @@ retry.
 
 Issue #7 advertises the four agent/context schemas only; Issue #7 does not
 execute Agent Skills, Superpowers, MCP tools, providers, or the agent loop.
-Issue #8 owns Agent Skills and Superpowers execution, Issue #9 owns MCP tools,
-and Issue #10 owns providers and the agent loop. The packaged examples are
+Issue #8 now delivers Agent Skills and Superpowers execution; Issue #9 owns MCP
+tools, and Issue #10 owns providers and the agent loop. The packaged examples are
 illustrative control-plane artifacts, not writable local configuration, and
 contain no credentials or local paths.
 
+## Agent Skills and Superpowers
+
+Production discovery is metadata-only and reads exactly the audited bundled
+packages plus explicitly configured private per-user skill roots. Project-local
+`.agents/skills` is never auto-discovered. An exact allowed selection binds the
+catalog, descriptor, version, source, package hash, and snapshot before full
+`SKILL.md` and declared resources load under canonical root containment.
+Symlinks, traversal, mutation, duplicate identity, unsafe ownership/mode, and
+unbounded content fail closed. Skill scripts remain hashed package members but
+are never executed, imported, evaluated, or spawned in v1.0.0; development has
+no bypass.
+
+The finite built-in phase engine records exact predecessor, input/output,
+handler, journal-head, catalog, snapshot, context-hash, and context-accounting
+bindings. A missing required capability returns
+`BLOCKED_SUPERPOWERS_MISSING`; the runtime never imitates the skill. A
+brainstorming approval is a durable pause. Human `APPROVE` or `REJECT` arrives
+only through the private same-user local socket with exact run, journal, phase,
+skill, snapshot, approval-hash, and UUID operation binding, and exact replay is
+restart-safe.
+
+`skill-execution-evidence.v1` binds a complete compact `journal_path`, catalog
+roots, snapshots, every phase attempt, approvals, final journal truth, and the
+handoff/document hashes without bodies, native paths, or secrets. The parser
+proves internal closure; TOSS still pins origin evidence and owns review and
+acceptance.
+
 `doctor` checks package, platform, Node, configuration, native manager state, restart backoff, and private socket health. A healthy active service with a matching socket identity passes the service check. Missing or stopped service state warns in development and fails in production; backoff, unsafe state, unavailable/degraded control, or identity mismatch fails. See the [Local Service Control v1 contract](docs/contracts/local-service-control-v1.md) for exact native commands, permissions, protocol bounds, stable failures, and shutdown ordering.
 
-`capabilities` advertises the delivered agentgateway and OpenAI, Anthropic, and Gemini normalized adapter transports plus the available pure routing-planning boundary. Skills, MCP, the agent loop, review execution, and evidence remain unavailable. An empty or unavailable capability is not an implementation promise. The supervised `serve` process owns the single-instance lock, private local status socket, and private append-only run-journal store. Active runs are durably recorded as `INTERRUPTED` before graceful shutdown removes the socket or lock. Agent execution remains unavailable until its later v1 waves.
+`capabilities` advertises the delivered Agent Skills host/Superpowers capabilities, agentgateway and OpenAI, Anthropic, and Gemini normalized adapter transports, plus the available pure routing-planning boundary. MCP, the complete agent loop, review execution, and aggregate ACP evidence remain unavailable. An empty or unavailable capability is not an implementation promise. The supervised `serve` process owns the single-instance lock, private local status socket, private append-only run-journal store, and Agent Skills recovery/flush lifecycle. Active runs are durably recorded as `INTERRUPTED` before graceful shutdown removes the socket or lock. Complete agent execution remains unavailable until its later v1 waves.
 
 Stable exit codes are `0` success, `2` usage, `3` invalid input, `4` blocked/policy, `5` validation, `6` conflict/stale revision, `69` unavailable capability, and `70` internal failure.
 
@@ -158,6 +185,7 @@ Stable exit codes are `0` success, `2` usage, `3` invalid input, `4` blocked/pol
 import { randomUUID } from "node:crypto";
 
 import {
+  createSkillsHost,
   createRunJournalStore,
   parseExecutionRequest,
   validateExecutionChain,
@@ -173,11 +201,28 @@ const journal = createRunJournalStore({
   now: () => new Date(),
   randomId: randomUUID,
 });
+
+const skills = createSkillsHost({
+  state_path: "/private/runtime-state",
+  socket_path: "/private/runtime/runtime.sock",
+  skill_roots: [],
+});
+await skills.recover();
+const catalog = await skills.discover({
+  query: null,
+  allowed_capabilities: ["test-driven-development"],
+});
 ```
 
 The public parser returns either a validated, deeply frozen domain value or a normalized failure. Input is bounded JSON; duplicate keys, unknown properties, unsupported schema versions, and unsafe JavaScript values are rejected.
 
-The same top-level API exports the closed project manifest, project registry-entry, candidate-intent, agent-definition, prompt-template, agent-registry-entry, compiled-context, provider-event, and agentgateway-capability parsers; the corresponding public agent hashes, registry factory/interface and pure compiler; safe project registry/intake, gateway profile/capability/route/health/credential-provider/observation types; the authenticated agentgateway factory; provider-neutral request/event/completion types; and the three adapter factories. Private agent object-store helpers, mutation claims, test factories, filesystem constructors, native SDK handles, raw fetch/SSE/header parsers, gateway wire clients, credential caches, and operation hooks remain outside the public package surface.
+The same top-level API exports the five closed Agent Skills parsers and hashes,
+the self-contained `createSkillsHost()` factory, and immutable skill/phase/
+approval/evidence contracts alongside the project, agent/context, provider,
+gateway, and routing surfaces. Private skill catalog/loader/object store, engine
+and approval construction seams, mutation claims, callbacks, native handles,
+test factories, raw fetch/SSE/header parsers, credential caches, and operation
+hooks remain outside the public declaration and package export surface.
 
 ## Contracts and examples
 

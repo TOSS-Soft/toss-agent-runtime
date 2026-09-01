@@ -7,11 +7,13 @@ import {
   readFile,
   readdir,
   realpath,
+  rename,
   rm,
   stat,
   writeFile,
 } from "node:fs/promises";
 import net from "node:net";
+import { homedir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -54,12 +56,33 @@ const REQUIRED_FILES = Object.freeze([
   "contracts/runtime/service-control-request.v1.schema.json",
   "contracts/runtime/service-control-response.v1.schema.json",
   "contracts/runtime/service-lock.v1.schema.json",
+  "contracts/runtime/skill-descriptor.v1.schema.json",
+  "contracts/runtime/skill-execution-evidence.v1.schema.json",
+  "contracts/runtime/skill-snapshot.v1.schema.json",
+  "contracts/runtime/superpowers-approval.v1.schema.json",
+  "contracts/runtime/superpowers-phase.v1.schema.json",
   "dist/contracts/runtime/candidate-job-intent.v1.schema.json",
   "dist/contracts/runtime/project-registry-entry.v1.schema.json",
   "dist/contracts/runtime/project-watch-manifest.v1.schema.json",
   "dist/contracts/runtime/service-control-request.v1.schema.json",
   "dist/contracts/runtime/service-control-response.v1.schema.json",
   "dist/contracts/runtime/service-lock.v1.schema.json",
+  "dist/contracts/runtime/skill-descriptor.v1.schema.json",
+  "dist/contracts/runtime/skill-execution-evidence.v1.schema.json",
+  "dist/contracts/runtime/skill-snapshot.v1.schema.json",
+  "dist/contracts/runtime/superpowers-approval.v1.schema.json",
+  "dist/contracts/runtime/superpowers-phase.v1.schema.json",
+  "dist/skills/bundled/brainstorming/SKILL.md",
+  "dist/skills/bundled/manifest.json",
+  "dist/skills/bundled/requesting-code-review/SKILL.md",
+  "dist/skills/bundled/systematic-debugging/SKILL.md",
+  "dist/skills/bundled/test-driven-development/SKILL.md",
+  "dist/skills/bundled/verification-before-completion/SKILL.md",
+  "dist/src/skills/approval.js",
+  "dist/src/skills/catalog.js",
+  "dist/src/skills/engine.js",
+  "dist/src/skills/loader.js",
+  "dist/src/skills/private-store.js",
   "dist/src/service/project/contracts.d.ts",
   "dist/src/service/project/contracts.js",
   "dist/src/service/project/errors.d.ts",
@@ -108,6 +131,11 @@ const REQUIRED_FILES = Object.freeze([
   "examples/runtime-contract-v1/execution-request.json",
   "examples/runtime-contract-v1/execution-result.json",
   "examples/runtime-contract-v1/runtime-capabilities.json",
+  "examples/runtime-contract-v1/skill-descriptor.json",
+  "examples/runtime-contract-v1/skill-execution-evidence.json",
+  "examples/runtime-contract-v1/skill-snapshot.json",
+  "examples/runtime-contract-v1/superpowers-approval.json",
+  "examples/runtime-contract-v1/superpowers-phase.json",
   "package.json",
 ]);
 
@@ -119,6 +147,7 @@ const ALLOWED_PATHS = Object.freeze([
   /^bin\/toss-runtime\.js$/,
   /^contracts\/runtime\/[a-z0-9.-]+\.schema\.json$/,
   /^dist\/contracts\/runtime\/[a-z0-9.-]+\.schema\.json$/,
+  /^dist\/skills\/bundled\/(?:manifest\.json|[a-z0-9-]+\/SKILL\.md)$/,
   /^dist\/src\/[a-z0-9_./-]+\.(?:js|js\.map|d\.ts|d\.ts\.map)$/,
   /^docs\/contracts\/[a-z0-9._-]+\.(?:md|json)$/,
   /^examples\/config\/runtime\.development\.yaml$/,
@@ -226,6 +255,12 @@ function assertPackageFiles(files) {
         publishedPath,
       ),
       `Private project declaration leaked: ${publishedPath}`,
+    );
+    assert(
+      !/^dist\/src\/skills\/(?:approval|bundled|catalog|context|engine|evidence|loader|paths|phases|private-store|runtime-host)\.(?:d\.ts|d\.ts\.map|js\.map)$/u.test(
+        publishedPath,
+      ),
+      `Private Agent Skills declaration or map leaked: ${publishedPath}`,
     );
   }
 }
@@ -392,6 +427,147 @@ async function assertInstalledAgentContextExample(temporaryDirectory) {
     ],
     { cwd: temporaryDirectory, encoding: "utf8", maxBuffer: 4 * 1024 * 1024 },
   );
+}
+
+async function assertInstalledAgentSkillsConsumer(temporaryDirectory) {
+  const sourcePath = path.join(temporaryDirectory, "agent-skills-consumer.mts");
+  const outputPath = path.join(temporaryDirectory, "agent-skills-consumer-dist");
+  await writeFile(
+    sourcePath,
+    `
+      import { strict as assert } from "node:assert";
+      import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+      import path from "node:path";
+      import {
+        createSkillsHost,
+        hashSkillDescriptor,
+        hashSkillExecutionEvidence,
+        hashSkillSnapshot,
+        hashSuperpowersApproval,
+        hashSuperpowersPhase,
+        parseSkillDescriptor,
+        parseSkillExecutionEvidence,
+        parseSkillSnapshot,
+        parseSuperpowersApproval,
+        parseSuperpowersPhase,
+        type SkillExecutionEvidenceV1,
+        type SkillsHostConfig,
+      } from "@toss-software/agent-runtime";
+
+      const root = await realpath(await mkdtemp(path.join("/tmp", "toss-installed-skills-")));
+      const packageRoot = path.join(
+        process.cwd(),
+        "node_modules",
+        "@toss-software",
+        "agent-runtime",
+      );
+      const exampleRoot = path.join(packageRoot, "examples", "runtime-contract-v1");
+      const readExample = (name: string) => readFile(path.join(exampleRoot, name));
+      const config: SkillsHostConfig = {
+        state_path: path.join(root, "state"),
+        socket_path: path.join(root, "runtime.sock"),
+        skill_roots: [],
+      };
+      const host = createSkillsHost(config);
+      try {
+        await host.recover();
+        const catalog = await host.discover({
+          query: null,
+          allowed_capabilities: [
+            "brainstorming",
+            "requesting-code-review",
+            "systematic-debugging",
+            "test-driven-development",
+            "verification-before-completion",
+          ],
+        });
+        assert.deepEqual(
+          catalog.descriptors.map((descriptor) => descriptor.name),
+          [
+            "brainstorming",
+            "requesting-code-review",
+            "systematic-debugging",
+            "test-driven-development",
+            "verification-before-completion",
+          ],
+        );
+        const selection = await host.select({
+          mode: "implicit",
+          capability: "test-driven-development",
+          allowed_capabilities: ["test-driven-development"],
+          query: null,
+          descriptor: null,
+        });
+        const loaded = await host.load(selection);
+
+        const descriptor = parseSkillDescriptor(await readExample("skill-descriptor.json"));
+        const snapshot = parseSkillSnapshot(await readExample("skill-snapshot.json"));
+        const phase = parseSuperpowersPhase(await readExample("superpowers-phase.json"));
+        const approval = parseSuperpowersApproval(await readExample("superpowers-approval.json"));
+        const evidence = parseSkillExecutionEvidence(
+          await readExample("skill-execution-evidence.json"),
+        );
+        assert.equal(descriptor.ok && snapshot.ok && phase.ok && approval.ok && evidence.ok, true);
+        if (!descriptor.ok || !snapshot.ok || !phase.ok || !approval.ok || !evidence.ok) {
+          throw new Error("Installed Agent Skills examples did not parse");
+        }
+        const typedEvidence: SkillExecutionEvidenceV1 = evidence.value;
+        assert.equal(hashSkillDescriptor(descriptor.value), descriptor.value.document_hash);
+        assert.equal(hashSkillSnapshot(snapshot.value), snapshot.value.document_hash);
+        assert.equal(hashSuperpowersPhase(phase.value), phase.value.document_hash);
+        assert.equal(hashSuperpowersApproval(approval.value), approval.value.document_hash);
+        assert.equal(hashSkillExecutionEvidence(typedEvidence), typedEvidence.document_hash);
+        assert.equal(loaded.document_hash, snapshot.value.document_hash);
+
+        for (const privateSpecifier of [
+          "@toss-software/agent-runtime/src/skills/catalog.js",
+          "@toss-software/agent-runtime/src/skills/private-store.js",
+        ]) {
+          assert.throws(
+            () => import.meta.resolve(privateSpecifier),
+            (error: unknown) =>
+              error instanceof Error &&
+              "code" in error &&
+              error.code === "ERR_PACKAGE_PATH_NOT_EXPORTED",
+          );
+        }
+      } finally {
+        host.stopIntake();
+        await host.flush(AbortSignal.timeout(5000));
+        await rm(root, { recursive: true, force: true });
+      }
+    `,
+    { mode: 0o600 },
+  );
+  const typeRoots = path.join(root, "node_modules", "@types");
+  await execFile(
+    process.execPath,
+    [
+      path.join(root, "node_modules", "typescript", "bin", "tsc"),
+      sourcePath,
+      "--module",
+      "NodeNext",
+      "--moduleResolution",
+      "NodeNext",
+      "--target",
+      "ES2023",
+      "--strict",
+      "--skipLibCheck",
+      "false",
+      "--types",
+      "node",
+      "--typeRoots",
+      typeRoots,
+      "--outDir",
+      outputPath,
+    ],
+    { cwd: temporaryDirectory, encoding: "utf8", maxBuffer: 4 * 1024 * 1024 },
+  );
+  await execFile(process.execPath, [path.join(outputPath, "agent-skills-consumer.mjs")], {
+    cwd: temporaryDirectory,
+    encoding: "utf8",
+    maxBuffer: 4 * 1024 * 1024,
+  });
 }
 
 function startInstalledServe(executable, configPath) {
@@ -655,6 +831,25 @@ async function assertMissing(candidate, label) {
     throw error;
   }
   throw new Error(`${label} remained after installed serve shutdown`);
+}
+
+async function moveOwnedTarballToTrash(candidate) {
+  const metadata = await lstat(candidate);
+  assert(metadata.isFile(), "Only the operation-owned package tarball may move to Trash");
+  const trashPath = await realpath(path.join(homedir(), ".Trash"));
+  const trashMetadata = await lstat(trashPath);
+  assert(trashMetadata.isDirectory(), "The current user's Trash path was not a directory");
+  const parsed = path.parse(path.basename(candidate));
+  const destination = path.join(trashPath, `${parsed.name}-${randomUUID()}${parsed.ext}`);
+  await assertMissing(destination, "Collision-safe package Trash destination");
+  await rename(candidate, destination);
+  const moved = await lstat(destination);
+  assert(
+    moved.isFile() && moved.size === metadata.size,
+    "Package tarball Trash move was incomplete",
+  );
+  await assertMissing(candidate, "Operation-owned package tarball after Trash move");
+  return destination;
 }
 
 async function requestInstalledStatus(socketPath, canonicalJson) {
@@ -943,7 +1138,8 @@ try {
   );
   assertPackageFiles(packageReport.files);
 
-  temporaryDirectory = await mkdtemp(path.join(temporaryRoot, "toss-runtime-package-"));
+  const privateTemporaryRoot = await realpath(homedir());
+  temporaryDirectory = await mkdtemp(path.join(privateTemporaryRoot, "toss-runtime-package-"));
   await execFile(npmCommand, ["init", "--yes"], {
     cwd: temporaryDirectory,
     encoding: "utf8",
@@ -964,6 +1160,7 @@ try {
     { cwd: temporaryDirectory, encoding: "utf8" },
   );
   await assertInstalledAgentContextExample(temporaryDirectory);
+  await assertInstalledAgentSkillsConsumer(temporaryDirectory);
 
   const executable = path.join(
     temporaryDirectory,
@@ -986,6 +1183,41 @@ try {
   await assertMissing(
     path.join(installedRoot, "dist", "src", "logging", "store.d.ts"),
     "Private operational store declaration",
+  );
+  const skillDeclaration = await readFile(
+    path.join(installedRoot, "dist", "src", "skills", "index.d.ts"),
+    "utf8",
+  );
+  assert(
+    !/from "\.\/(?:approval|catalog|context|engine|loader|private-store|runtime-host)\.js"/u.test(
+      skillDeclaration,
+    ) &&
+      !/RunJournalStore|hasServiceListener|randomId|readonly now|operationHooks|ForTest/u.test(
+        skillDeclaration,
+      ),
+    "Installed Agent Skills public declaration retained a private type edge",
+  );
+  for (const privateDeclaration of [
+    "approval.d.ts",
+    "catalog.d.ts",
+    "engine.d.ts",
+    "loader.d.ts",
+    "private-store.d.ts",
+    "runtime-host.d.ts",
+  ]) {
+    await assertMissing(
+      path.join(installedRoot, "dist", "src", "skills", privateDeclaration),
+      `Private Agent Skills declaration ${privateDeclaration}`,
+    );
+  }
+  await assertMissing(path.join(installedRoot, "skills"), "Duplicated source bundled skill tree");
+  const installedBundledManifest = JSON.parse(
+    await readFile(path.join(installedRoot, "dist", "skills", "bundled", "manifest.json"), "utf8"),
+  );
+  assert(
+    installedBundledManifest.schema_version === "bundled-skill-manifest.v1" &&
+      installedBundledManifest.packages.length === 5,
+    "Installed bundled Agent Skills manifest was incomplete",
   );
   const projectInterfaces = await readFile(
     path.join(installedRoot, "dist", "src", "service", "project", "interfaces.d.ts"),
@@ -1074,6 +1306,7 @@ try {
         gateway_profiles: {},
         provider_profiles: [],
         mcp_profiles: [],
+        skill_roots: [],
         secret_references: {},
       }),
       { mode: 0o600 },
@@ -1141,7 +1374,11 @@ try {
       temporaryDirectory === undefined
         ? Promise.resolve()
         : rm(temporaryDirectory, { recursive: true, force: true }),
-    () => (tarballPath === undefined ? Promise.resolve() : rm(tarballPath, { force: true })),
+    async () => {
+      if (tarballPath === undefined) return;
+      await moveOwnedTarballToTrash(tarballPath);
+      tarballPath = undefined;
+    },
     () =>
       packDirectory === undefined
         ? Promise.resolve()

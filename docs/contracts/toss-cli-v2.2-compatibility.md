@@ -104,6 +104,32 @@ Unknown major versions fail closed. Unknown exact schema versions fail closed. N
 
 Feature availability and supporting resources are checked in both directions. For example, an available provider feature without a provider transport, or an available skill feature without an Agent Skills host and Superpowers capability, fails before dispatch. Provider transports map to provider availability independently of routing; model classes map to routing availability.
 
+## Agent Skills and Superpowers mapping
+
+CLI policy remains the authority for the allowed and required Superpowers
+capabilities. The runtime performs metadata-only discovery from audited bundled
+packages and explicit private per-user skill roots; it never auto-discovers
+project-local `.agents/skills`. CLI selects or permits one exact descriptor,
+version, source identity, package hash, and catalog root. Only that exact
+post-selection identity may load full `SKILL.md` and declared resources under
+canonical path containment. Skill bodies remain untrusted content and skill
+scripts are never executed in v1.0.0, including development.
+
+If a required capability has no exact allowed package, the runtime returns
+`BLOCKED_SUPERPOWERS_MISSING`; the CLI must not treat a model imitation as the
+missing phase. A brainstorming approval is a durable `APPROVAL_PENDING` run,
+not text in the transcript. CLI sends the human decision through the private
+same-user local socket with exact journal, phase, skill, snapshot, approval hash,
+and UUID operation binding, and reconciles stale state before retry. Exact
+replay returns the original decision after restart.
+
+CLI validates `skill-execution-evidence.v1` before retaining it. The compact
+`journal_path` must reach the advertised exact head/state; catalog roots,
+snapshots, phase attempts, context accounting, approvals, and terminal code
+must be complete and hash-consistent. The CLI pins the evidence handoff or
+document hash as origin evidence and still applies its independent policy,
+review, output-schema, and acceptance decisions.
+
 ## Error and process mapping
 
 CLI calls that use JSON mode receive one `command-result.v1` object. Runtime exit codes map to CLI behavior as follows:

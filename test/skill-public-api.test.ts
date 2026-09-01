@@ -164,25 +164,30 @@ describe("Agent Skills public API", () => {
       skill_roots: Object.freeze([]),
     });
     const host = rootApi.createSkillsHost(config);
-
-    expect(Object.keys(host).sort()).toEqual([
-      "assembleContext",
-      "completePhase",
-      "discover",
-      "evidence",
-      "flush",
-      "load",
-      "recover",
-      "resumeApproval",
-      "select",
-      "startPhase",
-      "stopIntake",
-    ]);
-    expect(JSON.stringify(host)).not.toContain(root);
-    const catalog = await host.discover({ query: null, allowed_capabilities: ["brainstorming"] });
-    expect(Object.isFrozen(catalog)).toBe(true);
-    expect(Object.isFrozen(catalog.descriptors)).toBe(true);
-    expect(JSON.stringify(catalog)).not.toContain(root);
+    try {
+      await host.recover();
+      expect(Object.keys(host).sort()).toEqual([
+        "assembleContext",
+        "completePhase",
+        "discover",
+        "evidence",
+        "flush",
+        "load",
+        "recover",
+        "resumeApproval",
+        "select",
+        "startPhase",
+        "stopIntake",
+      ]);
+      expect(JSON.stringify(host)).not.toContain(root);
+      const catalog = await host.discover({ query: null, allowed_capabilities: ["brainstorming"] });
+      expect(Object.isFrozen(catalog)).toBe(true);
+      expect(Object.isFrozen(catalog.descriptors)).toBe(true);
+      expect(JSON.stringify(catalog)).not.toContain(root);
+    } finally {
+      host.stopIntake();
+      await host.flush(AbortSignal.timeout(5_000));
+    }
   });
 
   it("emits public declarations without private skill hooks, native paths, or body stores", () => {
@@ -222,6 +227,12 @@ describe("Agent Skills public API", () => {
       expect(skillsDeclaration).not.toMatch(
         /RunJournalStore|hasServiceListener|randomId|readonly now|operationHooks|ForTest/u,
       );
+      expect(skillsDeclaration).not.toMatch(
+        /from "\.\/(?:approval|catalog|context|engine|loader|private-store|runtime-host)\.js"/u,
+      );
+      expect(skillsDeclaration).toMatch(/export interface SkillSelection \{/u);
+      expect(skillsDeclaration).toMatch(/export interface StartSuperpowersPhaseRequest \{/u);
+      expect(skillsDeclaration).toMatch(/export interface ResumeSuperpowersApprovalRequest \{/u);
     } finally {
       rmSync(declarationRoot, { recursive: true, force: true });
     }
