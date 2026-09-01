@@ -499,7 +499,7 @@ CLI JSON mode returns one `command-result.v1` document. Exit codes are `0` succe
 ## 15. Reference artifacts
 
 The schema manifest maps every exact version to a stable `$id`. The
-`examples/runtime-contract-v1` directory groups three distinct reference sets.
+`examples/runtime-contract-v1` directory groups four distinct reference sets.
 `execution-request.json`, `execution-event.json`, and `execution-result.json`
 form the legacy execution chain. The model catalog, routing policy, prior
 routing state, and model-selection plan form the governed routing set. The
@@ -514,9 +514,10 @@ hash. Package verification loads examples through the public package API,
 validates the legacy execution chain, and recomputes every governed routing and
 agent/context hash. The planned routing example binds its exact next-state hash
 without embedding a cyclic plan hash in the state reservation. The Agent Skills
-reference set contains one canonical descriptor, snapshot, completed phase,
-approval request, and execution-evidence document. Package verification loads
-all five through public root parsers and recomputes their document hashes. The
-evidence example demonstrates the final compact `journal_path`, catalog-root
-membership, snapshot closure, and exact `context_accounting` shape without
-embedding bodies, native paths, or secrets.
+files are the fourth reference set and contain two related but distinct
+fixtures. `skill-descriptor.json`, `skill-snapshot.json`, and `skill-execution-evidence.json` form the TDD fixture chain, whose evidence contains its completed `TEST_DESIGN` phase.
+Separately, `superpowers-phase.json` and `superpowers-approval.json` form one real `BRAINSTORMING` transaction that is `APPROVAL_PENDING` in both phase and journal; it is not a completed phase.
+Package verification loads all five through public root parsers and recomputes
+their document hashes. The evidence example demonstrates the final compact
+`journal_path`, catalog-root membership, snapshot closure, and exact
+`context_accounting` shape without embedding bodies, native paths, or secrets.

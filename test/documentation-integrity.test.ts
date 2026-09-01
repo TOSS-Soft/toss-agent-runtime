@@ -282,8 +282,25 @@ describe("published protocol artifacts", () => {
       expect(hashSuperpowersApproval(approval.value)).toBe(approval.value.document_hash);
       expect(hashSkillExecutionEvidence(evidence.value)).toBe(evidence.value.document_hash);
       expect(snapshot.value.descriptor).toEqual(descriptor.value);
+      expect(evidence.value.snapshots).toEqual([snapshot.value]);
+      const completed = evidence.value.phases.find(
+        (candidate) => candidate.phase === "TEST_DESIGN" && candidate.status === "COMPLETED",
+      );
+      expect(completed).toBeDefined();
+      expect(completed?.skill.snapshot_hash).toBe(snapshot.value.document_hash);
       expect(evidence.value.journal_path).toHaveLength(3);
     }
+
+    const protocol = await readFile("docs/contracts/runtime-contract-protocol-v1.md", "utf8");
+    expect(protocol).toContain(
+      "`examples/runtime-contract-v1` directory groups four distinct reference sets.",
+    );
+    expect(protocol).toContain(
+      "`skill-descriptor.json`, `skill-snapshot.json`, and `skill-execution-evidence.json` form the TDD fixture chain, whose evidence contains its completed `TEST_DESIGN` phase.",
+    );
+    expect(protocol).toContain(
+      "Separately, `superpowers-phase.json` and `superpowers-approval.json` form one real `BRAINSTORMING` transaction that is `APPROVAL_PENDING` in both phase and journal; it is not a completed phase.",
+    );
   });
 
   it("links the approval example to one canonical pending brainstorming transaction", async () => {
