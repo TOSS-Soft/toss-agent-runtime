@@ -638,21 +638,21 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 - Consumes: `McpStreamableHttpBinding`, fixed fetch/DNS/socket seams, per-request secret resolver, SDK client factory, and profile-approved header mappings.
 - Produces: `createStreamableHttpToolTransport(options): ToolTransportAdapter`.
 
-- [ ] **Step 1: Write loopback/network-seam RED tests**
+- [x] **Step 1: Write loopback/network-seam RED tests**
 
   Cover HTTPS production, exact development loopback HTTP, userinfo/query/fragment rejection, redirects, public-to-private rebinding, private/link-local/metadata IPs, connection-time address mismatch, fixed content negotiation, per-request bearer resolution, no 401 refresh/retry, JSON and SSE replies, timeout/cancellation, revision mismatch, malformed bodies, rate limit classification, and `x-mcp-header` allowlist enforcement.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
   ```bash
   npm exec -- vitest run test/tool-streamable-http-transport.test.ts --maxWorkers=4
   ```
 
-- [ ] **Step 3: Implement fixed-origin transport policy**
+- [x] **Step 3: Implement fixed-origin transport policy**
 
   Normalize the endpoint once; validate DNS at configuration and connect; bind the actual socket address to the approved resolution; set `redirect: "error"`; construct headers from a closed local allowlist; resolve bearer tokens for each request; and never accept caller headers, uncontrolled query values, response-driven redirects, or automatic auth refresh. Map status/network failures to tool codes without response text.
 
-- [ ] **Step 4: Run GREEN and commit**
+- [x] **Step 4: Run GREEN and commit**
 
   ```bash
   npm exec -- vitest run test/tool-streamable-http-transport.test.ts test/tool-sdk-client.test.ts --maxWorkers=4
