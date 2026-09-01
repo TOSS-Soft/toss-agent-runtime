@@ -28,7 +28,12 @@ import {
   type SkillPackageManifest,
   type SkillSelection,
 } from "./catalog.js";
-import { hashSkillPackage, parseSkillSnapshot } from "./contracts.js";
+import {
+  canonicalSkillCatalogRoot,
+  hashSkillPackage,
+  parseSkillSnapshot,
+  SKILL_CATALOG_ROOT_JSON_LIMITS,
+} from "./contracts.js";
 import { RuntimeSkillError } from "./errors.js";
 import { assertSkillRelativePath } from "./paths.js";
 import {
@@ -877,11 +882,19 @@ function createLoader(
   };
   const retainCatalogRoot = async (selection: SkillSelection): Promise<void> => {
     resolveSkillSelectionForLoader(options.catalog, selection);
+    canonicalSkillCatalogRoot(selection.catalog_root);
     const record = {
       schema_version: "skill-private-catalog-root.v1" as const,
       catalog_root: selection.catalog_root,
     };
-    const canonical = Buffer.from(canonicalJson(record as unknown as JsonValue), "utf8");
+    const canonical = Buffer.from(
+      canonicalJson(record as unknown as JsonValue, {
+        ...SKILL_CATALOG_ROOT_JSON_LIMITS,
+        maxBytes: SKILL_LIMITS.catalogRootBytes + 128,
+        maxMembers: SKILL_LIMITS.catalogRootMembers + 4,
+      }),
+      "utf8",
+    );
     if (canonical.byteLength > SKILL_LIMITS.storedObjectBytes) limitExceeded();
     const replay = await store.readObject(selection.catalog_hash);
     if (replay !== null) {

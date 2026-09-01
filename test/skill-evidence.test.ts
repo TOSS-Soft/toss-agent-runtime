@@ -33,6 +33,7 @@ import { SKILL_LIMITS, type SkillsHost } from "../src/skills/index.js";
 import { createSkillEvidenceBuilder } from "../src/skills/evidence.js";
 import type { SkillsEngine } from "../src/skills/engine.js";
 import { builtInSuperpowersHandler } from "../src/skills/phases.js";
+import { createSkillPrivateStoreForTest } from "../src/skills/private-store.js";
 import { createSkillsRuntimeHostForTest } from "../src/skills/runtime-host.js";
 import type { SkillSelection } from "../src/skills/catalog.js";
 import type {
@@ -340,6 +341,96 @@ function highMemberEvidence(packageCount = 224): SkillExecutionEvidenceV1 {
   };
 }
 
+function evidenceWithCatalogDescriptorCount(count: number): SkillExecutionEvidenceV1 {
+  const base = validSkillExecutionEvidence();
+  const selected = base.catalogs[0]!.descriptors[0]!;
+  const descriptors = [
+    selected,
+    ...Array.from(
+      { length: count - 1 },
+      (_unused, index) =>
+        resign({
+          protocol_version: "runtime-contract.v1",
+          schema_version: "skill-descriptor.v1",
+          document_type: "skill-descriptor",
+          name: `catalog-${String(index).padStart(4, "0")}`,
+          description: "Legal multi-root catalog member.",
+          version: "1.0.0",
+          source: {
+            kind: "configured",
+            identity: `catalog-source-${String(index).padStart(4, "0")}`,
+          },
+          package_hash: sha256({ kind: "catalog-package", index }),
+          resource_count: 0,
+          total_bytes: 1,
+          required_runtime_capabilities: [],
+        }) as unknown as SkillSnapshotV1["descriptor"],
+    ),
+  ].sort((left, right) => {
+    for (const [leftField, rightField] of [
+      [left.name, right.name],
+      [left.version, right.version],
+      [left.source.kind, right.source.kind],
+      [left.source.identity, right.source.identity],
+      [left.package_hash, right.package_hash],
+      [left.document_hash, right.document_hash],
+    ] as const) {
+      const order = Buffer.from(leftField).compare(Buffer.from(rightField));
+      if (order !== 0) return order;
+    }
+    return 0;
+  });
+  const references = descriptors.map((descriptor) => ({
+    name: descriptor.name,
+    version: descriptor.version,
+    source: descriptor.source,
+    package_hash: descriptor.package_hash,
+    document_hash: descriptor.document_hash,
+  }));
+  const catalogHash = unboundedHash(references);
+  let previousPhaseHash = base.phases[0]!.previous_phase_hash;
+  const phases = base.phases.map((phase) => {
+    const next = resign({
+      ...phase,
+      catalog_hash: catalogHash,
+      previous_phase_hash: previousPhaseHash,
+    });
+    previousPhaseHash = next.document_hash;
+    return next;
+  });
+  return resignEvidence({
+    ...base,
+    catalogs: [{ descriptors, catalog_hash: catalogHash }],
+    phases,
+  }) as unknown as SkillExecutionEvidenceV1;
+}
+
+function validEvidenceJournalHistory(): readonly RunJournalEntryV1[] {
+  const history: RunJournalEntryV1[] = [];
+  for (const state of ["CREATED", "ROUTED", "RUNNING"] as const) {
+    const previous = history.at(-1);
+    const transition = decideRunTransition(
+      history,
+      {
+        run_id: "run-1",
+        expected_revision: previous?.journal_revision ?? 0,
+        expected_head_hash: previous?.entry_hash ?? ZERO_JOURNAL_HASH,
+        command_id: `fixture-${state.toLowerCase()}`,
+        operation_id: null,
+        next_state: state,
+        reason_code: `FIXTURE_${state}`,
+        trace: TRACE,
+        metadata: {},
+        side_effect: null,
+      },
+      () => new Date(`2026-08-30T12:00:0${history.length}.000Z`),
+    );
+    if (transition.kind !== "append") throw new Error("fixture transition must append");
+    history.push(transition.entry);
+  }
+  return history;
+}
+
 function denseSchemaOpenEvidence(shape: "array" | "object"): string {
   const prefix =
     '{"document_type":"skill-execution-evidence","schema_version":"skill-execution-evidence.v1","x":';
@@ -429,6 +520,83 @@ function resignZeroPhaseJournalPath(
 }
 
 describe("canonical Agent Skills evidence", () => {
+  it.each([257, 1_280])(
+    "parses a legal %i-descriptor catalog root within the independent evidence envelope",
+    (count) => {
+      const evidence = evidenceWithCatalogDescriptorCount(count);
+      const serialized = canonicalSkillEvidenceJson(evidence);
+      expect(Buffer.byteLength(serialized, "utf8")).toBeLessThan(SKILL_LIMITS.evidenceBytes);
+      expect(parseSkillExecutionEvidence(serialized)).toEqual({ ok: true, value: evidence });
+    },
+  );
+
+  it("builds a real public evidence projection from a legal 257-descriptor catalog root", async () => {
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-evidence-catalog-root-")));
+    roots.push(root);
+    const statePath = path.join(root, "state");
+    const expected = evidenceWithCatalogDescriptorCount(257);
+    const history = validEvidenceJournalHistory();
+    const final = history.at(-1)!;
+    const now = clock();
+    const randomId = ids();
+    const storeOptions = {
+      statePath,
+      now,
+      randomId,
+      hasServiceListener: () => Promise.resolve("absent" as const),
+    };
+    const store = createSkillPrivateStoreForTest(storeOptions);
+    const catalog = expected.catalogs[0]!;
+    const snapshot = expected.snapshots[0]!;
+    await store.publishObject(
+      catalog.catalog_hash,
+      Buffer.from(
+        canonicalJson({
+          schema_version: "skill-private-catalog-root.v1",
+          catalog_root: catalog,
+        }),
+        "utf8",
+      ),
+    );
+    await store.publishObject(
+      snapshot.package_hash,
+      Buffer.from(
+        canonicalJson({
+          schema_version: "skill-private-object.v1",
+          snapshot,
+          skill_markdown_base64: "",
+          resources: [],
+        }),
+        "utf8",
+      ),
+    );
+    const engine = {
+      evidenceHistory: () =>
+        Promise.resolve({
+          phases: expected.phases,
+          journal: {
+            run_id: "run-1",
+            state: final.state,
+            head: {
+              journal_revision: final.journal_revision,
+              sequence: final.sequence,
+              entry_hash: final.entry_hash,
+            },
+            entries: history,
+            unresolved_side_effects: [],
+          },
+        }),
+    } as unknown as SkillsEngine;
+    const builder = createSkillEvidenceBuilder({ ...storeOptions, engine });
+
+    const evidence = await builder.evidence("run-1");
+    expect(evidence).toEqual(expected);
+    expect(parseSkillExecutionEvidence(canonicalSkillEvidenceJson(evidence))).toEqual({
+      ok: true,
+      value: expected,
+    });
+  });
+
   it("parses the legal 224-snapshot evidence shape below the byte limit", () => {
     const evidence = highMemberEvidence();
     let observed: EvidenceSerializationProbe | null = null;

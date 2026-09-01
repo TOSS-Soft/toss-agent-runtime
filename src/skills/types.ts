@@ -9,9 +9,15 @@ export type SuperpowersPhaseName =
 export type SuperpowersPhaseStatus =
   "STARTED" | "APPROVAL_PENDING" | "COMPLETED" | "FAILED" | "BLOCKED";
 
+const CATALOG_ROOT_DESCRIPTORS = 16 * 256;
+const CATALOG_ROOT_MEMBERS = CATALOG_ROOT_DESCRIPTORS * (256 + 32) + 32;
+
 export const SKILL_LIMITS = Object.freeze({
   roots: 16,
   packagesPerRoot: 256,
+  catalogRootDescriptors: CATALOG_ROOT_DESCRIPTORS,
+  catalogRootBytes: 16_777_216,
+  catalogRootMembers: CATALOG_ROOT_MEMBERS,
   resourcesPerPackage: 256,
   nestingDepth: 8,
   descriptorBytes: 65_536,

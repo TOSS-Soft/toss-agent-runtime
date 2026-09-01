@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { describe, expect, it } from "vitest";
 
 import { canonicalJson, sha256 } from "../src/protocol/json.js";
@@ -8,6 +10,7 @@ import {
   parseSuperpowersApproval,
   parseSuperpowersPhase,
 } from "../src/skills/contracts.js";
+import { SKILL_LIMITS } from "../src/skills/types.js";
 import {
   validSkillDescriptor,
   validSkillExecutionEvidence,
@@ -30,6 +33,23 @@ function resignDocument<T extends Record<string, unknown>>(value: T): T {
 }
 
 describe("skill runtime contracts", () => {
+  it("publishes the authoritative global catalog-root cardinality in the evidence schema", () => {
+    const schema = JSON.parse(
+      readFileSync("contracts/runtime/skill-execution-evidence.v1.schema.json", "utf8"),
+    ) as {
+      readonly $defs: {
+        readonly catalog_root: {
+          readonly properties: { readonly descriptors: { readonly maxItems: number } };
+        };
+      };
+    };
+    expect(schema.$defs.catalog_root.properties.descriptors.maxItems).toBe(
+      SKILL_LIMITS.catalogRootDescriptors,
+    );
+    expect(SKILL_LIMITS.catalogRootDescriptors).toBe(
+      SKILL_LIMITS.roots * SKILL_LIMITS.packagesPerRoot,
+    );
+  });
   it.each([
     ["descriptor", parseSkillDescriptor, validSkillDescriptor()],
     ["snapshot", parseSkillSnapshot, validSkillSnapshot()],

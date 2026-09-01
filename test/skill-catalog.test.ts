@@ -701,6 +701,53 @@ describe("skill catalog metadata discovery", () => {
     );
   });
 
+  it("publishes and explicitly selects all 257 eligible descriptors across legal roots", async () => {
+    const first = await privateTemporaryDirectory("toss-skill-multi-root-a-");
+    const second = await privateTemporaryDirectory("toss-skill-multi-root-b-");
+    const firstNames = [
+      "brainstorming",
+      ...Array.from(
+        { length: 128 },
+        (_unused, index) => `package-${String(index).padStart(3, "0")}`,
+      ),
+    ];
+    const secondNames = Array.from(
+      { length: 128 },
+      (_unused, index) => `package-${String(index + 128).padStart(3, "0")}`,
+    );
+    await Promise.all([
+      ...firstNames.map((name) =>
+        writeConfiguredPackage(first, name, {
+          capabilities:
+            name === "brainstorming" ? ["brainstorming", "catalog-access"] : ["catalog-access"],
+        }),
+      ),
+      ...secondNames.map((name) =>
+        writeConfiguredPackage(second, name, { capabilities: ["catalog-access"] }),
+      ),
+    ]);
+    const configuredRoots = [first, second].sort((left, right) =>
+      Buffer.from(left).compare(Buffer.from(right)),
+    );
+    const catalog = createSkillCatalogForTest({ configuredRoots, includeBundled: false });
+    const discovered = await catalog.discover({
+      query: null,
+      allowed_capabilities: ["brainstorming", "catalog-access"],
+    });
+    expect(discovered.descriptors).toHaveLength(257);
+    const descriptor = discovered.descriptors.find((entry) => entry.name === "brainstorming");
+    if (descriptor === undefined) throw new Error("brainstorming descriptor missing");
+    const selected = catalog.select(discovered, {
+      mode: "explicit",
+      capability: "brainstorming",
+      allowed_capabilities: ["brainstorming", "catalog-access"],
+      query: "metadata query must not narrow an exact selection",
+      descriptor: reference(discovered, "brainstorming"),
+    });
+    expect(selected.catalog_root.descriptors).toHaveLength(257);
+    expect(selected.descriptor.document_hash).toBe(descriptor.document_hash);
+  });
+
   it("fails closed before enumerating more than 16 configured roots", async () => {
     const roots = await Promise.all(
       Array.from({ length: 17 }, (_unused, index) =>

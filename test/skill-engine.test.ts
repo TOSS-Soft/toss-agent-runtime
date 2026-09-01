@@ -99,8 +99,24 @@ function snapshot(name: string, version = "1.0.0"): SkillSnapshotV1 {
   });
 }
 
-function selection(value: SkillSnapshotV1): SkillSelection {
-  const descriptors = [value.descriptor];
+function selection(
+  value: SkillSnapshotV1,
+  catalogDescriptors: readonly SkillSnapshotV1["descriptor"][] = [value.descriptor],
+): SkillSelection {
+  const descriptors = [...catalogDescriptors].sort((left, right) => {
+    for (const [leftField, rightField] of [
+      [left.name, right.name],
+      [left.version, right.version],
+      [left.source.kind, right.source.kind],
+      [left.source.identity, right.source.identity],
+      [left.package_hash, right.package_hash],
+      [left.document_hash, right.document_hash],
+    ] as const) {
+      const order = Buffer.from(leftField).compare(Buffer.from(rightField));
+      if (order !== 0) return order;
+    }
+    return 0;
+  });
   const catalogHash = hashSkillCatalog(
     descriptors.map((descriptor) => ({
       name: descriptor.name,
@@ -1831,5 +1847,26 @@ describe("skills engine lifecycle and crash boundaries", () => {
       ),
     ).rejects.toMatchObject({ code: "RUNTIME_SKILL_UNAVAILABLE" });
     await expect(access(separateState)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("accepts a legal 257-descriptor catalog root at phase intake", async () => {
+    const { statePath } = await fixture();
+    const { journal, head } = await runningJournal(statePath);
+    const tdd = snapshot("test-driven-development");
+    const catalogDescriptors = [
+      tdd.descriptor,
+      ...Array.from(
+        { length: 256 },
+        (_unused, index) => snapshot(`catalog-skill-${String(index).padStart(3, "0")}`).descriptor,
+      ),
+    ];
+    const host = engine(statePath, journal, [tdd], { idOffset: 2_000 });
+
+    await expect(
+      host.startPhase({
+        ...startRequest(head, tdd, "TEST_DESIGN", "legal-multi-root"),
+        selection: selection(tdd, catalogDescriptors),
+      }),
+    ).resolves.toMatchObject({ phase: { status: "STARTED" } });
   });
 });

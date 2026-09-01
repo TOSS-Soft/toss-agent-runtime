@@ -62,6 +62,7 @@ import type {
 } from "./catalog.js";
 import type { SkillContext, SkillContextRequest } from "./context.js";
 import {
+  canonicalSkillCatalogRoot,
   hashSkillCatalog,
   parseSkillDescriptor,
   parseSkillSnapshot,
@@ -74,12 +75,14 @@ import {
 } from "./errors.js";
 import type { SkillLoader } from "./loader.js";
 import {
+  BUILTIN_SUPERPOWERS_POLICY,
   builtInPhaseContextBudget,
   builtInSuperpowersHandler,
   requiredBuiltInPhasePredecessors,
 } from "./phases.js";
 import {
   SKILL_LIMITS,
+  type SkillCatalogRoot,
   type SkillContextAccounting,
   type SkillDescriptorV1,
   type SkillSnapshotV1,
@@ -103,6 +106,7 @@ const QUARANTINE_STAGE_PATTERN =
   /^\.phase-quarantine\.([A-Za-z][A-Za-z0-9._:-]{0,127})\.([0-9a-f-]{36})\.stage$/u;
 const QUARANTINE_NAME_PATTERN = /^phase-history-[0-9a-f]{64}-(0|[1-9][0-9]*)\.bin$/u;
 const MUTATION_LOCK_PATTERN = /^\.phase-mutation-([0-9a-f]{64})\.lock$/u;
+const DELIVERED_RUNTIME_CAPABILITIES = new Set<string>(Object.keys(BUILTIN_SUPERPOWERS_POLICY));
 const MUTATION_STAGE_PATTERN =
   /^\.phase-mutation-stage\.([A-Za-z][A-Za-z0-9._:-]{0,127})\.([1-9][0-9]*)\.([0-9a-f-]{36})\.stage$/u;
 const MUTATION_TOMBSTONE_PATTERN =
@@ -310,6 +314,19 @@ function limitExceeded(): never {
   throw new RuntimeSkillError("RUNTIME_SKILL_LIMIT_EXCEEDED");
 }
 
+function assertDeliveredRuntimeCapabilities(descriptor: SkillDescriptorV1): void {
+  if (descriptor.required_runtime_capabilities.includes("external-scripts")) {
+    throw new RuntimeSkillError("RUNTIME_SKILL_SCRIPT_UNAVAILABLE");
+  }
+  if (
+    descriptor.required_runtime_capabilities.some(
+      (capability) => !DELIVERED_RUNTIME_CAPABILITIES.has(capability),
+    )
+  ) {
+    throw new RuntimeSkillError("BLOCKED_SUPERPOWERS_MISSING");
+  }
+}
+
 function errorCode(error: unknown): string | undefined {
   return typeof error === "object" && error !== null && "code" in error
     ? String(error.code)
@@ -454,7 +471,7 @@ function assertDeepFrozenData(
   }
   const descriptors = Object.getOwnPropertyDescriptors(value);
   state.members += Object.keys(descriptors).length;
-  if (state.members > 10_000) limitExceeded();
+  if (state.members > SKILL_LIMITS.catalogRootMembers + 10_000) limitExceeded();
   for (const [key, descriptor] of Object.entries(descriptors)) {
     if (Array.isArray(value) && key === "length") continue;
     if (
@@ -516,9 +533,15 @@ function exactSelectionAuthority(value: unknown): SkillSelection {
   if (
     !Array.isArray(root.descriptors) ||
     root.descriptors.length === 0 ||
-    root.descriptors.length > SKILL_LIMITS.packagesPerRoot ||
+    root.descriptors.length > SKILL_LIMITS.catalogRootDescriptors ||
     root.catalog_hash !== selection.catalog_hash
   ) {
+    invalid();
+  }
+  try {
+    canonicalSkillCatalogRoot(root as unknown as SkillCatalogRoot);
+  } catch (error) {
+    if (error instanceof RuntimeSkillError) throw error;
     invalid();
   }
   const descriptors = root.descriptors.map((descriptor) => {
@@ -640,6 +663,7 @@ function captureStartRequest(value: unknown): CapturedStart {
     invalid();
   }
   const selection = exactSelectionAuthority(source.selection);
+  assertDeliveredRuntimeCapabilities(selection.descriptor);
   if (selection.descriptor.name !== handler.capability) integrity();
   const expectedJournalHead = copiedJournalHead(source.expected_journal_head);
   const trace = copiedTrace(source.trace);

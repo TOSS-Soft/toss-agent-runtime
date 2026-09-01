@@ -182,11 +182,8 @@ Stable exit codes are `0` success, `2` usage, `3` invalid input, `4` blocked/pol
 ## Library API
 
 ```ts
-import { randomUUID } from "node:crypto";
-
 import {
   createSkillsHost,
-  createRunJournalStore,
   parseExecutionRequest,
   validateExecutionChain,
 } from "@toss-software/agent-runtime";
@@ -195,12 +192,6 @@ const parsed = parseExecutionRequest(requestBytes);
 if (!parsed.ok) {
   console.error(parsed.code, parsed.issues);
 }
-
-const journal = createRunJournalStore({
-  statePath: "/private/runtime-state",
-  now: () => new Date(),
-  randomId: randomUUID,
-});
 
 const skills = createSkillsHost({
   state_path: "/private/runtime-state",

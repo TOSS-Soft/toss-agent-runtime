@@ -23,7 +23,12 @@ import {
   loadBundledCatalog,
   type BundledCatalogTestOverride,
 } from "./bundled.js";
-import { hashSkillCatalog, hashSkillDescriptor, parseSkillDescriptor } from "./contracts.js";
+import {
+  freezeSkillCatalogRoot,
+  hashSkillCatalog,
+  hashSkillDescriptor,
+  parseSkillDescriptor,
+} from "./contracts.js";
 import { RuntimeSkillError } from "./errors.js";
 import { assertConfiguredSkillRootPath, assertSkillRelativePath } from "./paths.js";
 import {
@@ -1464,10 +1469,10 @@ class FileSystemSkillCatalog implements SkillCatalog {
     );
     const descriptors = selected.map((entry) => entry.descriptor);
     const catalogHash = hashSkillCatalog(descriptors.map(referenceOf));
-    const snapshot = deepFreezeJson({
+    const snapshot = freezeSkillCatalogRoot({
       descriptors,
       catalog_hash: catalogHash,
-    } as unknown as JsonValue) as unknown as SkillCatalogSnapshot;
+    });
     this.snapshots.set(
       snapshot,
       new Map(selected.map((entry) => [entry.descriptor.document_hash, entry])),
@@ -1519,15 +1524,20 @@ class FileSystemSkillCatalog implements SkillCatalog {
       descriptor: referenceOf(entry.descriptor),
       manifest_identity: entry.manifestIdentity,
     });
-    const catalogRoot = deepFreezeJson(
-      parseJsonBytes(canonicalJson(snapshot)),
-    ) as unknown as SkillCatalogRoot;
-    const selection = deepFreezeJson({
-      descriptor: entry.descriptor,
-      catalog_hash: snapshot.catalog_hash,
-      catalog_root: catalogRoot,
-      package_handle: packageHandle,
-    } as unknown as JsonValue) as unknown as SkillSelection;
+    const catalogRoot = freezeSkillCatalogRoot(snapshot);
+    const selection = deepFreezeJson(
+      {
+        descriptor: entry.descriptor,
+        catalog_hash: snapshot.catalog_hash,
+        catalog_root: catalogRoot,
+        package_handle: packageHandle,
+      } as unknown as JsonValue,
+      {
+        maxBytes: SKILL_LIMITS.catalogRootBytes + SKILL_LIMITS.descriptorBytes + 1_024,
+        maxDepth: SKILL_LIMITS.nestingDepth + 6,
+        maxMembers: SKILL_LIMITS.catalogRootMembers + 10_000,
+      },
+    ) as unknown as SkillSelection;
     this.selections.set(selection, {
       entry,
       catalogHash: snapshot.catalog_hash,

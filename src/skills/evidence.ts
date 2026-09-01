@@ -1,14 +1,17 @@
 import type { RunJournalEntryV1 } from "../journal/types.js";
-import { canonicalJson, deepFreezeJson, parseJsonBytes, type JsonValue } from "../protocol/json.js";
+import { canonicalJson, parseJsonBytes, type JsonValue } from "../protocol/json.js";
 import { approvalRequest, decisionMetadata, pendingMetadata } from "./approval.js";
 import {
+  canonicalSkillCatalogRoot,
   canonicalSkillEvidenceJson,
+  freezeSkillCatalogRoot,
   hashSkillCatalog,
   hashSkillExecutionEvidence,
   hashSkillExecutionHandoff,
   parseSkillDescriptor,
   parseSkillExecutionEvidence,
   parseSkillSnapshot,
+  SKILL_CATALOG_ROOT_JSON_LIMITS,
 } from "./contracts.js";
 import type { SkillsEngine } from "./engine.js";
 import {
@@ -147,12 +150,13 @@ function publicCatalogRoot(
   bytes: Uint8Array,
   expectedHash: `sha256:${string}`,
 ): StoredCatalogRootRecord {
+  if (bytes.byteLength > SKILL_LIMITS.catalogRootBytes + 128) limitExceeded();
   let value: JsonValue;
   try {
     value = parseJsonBytes(bytes, {
-      maxBytes: SKILL_LIMITS.storedObjectBytes,
-      maxDepth: SKILL_LIMITS.nestingDepth + 8,
-      maxMembers: 10_000,
+      ...SKILL_CATALOG_ROOT_JSON_LIMITS,
+      maxBytes: SKILL_LIMITS.catalogRootBytes + 128,
+      maxMembers: SKILL_LIMITS.catalogRootMembers + 4,
     });
   } catch {
     return integrity();
@@ -164,7 +168,7 @@ function publicCatalogRoot(
     !isRecord(value.catalog_root) ||
     !exactKeys(value.catalog_root, ["descriptors", "catalog_hash"]) ||
     !Array.isArray(value.catalog_root.descriptors) ||
-    value.catalog_root.descriptors.length > SKILL_LIMITS.packagesPerRoot ||
+    value.catalog_root.descriptors.length > SKILL_LIMITS.catalogRootDescriptors ||
     value.catalog_root.catalog_hash !== expectedHash
   ) {
     return integrity();
@@ -174,6 +178,7 @@ function publicCatalogRoot(
     if (!parsed.ok) return integrity();
     return parsed.value;
   });
+  canonicalSkillCatalogRoot({ descriptors, catalog_hash: expectedHash });
   if (
     descriptors.some((descriptor, index) =>
       index === 0 ? false : descriptorOrder(descriptors[index - 1]!, descriptor) >= 0,
@@ -192,10 +197,10 @@ function publicCatalogRoot(
   }
   return Object.freeze({
     schema_version: "skill-private-catalog-root.v1",
-    catalog_root: deepFreezeJson({
+    catalog_root: freezeSkillCatalogRoot({
       descriptors,
       catalog_hash: expectedHash,
-    } as unknown as JsonValue) as unknown as SkillCatalogRoot,
+    }),
   });
 }
 

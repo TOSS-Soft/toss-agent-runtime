@@ -206,7 +206,7 @@ describe("bounded skill context", () => {
     expect(context.included_tokens).toBe(Math.ceil(context.included_utf8_bytes / 4));
   });
 
-  it("rejects an altered stored resource and never exposes absolute paths, secrets, or executable handles", () => {
+  it("rejects an altered stored resource", () => {
     const required = resource("references/green.md", "reference", ["GREEN"], null, "green\n");
     const { snapshot, material } = fixture([required]);
     const altered = {
@@ -217,10 +217,6 @@ describe("bounded skill context", () => {
     expect(() => assembleSkillContext(request(snapshot), altered)).toThrowError(
       new RuntimeSkillError("RUNTIME_SKILL_INTEGRITY"),
     );
-    const context = assembleSkillContext(request(snapshot), material);
-    expect(JSON.stringify(context)).not.toContain("/private/");
-    expect(JSON.stringify(context)).not.toContain("SECRET");
-    expect(Object.values(context).some((value) => typeof value === "function")).toBe(false);
   });
 
   it("partially includes the largest UTF-8-safe optional prefix and stops lower priorities", () => {

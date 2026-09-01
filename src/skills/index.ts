@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
+import { types as utilTypes } from "node:util";
 
 import { createRunJournalStore } from "../journal/store.js";
 import type { JournalHead } from "../journal/types.js";
@@ -183,29 +184,116 @@ export interface SkillsHost {
   flush(signal: AbortSignal): Promise<void>;
 }
 
-function isStringArray(value: unknown): value is readonly string[] {
-  return (
-    Array.isArray(value) &&
-    (value as readonly unknown[]).every((entry) => typeof entry === "string")
-  );
+function invalidSkillsHostConfig(): never {
+  throw new Error("Invalid SkillsHostConfig");
+}
+
+function capturedStringArray(value: unknown): readonly string[] {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    utilTypes.isProxy(value) ||
+    !Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Array.prototype ||
+    Object.getOwnPropertySymbols(value).length !== 0
+  ) {
+    return invalidSkillsHostConfig();
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value) as Record<string, PropertyDescriptor>;
+  const lengthDescriptor = descriptors.length;
+  if (
+    lengthDescriptor === undefined ||
+    lengthDescriptor.get !== undefined ||
+    lengthDescriptor.set !== undefined ||
+    typeof lengthDescriptor.value !== "number" ||
+    !Number.isSafeInteger(lengthDescriptor.value) ||
+    lengthDescriptor.value < 0 ||
+    lengthDescriptor.value > SKILL_LIMITS.roots
+  ) {
+    return invalidSkillsHostConfig();
+  }
+  const length = lengthDescriptor.value;
+  const expectedNames = ["length", ...Array.from({ length }, (_unused, index) => String(index))];
+  const names = Object.getOwnPropertyNames(value);
+  if (
+    names.length !== expectedNames.length ||
+    names.some((name) => !expectedNames.includes(name))
+  ) {
+    return invalidSkillsHostConfig();
+  }
+  const captured: string[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (
+      descriptor === undefined ||
+      descriptor.enumerable !== true ||
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined ||
+      typeof descriptor.value !== "string"
+    ) {
+      return invalidSkillsHostConfig();
+    }
+    captured.push(descriptor.value);
+  }
+  return Object.freeze(captured);
+}
+
+function captureSkillsHostConfig(value: unknown): Readonly<SkillsHostConfig> {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    utilTypes.isProxy(value) ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype ||
+    Object.getOwnPropertySymbols(value).length !== 0
+  ) {
+    return invalidSkillsHostConfig();
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const expectedNames = ["skill_roots", "socket_path", "state_path"];
+  const names = Object.getOwnPropertyNames(value).sort();
+  if (
+    names.length !== expectedNames.length ||
+    names.some((name, index) => name !== expectedNames[index])
+  ) {
+    return invalidSkillsHostConfig();
+  }
+  const captured: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  for (const name of expectedNames) {
+    const descriptor = descriptors[name];
+    if (
+      descriptor === undefined ||
+      descriptor.enumerable !== true ||
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined
+    ) {
+      return invalidSkillsHostConfig();
+    }
+    captured[name] = descriptor.value;
+  }
+  if (typeof captured.state_path !== "string" || typeof captured.socket_path !== "string") {
+    return invalidSkillsHostConfig();
+  }
+  return Object.freeze({
+    state_path: captured.state_path,
+    socket_path: captured.socket_path,
+    skill_roots: capturedStringArray(captured.skill_roots),
+  });
 }
 
 export function createSkillsHost(config: SkillsHostConfig): SkillsHost {
-  const keys = Object.keys(config).sort();
+  const captured = captureSkillsHostConfig(config);
   if (
-    Object.getPrototypeOf(config) !== Object.prototype ||
-    keys.join("\u0000") !== ["skill_roots", "socket_path", "state_path"].join("\u0000") ||
-    !path.isAbsolute(config.state_path) ||
-    path.normalize(config.state_path) !== config.state_path ||
-    !path.isAbsolute(config.socket_path) ||
-    path.normalize(config.socket_path) !== config.socket_path ||
-    /[\u0000-\u001f\u007f]/u.test(config.state_path) ||
-    /[\u0000-\u001f\u007f]/u.test(config.socket_path) ||
-    !isStringArray(config.skill_roots)
+    !path.isAbsolute(captured.state_path) ||
+    path.normalize(captured.state_path) !== captured.state_path ||
+    !path.isAbsolute(captured.socket_path) ||
+    path.normalize(captured.socket_path) !== captured.socket_path ||
+    /[\u0000-\u001f\u007f]/u.test(captured.state_path) ||
+    /[\u0000-\u001f\u007f]/u.test(captured.socket_path)
   ) {
-    throw new Error("Invalid SkillsHostConfig");
+    return invalidSkillsHostConfig();
   }
-  const roots = [...config.skill_roots];
+  const roots = [...captured.skill_roots];
   for (const root of roots) assertConfiguredSkillRootPath(root);
   if (
     roots.length > SKILL_LIMITS.roots ||
@@ -222,10 +310,10 @@ export function createSkillsHost(config: SkillsHostConfig): SkillsHost {
       }),
     )
   ) {
-    throw new Error("Invalid SkillsHostConfig");
+    return invalidSkillsHostConfig();
   }
-  const statePath = config.state_path;
-  const socketPath = config.socket_path;
+  const statePath = captured.state_path;
+  const socketPath = captured.socket_path;
   const now = () => new Date();
   const journal = createRunJournalStore({ statePath, now, randomId: randomUUID });
   return createSkillsRuntimeHost({

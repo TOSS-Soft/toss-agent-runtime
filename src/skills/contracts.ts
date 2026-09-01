@@ -5,6 +5,7 @@ import { RUN_TRANSITION_MATRIX } from "../journal/state-machine.js";
 import type { RunJournalEntryV1, RunState } from "../journal/types.js";
 import {
   canonicalJson,
+  deepFreezeJson,
   parseJsonBytes,
   sha256,
   type JsonLimits,
@@ -26,6 +27,7 @@ import type {
   HashableSuperpowersPhaseV1,
   SkillDescriptorReference,
   SkillDescriptorV1,
+  SkillCatalogRoot,
   SkillExecutionEvidenceV1,
   SkillJournalPathLinkV1,
   SkillSnapshotV1,
@@ -47,6 +49,43 @@ const DOCUMENT_LIMITS: JsonLimits = Object.freeze({
   maxDepth: SKILL_LIMITS.nestingDepth,
   maxMembers: 10_000,
 });
+
+export const SKILL_CATALOG_ROOT_JSON_LIMITS: JsonLimits = Object.freeze({
+  maxBytes: SKILL_LIMITS.catalogRootBytes,
+  maxDepth: SKILL_LIMITS.nestingDepth + 4,
+  maxMembers: SKILL_LIMITS.catalogRootMembers,
+});
+
+function catalogLimit(): never {
+  throw new RuntimeSkillError("RUNTIME_SKILL_LIMIT_EXCEEDED");
+}
+
+export function canonicalSkillCatalogRoot(value: SkillCatalogRoot): string {
+  if (
+    !Array.isArray(value.descriptors) ||
+    value.descriptors.length > SKILL_LIMITS.catalogRootDescriptors
+  ) {
+    return catalogLimit();
+  }
+  let canonical: string;
+  try {
+    canonical = canonicalJson(value, SKILL_CATALOG_ROOT_JSON_LIMITS);
+  } catch {
+    return catalogLimit();
+  }
+  if (Buffer.byteLength(canonical, "utf8") > SKILL_LIMITS.catalogRootBytes) {
+    return catalogLimit();
+  }
+  return canonical;
+}
+
+export function freezeSkillCatalogRoot(value: SkillCatalogRoot): SkillCatalogRoot {
+  const canonical = canonicalSkillCatalogRoot(value);
+  return deepFreezeJson(
+    parseJsonBytes(canonical, SKILL_CATALOG_ROOT_JSON_LIMITS),
+    SKILL_CATALOG_ROOT_JSON_LIMITS,
+  ) as unknown as SkillCatalogRoot;
+}
 
 export const SKILL_EVIDENCE_JSON_LIMITS: JsonLimits = Object.freeze({
   maxBytes: SKILL_LIMITS.evidenceBytes,
@@ -578,7 +617,17 @@ export function hashSkillPackage(
 }
 
 export function hashSkillCatalog(value: readonly SkillDescriptorReference[]): `sha256:${string}` {
-  return sha256(value, DOCUMENT_LIMITS);
+  if (value.length > SKILL_LIMITS.catalogRootDescriptors) return catalogLimit();
+  let canonical: string;
+  try {
+    canonical = canonicalJson(value, SKILL_CATALOG_ROOT_JSON_LIMITS);
+  } catch {
+    return catalogLimit();
+  }
+  if (Buffer.byteLength(canonical, "utf8") > SKILL_LIMITS.catalogRootBytes) {
+    return catalogLimit();
+  }
+  return `sha256:${createHash("sha256").update(canonical, "utf8").digest("hex")}`;
 }
 
 function parseDocument<T extends RuntimeDocument>(
@@ -957,6 +1006,7 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
     ReadonlyMap<`sha256:${string}`, SkillDescriptorV1>
   >();
   for (const [index, catalog] of value.catalogs.entries()) {
+    canonicalSkillCatalogRoot(catalog);
     const descriptors = catalog.descriptors;
     const references = descriptors.map((descriptor) => ({
       name: descriptor.name,
