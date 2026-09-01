@@ -495,6 +495,9 @@ export function createToolSdkClientFactory(
         return Object.freeze(connection);
       } catch (error) {
         await closeAfterFailure(port);
+        if (request.signal.aborted) {
+          throw new RuntimeToolError("RUNTIME_TOOL_CANCELLED");
+        }
         throw classifyMcpSdkError(error);
       }
     },

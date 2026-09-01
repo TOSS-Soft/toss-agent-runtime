@@ -592,7 +592,7 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 - Consumes: `McpStdioBinding`, `ToolSdkClientFactory`, scoped secret leases, injected spawn/clock seams, and `ToolTransportConnectRequest`.
 - Produces: `createStdioToolTransport(options): ToolTransportAdapter`.
 
-- [ ] **Step 1: Write real-child-process RED tests**
+- [x] **Step 1: Write real-child-process RED tests**
 
   Assert absolute normalized executable, no shell/PATH lookup, trusted fixed args/cwd only, empty/minimal environment, literal secret-name rejection in production, scoped secret injection, no request-derived args, bounded redacted stderr, initialization timeout, lease expiry, cancellation, graceful close, SIGTERM/SIGKILL escalation, and awaited reaping.
 
@@ -606,17 +606,17 @@ export const TOOL_HARD_LIMITS = Object.freeze({
   expect(publicFailure).not.toContain("stderr-secret");
   ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
   ```bash
   npm exec -- vitest run test/tool-stdio-transport.test.ts --maxWorkers=4
   ```
 
-- [ ] **Step 3: Implement stdio lifecycle policy**
+- [x] **Step 3: Implement stdio lifecycle policy**
 
   Capture binding values before spawn, open no shell, supply only fixed runtime keys and explicitly configured values, resolve secrets immediately before launch, cap session lifetime to the shortest lease, and keep stderr in a bounded redacting ring used only for status classification. Close stdin, wait boundedly, send SIGTERM, then SIGKILL, and await `exit` before resolving `close()`.
 
-- [ ] **Step 4: Run GREEN and commit**
+- [x] **Step 4: Run GREEN and commit**
 
   ```bash
   npm exec -- vitest run test/tool-stdio-transport.test.ts test/tool-sdk-client.test.ts --maxWorkers=4

@@ -317,6 +317,7 @@ describe("package metadata", () => {
 
     const sdkBoundaryDeclarations = await Promise.all([
       readFile("dist/src/tools/transports/sdk-client.d.ts", "utf8"),
+      readFile("dist/src/tools/transports/stdio.d.ts", "utf8"),
       readFile("dist/src/tools/transports/types.d.ts", "utf8"),
     ]);
     expect(sdkBoundaryDeclarations.join("\n")).not.toContain("@modelcontextprotocol");
