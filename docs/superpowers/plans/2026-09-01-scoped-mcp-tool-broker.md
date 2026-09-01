@@ -548,7 +548,7 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 - Consumes: official MCP client APIs, pinned protocol revision, `AbortSignal`, deadlines, and TOSS-owned request/result records.
 - Produces: `ToolTransportAdapter`, `ToolTransportConnection`, `ToolSdkClientFactory`, SDK-to-domain error classification, and official/hand-authored test fixtures.
 
-- [ ] **Step 1: Install exact dependencies and write adapter RED tests**
+- [x] **Step 1: Install exact dependencies and write adapter RED tests**
 
   ```bash
   npm install --save-exact @modelcontextprotocol/client@2.0.0
@@ -557,7 +557,7 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 
   Test exact initialization revision, no fallback, full `nextCursor` preservation, `tools/list_changed`, `_meta` pass-through from trusted input only, cancellation, close, and conversion of native errors to stable safe descriptors. Include one official server fixture and separate hand-authored malformed frames.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
   ```bash
   npm exec -- vitest run test/tool-sdk-client.test.ts --maxWorkers=4
@@ -565,11 +565,11 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 
   Expected: FAIL because the transport-neutral client wrapper is absent.
 
-- [ ] **Step 3: Implement the private SDK translation boundary**
+- [x] **Step 3: Implement the private SDK translation boundary**
 
   Keep all SDK imports below `src/tools/transports/`. Translate SDK values immediately into closed records. Refuse negotiated revision mismatch, server-request handlers, unsupported capabilities, caller-supplied `_meta`, and automatic call retry. Bound frames and native error inspection before classification.
 
-- [ ] **Step 4: Prove no public SDK type leakage and run GREEN**
+- [x] **Step 4: Prove no public SDK type leakage and run GREEN**
 
   ```bash
   npm exec -- vitest run test/tool-sdk-client.test.ts test/package-metadata.test.ts --maxWorkers=4

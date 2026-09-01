@@ -59,6 +59,15 @@ async function realDryPackPaths(): Promise<readonly string[]> {
 }
 
 describe("package metadata", () => {
+  it("pins the official MCP client and test server SDKs exactly", async () => {
+    const manifest = JSON.parse(await readFile("package.json", "utf8")) as {
+      readonly dependencies: Readonly<Record<string, string>>;
+      readonly devDependencies: Readonly<Record<string, string>>;
+    };
+    expect(manifest.dependencies["@modelcontextprotocol/client"]).toBe("2.0.0");
+    expect(manifest.devDependencies["@modelcontextprotocol/server"]).toBe("2.0.0");
+  });
+
   it("exports the frozen development identity", () => {
     expect(PACKAGE_NAME).toBe("@toss-software/agent-runtime");
     expect(PACKAGE_VERSION).toBe("0.0.0-development");
@@ -305,6 +314,13 @@ describe("package metadata", () => {
 
     expect(packedFiles).toEqual(expectedFiles);
     expect(expectedFiles).toEqual([...expectedFiles].sort());
+
+    const sdkBoundaryDeclarations = await Promise.all([
+      readFile("dist/src/tools/transports/sdk-client.d.ts", "utf8"),
+      readFile("dist/src/tools/transports/types.d.ts", "utf8"),
+    ]);
+    expect(sdkBoundaryDeclarations.join("\n")).not.toContain("@modelcontextprotocol");
+    expect(packageApi).not.toHaveProperty("createToolSdkClientFactory");
 
     for (const schema of [
       "agent-definition.v1",
