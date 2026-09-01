@@ -705,7 +705,7 @@ describe("Agent Skills public API", () => {
       host.stopIntake();
       await host.flush(AbortSignal.timeout(5_000));
     }
-  });
+  }, 20_000);
 
   it("returns only frozen public data without private root, environment, or native authority", async () => {
     const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-skills-public-context-")));

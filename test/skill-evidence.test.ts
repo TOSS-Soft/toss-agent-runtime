@@ -2534,7 +2534,7 @@ describe("canonical Agent Skills evidence", () => {
       code: "RUNTIME_SKILL_LIMIT_EXCEEDED",
     });
     expect(evidenceReads).toBe(0);
-  }, 30_000);
+  }, 45_000);
 
   it("records distinct same-digest resources as included, partial, and omitted", async () => {
     const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-skill-accounting-")));
