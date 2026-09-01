@@ -182,7 +182,7 @@ describe("baseline CLI", () => {
       id: "execution-capabilities",
       status: "WARN",
       message:
-        "Execution routing, skills, MCP, and orchestration are not installed in the baseline wave",
+        "Routing and Agent Skills are available; MCP, agent loop, review execution, and aggregate evidence remain unavailable",
     });
   });
 
@@ -604,7 +604,7 @@ describe("baseline CLI", () => {
         id: "execution-capabilities",
         status: "FAIL",
         message:
-          "Execution routing, skills, MCP, and orchestration are not installed in the baseline wave",
+          "Routing and Agent Skills are available; MCP, agent loop, review execution, and aggregate evidence remain unavailable",
       });
     } finally {
       vi.unstubAllEnvs();

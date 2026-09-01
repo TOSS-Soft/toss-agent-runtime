@@ -12,6 +12,8 @@ import type {
   ValidationIssue,
   ValidationResult,
 } from "../protocol/types.js";
+import type { JournalHead } from "../journal/types.js";
+import type { SuperpowersPhaseName } from "../skills/types.js";
 import { MAX_PROJECT_ROOT_BYTES, type ProjectRegistration } from "./project/types.js";
 
 const Ajv2020 = Ajv2020Module.default;
@@ -63,7 +65,24 @@ export interface ServiceProjectListRequestV1 extends ServiceControlRequestBaseV1
 export type ServiceProjectRequestV1 =
   ServiceProjectRegisterRequestV1 | ServiceProjectUnregisterRequestV1 | ServiceProjectListRequestV1;
 
-export type ServiceControlRequestV1 = ServiceStatusRequestV1 | ServiceProjectRequestV1;
+export interface ServiceSuperpowersApproveRequestV1 extends ServiceControlRequestBaseV1 {
+  readonly command: "superpowers-approve";
+  readonly operation_id: string;
+  readonly run_id: string;
+  readonly expected_journal_revision: number;
+  readonly expected_journal_head_hash: `sha256:${string}`;
+  readonly phase: SuperpowersPhaseName;
+  readonly skill_name: string;
+  readonly skill_version: string;
+  readonly skill_snapshot_hash: `sha256:${string}`;
+  readonly approval_request_hash: `sha256:${string}`;
+  readonly decision: "APPROVE" | "REJECT";
+}
+
+export type ServiceSkillRequestV1 = ServiceSuperpowersApproveRequestV1;
+
+export type ServiceControlRequestV1 =
+  ServiceStatusRequestV1 | ServiceProjectRequestV1 | ServiceSkillRequestV1;
 
 export interface ServiceStatusV1 {
   readonly package_version: string;
@@ -84,13 +103,26 @@ export type ServiceProjectDataV1 =
       readonly registrations: readonly ProjectRegistration[];
     };
 
+export interface SuperpowersApprovalDataV1 {
+  readonly kind: "superpowers-approval";
+  readonly run_id: string;
+  readonly state: "RUNNING" | "BLOCKED";
+  readonly phase: SuperpowersPhaseName;
+  readonly journal_head: JournalHead;
+  readonly approval_request_hash: `sha256:${string}`;
+  readonly approval_decision_hash: `sha256:${string}`;
+  readonly replayed: boolean;
+}
+
+export type ServiceControlDataV1 = ServiceProjectDataV1 | SuperpowersApprovalDataV1;
+
 export interface ServiceControlResponseV1 {
   readonly schema_version: "service-control-response.v1";
   readonly document_type: "service-control-response";
   readonly request_id: string | null;
   readonly ok: boolean;
   readonly status: ServiceStatusV1 | null;
-  readonly data: ServiceProjectDataV1 | null;
+  readonly data: ServiceControlDataV1 | null;
   readonly error: RuntimeError | null;
 }
 
@@ -216,7 +248,9 @@ export function parseServiceControlResponse(
   const registrations =
     parsed.value.data?.kind === "project-registration"
       ? [parsed.value.data.registration]
-      : (parsed.value.data?.registrations ?? []);
+      : parsed.value.data?.kind === "project-list"
+        ? parsed.value.data.registrations
+        : [];
   if (
     registrations.some(
       (registration) =>

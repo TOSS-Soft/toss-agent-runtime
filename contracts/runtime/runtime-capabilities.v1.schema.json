@@ -87,7 +87,12 @@
           "runtime-capabilities.v1",
           "service-control-request.v1",
           "service-control-response.v1",
-          "service-lock.v1"
+          "service-lock.v1",
+          "skill-descriptor.v1",
+          "skill-execution-evidence.v1",
+          "skill-snapshot.v1",
+          "superpowers-approval.v1",
+          "superpowers-phase.v1"
         ]
       }
     },

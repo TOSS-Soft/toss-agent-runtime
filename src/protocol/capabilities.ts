@@ -11,6 +11,15 @@ import { createProtocolValidator } from "./validator.js";
 
 export type Availability = "available" | "unavailable" | "blocked";
 
+const AGENT_SKILL_HOST_VERSIONS = Object.freeze(["agent-skills.v1"]);
+const SUPERPOWERS_CAPABILITIES = Object.freeze([
+  "brainstorming",
+  "requesting-code-review",
+  "systematic-debugging",
+  "test-driven-development",
+  "verification-before-completion",
+]);
+
 export interface RuntimeCapabilitiesV1 extends RuntimeDocument {
   readonly protocol_version: "runtime-contract.v1";
   readonly schema_version: "runtime-capabilities.v1";
@@ -81,6 +90,11 @@ export function createBaselineCapabilities(platform: {
       "service-control-request.v1",
       "service-control-response.v1",
       "service-lock.v1",
+      "skill-descriptor.v1",
+      "skill-execution-evidence.v1",
+      "skill-snapshot.v1",
+      "superpowers-approval.v1",
+      "superpowers-phase.v1",
     ]),
     provider_transports: Object.freeze(["agentgateway", "openai", "anthropic", "gemini"]),
     model_classes: Object.freeze([
@@ -106,15 +120,15 @@ export function createBaselineCapabilities(platform: {
         capabilities: Object.freeze(["independent-review", "reasoning", "text"]),
       }),
     ]),
-    skill_host_versions: Object.freeze([]),
-    superpowers_capabilities: Object.freeze([]),
+    skill_host_versions: AGENT_SKILL_HOST_VERSIONS,
+    superpowers_capabilities: SUPERPOWERS_CAPABILITIES,
     mcp_transports: Object.freeze([]),
     mcp_profiles: Object.freeze([]),
     execution_topologies: Object.freeze([]),
     features: Object.freeze({
       providers: "available",
       routing: "available",
-      skills: "unavailable",
+      skills: "available",
       mcp: "unavailable",
       agent_loop: "unavailable",
       review: "unavailable",
@@ -226,6 +240,21 @@ export function parseRuntimeCapabilities(
         "/skill_host_versions",
         "featureCoherence",
         "available skills require a host version and declared Superpowers capabilities",
+      ),
+    );
+  }
+  if (
+    result.value.features.skills === "available" &&
+    (JSON.stringify(result.value.skill_host_versions) !==
+      JSON.stringify(AGENT_SKILL_HOST_VERSIONS) ||
+      JSON.stringify(result.value.superpowers_capabilities) !==
+        JSON.stringify(SUPERPOWERS_CAPABILITIES))
+  ) {
+    issues.push(
+      capabilityIssue(
+        "/superpowers_capabilities",
+        "featureCoherence",
+        "available skills require the exact built-in Agent Skills host and capability set",
       ),
     );
   }

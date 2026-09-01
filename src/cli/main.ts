@@ -48,6 +48,8 @@ import { createProjectIntake } from "../service/project/intake.js";
 import { RuntimeProjectError, type RuntimeProjectErrorCode } from "../service/project/errors.js";
 import { createProjectRegistry } from "../service/project/registry.js";
 import { createProjectWatcher } from "../service/project/watcher.js";
+import { RuntimeSkillError } from "../skills/index.js";
+import { createSkillsRuntimeHost } from "../skills/runtime-host.js";
 import { PACKAGE_VERSION } from "../version.js";
 import { CliUsageError, parseCli, type BaselineCommand, type ServiceAction } from "./grammar.js";
 import {
@@ -346,6 +348,14 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
         intake,
         runtimeStatePath: loaded.config.paths.state,
       });
+      const skills = createSkillsRuntimeHost({
+        statePath: loaded.config.paths.state,
+        socketPath: loaded.config.paths.socket,
+        configuredRoots: loaded.config.skill_roots,
+        journal,
+        now: options.now,
+        randomId: randomUUID,
+      });
       return runSupervisor({
         loaded,
         signals: options.signals,
@@ -357,8 +367,48 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
         socketProbe: {
           identify: (socketPath) => probeRuntimeServiceIdentity({ socketPath }),
         },
-        recoveryParticipants: [journal, projects],
+        recoveryParticipants: [journal, skills, projects],
+        journalParticipant: journal,
         interruptionRecorder: journal,
+        handleSkillRequest: async (request) => {
+          const traceHash = createHash("sha256")
+            .update(`skill-control:${request.operation_id}`, "utf8")
+            .digest("hex");
+          const outcome = await skills.resumeApproval({
+            run_id: request.run_id,
+            expected_journal_head: {
+              journal_revision: request.expected_journal_revision,
+              sequence: request.expected_journal_revision,
+              entry_hash: request.expected_journal_head_hash,
+            },
+            phase: request.phase,
+            skill_name: request.skill_name,
+            skill_version: request.skill_version,
+            skill_snapshot_hash: request.skill_snapshot_hash,
+            approval_request_hash: request.approval_request_hash,
+            operation_id: request.operation_id,
+            decision: request.decision,
+            trace: {
+              trace_id: traceHash.slice(0, 32),
+              span_id: traceHash.slice(32, 48),
+              trace_flags: 1,
+            },
+          });
+          const expectedState = request.decision === "APPROVE" ? "RUNNING" : "BLOCKED";
+          if (outcome.approval?.kind !== "DECISION" || outcome.state !== expectedState) {
+            throw new RuntimeSkillError("RUNTIME_SKILL_INTEGRITY");
+          }
+          return {
+            kind: "superpowers-approval",
+            run_id: outcome.phase.run_id,
+            state: outcome.state,
+            phase: outcome.phase.phase,
+            journal_head: outcome.journal_head,
+            approval_request_hash: outcome.approval.approval_request_hash,
+            approval_decision_hash: outcome.approval.document_hash,
+            replayed: outcome.replayed,
+          };
+        },
         operationalLogger: logStore,
         acquireLock: acquireInstanceLock,
         createControlServer: (serverOptions) =>
@@ -923,7 +973,7 @@ async function doctor(
     id: "execution-capabilities",
     status: production ? "FAIL" : "WARN",
     message:
-      "Execution routing, skills, MCP, and orchestration are not installed in the baseline wave",
+      "Routing and Agent Skills are available; MCP, agent loop, review execution, and aggregate evidence remain unavailable",
   });
   const healthy = checks.every((check) => check.status !== "FAIL");
   const data = jsonValue({ healthy, checks });

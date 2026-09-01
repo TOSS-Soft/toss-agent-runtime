@@ -19,6 +19,7 @@ gateway_profiles:
     body_observability: off
 provider_profiles: []
 mcp_profiles: []
+skill_roots: []
 secret_references:
   gateway-development-token:
     source: env

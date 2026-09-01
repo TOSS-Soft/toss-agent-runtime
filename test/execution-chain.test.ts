@@ -41,8 +41,14 @@ describe("Runtime Contract Protocol v1 chain", () => {
   it("reports the delivered provider and routing planning subsystems in the baseline", () => {
     const document = createBaselineCapabilities({ os: "linux", arch: "x64", node: "22.23.1" });
     expect(document.execution_topologies).toEqual([]);
-    expect(document.skill_host_versions).toEqual([]);
-    expect(document.superpowers_capabilities).toEqual([]);
+    expect(document.skill_host_versions).toEqual(["agent-skills.v1"]);
+    expect(document.superpowers_capabilities).toEqual([
+      "brainstorming",
+      "requesting-code-review",
+      "systematic-debugging",
+      "test-driven-development",
+      "verification-before-completion",
+    ]);
     expect(document.mcp_transports).toEqual([]);
     expect(document.model_classes.map((entry) => entry.logical_class)).toEqual([
       "economy",
@@ -77,11 +83,16 @@ describe("Runtime Contract Protocol v1 chain", () => {
       "service-control-request.v1",
       "service-control-response.v1",
       "service-lock.v1",
+      "skill-descriptor.v1",
+      "skill-execution-evidence.v1",
+      "skill-snapshot.v1",
+      "superpowers-approval.v1",
+      "superpowers-phase.v1",
     ]);
     expect(document.features).toEqual({
       providers: "available",
       routing: "available",
-      skills: "unavailable",
+      skills: "available",
       mcp: "unavailable",
       agent_loop: "unavailable",
       review: "unavailable",
@@ -100,13 +111,19 @@ describe("Runtime Contract Protocol v1 chain", () => {
         "prompt-template.v1",
       ]),
     );
-    expect(chain.capabilities.skill_host_versions).toEqual([]);
-    expect(chain.capabilities.superpowers_capabilities).toEqual([]);
+    expect(chain.capabilities.skill_host_versions).toEqual(["agent-skills.v1"]);
+    expect(chain.capabilities.superpowers_capabilities).toEqual([
+      "brainstorming",
+      "requesting-code-review",
+      "systematic-debugging",
+      "test-driven-development",
+      "verification-before-completion",
+    ]);
     expect(chain.capabilities.mcp_transports).toEqual([]);
     expect(chain.capabilities.mcp_profiles).toEqual([]);
     expect(chain.capabilities.execution_topologies).toEqual([]);
     expect(chain.capabilities.features).toMatchObject({
-      skills: "unavailable",
+      skills: "available",
       mcp: "unavailable",
       agent_loop: "unavailable",
       review: "unavailable",
@@ -119,7 +136,7 @@ describe("Runtime Contract Protocol v1 chain", () => {
     });
     if (!result.ok) {
       expect(result.issues.map((issue) => issue.keyword)).toContain("modelCapability");
-      expect(result.issues.map((issue) => issue.keyword)).toContain("superpowersCapability");
+      expect(result.issues.map((issue) => issue.keyword)).not.toContain("superpowersCapability");
       expect(result.issues.map((issue) => issue.keyword)).toContain("mcpTransport");
       expect(result.issues.map((issue) => issue.keyword)).toContain("executionTopology");
     }
@@ -136,6 +153,20 @@ describe("Runtime Contract Protocol v1 chain", () => {
       ok: false,
       code: "RUNTIME_DOCUMENT_INVALID",
     });
+  });
+
+  it("rejects partial or invented Agent Skills capability advertisements", () => {
+    const baseline = createBaselineCapabilities({ os: "darwin", arch: "arm64", node: "24.20.0" });
+    for (const mutation of [
+      { skill_host_versions: ["agent-skills.v2"] },
+      { superpowers_capabilities: baseline.superpowers_capabilities.slice(1) },
+      { superpowers_capabilities: [...baseline.superpowers_capabilities, "external-scripts"] },
+    ]) {
+      expect(parseRuntimeCapabilities(canonicalJson({ ...baseline, ...mutation }))).toMatchObject({
+        ok: false,
+        code: "RUNTIME_DOCUMENT_INVALID",
+      });
+    }
   });
 
   it("requires every execution feature and the exact MCP profile", async () => {

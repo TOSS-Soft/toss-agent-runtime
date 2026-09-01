@@ -13,10 +13,10 @@ governance state, assignment, human authority, and evidence acceptance. The
 runtime may execute an exact request and emit evidence, but it cannot approve
 its own work, mutate governance state, or widen its authority.
 
-The package supports Node.js 22 and 24 LTS on macOS. Linux, Windows, and other
-operating systems are outside the v1.0.0 release contract. Node.js 20 is not
-supported because it is end-of-life at the time of this design. The source is
-TypeScript ESM, built and published with npm.
+The package supports the automatically resolved latest Node.js LTS on macOS.
+Linux, Windows, non-LTS Node releases, and older LTS lines are outside the
+v1.0.0 release contract. The source is TypeScript ESM, built and published with
+npm.
 
 ## Delivery model
 
@@ -174,11 +174,16 @@ agent cannot increase its model class, budget, tool profile, or review policy.
 
 ## Skills, tools, and security
 
-Skills are immutable content-addressed packages. Discovery reads only name,
-description, and identity; selection loads the complete `SKILL.md` and required
-resources. All relative paths are resolved beneath the canonical skill root.
+Skills are immutable content-addressed packages. Metadata-only discovery reads
+only bounded descriptors from audited bundled packages and explicitly
+configured private per-user skill roots; project-local `.agents/skills` is
+never auto-discovered. Selection binds one exact catalog, descriptor, version,
+source and package hash before the full `SKILL.md` and declared resources load.
+Every relative/canonical path remains contained beneath that selected root.
 Missing required capabilities produce `BLOCKED_SUPERPOWERS_MISSING`. Approval
-gates persist a real paused run rather than being simulated in prompt text.
+gates persist a real paused run rather than being simulated in prompt text, and
+the private same-user local socket requires exact request binding and durable
+restart/replay.
 
 MCP discovery is filtered before tools reach the model. Input and output are
 validated against the discovered schemas. Tool output is always untrusted
@@ -186,11 +191,9 @@ content with provenance. Policy classifies operations as read-only,
 reversible-write, or irreversible/high-impact and decides whether approval is
 required.
 
-Arbitrary scripts are denied by default. Development execution may use an
-explicit process runner with a minimal environment, contained working
-directory, timeout, and output limit. Production skill scripts require a
-configured sandbox driver that enforces the declared filesystem, process,
-resource, and network profile; absence of that driver fails closed.
+Skill scripts are package members only for integrity hashing. They are never
+executed, imported, evaluated, or spawned in v1.0.0. Development has no script
+bypass; a request that depends on external skill-script execution fails closed.
 
 Network endpoints are parsed and resolved against an allowlist. Redirects are
 revalidated, loopback/link-local/private destinations are denied unless the
@@ -214,11 +217,12 @@ cannot be labeled complete.
 
 ## Verification and release gates
 
-The mandatory CI matrix runs on Node.js 22 and 24 and includes formatting,
-linting, strict type checking, unit tests, integration tests, schema and
-semantic fixtures, package-content validation, dependency audit, and clean
-install smoke tests. Deterministic fakes provide clocks, IDs, providers,
-gateway, MCP servers, filesystems where necessary, and fault injection.
+The mandatory CI lane automatically resolves the latest Node.js LTS and runs on
+macOS only. It includes formatting, linting, strict type checking, unit tests,
+integration tests, schema and semantic fixtures, package-content validation,
+dependency audit, and clean install smoke tests. Deterministic fakes provide
+clocks, IDs, providers, gateway, MCP servers, filesystems where necessary, and
+fault injection.
 
 Security, state transition, interruption, partial-write, idempotency,
 injection, symlink escape, SSRF, redaction, reviewer independence, and

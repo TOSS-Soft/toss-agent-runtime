@@ -1,0 +1,25 @@
+{
+  "decision": null,
+  "document_hash": "sha256:ed2d71876b36f4d2d4c928f5a7d2290fd1e5ac3d4e3c83272513b91a28cc893b",
+  "document_type": "superpowers-approval",
+  "kind": "REQUEST",
+  "pending_journal_head": {
+    "entry_hash": "sha256:52c167895d344c1c1123541a808f8ce6831bd72b8991bf0264c13f472a5bf2c8",
+    "journal_revision": 4,
+    "sequence": 4
+  },
+  "phase": "BRAINSTORMING",
+  "phase_document_hash": "sha256:07aa27762d63cb5aa54a08da659882986040d1ca8552cd9517b9f4a76b253bee",
+  "phase_operation_id": "approval-example-brainstorming",
+  "protocol_version": "runtime-contract.v1",
+  "run_id": "run-agent-skills-approval-example",
+  "schema_version": "superpowers-approval.v1",
+  "skill_name": "brainstorming",
+  "skill_snapshot_hash": "sha256:c712cdd343603d8733f871d4ea6fe1ff8774cc0bad5587f1bf1bb3432548215c",
+  "skill_version": "1.0.0",
+  "trace": {
+    "span_id": "2222222222222222",
+    "trace_flags": 1,
+    "trace_id": "11111111111111111111111111111111"
+  }
+}

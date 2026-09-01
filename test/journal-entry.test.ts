@@ -149,6 +149,44 @@ describe("run journal entry contract", () => {
     ).toMatchObject({ ok: true });
   });
 
+  it.each(["0", "a", "b", "c", "d", "e", "f"] as const)(
+    "accepts a canonical %s-leading UUID approval operation id exactly once",
+    (firstNibble) => {
+      const canonical = `${firstNibble}0000000-0000-4000-8000-000000000777`;
+
+      expect(parseRunJournalEntry(canonicalJson(entry({ operation_id: canonical })))).toMatchObject(
+        {
+          ok: true,
+        },
+      );
+    },
+  );
+
+  it("rejects noncanonical UUIDs and UUID side-effect identities", () => {
+    const canonical = "a0000000-0000-4000-8000-000000000777";
+
+    expect(
+      parseRunJournalEntry(
+        canonicalJson(entry({ operation_id: "A0000000-0000-4000-8000-000000000ABC" })),
+      ),
+    ).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
+    expect(
+      parseRunJournalEntry(
+        canonicalJson(
+          entry({
+            operation_id: canonical,
+            side_effect: {
+              identity: "effect-1",
+              phase: "INTENT",
+              input_hash: `sha256:${"2".repeat(64)}`,
+              output_hash: null,
+            },
+          }),
+        ),
+      ),
+    ).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
+  });
+
   it.each([
     {
       name: "intent output",

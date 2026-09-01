@@ -56,7 +56,9 @@ export interface RunSupervisorOptions {
   readonly processProbe: ProcessProbe;
   readonly socketProbe: SocketIdentityProbe;
   readonly recoveryParticipants: readonly RecoveryParticipant[];
+  readonly journalParticipant?: RecoveryParticipant;
   readonly interruptionRecorder: InterruptionRecorder;
+  readonly handleSkillRequest?: CreateServiceControlServerOptions["handleSkillRequest"];
   readonly operationalLogger?: SupervisorOperationalLogger;
   readonly onReady: () => void;
   readonly acquireLock?: (options: AcquireInstanceLockOptions) => Promise<InstanceLock>;
@@ -349,6 +351,9 @@ export async function runSupervisor(options: RunSupervisorOptions): Promise<Supe
           idleTimeoutMs: 5_000,
           maxConnections: 32,
           cacheSize: 256,
+          ...(options.handleSkillRequest === undefined
+            ? {}
+            : { handleSkillRequest: options.handleSkillRequest }),
         });
         await server.listen();
         await logLifecycle("service.ready");
@@ -372,7 +377,16 @@ export async function runSupervisor(options: RunSupervisorOptions): Promise<Supe
           drain: async (signal) => {
             shutdownSequenceStarted = true;
             try {
-              for (const participant of options.recoveryParticipants) {
+              const journalParticipant = options.journalParticipant;
+              const dependents =
+                journalParticipant === undefined
+                  ? options.recoveryParticipants
+                  : options.recoveryParticipants.filter(
+                      (participant) => participant !== journalParticipant,
+                    );
+              const journalStage = journalParticipant === undefined ? [] : [journalParticipant];
+
+              for (const participant of dependents) {
                 if (signal.aborted) break;
                 try {
                   participant.stopIntake();
@@ -381,7 +395,19 @@ export async function runSupervisor(options: RunSupervisorOptions): Promise<Supe
                 }
               }
 
-              for (const participant of options.recoveryParticipants) {
+              for (const participant of dependents) {
+                if (signal.aborted) break;
+                const flushed = await runParticipantStage(signal, () => participant.flush(signal));
+                if (flushed.error !== undefined) capture(flushed.error);
+              }
+
+              for (const participant of journalStage) {
+                if (signal.aborted) break;
+                try {
+                  participant.stopIntake();
+                } catch (error) {
+                  capture(error);
+                }
                 if (signal.aborted) break;
                 const flushed = await runParticipantStage(signal, () => participant.flush(signal));
                 if (flushed.error !== undefined) capture(flushed.error);

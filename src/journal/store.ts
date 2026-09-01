@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { realpath } from "node:fs/promises";
 import path from "node:path";
 
@@ -44,6 +45,46 @@ export interface RunJournalStore {
   interruptActive(signal: AbortSignal): Promise<void>;
 }
 
+type InternalRunJournalBarrier = <T>(
+  runId: string,
+  operation: (
+    snapshot: RunJournalSnapshot | null,
+    transition: (command: TransitionCommand) => Promise<TransitionResult>,
+  ) => Promise<T>,
+  inherited: readonly HeldOfficialBarrier[],
+) => Promise<T>;
+
+const OFFICIAL_RUN_JOURNAL_BARRIERS = new WeakMap<RunJournalStore, InternalRunJournalBarrier>();
+interface HeldOfficialBarrier {
+  readonly coordinator: JournalCoordinator;
+  readonly runId: string;
+  active: boolean;
+}
+const HELD_OFFICIAL_BARRIERS = new AsyncLocalStorage<readonly HeldOfficialBarrier[]>();
+
+/** @internal Skills-engine capability check; official stores are identity-branded. */
+export function hasOfficialRunJournalBarrier(store: RunJournalStore): boolean {
+  return OFFICIAL_RUN_JOURNAL_BARRIERS.has(store);
+}
+
+export function withRunJournalBarrier<T>(
+  store: RunJournalStore,
+  runId: string,
+  operation: (
+    snapshot: RunJournalSnapshot | null,
+    transition: (command: TransitionCommand) => Promise<TransitionResult>,
+  ) => Promise<T>,
+): Promise<T> {
+  const barrier = OFFICIAL_RUN_JOURNAL_BARRIERS.get(store);
+  if (barrier === undefined) {
+    return Promise.reject(new RuntimeJournalError("RUNTIME_JOURNAL_UNAVAILABLE"));
+  }
+  const inherited = Object.freeze(
+    (HELD_OFFICIAL_BARRIERS.getStore() ?? []).filter((held) => held.active),
+  );
+  return barrier(runId, operation, inherited);
+}
+
 interface ParsedJournal {
   readonly entries: readonly RunJournalEntryV1[];
   readonly validPrefixLength: number;
@@ -51,6 +92,7 @@ interface ParsedJournal {
 }
 
 interface JournalCoordinator {
+  readonly canonicalRoot: string;
   readonly queues: Map<string, Promise<unknown>>;
 }
 
@@ -72,7 +114,7 @@ function coordinatorFor(filesystem: ReturnType<typeof createJournalFilesystem>) 
     const canonicalRoot = await realpath(filesystem.statePath);
     let coordinator = coordinators.get(canonicalRoot)?.deref();
     if (coordinator === undefined) {
-      coordinator = { queues: new Map() };
+      coordinator = { canonicalRoot, queues: new Map() };
       coordinators.set(canonicalRoot, new WeakRef(coordinator));
       coordinatorFinalizer.register(coordinator, canonicalRoot);
     }
@@ -323,7 +365,7 @@ export function createRunJournalStore(options: CreateRunJournalStoreOptions): Ru
     return Object.freeze(result);
   };
 
-  return {
+  const store: RunJournalStore = {
     async recover() {
       await coordinator;
       await listInternal();
@@ -388,4 +430,78 @@ export function createRunJournalStore(options: CreateRunJournalStoreOptions): Ru
       }
     },
   };
+  const officialBarrier = <T>(
+    runId: string,
+    operation: (
+      snapshot: RunJournalSnapshot | null,
+      transition: (command: TransitionCommand) => Promise<TransitionResult>,
+    ) => Promise<T>,
+    inherited: readonly HeldOfficialBarrier[],
+  ): Promise<T> => {
+    if (intakeStopped) {
+      return Promise.reject(new RuntimeJournalError("RUNTIME_JOURNAL_UNAVAILABLE"));
+    }
+    const accepted = coordinator.then((shared) => {
+      const targetKey = Buffer.from(`${shared.canonicalRoot}\0${runId}`, "utf8");
+      const violatesOrder = inherited.some(
+        (held) =>
+          Buffer.from(`${held.coordinator.canonicalRoot}\0${held.runId}`, "utf8").compare(
+            targetKey,
+          ) >= 0,
+      );
+      if (violatesOrder) throw new RuntimeJournalError("RUNTIME_JOURNAL_UNAVAILABLE");
+      return enqueue(runId, async () => {
+        const snapshot = await loadInternal(runId);
+        const held: HeldOfficialBarrier = { coordinator: shared, runId, active: true };
+        let active = true;
+        let used = false;
+        const issued: Promise<TransitionResult>[] = [];
+        const transition = (command: TransitionCommand): Promise<TransitionResult> => {
+          let result: Promise<TransitionResult>;
+          if (!active || used || command.run_id !== runId) {
+            result = Promise.reject(new RuntimeJournalError("RUNTIME_JOURNAL_UNAVAILABLE"));
+          } else {
+            used = true;
+            result = appendInternal(command);
+          }
+          void result.catch(() => undefined);
+          if (active) {
+            issued.push(result);
+          }
+          return result;
+        };
+        let operationResult: T | undefined;
+        let operationError: unknown;
+        let operationSucceeded = false;
+        try {
+          operationResult = await HELD_OFFICIAL_BARRIERS.run(
+            Object.freeze([...inherited, held]),
+            () => operation(snapshot, transition),
+          );
+          operationSucceeded = true;
+        } catch (error) {
+          operationError = error;
+        } finally {
+          held.active = false;
+          active = false;
+        }
+        const settled = await Promise.allSettled(issued);
+        if (!operationSucceeded) throw operationError;
+        const failed = settled.find(
+          (result): result is PromiseRejectedResult => result.status === "rejected",
+        );
+        if (failed !== undefined) throw failed.reason;
+        return operationResult as T;
+      });
+    });
+    pending.add(accepted);
+    void accepted
+      .finally(() => {
+        pending.delete(accepted);
+      })
+      .catch(() => undefined);
+    return accepted;
+  };
+  OFFICIAL_RUN_JOURNAL_BARRIERS.set(store, officialBarrier);
+  return store;
 }

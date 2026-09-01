@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toss.software/schemas/runtime/v1/skill-descriptor.v1.schema.json",
+  "title": "TOSS skill descriptor v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "schema_version",
+    "document_type",
+    "name",
+    "description",
+    "version",
+    "source",
+    "package_hash",
+    "resource_count",
+    "total_bytes",
+    "required_runtime_capabilities",
+    "document_hash"
+  ],
+  "properties": {
+    "protocol_version": { "const": "runtime-contract.v1" },
+    "schema_version": { "const": "skill-descriptor.v1" },
+    "document_type": { "const": "skill-descriptor" },
+    "name": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+    "description": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "version": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "source": { "$ref": "#/$defs/source" },
+    "package_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+    "resource_count": { "type": "integer", "minimum": 0, "maximum": 256 },
+    "total_bytes": { "type": "integer", "minimum": 0, "maximum": 16777216 },
+    "required_runtime_capabilities": {
+      "type": "array",
+      "maxItems": 256,
+      "items": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" }
+    },
+    "document_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
+  },
+  "$defs": {
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "identity"],
+      "properties": {
+        "kind": { "enum": ["configured", "bundled"] },
+        "identity": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" }
+      }
+    }
+  }
+}

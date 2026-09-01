@@ -34,7 +34,8 @@
       "oneOf": [
         { "type": "null" },
         { "$ref": "#/$defs/project_registration_data" },
-        { "$ref": "#/$defs/project_list_data" }
+        { "$ref": "#/$defs/project_list_data" },
+        { "$ref": "#/$defs/superpowers_approval_data" }
       ]
     },
     "error": {
@@ -43,6 +44,29 @@
   },
   "$defs": {
     "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "identifier": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9._:-]{0,127}$" },
+    "positive_integer": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "journal_head": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["journal_revision", "sequence", "entry_hash"],
+      "properties": {
+        "journal_revision": { "$ref": "#/$defs/positive_integer" },
+        "sequence": { "$ref": "#/$defs/positive_integer" },
+        "entry_hash": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "phase": {
+      "enum": [
+        "BRAINSTORMING",
+        "TEST_DESIGN",
+        "RED",
+        "GREEN",
+        "DEBUGGING",
+        "REVIEW",
+        "VERIFICATION"
+      ]
+    },
     "project_registration": {
       "type": "object",
       "additionalProperties": false,
@@ -82,6 +106,30 @@
           "maxItems": 12,
           "items": { "$ref": "#/$defs/project_registration" }
         }
+      }
+    },
+    "superpowers_approval_data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "run_id",
+        "state",
+        "phase",
+        "journal_head",
+        "approval_request_hash",
+        "approval_decision_hash",
+        "replayed"
+      ],
+      "properties": {
+        "kind": { "const": "superpowers-approval" },
+        "run_id": { "$ref": "#/$defs/identifier" },
+        "state": { "enum": ["RUNNING", "BLOCKED"] },
+        "phase": { "$ref": "#/$defs/phase" },
+        "journal_head": { "$ref": "#/$defs/journal_head" },
+        "approval_request_hash": { "$ref": "#/$defs/sha256" },
+        "approval_decision_hash": { "$ref": "#/$defs/sha256" },
+        "replayed": { "type": "boolean" }
       }
     },
     "service_error": {
@@ -171,6 +219,86 @@
         },
         {
           "properties": {
+            "code": { "const": "BLOCKED_SUPERPOWERS_MISSING" },
+            "category": { "const": "unsupported-capability" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Required Superpowers skill is unavailable" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_SKILL_INVALID" },
+            "category": { "const": "invalid-input" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Skill input is invalid" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_SKILL_PATH_UNSAFE" },
+            "category": { "const": "integrity" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Skill path is unsafe" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_SKILL_INTEGRITY" },
+            "category": { "const": "integrity" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Skill integrity check failed" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_SKILL_LIMIT_EXCEEDED" },
+            "category": { "const": "policy-denied" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Skill limit is exceeded" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_SKILL_CONTEXT_OVERFLOW" },
+            "category": { "const": "policy-denied" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Skill context exceeds its configured limit" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_SKILL_SCRIPT_UNAVAILABLE" },
+            "category": { "const": "unsupported-capability" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Skill script is unavailable" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_SKILL_STALE_STATE" },
+            "category": { "const": "stale-revision" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Skill state is stale" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_SKILL_OPERATION_CONFLICT" },
+            "category": { "const": "stale-revision" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Skill operation conflicts with an existing operation" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_SKILL_UNAVAILABLE" },
+            "category": { "const": "unavailable" },
+            "retryable": { "const": true },
+            "safe_message": { "const": "Skill is unavailable" }
+          }
+        },
+        {
+          "properties": {
             "code": { "const": "RUNTIME_OPERATION_CONFLICT" },
             "category": { "const": "stale-revision" },
             "retryable": { "const": false },
@@ -248,7 +376,8 @@
         "data": {
           "oneOf": [
             { "$ref": "#/$defs/project_registration_data" },
-            { "$ref": "#/$defs/project_list_data" }
+            { "$ref": "#/$defs/project_list_data" },
+            { "$ref": "#/$defs/superpowers_approval_data" }
           ]
         },
         "error": { "type": "null" }

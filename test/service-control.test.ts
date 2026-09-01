@@ -25,13 +25,20 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { canonicalJson } from "../src/protocol/json.js";
-import type { ServiceStatusV1 } from "../src/service/contracts.js";
+import type {
+  ServiceStatusV1,
+  ServiceSuperpowersApproveRequestV1,
+  SuperpowersApprovalDataV1,
+} from "../src/service/contracts.js";
 import { RuntimeProjectError } from "../src/service/project/errors.js";
+import { RuntimeSkillError } from "../src/skills/errors.js";
 import {
   createServiceControlServer,
+  probePrivateServiceSocketListener,
   probeServiceIdentity,
   requestProjectOperation,
   requestServiceStatus,
+  requestSuperpowersApprovalDecision,
   type ServiceControlOperationHooks,
   type ServiceControlServer,
 } from "../src/service/control.js";
@@ -146,6 +153,48 @@ const projectRegistration = {
   state: "ACTIVE",
 } as const;
 const fixedOperationId = "00000000-0000-4000-8000-000000000090";
+
+function approvalRequest(
+  overrides: Partial<ServiceSuperpowersApproveRequestV1> = {},
+): ServiceSuperpowersApproveRequestV1 {
+  return {
+    schema_version: "service-control-request.v1",
+    document_type: "service-control-request",
+    request_id: fixedRequestId,
+    command: "superpowers-approve",
+    operation_id: fixedOperationId,
+    run_id: "run-1",
+    expected_journal_revision: 4,
+    expected_journal_head_hash: `sha256:${"a".repeat(64)}`,
+    phase: "BRAINSTORMING",
+    skill_name: "brainstorming",
+    skill_version: "1.0.0",
+    skill_snapshot_hash: `sha256:${"b".repeat(64)}`,
+    approval_request_hash: `sha256:${"c".repeat(64)}`,
+    decision: "APPROVE",
+    ...overrides,
+  };
+}
+
+function approvalData(
+  request: ServiceSuperpowersApproveRequestV1,
+  replayed = false,
+): SuperpowersApprovalDataV1 {
+  return {
+    kind: "superpowers-approval",
+    run_id: request.run_id,
+    state: request.decision === "APPROVE" ? "RUNNING" : "BLOCKED",
+    phase: request.phase,
+    journal_head: {
+      journal_revision: request.expected_journal_revision + 1,
+      sequence: request.expected_journal_revision + 1,
+      entry_hash: `sha256:${"d".repeat(64)}`,
+    },
+    approval_request_hash: request.approval_request_hash,
+    approval_decision_hash: `sha256:${"e".repeat(64)}`,
+    replayed,
+  };
+}
 
 function numberedRequestId(index: number): string {
   return `018f0f64-7b21-7d4f-8c3d-${index.toString(16).padStart(12, "0")}`;
@@ -1019,6 +1068,20 @@ describe("private service control socket", () => {
     },
   );
 
+  it("proves listener presence and stale absence only for an exact private socket", async () => {
+    await leaveClosedSocketLinks(socketPath);
+    await expect(probePrivateServiceSocketListener({ socketPath })).resolves.toBe("absent");
+
+    await unlink(socketPath);
+    await listenNative(socketPath);
+    await chmod(socketPath, 0o600);
+    await expect(probePrivateServiceSocketListener({ socketPath })).resolves.toBe("present");
+
+    await closeNative(nativeServers.pop()!);
+    await writeFile(socketPath, "not a socket", { mode: 0o600 });
+    await expect(probePrivateServiceSocketListener({ socketPath })).resolves.toBe("unknown");
+  });
+
   it.each([legacyStagedSocket, previousStagedSocket, currentStagedSocket])(
     "reclaims a crash between hard-link publication and staged unlink: %s",
     async (stagedName) => {
@@ -1391,6 +1454,112 @@ describe("private service control socket", () => {
       error: null,
     });
     expect(handlerCalls).toBe(1);
+  });
+
+  it("dispatches approval only to the distinct skill handler and byte-replays its response", async () => {
+    let skillCalls = 0;
+    let projectCalls = 0;
+    await listenControl({
+      handleProjectRequest: () => {
+        projectCalls += 1;
+        return Promise.resolve({ kind: "project-list", registrations: [] });
+      },
+      handleSkillRequest: (request) => {
+        skillCalls += 1;
+        expect(request).toEqual(approvalRequest());
+        return Promise.resolve(approvalData(request));
+      },
+    });
+    const frame = `${canonicalJson(approvalRequest())}\n`;
+
+    const first = await sendRaw(frame);
+    const second = await sendRaw(frame);
+
+    expect(second).toBe(first);
+    expect(JSON.parse(first)).toMatchObject({
+      ok: true,
+      status: null,
+      data: approvalData(approvalRequest()),
+      error: null,
+    });
+    expect(skillCalls).toBe(1);
+    expect(projectCalls).toBe(0);
+  });
+
+  it("rejects malformed approval and post-stop approval without dispatch", async () => {
+    let calls = 0;
+    const server = await listenControl({
+      handleSkillRequest: (request) => {
+        calls += 1;
+        return Promise.resolve(approvalData(request));
+      },
+    });
+    const malformed = {
+      ...approvalRequest(),
+      skill_version: "01.0.0",
+    };
+    expect(JSON.parse(await sendRaw(`${canonicalJson(malformed)}\n`))).toMatchObject({
+      ok: false,
+      error: { code: "RUNTIME_SERVICE_CONTROL_INVALID" },
+    });
+    server.stopAccepting();
+    await expect(connectUntilClosed()).resolves.toBeUndefined();
+    expect(calls).toBe(0);
+  });
+
+  it("drains an in-flight approval handler before shutdown completes", async () => {
+    let resolveHandler: (() => void) | undefined;
+    const request = approvalRequest();
+    const server = await listenControl({
+      handleSkillRequest: async () => {
+        await new Promise<void>((resolve) => {
+          resolveHandler = resolve;
+        });
+        return approvalData(request);
+      },
+    });
+    const response = sendRaw(`${canonicalJson(request)}\n`);
+    await vi.waitFor(() => expect(resolveHandler).toBeTypeOf("function"));
+    server.stopAccepting();
+    let drained = false;
+    const draining = server.drain(new AbortController().signal).then(() => {
+      drained = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(drained).toBe(false);
+    resolveHandler?.();
+    expect(JSON.parse(await response)).toMatchObject({ ok: true });
+    await draining;
+    expect(drained).toBe(true);
+  });
+
+  it("normalizes forged skill errors while preserving one known fixed skill error", async () => {
+    const knownId = fixedRequestId;
+    const forgedId = otherRequestId;
+    await listenControl({
+      handleSkillRequest: (request) =>
+        request.request_id === knownId
+          ? Promise.reject(new RuntimeSkillError("RUNTIME_SKILL_STALE_STATE"))
+          : Promise.reject(
+              Object.assign(new Error("forged skill detail"), {
+                code: "RUNTIME_SKILL_STALE_STATE",
+                safe_message: "forged skill detail",
+              }),
+            ),
+    });
+
+    const known = await sendRaw(`${canonicalJson(approvalRequest({ request_id: knownId }))}\n`);
+    const forged = await sendRaw(`${canonicalJson(approvalRequest({ request_id: forgedId }))}\n`);
+
+    expect(JSON.parse(known)).toMatchObject({
+      ok: false,
+      error: { code: "RUNTIME_SKILL_STALE_STATE" },
+    });
+    expect(forged).not.toContain("forged skill detail");
+    expect(JSON.parse(forged)).toMatchObject({
+      ok: false,
+      error: { code: "RUNTIME_SERVICE_UNAVAILABLE" },
+    });
   });
 
   it("returns a fixed project error and never reflects handler details", async () => {
@@ -1860,6 +2029,68 @@ describe("private service control socket", () => {
         operation: { command: "project-list" },
       }),
     ).resolves.toEqual({ kind: "project-list", registrations: [projectRegistration] });
+  });
+
+  it("requests one exactly bound approval decision over the private socket", async () => {
+    const request = approvalRequest();
+    await listenControl({
+      handleSkillRequest: (received) => Promise.resolve(approvalData(received)),
+    });
+
+    await expect(
+      requestSuperpowersApprovalDecision({ socketPath, request, idleTimeoutMs: 5_000 }),
+    ).resolves.toEqual(approvalData(request));
+  });
+
+  it.each(["0", "a", "b", "c", "d", "e", "f"] as const)(
+    "round-trips a canonical %s-leading approval operation UUID over the private socket",
+    async (firstNibble) => {
+      const request = approvalRequest({
+        operation_id: `${firstNibble}0000000-0000-4000-8000-000000000777`,
+      });
+      await listenControl({
+        handleSkillRequest: (received) => Promise.resolve(approvalData(received)),
+      });
+
+      await expect(
+        requestSuperpowersApprovalDecision({ socketPath, request, idleTimeoutMs: 5_000 }),
+      ).resolves.toEqual(approvalData(request));
+    },
+  );
+
+  it("rejects an approval response that skips the single decision journal transition", async () => {
+    const request = approvalRequest();
+    await listenControl({
+      handleSkillRequest: (received) => {
+        const data = approvalData(received);
+        return Promise.resolve({
+          ...data,
+          journal_head: {
+            ...data.journal_head,
+            journal_revision: received.expected_journal_revision + 2,
+            sequence: received.expected_journal_revision + 2,
+          },
+        });
+      },
+    });
+
+    await expect(
+      requestSuperpowersApprovalDecision({ socketPath, request, idleTimeoutMs: 5_000 }),
+    ).rejects.toMatchObject({ code: "RUNTIME_SERVICE_UNAVAILABLE" });
+  });
+
+  it("reconstructs a known skill failure through the control client", async () => {
+    await listenControl({
+      handleSkillRequest: () => Promise.reject(new RuntimeSkillError("RUNTIME_SKILL_STALE_STATE")),
+    });
+
+    await expect(
+      requestSuperpowersApprovalDecision({
+        socketPath,
+        request: approvalRequest(),
+        idleTimeoutMs: 5_000,
+      }),
+    ).rejects.toEqual(new RuntimeSkillError("RUNTIME_SKILL_STALE_STATE"));
   });
 
   it("returns a structured failure when a project list exceeds the transport bound", async () => {

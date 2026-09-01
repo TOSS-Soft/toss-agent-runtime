@@ -13,6 +13,9 @@ import {
   parseJsonBytes,
   type JsonValue,
 } from "../protocol/json.js";
+import { RuntimeSkillError } from "../skills/errors.js";
+import { assertConfiguredSkillRootPath } from "../skills/paths.js";
+import { SKILL_LIMITS } from "../skills/types.js";
 import type {
   LoadedConfig,
   RuntimeConfigV1,
@@ -94,6 +97,7 @@ export function defaultConfig(
     gateway_profiles: {},
     provider_profiles: [],
     mcp_profiles: [],
+    skill_roots: [],
     secret_references: {},
   };
   return deepFreezeJson(config as unknown as JsonValue) as unknown as RuntimeConfigV1;
@@ -221,6 +225,44 @@ function assertGatewayProfiles(config: RuntimeConfigV1): void {
   }
 }
 
+function invalidSkillRoots(): never {
+  throw new RuntimeConfigError("RUNTIME_CONFIG_INVALID", "Configured skill roots are invalid");
+}
+
+function isAncestorPath(ancestor: string, descendant: string): boolean {
+  const relative = path.relative(ancestor, descendant);
+  return relative !== "" && !path.isAbsolute(relative) && !relative.startsWith(`..${path.sep}`);
+}
+
+function bytewiseCompare(left: string, right: string): number {
+  return Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8"));
+}
+
+function assertSkillRoots(skillRoots: readonly string[]): void {
+  if (skillRoots.length > SKILL_LIMITS.roots) invalidSkillRoots();
+
+  const seen = new Set<string>();
+  for (const skillRoot of skillRoots) {
+    try {
+      assertConfiguredSkillRootPath(skillRoot);
+    } catch (error) {
+      if (error instanceof RuntimeSkillError) invalidSkillRoots();
+      throw error;
+    }
+    if (seen.has(skillRoot)) invalidSkillRoots();
+    seen.add(skillRoot);
+  }
+
+  for (let index = 1; index < skillRoots.length; index += 1) {
+    if (bytewiseCompare(skillRoots[index - 1]!, skillRoots[index]!) >= 0) invalidSkillRoots();
+  }
+  for (let index = 0; index < skillRoots.length; index += 1) {
+    for (let nested = index + 1; nested < skillRoots.length; nested += 1) {
+      if (isAncestorPath(skillRoots[index]!, skillRoots[nested]!)) invalidSkillRoots();
+    }
+  }
+}
+
 function assertConfig(
   value: JsonValue,
   options: {
@@ -252,6 +294,7 @@ function assertConfig(
     platform: options.platform,
     socketPathByteLimit: options.socketPathByteLimit,
   });
+  assertSkillRoots(config.skill_roots);
   assertGatewayProfiles(config);
   return config;
 }

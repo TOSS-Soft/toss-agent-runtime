@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toss.software/schemas/runtime/v1/superpowers-phase.v1.schema.json",
+  "title": "TOSS Superpowers phase v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "schema_version",
+    "document_type",
+    "run_id",
+    "phase_revision",
+    "previous_phase_hash",
+    "execution_request_hash",
+    "observed_journal_head",
+    "catalog_hash",
+    "skill",
+    "phase",
+    "handler",
+    "operation_id",
+    "status",
+    "predecessor_phase_hashes",
+    "input_hash",
+    "context_hash",
+    "context_accounting",
+    "output_hash",
+    "terminal_code",
+    "occurred_at",
+    "trace",
+    "document_hash"
+  ],
+  "properties": {
+    "protocol_version": { "const": "runtime-contract.v1" },
+    "schema_version": { "const": "superpowers-phase.v1" },
+    "document_type": { "const": "superpowers-phase" },
+    "run_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+    "phase_revision": { "$ref": "#/$defs/positive_integer" },
+    "previous_phase_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+    "execution_request_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+    "observed_journal_head": { "$ref": "#/$defs/journal_head" },
+    "catalog_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+    "skill": { "$ref": "#/$defs/skill" },
+    "phase": { "$ref": "#/$defs/phase" },
+    "handler": { "$ref": "#/$defs/handler" },
+    "operation_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+    "status": { "enum": ["STARTED", "APPROVAL_PENDING", "COMPLETED", "FAILED", "BLOCKED"] },
+    "predecessor_phase_hashes": {
+      "type": "array",
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
+    },
+    "input_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+    "context_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+    "context_accounting": { "$ref": "#/$defs/context_accounting" },
+    "output_hash": {
+      "oneOf": [{ "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }, { "type": "null" }]
+    },
+    "terminal_code": {
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/terminal_code" }]
+    },
+    "occurred_at": { "$ref": "runtime-common.v1.schema.json#/$defs/utc_timestamp" },
+    "trace": { "$ref": "runtime-common.v1.schema.json#/$defs/trace_context" },
+    "document_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
+  },
+  "$defs": {
+    "positive_integer": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "nonnegative_integer": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "context_accounting": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "skill_markdown",
+        "resources",
+        "original_utf8_bytes",
+        "included_utf8_bytes",
+        "original_conservative_units",
+        "included_conservative_units",
+        "remaining_bytes",
+        "remaining_conservative_units",
+        "segment_count",
+        "truncation_count"
+      ],
+      "properties": {
+        "skill_markdown": {
+          "allOf": [
+            { "$ref": "#/$defs/context_resource" },
+            {
+              "type": "object",
+              "properties": { "path": { "const": "SKILL.md" }, "state": { "const": "INCLUDED" } }
+            }
+          ]
+        },
+        "resources": {
+          "type": "array",
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/context_resource" }
+        },
+        "original_utf8_bytes": { "$ref": "#/$defs/nonnegative_integer" },
+        "included_utf8_bytes": { "$ref": "#/$defs/nonnegative_integer" },
+        "original_conservative_units": { "$ref": "#/$defs/nonnegative_integer" },
+        "included_conservative_units": { "$ref": "#/$defs/nonnegative_integer" },
+        "remaining_bytes": { "$ref": "#/$defs/nonnegative_integer" },
+        "remaining_conservative_units": { "$ref": "#/$defs/nonnegative_integer" },
+        "segment_count": { "$ref": "#/$defs/nonnegative_integer" },
+        "truncation_count": { "$ref": "#/$defs/nonnegative_integer" }
+      }
+    },
+    "context_resource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "source_hash",
+        "state",
+        "original_bytes",
+        "included_bytes",
+        "included_hash",
+        "original_conservative_units",
+        "included_conservative_units"
+      ],
+      "properties": {
+        "path": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "source_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+        "state": { "enum": ["INCLUDED", "PARTIAL", "OMITTED"] },
+        "original_bytes": { "$ref": "#/$defs/nonnegative_integer" },
+        "included_bytes": { "$ref": "#/$defs/nonnegative_integer" },
+        "included_hash": {
+          "oneOf": [{ "type": "null" }, { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }]
+        },
+        "original_conservative_units": { "$ref": "#/$defs/nonnegative_integer" },
+        "included_conservative_units": { "$ref": "#/$defs/nonnegative_integer" }
+      }
+    },
+    "terminal_code": {
+      "enum": [
+        "BLOCKED_SUPERPOWERS_MISSING",
+        "RUNTIME_SKILL_INVALID",
+        "RUNTIME_SKILL_PATH_UNSAFE",
+        "RUNTIME_SKILL_INTEGRITY",
+        "RUNTIME_SKILL_LIMIT_EXCEEDED",
+        "RUNTIME_SKILL_CONTEXT_OVERFLOW",
+        "RUNTIME_SKILL_APPROVAL_REJECTED",
+        "RUNTIME_SKILL_SCRIPT_UNAVAILABLE",
+        "RUNTIME_SKILL_STALE_STATE",
+        "RUNTIME_SKILL_OPERATION_CONFLICT",
+        "RUNTIME_SKILL_UNAVAILABLE"
+      ]
+    },
+    "journal_head": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["journal_revision", "sequence", "entry_hash"],
+      "properties": {
+        "journal_revision": { "$ref": "#/$defs/positive_integer" },
+        "sequence": { "$ref": "#/$defs/positive_integer" },
+        "entry_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
+      }
+    },
+    "skill": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "source", "package_hash", "document_hash", "snapshot_hash"],
+      "properties": {
+        "name": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+        "version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "source": { "$ref": "#/$defs/source" },
+        "package_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+        "document_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+        "snapshot_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "identity"],
+      "properties": {
+        "kind": { "enum": ["configured", "bundled"] },
+        "identity": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" }
+      }
+    },
+    "phase": {
+      "enum": [
+        "BRAINSTORMING",
+        "TEST_DESIGN",
+        "RED",
+        "GREEN",
+        "DEBUGGING",
+        "REVIEW",
+        "VERIFICATION"
+      ]
+    },
+    "handler": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "hash"],
+      "properties": {
+        "version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
+      }
+    }
+  }
+}

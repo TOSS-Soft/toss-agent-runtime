@@ -18,6 +18,11 @@ import promptTemplateSchema from "../../contracts/runtime/prompt-template.v1.sch
 import providerEventSchema from "../../contracts/runtime/provider-event.v1.schema.json" with { type: "json" };
 import runJournalEntrySchema from "../../contracts/runtime/run-journal-entry.v1.schema.json" with { type: "json" };
 import runtimeCapabilitiesSchema from "../../contracts/runtime/runtime-capabilities.v1.schema.json" with { type: "json" };
+import skillDescriptorSchema from "../../contracts/runtime/skill-descriptor.v1.schema.json" with { type: "json" };
+import skillExecutionEvidenceSchema from "../../contracts/runtime/skill-execution-evidence.v1.schema.json" with { type: "json" };
+import skillSnapshotSchema from "../../contracts/runtime/skill-snapshot.v1.schema.json" with { type: "json" };
+import superpowersApprovalSchema from "../../contracts/runtime/superpowers-approval.v1.schema.json" with { type: "json" };
+import superpowersPhaseSchema from "../../contracts/runtime/superpowers-phase.v1.schema.json" with { type: "json" };
 import {
   canonicalJson,
   deepFreezeJson,
@@ -63,6 +68,14 @@ const REGISTERED_SCHEMAS: Readonly<Record<string, string>> = {
     "https://toss.software/schemas/runtime/v1/run-journal-entry.v1.schema.json",
   "runtime-capabilities.v1":
     "https://toss.software/schemas/runtime/v1/runtime-capabilities.v1.schema.json",
+  "skill-descriptor.v1": "https://toss.software/schemas/runtime/v1/skill-descriptor.v1.schema.json",
+  "skill-execution-evidence.v1":
+    "https://toss.software/schemas/runtime/v1/skill-execution-evidence.v1.schema.json",
+  "skill-snapshot.v1": "https://toss.software/schemas/runtime/v1/skill-snapshot.v1.schema.json",
+  "superpowers-approval.v1":
+    "https://toss.software/schemas/runtime/v1/superpowers-approval.v1.schema.json",
+  "superpowers-phase.v1":
+    "https://toss.software/schemas/runtime/v1/superpowers-phase.v1.schema.json",
 };
 
 const FRAGMENTS = {
@@ -114,6 +127,23 @@ export interface ProtocolValidator {
   ): ValidationResult<T>;
 }
 
+type ParsedDocumentValidator = <T extends RuntimeDocument>(
+  candidate: JsonValue,
+  expectedType: T["document_type"],
+) => ValidationResult<T>;
+
+const PARSED_DOCUMENT_VALIDATORS = new WeakMap<ProtocolValidator, ParsedDocumentValidator>();
+
+export function validateParsedProtocolDocument<T extends RuntimeDocument>(
+  validator: ProtocolValidator,
+  candidate: JsonValue,
+  expectedType: T["document_type"],
+): ValidationResult<T> {
+  const validate = PARSED_DOCUMENT_VALIDATORS.get(validator);
+  if (validate === undefined) throw new TypeError("unknown protocol validator");
+  return validate(candidate, expectedType);
+}
+
 export function createProtocolValidator(): ProtocolValidator {
   const ajv = new Ajv2020({
     allErrors: true,
@@ -141,6 +171,11 @@ export function createProtocolValidator(): ProtocolValidator {
   ajv.addSchema(providerEventSchema);
   ajv.addSchema(runJournalEntrySchema);
   ajv.addSchema(runtimeCapabilitiesSchema);
+  ajv.addSchema(skillDescriptorSchema);
+  ajv.addSchema(skillSnapshotSchema);
+  ajv.addSchema(superpowersPhaseSchema);
+  ajv.addSchema(superpowersApprovalSchema);
+  ajv.addSchema(skillExecutionEvidenceSchema);
 
   const fragmentValidators = Object.fromEntries(
     Object.entries(FRAGMENTS).map(([name, schemaReference]) => {
@@ -152,7 +187,64 @@ export function createProtocolValidator(): ProtocolValidator {
     }),
   ) as Record<FragmentName, ValidateFunction>;
 
-  return {
+  const validateDocument = <T extends RuntimeDocument>(
+    candidate: JsonValue,
+    expectedType: T["document_type"],
+  ): ValidationResult<T> => {
+    if (!isJsonObject(candidate) || candidate.document_type !== expectedType) {
+      return {
+        ok: false,
+        code: "RUNTIME_DOCUMENT_INVALID",
+        issues: [
+          {
+            path: "/document_type",
+            keyword: "const",
+            message: `must equal ${JSON.stringify(expectedType)}`,
+          },
+        ],
+      };
+    }
+
+    const schemaVersion = candidate.schema_version;
+    if (typeof schemaVersion !== "string") {
+      return {
+        ok: false,
+        code: "RUNTIME_DOCUMENT_INVALID",
+        issues: [{ path: "/schema_version", keyword: "type", message: "must be string" }],
+      };
+    }
+
+    const schemaId = REGISTERED_SCHEMAS[schemaVersion];
+    if (schemaId === undefined) {
+      return {
+        ok: false,
+        code: "RUNTIME_DOCUMENT_UNSUPPORTED",
+        issues: [
+          {
+            path: "/schema_version",
+            keyword: "supported",
+            message: "schema version is not registered",
+          },
+        ],
+      };
+    }
+
+    const validate = ajv.getSchema(schemaId);
+    if (validate === undefined) {
+      throw new Error(`Registered schema is unavailable: ${schemaId}`);
+    }
+    if (!validate(candidate)) {
+      return {
+        ok: false,
+        code: "RUNTIME_DOCUMENT_INVALID",
+        issues: normalizeIssues(validate.errors),
+      };
+    }
+
+    return { ok: true, value: candidate as unknown as T };
+  };
+
+  const protocolValidator: ProtocolValidator = {
     validateFragment(name, value) {
       let candidate: JsonValue;
       try {
@@ -190,57 +282,9 @@ export function createProtocolValidator(): ProtocolValidator {
         return jsonFailure(error);
       }
 
-      if (!isJsonObject(candidate) || candidate.document_type !== expectedType) {
-        return {
-          ok: false,
-          code: "RUNTIME_DOCUMENT_INVALID",
-          issues: [
-            {
-              path: "/document_type",
-              keyword: "const",
-              message: `must equal ${JSON.stringify(expectedType)}`,
-            },
-          ],
-        };
-      }
-
-      const schemaVersion = candidate.schema_version;
-      if (typeof schemaVersion !== "string") {
-        return {
-          ok: false,
-          code: "RUNTIME_DOCUMENT_INVALID",
-          issues: [{ path: "/schema_version", keyword: "type", message: "must be string" }],
-        };
-      }
-
-      const schemaId = REGISTERED_SCHEMAS[schemaVersion];
-      if (schemaId === undefined) {
-        return {
-          ok: false,
-          code: "RUNTIME_DOCUMENT_UNSUPPORTED",
-          issues: [
-            {
-              path: "/schema_version",
-              keyword: "supported",
-              message: "schema version is not registered",
-            },
-          ],
-        };
-      }
-
-      const validate = ajv.getSchema(schemaId);
-      if (validate === undefined) {
-        throw new Error(`Registered schema is unavailable: ${schemaId}`);
-      }
-      if (!validate(candidate)) {
-        return {
-          ok: false,
-          code: "RUNTIME_DOCUMENT_INVALID",
-          issues: normalizeIssues(validate.errors),
-        };
-      }
-
-      return { ok: true, value: candidate as unknown as T };
+      return validateDocument(candidate, expectedType);
     },
   };
+  PARSED_DOCUMENT_VALIDATORS.set(protocolValidator, validateDocument);
+  return protocolValidator;
 }

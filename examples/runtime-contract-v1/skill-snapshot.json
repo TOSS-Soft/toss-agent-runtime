@@ -1,0 +1,28 @@
+{
+  "descriptor": {
+    "description": "Guides test-first RED, GREEN, and refactoring evidence for TOSS runtime changes.",
+    "document_hash": "sha256:afd8b9d9e9ab0166502d8e8fd1a72c4a76200547f193c0d428df0c3d27b44e8e",
+    "document_type": "skill-descriptor",
+    "name": "test-driven-development",
+    "package_hash": "sha256:cc07f50ea5136dccbd3484238607f4c4578d38b05bb37c8605e40910f35dcbe3",
+    "protocol_version": "runtime-contract.v1",
+    "required_runtime_capabilities": ["test-driven-development"],
+    "resource_count": 0,
+    "schema_version": "skill-descriptor.v1",
+    "source": {
+      "identity": "sha256:f10088565ee4d9cd7f02356804cf5b943a56e41209a8a5dd8a2f8d79feb3ab97",
+      "kind": "bundled"
+    },
+    "total_bytes": 467,
+    "version": "1.0.0"
+  },
+  "document_hash": "sha256:9a95e52c081ea3637bcfdbc769aa983ac5de371c16f43ddc9393f975997129fa",
+  "document_type": "skill-snapshot",
+  "package_hash": "sha256:cc07f50ea5136dccbd3484238607f4c4578d38b05bb37c8605e40910f35dcbe3",
+  "protocol_version": "runtime-contract.v1",
+  "resources": [],
+  "schema_version": "skill-snapshot.v1",
+  "skill_markdown_bytes": 467,
+  "skill_markdown_hash": "sha256:ebbe76626e1677f1873a13f87001d2d4171ad1e292bbe4e2df14e558d942910d",
+  "total_bytes": 467
+}

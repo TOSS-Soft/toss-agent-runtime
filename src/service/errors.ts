@@ -53,6 +53,10 @@ const SERVICE_ERROR_DETAILS = {
 
 export type RuntimeServiceErrorCode = keyof typeof SERVICE_ERROR_DETAILS;
 
+export function isRuntimeServiceErrorCode(value: string): value is RuntimeServiceErrorCode {
+  return Object.prototype.hasOwnProperty.call(SERVICE_ERROR_DETAILS, value);
+}
+
 export class RuntimeServiceError extends Error implements RuntimeError {
   readonly category: RuntimeError["category"];
   readonly retryable: boolean;

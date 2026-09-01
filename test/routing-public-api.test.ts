@@ -160,7 +160,7 @@ describe("baseline governed routing capability", () => {
     expect(capabilities.features).toEqual({
       providers: "available",
       routing: "available",
-      skills: "unavailable",
+      skills: "available",
       mcp: "unavailable",
       agent_loop: "unavailable",
       review: "unavailable",

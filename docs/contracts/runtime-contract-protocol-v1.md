@@ -439,16 +439,67 @@ approvals, and side-effect idempotency. Issue #10 owns provider calls and the
 agent loop, including provider-neutral turns, structured output, pause/resume,
 and terminal status.
 
-## 13. Stable failures
+## 13. Agent Skills host and Superpowers phases
+
+The v1 host has exactly two production sources: audited bundled Superpowers
+packages and explicitly configured private per-user skill roots. Metadata-only
+discovery reads the package name, description, version, source and package
+identities, resource/byte counts, and declared runtime capabilities. It does
+not read `SKILL.md` or resource bodies. Project-local `.agents/skills` is never
+auto-discovered, and a repository cannot add a skill source by naming one in
+content. Configured package directories and regular files must remain owned by
+the current user with modes `0700` and `0600`; bundled files must match the
+installed audited manifest and cannot be group/world writable.
+
+Selection resolves one exact allowed descriptor, version, package hash, and
+catalog root. Only after that exact selection may the loader read the full
+`SKILL.md` and declared references/assets/scripts. Every lexical and canonical
+path stays beneath its selected root; full `SKILL.md` loads only after exact
+selection and canonical path containment succeeds. Every directory and regular-file identity
+is revalidated around reads, and symlinks, traversal, mutation, cross-owner
+configured content, duplicate identities, unbounded content, or an incomplete
+snapshot fail closed. Skill scripts are hashed package content but are never
+executed, imported, evaluated, or spawned in v1.0.0; development mode provides
+no script bypass.
+
+The built-in finite phase policy is
+`BRAINSTORMING`, `TEST_DESIGN`, `RED`, `GREEN`, `DEBUGGING`, `REVIEW`, and
+`VERIFICATION`. Each `superpowers-phase.v1` record binds the execution request,
+observed journal head, exact catalog root, full descriptor/package/source and
+snapshot identities, built-in handler hash, exact predecessor phase hashes,
+input/output hashes, compiled context hash, and closed `context_accounting`.
+A required capability with no exact usable skill stops before imitation with
+`BLOCKED_SUPERPOWERS_MISSING`.
+
+`BRAINSTORMING` completion creates a real durable approval pause. Approval is
+not model text: `superpowers-approve` arrives through the private same-user
+local control socket and is accepted only with exact run, journal revision/head,
+phase, skill version/snapshot, approval-request hash, decision, and operation-ID
+binding. Restart recovery verifies the phase and journal projections together;
+an exact repeated request replays its byte-identical decision, while stale,
+conflicting, missing, duplicate, orphaned, or re-signed drift fails closed.
+
+`skill-execution-evidence.v1` is a bounded immutable handoff. Its compact
+`journal_path` proves the complete run-state/revision/attempt chain without
+copying unrelated journal metadata. Dedicated projections bind every catalog,
+snapshot, phase attempt, approval request/decision and, when applicable, the
+exact terminal journal entry. The parser recomputes nested hashes, catalog
+membership, context accounting, approval bijection, final journal truth,
+handoff hash, and document hash. This establishes internal closure; origin
+authenticity still requires the handoff/document hash to be pinned by a trusted
+consumer or checked against trusted private state. The artifact is evidence,
+not TOSS governance acceptance.
+
+## 14. Stable failures
 
 Library validation returns `RUNTIME_DOCUMENT_INVALID` for malformed content and `RUNTIME_DOCUMENT_UNSUPPORTED` for a recognized envelope requiring an unimplemented version or capability. Issues contain a JSON Pointer-like path, stable keyword, and safe message in deterministic order.
 
 CLI JSON mode returns one `command-result.v1` document. Exit codes are `0` success, `2` usage, `3` invalid input, `4` policy/blocked, `5` validation, `6` conflict/stale revision, `69` unavailable, and `70` internal. Failure output MUST be safe to persist and MUST NOT echo secret-shaped option values.
 
-## 14. Reference artifacts
+## 15. Reference artifacts
 
 The schema manifest maps every exact version to a stable `$id`. The
-`examples/runtime-contract-v1` directory groups three distinct reference sets.
+`examples/runtime-contract-v1` directory groups four distinct reference sets.
 `execution-request.json`, `execution-event.json`, and `execution-result.json`
 form the legacy execution chain. The model catalog, routing policy, prior
 routing state, and model-selection plan form the governed routing set. The
@@ -462,4 +513,11 @@ all budget dimensions, input references, request hash, and compiled-context
 hash. Package verification loads examples through the public package API,
 validates the legacy execution chain, and recomputes every governed routing and
 agent/context hash. The planned routing example binds its exact next-state hash
-without embedding a cyclic plan hash in the state reservation.
+without embedding a cyclic plan hash in the state reservation. The Agent Skills
+files are the fourth reference set and contain two related but distinct
+fixtures. `skill-descriptor.json`, `skill-snapshot.json`, and `skill-execution-evidence.json` form the TDD fixture chain, whose evidence contains its completed `TEST_DESIGN` phase.
+Separately, `superpowers-phase.json` and `superpowers-approval.json` form one real `BRAINSTORMING` transaction that is `APPROVAL_PENDING` in both phase and journal; it is not a completed phase.
+Package verification loads all five through public root parsers and recomputes
+their document hashes. The evidence example demonstrates the final compact
+`journal_path`, catalog-root membership, snapshot closure, and exact
+`context_accounting` shape without embedding bodies, native paths, or secrets.

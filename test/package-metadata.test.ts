@@ -228,6 +228,75 @@ describe("package metadata", () => {
     );
   }, 30_000);
 
+  it("publishes the complete Agent Skills contract and keeps its private seams out", async () => {
+    const packageFiles = JSON.parse(
+      await readFile("scripts/package-files.json", "utf8"),
+    ) as readonly string[];
+    const skillSchemas = [
+      "skill-descriptor.v1",
+      "skill-execution-evidence.v1",
+      "skill-snapshot.v1",
+      "superpowers-approval.v1",
+      "superpowers-phase.v1",
+    ];
+    const skillExamples = [
+      "skill-descriptor",
+      "skill-execution-evidence",
+      "skill-snapshot",
+      "superpowers-approval",
+      "superpowers-phase",
+    ];
+
+    for (const schema of skillSchemas) {
+      expect(packageFiles).toContain(`contracts/runtime/${schema}.schema.json`);
+      expect(packageFiles).toContain(`dist/contracts/runtime/${schema}.schema.json`);
+    }
+    for (const example of skillExamples) {
+      expect(packageFiles).toContain(`examples/runtime-contract-v1/${example}.json`);
+    }
+    for (const publicModule of ["contracts", "errors", "index", "types"]) {
+      expect(packageFiles).toContain(`dist/src/skills/${publicModule}.js`);
+      expect(packageFiles).toContain(`dist/src/skills/${publicModule}.d.ts`);
+    }
+    for (const runtimeModule of [
+      "approval",
+      "bundled",
+      "catalog",
+      "context",
+      "engine",
+      "evidence",
+      "loader",
+      "paths",
+      "phases",
+      "private-store",
+      "runtime-host",
+    ]) {
+      expect(packageFiles).toContain(`dist/src/skills/${runtimeModule}.js`);
+    }
+    expect(packageFiles).toEqual(
+      expect.arrayContaining([
+        "dist/skills/bundled/manifest.json",
+        "dist/skills/bundled/brainstorming/SKILL.md",
+        "dist/skills/bundled/requesting-code-review/SKILL.md",
+        "dist/skills/bundled/systematic-debugging/SKILL.md",
+        "dist/skills/bundled/test-driven-development/SKILL.md",
+        "dist/skills/bundled/verification-before-completion/SKILL.md",
+      ]),
+    );
+    expect(packageFiles.some((entry) => entry.startsWith("skills/bundled/"))).toBe(false);
+    for (const privateModule of ["approval", "catalog", "engine", "loader", "private-store"]) {
+      expect(packageFiles).not.toContain(`dist/src/skills/${privateModule}.d.ts`);
+      expect(packageFiles).not.toContain(`dist/src/skills/${privateModule}.d.ts.map`);
+      expect(packageFiles).not.toContain(`dist/src/skills/${privateModule}.js.map`);
+    }
+    for (const packedPath of packageFiles) {
+      expect(packedPath).not.toMatch(/(?:^|\/)\.superpowers(?:\/|$)/u);
+      expect(packedPath).not.toMatch(/(?:^|\/)(?:stages?|claims?|objects?)(?:\/|$)/iu);
+      expect(packedPath).not.toMatch(/(?:^|\/)(?:\.env|id_rsa|id_ed25519)(?:\.|$)/iu);
+      expect(packedPath).not.toMatch(/\.tgz$/u);
+    }
+  });
+
   it("matches the exact real dry-pack allowlist and keeps agent internals private", async () => {
     const expectedFiles = JSON.parse(
       await readFile("scripts/package-files.json", "utf8"),
