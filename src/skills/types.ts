@@ -166,6 +166,17 @@ export interface SuperpowersApprovalDecisionV1 extends RuntimeDocument {
   readonly document_hash: `sha256:${string}`;
 }
 
+export interface SkillJournalPathLinkV1 {
+  readonly run_id: string;
+  readonly journal_revision: number;
+  readonly sequence: number;
+  readonly previous_entry_hash: `sha256:${string}`;
+  readonly entry_hash: `sha256:${string}`;
+  readonly previous_state: RunState | null;
+  readonly state: RunState;
+  readonly run_attempt: number;
+}
+
 export interface SkillExecutionEvidenceV1 extends RuntimeDocument {
   readonly protocol_version: "runtime-contract.v1";
   readonly schema_version: "skill-execution-evidence.v1";
@@ -173,7 +184,7 @@ export interface SkillExecutionEvidenceV1 extends RuntimeDocument {
   readonly run_id: string;
   readonly journal_head: JournalHead;
   readonly run_state: RunState;
-  readonly journal_entries: readonly RunJournalEntryV1[];
+  readonly journal_path: readonly SkillJournalPathLinkV1[];
   readonly terminal_journal_entry: RunJournalEntryV1 | null;
   readonly catalogs: readonly SkillCatalogRoot[];
   readonly snapshots: readonly SkillSnapshotV1[];

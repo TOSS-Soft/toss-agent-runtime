@@ -11,7 +11,7 @@
     "run_id",
     "journal_head",
     "run_state",
-    "journal_entries",
+    "journal_path",
     "terminal_journal_entry",
     "catalogs",
     "snapshots",
@@ -42,10 +42,10 @@
         "INTERRUPTED"
       ]
     },
-    "journal_entries": {
+    "journal_path": {
       "type": "array",
       "maxItems": 1024,
-      "items": { "$ref": "run-journal-entry.v1.schema.json" }
+      "items": { "$ref": "#/$defs/journal_path_link" }
     },
     "terminal_journal_entry": {
       "oneOf": [{ "type": "null" }, { "$ref": "run-journal-entry.v1.schema.json" }]
@@ -101,19 +101,129 @@
         "entry_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
       }
     },
+    "journal_path_link": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "journal_revision",
+        "sequence",
+        "previous_entry_hash",
+        "entry_hash",
+        "previous_state",
+        "state",
+        "run_attempt"
+      ],
+      "properties": {
+        "run_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+        "journal_revision": { "$ref": "#/$defs/positive_integer" },
+        "sequence": { "$ref": "#/$defs/positive_integer" },
+        "previous_entry_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+        "entry_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+        "previous_state": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "enum": [
+                "CREATED",
+                "ROUTED",
+                "RUNNING",
+                "TOOL_PENDING",
+                "APPROVAL_PENDING",
+                "REVIEW_PENDING",
+                "COMPLETED",
+                "FAILED",
+                "BLOCKED",
+                "CANCELLED",
+                "INTERRUPTED"
+              ]
+            }
+          ]
+        },
+        "state": {
+          "enum": [
+            "CREATED",
+            "ROUTED",
+            "RUNNING",
+            "TOOL_PENDING",
+            "APPROVAL_PENDING",
+            "REVIEW_PENDING",
+            "COMPLETED",
+            "FAILED",
+            "BLOCKED",
+            "CANCELLED",
+            "INTERRUPTED"
+          ]
+        },
+        "run_attempt": { "$ref": "#/$defs/positive_integer" }
+      }
+    },
     "approval": {
       "type": "object",
       "additionalProperties": false,
       "required": ["request", "request_journal_entry", "decision", "decision_journal_entry"],
       "properties": {
         "request": { "$ref": "superpowers-approval.v1.schema.json" },
-        "request_journal_entry": { "$ref": "run-journal-entry.v1.schema.json" },
+        "request_journal_entry": { "$ref": "#/$defs/approval_request_journal_entry" },
         "decision": {
           "oneOf": [{ "type": "null" }, { "$ref": "superpowers-approval.v1.schema.json" }]
         },
         "decision_journal_entry": {
-          "oneOf": [{ "type": "null" }, { "$ref": "run-journal-entry.v1.schema.json" }]
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/approval_decision_journal_entry" }]
         }
+      }
+    },
+    "approval_request_journal_entry": {
+      "allOf": [
+        { "$ref": "run-journal-entry.v1.schema.json" },
+        {
+          "type": "object",
+          "properties": {
+            "previous_state": { "const": "RUNNING" },
+            "state": { "const": "APPROVAL_PENDING" },
+            "reason_code": { "const": "SUPERPOWERS_APPROVAL_REQUIRED" },
+            "side_effect": { "type": "null" },
+            "metadata": { "$ref": "#/$defs/approval_request_metadata" }
+          }
+        }
+      ]
+    },
+    "approval_decision_journal_entry": {
+      "allOf": [
+        { "$ref": "run-journal-entry.v1.schema.json" },
+        {
+          "type": "object",
+          "properties": {
+            "previous_state": { "const": "APPROVAL_PENDING" },
+            "state": { "enum": ["RUNNING", "BLOCKED"] },
+            "reason_code": {
+              "enum": ["SUPERPOWERS_APPROVAL_GRANTED", "SUPERPOWERS_APPROVAL_REJECTED"]
+            },
+            "side_effect": { "type": "null" },
+            "metadata": { "$ref": "#/$defs/approval_decision_metadata" }
+          }
+        }
+      ]
+    },
+    "approval_request_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "phase"],
+      "properties": {
+        "kind": { "const": "superpowers-approval-pending" },
+        "phase": { "$ref": "superpowers-phase.v1.schema.json" }
+      }
+    },
+    "approval_decision_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "request", "decision", "occurred_at", "phase"],
+      "properties": {
+        "kind": { "const": "superpowers-approval-decision" },
+        "request": { "$ref": "superpowers-approval.v1.schema.json" },
+        "decision": { "$ref": "superpowers-approval.v1.schema.json" },
+        "occurred_at": { "$ref": "runtime-common.v1.schema.json#/$defs/utc_timestamp" },
+        "phase": { "$ref": "superpowers-phase.v1.schema.json" }
       }
     },
     "terminal_code": {

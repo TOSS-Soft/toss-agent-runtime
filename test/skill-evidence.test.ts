@@ -20,12 +20,14 @@ import {
   requestSuperpowersApproval,
 } from "../src/skills/approval.js";
 import {
+  canonicalSkillEvidenceJson,
   hashSkillCatalog,
   hashSkillExecutionEvidence,
   hashSkillExecutionHandoff,
   parseSkillExecutionEvidence,
   SKILL_EVIDENCE_JSON_LIMITS,
 } from "../src/skills/contracts.js";
+import * as skillContracts from "../src/skills/contracts.js";
 import { SKILL_LIMITS, type SkillsHost } from "../src/skills/index.js";
 import { createSkillEvidenceBuilder } from "../src/skills/evidence.js";
 import type { SkillsEngine } from "../src/skills/engine.js";
@@ -34,6 +36,7 @@ import { createSkillsRuntimeHostForTest } from "../src/skills/runtime-host.js";
 import type { SkillSelection } from "../src/skills/catalog.js";
 import type {
   SkillExecutionEvidenceV1,
+  SkillJournalPathLinkV1,
   SkillSnapshotV1,
   SuperpowersPhaseName,
   SuperpowersPhaseV1,
@@ -47,6 +50,12 @@ const TRACE = {
 } as const;
 const EXECUTION_REQUEST_HASH = `sha256:${"e".repeat(64)}` as const;
 const roots: string[] = [];
+
+type EvidenceSerializationProbe = Readonly<{
+  scanned_code_units: number;
+  max_buffered_string_bytes: number;
+  members: number;
+}>;
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -148,7 +157,13 @@ function resignEvidence(value: Record<string, unknown>): Record<string, unknown>
     ...preimage,
     handoff_hash: hashSkillExecutionHandoff(preimage as never),
   };
-  return { ...withHandoff, document_hash: sha256(withHandoff) };
+  return {
+    ...withHandoff,
+    document_hash: hashSkillExecutionEvidence({
+      ...withHandoff,
+      document_hash: `sha256:${"0".repeat(64)}`,
+    } as SkillExecutionEvidenceV1),
+  };
 }
 
 function resignJournal(value: RunJournalEntryV1): RunJournalEntryV1 {
@@ -174,29 +189,42 @@ function resignJournalCommand(value: RunJournalEntryV1): RunJournalEntryV1 {
   });
 }
 
+function journalPathLink(entry: RunJournalEntryV1): SkillJournalPathLinkV1 {
+  return {
+    run_id: entry.run_id,
+    journal_revision: entry.journal_revision,
+    sequence: entry.sequence,
+    previous_entry_hash: entry.previous_entry_hash,
+    entry_hash: entry.entry_hash,
+    previous_state: entry.previous_state,
+    state: entry.state,
+    run_attempt: entry.run_attempt,
+  };
+}
+
 function resignZeroPhaseJournalPath(
   evidence: SkillExecutionEvidenceV1,
-  mutate: (entry: RunJournalEntryV1, index: number) => RunJournalEntryV1,
+  mutate: (entry: SkillJournalPathLinkV1, index: number) => SkillJournalPathLinkV1,
 ): Record<string, unknown> {
   if (evidence.terminal_journal_entry === null || evidence.approvals.length !== 0) {
     throw new Error("zero-phase terminal evidence expected");
   }
-  const pathEntries = [...evidence.journal_entries, evidence.terminal_journal_entry];
-  const resigned: RunJournalEntryV1[] = [];
-  for (const [index, original] of pathEntries.entries()) {
-    const previous = resigned.at(-1);
-    const mutated = mutate(original, index);
-    resigned.push(
-      resignJournalCommand({
-        ...mutated,
-        previous_entry_hash: previous?.entry_hash ?? ZERO_JOURNAL_HASH,
-      }),
-    );
-  }
-  const terminal = resigned.at(-1)!;
+  const terminalIndex = evidence.journal_path.length - 1;
+  const path = evidence.journal_path.map((entry, index) => mutate(entry, index));
+  const mutatedTerminalLink = path[terminalIndex]!;
+  const terminal = resignJournalCommand({
+    ...evidence.terminal_journal_entry,
+    journal_revision: mutatedTerminalLink.journal_revision,
+    sequence: mutatedTerminalLink.sequence,
+    previous_entry_hash: mutatedTerminalLink.previous_entry_hash,
+    previous_state: mutatedTerminalLink.previous_state,
+    state: mutatedTerminalLink.state,
+    run_attempt: mutatedTerminalLink.run_attempt,
+  });
+  path[terminalIndex] = journalPathLink(terminal);
   return resignEvidence({
     ...evidence,
-    journal_entries: resigned.slice(0, -1),
+    journal_path: path,
     terminal_journal_entry: terminal,
     journal_head: {
       journal_revision: terminal.journal_revision,
@@ -208,6 +236,48 @@ function resignZeroPhaseJournalPath(
 }
 
 describe("canonical Agent Skills evidence", () => {
+  it("emits canonical JSON strings incrementally and stops before an escaping value can overflow", () => {
+    const corpus = [
+      "",
+      'quote \" slash / backslash \\\\',
+      "\u0000\b\t\n\f\r\u001f",
+      "plain ASCII",
+      "Türkçe 漢字",
+      "emoji 😀 pair",
+      "lone-high-\ud800",
+      "lone-low-\udfff",
+      "mixed-\ud800😀\udfff\u2028\u2029",
+    ];
+    for (const value of corpus) {
+      expect(canonicalSkillEvidenceJson({ value })).toBe(canonicalJson({ value }));
+    }
+
+    const withProbe = (
+      skillContracts as unknown as {
+        withSkillEvidenceSerializationProbeForTest?: <T>(
+          observe: (probe: EvidenceSerializationProbe) => void,
+          operation: () => T,
+        ) => T;
+      }
+    ).withSkillEvidenceSerializationProbeForTest;
+    expect(withProbe).toBeTypeOf("function");
+
+    const value = "\u0000".repeat(2_096_000);
+    let observed: EvidenceSerializationProbe | null = null;
+    expect(() =>
+      withProbe?.(
+        (probe) => {
+          observed = probe;
+        },
+        () => hashSkillExecutionHandoff({ value } as never),
+      ),
+    ).toThrow(expect.objectContaining({ code: "RUNTIME_SKILL_LIMIT_EXCEEDED" }));
+    expect(observed).not.toBeNull();
+    expect(observed!.scanned_code_units).toBeLessThan(value.length);
+    expect(observed!.scanned_code_units).toBeLessThan(400_000);
+    expect(observed!.max_buffered_string_bytes).toBeLessThanOrEqual(4_096);
+  });
+
   it("hashes only exact plain evidence documents without observing hidden properties", () => {
     const valid = Object.freeze({ ...validSkillExecutionEvidence() });
     expect(hashSkillExecutionEvidence(valid)).toBe(valid.document_hash);
@@ -338,6 +408,147 @@ describe("canonical Agent Skills evidence", () => {
       ok: false,
       code: "RUNTIME_DOCUMENT_INVALID",
     });
+
+    const exactDenseObject = `{${Array.from(
+      { length: SKILL_EVIDENCE_JSON_LIMITS.maxMembers },
+      (_unused, index) => `${JSON.stringify(index.toString(36))}:0`,
+    ).join(",")}}`;
+    expect(Buffer.byteLength(exactDenseObject, "utf8")).toBeLessThan(SKILL_LIMITS.evidenceBytes);
+    expect(parseSkillExecutionEvidence(exactDenseObject)).toMatchObject({
+      ok: false,
+      code: "RUNTIME_DOCUMENT_INVALID",
+      issues: [{ keyword: "evidencePreflight" }],
+    });
+  });
+
+  it("projects a metadata-dense official history as compact closed journal path links", async () => {
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-evidence-compact-path-")));
+    roots.push(root);
+    const runId = "run-compact-path";
+    const history: RunJournalEntryV1[] = [];
+    const now = clock();
+    const states: RunState[] = ["CREATED", "ROUTED", "RUNNING"];
+    while (states.length < 131) states.push(states.at(-1) === "RUNNING" ? "FAILED" : "RUNNING");
+    states.push("BLOCKED");
+    const legalMetadata = Array.from({ length: 1_000 }, (_unused, index) => index);
+    for (const state of states) {
+      const previous = history.at(-1);
+      const transition = decideRunTransition(
+        history,
+        {
+          ...journalCommand(
+            runId,
+            state,
+            previous === undefined
+              ? null
+              : {
+                  journal_revision: previous.journal_revision,
+                  sequence: previous.sequence,
+                  entry_hash: previous.entry_hash,
+                },
+          ),
+          command_id: `${runId}-${state.toLowerCase()}-${history.length}`,
+          reason_code: state === "BLOCKED" ? "BLOCKED_SUPERPOWERS_MISSING" : `MOVE_${state}`,
+          metadata: legalMetadata,
+        },
+        now,
+      );
+      if (transition.kind !== "append") throw new Error("compact path fixture must append");
+      history.push(transition.entry);
+    }
+    const final = history.at(-1)!;
+    const engine = {
+      evidenceHistory: () =>
+        Promise.resolve({
+          phases: [],
+          journal: {
+            run_id: runId,
+            state: final.state,
+            head: {
+              journal_revision: final.journal_revision,
+              sequence: final.sequence,
+              entry_hash: final.entry_hash,
+            },
+            entries: history,
+            unresolved_side_effects: [],
+          },
+        }),
+    } as unknown as SkillsEngine;
+    const builder = createSkillEvidenceBuilder({
+      statePath: path.join(root, "state"),
+      engine,
+      now,
+      randomId: ids(),
+      hasServiceListener: () => Promise.resolve("absent"),
+    });
+
+    const evidence = await builder.evidence(runId);
+    if (evidence === null) throw new Error("compact journal-path evidence expected");
+    const projected = evidence as unknown as Readonly<Record<string, unknown>>;
+    const journalPath = projected.journal_path as readonly Readonly<Record<string, unknown>>[];
+    expect(projected.journal_entries).toBeUndefined();
+    expect(journalPath).toHaveLength(132);
+    expect(Object.keys(journalPath[0]!).sort()).toEqual(
+      [
+        "entry_hash",
+        "journal_revision",
+        "previous_entry_hash",
+        "previous_state",
+        "run_attempt",
+        "run_id",
+        "sequence",
+        "state",
+      ].sort(),
+    );
+    expect(journalPath.map((entry) => entry.entry_hash)).toEqual(
+      history.map((entry) => entry.entry_hash),
+    );
+    const serialized = canonicalSkillEvidenceJson(evidence);
+    expect(Buffer.byteLength(serialized, "utf8")).toBeLessThan(SKILL_LIMITS.evidenceBytes);
+    expect(parseSkillExecutionEvidence(serialized)).toEqual({ ok: true, value: evidence });
+  });
+
+  it("admits the complete 1024-link closed path below the exclusive member ceiling", () => {
+    const base = validSkillExecutionEvidence();
+    const journalPath = [...base.journal_path];
+    while (journalPath.length < 1_024) {
+      const previous = journalPath.at(-1)!;
+      const state = previous.state === "RUNNING" ? "TOOL_PENDING" : "RUNNING";
+      const sequence = previous.sequence + 1;
+      journalPath.push({
+        run_id: base.run_id,
+        journal_revision: sequence,
+        sequence,
+        previous_entry_hash: previous.entry_hash,
+        entry_hash: sha256({ kind: "maximum-journal-path", sequence }),
+        previous_state: previous.state,
+        state,
+        run_attempt: previous.run_attempt,
+      });
+    }
+    const final = journalPath.at(-1)!;
+    const evidence = resignEvidence({
+      ...base,
+      journal_path: journalPath,
+      journal_head: {
+        journal_revision: final.journal_revision,
+        sequence: final.sequence,
+        entry_hash: final.entry_hash,
+      },
+      run_state: final.state,
+    }) as unknown as SkillExecutionEvidenceV1;
+    let observed: EvidenceSerializationProbe | null = null;
+    const serialized = skillContracts.withSkillEvidenceSerializationProbeForTest(
+      (probe) => {
+        observed = probe;
+      },
+      () => canonicalSkillEvidenceJson(evidence),
+    );
+
+    expect(Buffer.byteLength(serialized, "utf8")).toBeLessThan(SKILL_LIMITS.evidenceBytes);
+    expect(observed).not.toBeNull();
+    expect(observed!.members).toBeLessThan(SKILL_EVIDENCE_JSON_LIMITS.maxMembers);
+    expect(parseSkillExecutionEvidence(serialized)).toEqual({ ok: true, value: evidence });
   });
 
   it("rejects the 129th approval in the first linear journal pass before object reads", async () => {
@@ -648,11 +859,19 @@ describe("canonical Agent Skills evidence", () => {
 
     const evidence = await builder.evidence("run-near-byte");
     if (evidence === null) throw new Error("near-byte evidence expected");
-    const serialized = canonicalJson(evidence, SKILL_EVIDENCE_JSON_LIMITS);
+    let observed: EvidenceSerializationProbe | null = null;
+    const serialized = skillContracts.withSkillEvidenceSerializationProbeForTest(
+      (probe) => {
+        observed = probe;
+      },
+      () => canonicalSkillEvidenceJson(evidence),
+    );
     const bytes = Buffer.byteLength(serialized, "utf8");
     expect(evidence.approvals).toHaveLength(96);
     expect(bytes).toBeGreaterThan(Math.floor((SKILL_LIMITS.evidenceBytes * 3) / 4));
     expect(bytes).toBeLessThanOrEqual(SKILL_LIMITS.evidenceBytes);
+    expect(observed).not.toBeNull();
+    expect(observed!.members).toBeLessThan(SKILL_EVIDENCE_JSON_LIMITS.maxMembers);
     expect(parseSkillExecutionEvidence(serialized)).toEqual({ ok: true, value: evidence });
   }, 20_000);
 
@@ -719,6 +938,28 @@ describe("canonical Agent Skills evidence", () => {
     const approvalEvidence = await host.evidence("run-1");
     if (approvalEvidence === null) throw new Error("approved evidence expected");
     const approvalProjection = approvalEvidence.approvals[0]!;
+    const schemaOpenApprovalMetadata = {
+      ...approvalEvidence,
+      approvals: [
+        {
+          ...approvalProjection,
+          request_journal_entry: {
+            ...approvalProjection.request_journal_entry,
+            metadata: Array.from({ length: 1_000 }, (_unused, index) => index),
+          },
+        },
+      ],
+    };
+    expect(parseSkillExecutionEvidence(canonicalJson(schemaOpenApprovalMetadata))).toMatchObject({
+      ok: false,
+      code: "RUNTIME_DOCUMENT_INVALID",
+      issues: [
+        expect.objectContaining({
+          path: "/approvals/0/request_journal_entry/metadata",
+          keyword: "type",
+        }),
+      ],
+    });
     const approvedTerminal = approvalEvidence.phases.at(-1)!;
     const requestEntry = approvalProjection.request_journal_entry;
     const advancedWithoutDecision = resignJournalCommand({
@@ -1400,9 +1641,7 @@ describe("canonical Agent Skills evidence", () => {
         ok: true,
         value: projected,
       });
-      expect(projected.journal_entries.map((entry) => entry.state)).toEqual(
-        fixture.states.slice(0, -1),
-      );
+      expect(projected.journal_path.map((entry) => entry.state)).toEqual(fixture.states);
       closedJournalEvidence.push(projected);
     }
 
@@ -1410,7 +1649,7 @@ describe("canonical Agent Skills evidence", () => {
     const impossibleCreatedPredecessor = resignZeroPhaseJournalPath(
       reviewEvidence,
       (entry, index) =>
-        index === reviewEvidence.journal_entries.length
+        index === reviewEvidence.journal_path.length - 1
           ? { ...entry, previous_state: "CREATED" }
           : entry,
     );
@@ -1420,7 +1659,7 @@ describe("canonical Agent Skills evidence", () => {
     });
 
     const retryJournalEvidence = closedJournalEvidence[1]!;
-    const retryTerminalIndex = retryJournalEvidence.journal_entries.length;
+    const retryTerminalIndex = retryJournalEvidence.journal_path.length - 1;
     for (const runAttempt of [1, 99]) {
       const impossibleAttempt = resignZeroPhaseJournalPath(retryJournalEvidence, (entry, index) =>
         index === retryTerminalIndex ? { ...entry, run_attempt: runAttempt } : entry,
@@ -1432,39 +1671,36 @@ describe("canonical Agent Skills evidence", () => {
     }
     const retryOmitted = resignEvidence({
       ...retryJournalEvidence,
-      journal_entries: retryJournalEvidence.journal_entries.filter((_entry, index) => index !== 3),
+      journal_path: retryJournalEvidence.journal_path.filter((_entry, index) => index !== 3),
     });
     const retryFork = resignEvidence({
       ...retryJournalEvidence,
-      journal_entries: [
-        ...retryJournalEvidence.journal_entries,
-        resignJournalCommand({
-          ...retryJournalEvidence.journal_entries[2]!,
-          command_id: "forked-running-entry",
-        }),
+      journal_path: [
+        ...retryJournalEvidence.journal_path,
+        {
+          ...retryJournalEvidence.journal_path[2]!,
+          entry_hash: sha256({ kind: "forked-running-entry" }),
+        },
       ],
     });
     const retryDuplicate = resignEvidence({
       ...retryJournalEvidence,
-      journal_entries: [
-        ...retryJournalEvidence.journal_entries,
-        retryJournalEvidence.journal_entries[2]!,
-      ],
+      journal_path: [...retryJournalEvidence.journal_path, retryJournalEvidence.journal_path[2]!],
     });
     const retryTerminal = retryJournalEvidence.terminal_journal_entry!;
     const retryOrphan = resignEvidence({
       ...retryJournalEvidence,
-      journal_entries: [
-        ...retryJournalEvidence.journal_entries,
-        resignJournalCommand({
-          ...retryTerminal,
+      journal_path: [
+        ...retryJournalEvidence.journal_path,
+        {
+          ...journalPathLink(retryTerminal),
           journal_revision: retryTerminal.journal_revision + 1,
           sequence: retryTerminal.sequence + 1,
           previous_entry_hash: retryTerminal.entry_hash,
-          command_id: "orphan-retry-after-terminal",
+          entry_hash: sha256({ kind: "orphan-retry-after-terminal" }),
           previous_state: retryTerminal.state,
           state: "RUNNING",
-        }),
+        },
       ],
     });
     for (const impossible of [retryOmitted, retryFork, retryDuplicate, retryOrphan]) {
@@ -1527,17 +1763,14 @@ describe("canonical Agent Skills evidence", () => {
     });
     expect(mixedEvidence?.phases.at(-1)?.status).toBe("COMPLETED");
     if (mixedEvidence === null) throw new Error("mixed terminal evidence expected");
-    const mixedJournalEntries = (
-      mixedEvidence as SkillExecutionEvidenceV1 & {
-        readonly journal_entries: readonly RunJournalEntryV1[];
-      }
-    ).journal_entries;
+    const mixedJournalEntries = mixedEvidence.journal_path;
     expect(mixedJournalEntries.map((entry) => entry.state)).toEqual([
       "CREATED",
       "ROUTED",
       "RUNNING",
       "TOOL_PENDING",
       "RUNNING",
+      "BLOCKED",
     ]);
     expect(parseSkillExecutionEvidence(canonicalJson(mixedEvidence))).toEqual({
       ok: true,
@@ -1548,9 +1781,9 @@ describe("canonical Agent Skills evidence", () => {
         canonicalJson(
           resignEvidence({
             ...approvalEvidence,
-            journal_entries: [
-              ...approvalEvidence.journal_entries,
-              approvalProjection.request_journal_entry,
+            journal_path: [
+              ...approvalEvidence.journal_path,
+              journalPathLink(approvalProjection.request_journal_entry),
             ],
           }),
         ),

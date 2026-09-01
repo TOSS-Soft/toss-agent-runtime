@@ -143,6 +143,7 @@ export type {
   SkillDescriptorV1,
   SkillCatalogRoot,
   SkillExecutionEvidenceV1,
+  SkillJournalPathLinkV1,
   SkillResourceRole,
   SkillResourceV1,
   SkillSnapshotV1,

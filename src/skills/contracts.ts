@@ -29,6 +29,7 @@ import type {
   SkillDescriptorReference,
   SkillDescriptorV1,
   SkillExecutionEvidenceV1,
+  SkillJournalPathLinkV1,
   SkillSnapshotV1,
   SuperpowersApprovalDecisionV1,
   SuperpowersApprovalRequestV1,
@@ -49,15 +50,30 @@ const DOCUMENT_LIMITS: JsonLimits = Object.freeze({
   maxMembers: 10_000,
 });
 
+const EVIDENCE_CLOSED_MEMBER_MIN_BYTES = 18;
+const EVIDENCE_TERMINAL_DOCUMENT_MAX_MEMBERS = 10_000;
+const EVIDENCE_FIXED_MEMBER_ALLOWANCE = 4_096;
+const EVIDENCE_SCHEMA_MEMBER_UPPER_BOUND =
+  Math.floor(SKILL_LIMITS.evidenceBytes / EVIDENCE_CLOSED_MEMBER_MIN_BYTES) +
+  EVIDENCE_TERMINAL_DOCUMENT_MAX_MEMBERS +
+  EVIDENCE_FIXED_MEMBER_ALLOWANCE;
+const EVIDENCE_MEMBER_CEILING = 131_072;
+
+if (EVIDENCE_SCHEMA_MEMBER_UPPER_BOUND >= EVIDENCE_MEMBER_CEILING) {
+  throw new Error("skill evidence member ceiling is below the closed schema bound");
+}
+
 export const SKILL_EVIDENCE_JSON_LIMITS: JsonLimits = Object.freeze({
   maxBytes: SKILL_LIMITS.evidenceBytes,
   maxDepth: SKILL_LIMITS.nestingDepth + 8,
-  // Closed evidence has at most 512 phases, 128 approval projections, 256
-  // snapshots with 256 resources each, bounded catalog roots, and a journal
-  // path that must itself fit the 2 MiB envelope. 131,072 admits that legal
-  // surface (including the 128-approval shape) while rejecting scalar-dense
-  // non-evidence input long before jsonc-parser allocates an AST.
-  maxMembers: 131_072,
+  // After ordinary journal metadata is replaced by eight-field path links,
+  // every repeatable closed evidence unit uses at least 18 canonical bytes per
+  // counted member. The sole arbitrary safe_json authority is the dedicated
+  // terminal journal document, whose own parser admits at most 10,000 members;
+  // 4,096 more cover every non-repeatable root/container member.
+  // floor(2 MiB / 18) + 10,000 + 4,096 = 130,604, so the next power-of-two
+  // ceiling is conservative for every byte-valid shape. The ceiling is exclusive.
+  maxMembers: EVIDENCE_MEMBER_CEILING,
 });
 
 type EvidenceContainer =
@@ -98,7 +114,7 @@ function preflightEvidenceStructure(input: string | Uint8Array): void {
 
   const countMember = () => {
     members += 1;
-    if (members > SKILL_EVIDENCE_JSON_LIMITS.maxMembers) throw new Error("member limit");
+    if (members >= SKILL_EVIDENCE_JSON_LIMITS.maxMembers) throw new Error("member limit");
   };
   const beginValue = (token: number): void => {
     if (token === EVIDENCE_TOKEN.OPEN_BRACKET || token === EVIDENCE_TOKEN.OPEN_BRACE) {
@@ -203,6 +219,33 @@ interface EvidenceSerializationState {
   members: number;
 }
 
+interface EvidenceSerializationProbe {
+  scanned_code_units: number;
+  max_buffered_string_bytes: number;
+  members: number;
+}
+
+let evidenceSerializationProbe: EvidenceSerializationProbe | null = null;
+
+export function withSkillEvidenceSerializationProbeForTest<T>(
+  observe: (probe: Readonly<EvidenceSerializationProbe>) => void,
+  operation: () => T,
+): T {
+  if (evidenceSerializationProbe !== null) throw new Error("evidence probe is already active");
+  const probe: EvidenceSerializationProbe = {
+    scanned_code_units: 0,
+    max_buffered_string_bytes: 0,
+    members: 0,
+  };
+  evidenceSerializationProbe = probe;
+  try {
+    return operation();
+  } finally {
+    evidenceSerializationProbe = null;
+    observe(Object.freeze({ ...probe }));
+  }
+}
+
 function evidenceLimit(): never {
   throw new RuntimeSkillError("RUNTIME_SKILL_LIMIT_EXCEEDED");
 }
@@ -214,16 +257,75 @@ function appendEvidenceChunk(state: EvidenceSerializationState, chunk: string): 
   state.chunks.push(chunk);
 }
 
-function appendEvidenceString(state: EvidenceSerializationState, value: string): void {
-  if (state.bytes + Buffer.byteLength(value, "utf8") + 2 > SKILL_EVIDENCE_JSON_LIMITS.maxBytes) {
-    evidenceLimit();
+function escapedEvidenceStringAtom(
+  value: string,
+  index: number,
+): Readonly<{ chunk: string; bytes: number; codeUnits: number }> {
+  const code = value.charCodeAt(index);
+  if (code === 0x22) return { chunk: '\\"', bytes: 2, codeUnits: 1 };
+  if (code === 0x5c) return { chunk: "\\\\", bytes: 2, codeUnits: 1 };
+  if (code === 0x08) return { chunk: "\\b", bytes: 2, codeUnits: 1 };
+  if (code === 0x09) return { chunk: "\\t", bytes: 2, codeUnits: 1 };
+  if (code === 0x0a) return { chunk: "\\n", bytes: 2, codeUnits: 1 };
+  if (code === 0x0c) return { chunk: "\\f", bytes: 2, codeUnits: 1 };
+  if (code === 0x0d) return { chunk: "\\r", bytes: 2, codeUnits: 1 };
+  if (code < 0x20 || (code >= 0xd800 && code <= 0xdfff)) {
+    if (code >= 0xd800 && code <= 0xdbff && index + 1 < value.length) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        return { chunk: value.slice(index, index + 2), bytes: 4, codeUnits: 2 };
+      }
+    }
+    return {
+      chunk: `\\u${code.toString(16).padStart(4, "0")}`,
+      bytes: 6,
+      codeUnits: 1,
+    };
   }
-  appendEvidenceChunk(state, JSON.stringify(value));
+  return {
+    chunk: value[index]!,
+    bytes: code <= 0x7f ? 1 : code <= 0x7ff ? 2 : 3,
+    codeUnits: 1,
+  };
+}
+
+function appendEvidenceString(state: EvidenceSerializationState, value: string): void {
+  if (state.bytes + 2 > SKILL_EVIDENCE_JSON_LIMITS.maxBytes) evidenceLimit();
+  appendEvidenceChunk(state, '"');
+  let buffered = "";
+  let bufferedBytes = 0;
+  const flush = (): void => {
+    if (bufferedBytes === 0) return;
+    if (bufferedBytes > (evidenceSerializationProbe?.max_buffered_string_bytes ?? 0)) {
+      if (evidenceSerializationProbe !== null) {
+        evidenceSerializationProbe.max_buffered_string_bytes = bufferedBytes;
+      }
+    }
+    appendEvidenceChunk(state, buffered);
+    buffered = "";
+    bufferedBytes = 0;
+  };
+  for (let index = 0; index < value.length;) {
+    const atom = escapedEvidenceStringAtom(value, index);
+    if (state.bytes + bufferedBytes + atom.bytes + 1 > SKILL_EVIDENCE_JSON_LIMITS.maxBytes) {
+      evidenceLimit();
+    }
+    if (bufferedBytes + atom.bytes > 4_096) flush();
+    buffered += atom.chunk;
+    bufferedBytes += atom.bytes;
+    index += atom.codeUnits;
+    if (evidenceSerializationProbe !== null) {
+      evidenceSerializationProbe.scanned_code_units += atom.codeUnits;
+    }
+  }
+  flush();
+  appendEvidenceChunk(state, '"');
 }
 
 function countEvidenceMembers(state: EvidenceSerializationState, count: number): void {
-  if (state.members + count > SKILL_EVIDENCE_JSON_LIMITS.maxMembers) evidenceLimit();
+  if (state.members + count >= SKILL_EVIDENCE_JSON_LIMITS.maxMembers) evidenceLimit();
   state.members += count;
+  if (evidenceSerializationProbe !== null) evidenceSerializationProbe.members += count;
 }
 
 function serializeEvidenceValue(
@@ -793,6 +895,22 @@ function projectedTransitionAllowed(previous: RunState, next: RunState): boolean
   return (RUN_TRANSITION_MATRIX[previous] as readonly RunState[]).includes(next);
 }
 
+function journalPathLinkMatchesEntry(
+  link: SkillJournalPathLinkV1,
+  entry: RunJournalEntryV1,
+): boolean {
+  return (
+    link.run_id === entry.run_id &&
+    link.journal_revision === entry.journal_revision &&
+    link.sequence === entry.sequence &&
+    link.previous_entry_hash === entry.previous_entry_hash &&
+    link.entry_hash === entry.entry_hash &&
+    link.previous_state === entry.previous_state &&
+    link.state === entry.state &&
+    link.run_attempt === entry.run_attempt
+  );
+}
+
 function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   const catalogHashes = value.catalogs.map((catalog) => catalog.catalog_hash);
@@ -1013,49 +1131,70 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
   );
   const requests = new Set<string>();
   const decisions = new Set<string>();
+  const journalPathByHash = new Map<`sha256:${string}`, SkillJournalPathLinkV1>();
+  const journalPathSequences = new Set<number>();
+  for (const [index, link] of value.journal_path.entries()) {
+    const previous = value.journal_path[index - 1];
+    const duplicate =
+      journalPathByHash.has(link.entry_hash) || journalPathSequences.has(link.sequence);
+    const firstInvalid =
+      previous === undefined &&
+      (link.journal_revision !== 1 ||
+        link.sequence !== 1 ||
+        link.run_attempt !== 1 ||
+        link.previous_entry_hash !== ZERO_JOURNAL_HASH ||
+        link.previous_state !== null ||
+        link.state !== "CREATED");
+    const successorInvalid =
+      previous !== undefined &&
+      (link.journal_revision !== previous.journal_revision + 1 ||
+        link.sequence !== previous.sequence + 1 ||
+        link.previous_entry_hash !== previous.entry_hash ||
+        link.previous_state !== previous.state ||
+        !projectedTransitionAllowed(previous.state, link.state) ||
+        link.run_attempt !== projectedRunAttempt(previous, link.state));
+    if (link.run_id !== value.run_id || duplicate || firstInvalid || successorInvalid) {
+      issues.push(issue(`/journal_path/${index}`, "chain", "journal path link is inconsistent"));
+    }
+    journalPathByHash.set(link.entry_hash, link);
+    journalPathSequences.add(link.sequence);
+  }
+  const journalPathHead = value.journal_path.at(-1);
+  if (
+    value.journal_path.length === 0 ||
+    journalPathHead === undefined ||
+    value.journal_path.length !== value.journal_head.sequence ||
+    journalPathHead.journal_revision !== value.journal_head.journal_revision ||
+    journalPathHead.sequence !== value.journal_head.sequence ||
+    journalPathHead.entry_hash !== value.journal_head.entry_hash ||
+    journalPathHead.state !== value.run_state
+  ) {
+    issues.push(issue("/journal_head", "chain", "journal head is not the exact compact path head"));
+  }
+
   const projectedJournalEntries = new Map<`sha256:${string}`, RunJournalEntryV1>();
   const projectedJournalSources = new Map<
     `sha256:${string}`,
-    "ordinary" | "approval-request" | "approval-decision" | "terminal"
+    "approval-request" | "approval-decision" | "terminal"
   >();
-  const projectedJournalSequences = new Set<number>();
   const addProjectedJournalEntry = (
     entry: RunJournalEntryV1,
-    source: "ordinary" | "approval-request" | "approval-decision" | "terminal",
+    source: "approval-request" | "approval-decision" | "terminal",
   ): void => {
+    const link = journalPathByHash.get(entry.entry_hash);
     if (
       projectedJournalEntries.has(entry.entry_hash) ||
-      projectedJournalSequences.has(entry.sequence)
+      link === undefined ||
+      !journalPathLinkMatchesEntry(link, entry)
     ) {
       issues.push(
-        issue("/journal_entries", "projection", "journal entries must be projected exactly once"),
+        issue("/journal_path", "projection", "full journal entries must match one path link"),
       );
       return;
     }
     projectedJournalEntries.set(entry.entry_hash, entry);
     projectedJournalSources.set(entry.entry_hash, source);
-    projectedJournalSequences.add(entry.sequence);
   };
-  for (const [index, entry] of value.journal_entries.entries()) {
-    const parsed = parseRunJournalEntry(canonicalJson(entry));
-    const metadataKind =
-      typeof entry.metadata === "object" &&
-      entry.metadata !== null &&
-      !Array.isArray(entry.metadata)
-        ? (entry.metadata as Readonly<Record<string, JsonValue>>).kind
-        : undefined;
-    if (
-      !parsed.ok ||
-      entry.run_id !== value.run_id ||
-      metadataKind === "superpowers-approval-pending" ||
-      metadataKind === "superpowers-approval-decision"
-    ) {
-      issues.push(
-        issue(`/journal_entries/${index}`, "binding", "ordinary journal entry is inconsistent"),
-      );
-    }
-    addProjectedJournalEntry(entry, "ordinary");
-  }
   for (const [index, approval] of value.approvals.entries()) {
     const requestResult = parseSuperpowersApproval(canonicalJson(approval.request));
     const decisionResult =
@@ -1180,18 +1319,6 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
       }
     }
   }
-  for (const entry of projectedJournalEntries.values()) {
-    const previous = projectedJournalEntries.get(entry.previous_entry_hash);
-    if (
-      previous !== undefined &&
-      (entry.journal_revision !== previous.journal_revision + 1 ||
-        entry.sequence !== previous.sequence + 1 ||
-        entry.previous_state !== previous.state ||
-        entry.run_attempt !== projectedRunAttempt(previous, entry.state))
-    ) {
-      issues.push(issue("/approvals", "runAttempt", "projected journal attempts are inconsistent"));
-    }
-  }
   if (pendingPhaseHashes.size !== 0) {
     issues.push(issue("/approvals", "projection", "every pending phase requires one approval"));
   }
@@ -1254,51 +1381,8 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
   }
   if (terminalEntry !== null) addProjectedJournalEntry(terminalEntry, "terminal");
 
-  const completeJournal = [...projectedJournalEntries.values()].sort(
-    (left, right) => left.sequence - right.sequence,
-  );
-  for (const [index, entry] of completeJournal.entries()) {
-    const previous = completeJournal[index - 1];
-    const entryResult = parseRunJournalEntry(canonicalJson(entry));
-    const firstInvalid =
-      previous === undefined &&
-      (entry.journal_revision !== 1 ||
-        entry.sequence !== 1 ||
-        entry.run_attempt !== 1 ||
-        entry.previous_entry_hash !== ZERO_JOURNAL_HASH ||
-        entry.previous_state !== null ||
-        entry.state !== "CREATED");
-    const successorInvalid =
-      previous !== undefined &&
-      (entry.journal_revision !== previous.journal_revision + 1 ||
-        entry.sequence !== previous.sequence + 1 ||
-        entry.previous_entry_hash !== previous.entry_hash ||
-        entry.previous_state !== previous.state ||
-        !projectedTransitionAllowed(previous.state, entry.state) ||
-        entry.run_attempt !== projectedRunAttempt(previous, entry.state) ||
-        !orderedTimestamp(previous.timestamp, entry.timestamp));
-    if (!entryResult.ok || entry.run_id !== value.run_id || firstInvalid || successorInvalid) {
-      issues.push(
-        issue(`/journal_entries/${index}`, "chain", "complete journal projection is inconsistent"),
-      );
-    }
-  }
-  const completeJournalHead = completeJournal.at(-1);
-  if (
-    completeJournal.length === 0 ||
-    completeJournalHead === undefined ||
-    completeJournal.length !== value.journal_head.sequence ||
-    completeJournalHead.journal_revision !== value.journal_head.journal_revision ||
-    completeJournalHead.sequence !== value.journal_head.sequence ||
-    completeJournalHead.entry_hash !== value.journal_head.entry_hash ||
-    completeJournalHead.state !== value.run_state
-  ) {
-    issues.push(
-      issue("/journal_head", "chain", "journal head is not the exact complete projected path"),
-    );
-  }
   for (const [index, phase] of value.phases.entries()) {
-    const observed = projectedJournalEntries.get(phase.observed_journal_head.entry_hash);
+    const observed = journalPathByHash.get(phase.observed_journal_head.entry_hash);
     if (
       observed === undefined ||
       observed.journal_revision !== phase.observed_journal_head.journal_revision ||
@@ -1314,7 +1398,7 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
       );
     }
   }
-  for (const entry of completeJournal) {
+  for (const entry of projectedJournalEntries.values()) {
     const metadataKind =
       typeof entry.metadata === "object" &&
       entry.metadata !== null &&

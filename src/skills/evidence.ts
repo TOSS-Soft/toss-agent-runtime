@@ -25,6 +25,7 @@ import {
   type SkillCatalogRoot,
   type SkillDescriptorReference,
   type SkillExecutionEvidenceV1,
+  type SkillJournalPathLinkV1,
   type SkillSnapshotV1,
   type SuperpowersPhaseV1,
 } from "./types.js";
@@ -206,6 +207,19 @@ function journalHead(entry: RunJournalEntryV1) {
   });
 }
 
+function journalPathLink(entry: RunJournalEntryV1): SkillJournalPathLinkV1 {
+  return Object.freeze({
+    run_id: entry.run_id,
+    journal_revision: entry.journal_revision,
+    sequence: entry.sequence,
+    previous_entry_hash: entry.previous_entry_hash,
+    entry_hash: entry.entry_hash,
+    previous_state: entry.previous_state,
+    state: entry.state,
+    run_attempt: entry.run_attempt,
+  });
+}
+
 function terminalFromJournal(entry: RunJournalEntryV1 | undefined): RuntimeSkillErrorCode | null {
   if (
     entry !== undefined &&
@@ -278,12 +292,8 @@ export function createSkillEvidenceBuilder(
         zeroPhaseCode !== null && !approvalJournalHashes.has(finalJournal.entry_hash)
           ? finalJournal
           : null;
-      const journalEntries = verified.journal.entries.filter(
-        (entry) =>
-          !approvalJournalHashes.has(entry.entry_hash) &&
-          entry.entry_hash !== terminalJournalEntry?.entry_hash,
-      );
-      if (journalEntries.length > 1024) limitExceeded();
+      if (verified.journal.entries.length > 1024) limitExceeded();
+      const journalPath = verified.journal.entries.map(journalPathLink);
 
       const phaseByPackage = new Map<`sha256:${string}`, SuperpowersPhaseV1>();
       const catalogHashes = new Set<`sha256:${string}`>();
@@ -309,7 +319,7 @@ export function createSkillEvidenceBuilder(
         run_id: runId,
         journal_head: verified.journal.head,
         run_state: verified.journal.state,
-        journal_entries: journalEntries,
+        journal_path: journalPath,
         terminal_journal_entry: terminalJournalEntry,
         catalogs: [] as readonly SkillCatalogRoot[],
         snapshots: [] as readonly SkillSnapshotV1[],

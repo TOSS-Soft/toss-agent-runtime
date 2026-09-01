@@ -335,6 +335,7 @@ export {
   type SkillDescriptorV1,
   type SkillDiscoveryRequest,
   type SkillExecutionEvidenceV1,
+  type SkillJournalPathLinkV1,
   type SkillHostContextRequest,
   type SkillResourceRole,
   type SkillResourceV1,
