@@ -1,6 +1,12 @@
-import type { TaskContractReference } from "../agents/types.js";
+import type {
+  AgentDefinitionReference,
+  McpProfileReference,
+  TaskContractReference,
+} from "../agents/types.js";
+import type { JournalHead } from "../journal/types.js";
 import type { JsonValue } from "../protocol/json.js";
-import type { RuntimeDocument } from "../protocol/types.js";
+import type { RuntimeDocument, RuntimeError, TraceContext } from "../protocol/types.js";
+import type { RuntimeToolErrorCode } from "./errors.js";
 
 export type McpProtocolRevision = "2025-06-18" | "2026-07-28";
 export type McpTransportKind = "stdio" | "streamable-http" | "agentgateway";
@@ -107,4 +113,219 @@ export type McpServerBinding = McpStdioBinding | McpStreamableHttpBinding | McpA
 export interface McpProfileConfig {
   readonly profile: McpProfileV1;
   readonly servers: Readonly<Record<string, McpServerBinding>>;
+}
+
+export interface McpToolAnnotationsV1 {
+  readonly read_only_hint: boolean | null;
+  readonly destructive_hint: boolean | null;
+  readonly idempotent_hint: boolean | null;
+  readonly open_world_hint: boolean | null;
+}
+
+export interface McpDiscoveredToolV1 {
+  readonly alias: string;
+  readonly native_name: string;
+  readonly input_schema_hash: `sha256:${string}`;
+  readonly output_schema_hash: `sha256:${string}` | null;
+  readonly operation_class: ToolOperationClass;
+  readonly annotations: McpToolAnnotationsV1;
+}
+
+export interface McpDiscoveredServerV1 {
+  readonly server_id: string;
+  readonly binding_name: string;
+  readonly transport: McpTransportKind;
+  readonly protocol_revision: McpProtocolRevision;
+  readonly server: Readonly<{
+    name: string;
+    version: string;
+    identity_hash: `sha256:${string}`;
+  }>;
+  readonly tools: readonly McpDiscoveredToolV1[];
+}
+
+export interface HashableMcpDiscoverySnapshotV1 extends RuntimeDocument {
+  readonly protocol_version: "runtime-contract.v1";
+  readonly schema_version: "mcp-discovery-snapshot.v1";
+  readonly document_type: "mcp-discovery-snapshot";
+  readonly run_id: string;
+  readonly session_id: string;
+  readonly execution_request_hash: `sha256:${string}`;
+  readonly profile: McpProfileReference;
+  readonly created_at: string;
+  readonly expires_at: string;
+  readonly stale: boolean;
+  readonly servers: readonly McpDiscoveredServerV1[];
+}
+
+export interface McpDiscoverySnapshotV1 extends HashableMcpDiscoverySnapshotV1 {
+  readonly document_hash: `sha256:${string}`;
+}
+
+interface ToolApprovalBaseV1 extends RuntimeDocument {
+  readonly protocol_version: "runtime-contract.v1";
+  readonly schema_version: "tool-approval.v1";
+  readonly document_type: "tool-approval";
+  readonly run_id: string;
+  readonly pending_journal_head: JournalHead;
+  readonly call_id: string;
+  readonly decision: "APPROVE" | "REJECT" | null;
+  readonly trace: TraceContext;
+}
+
+export interface ToolApprovalRequestV1 extends ToolApprovalBaseV1 {
+  readonly kind: "REQUEST";
+  readonly execution_request_hash: `sha256:${string}`;
+  readonly agent_definition: AgentDefinitionReference;
+  readonly task_contract: TaskContractReference;
+  readonly role: "worker" | "reviewer";
+  readonly profile: McpProfileReference;
+  readonly discovery_snapshot_hash: `sha256:${string}`;
+  readonly server_id: string;
+  readonly alias: string;
+  readonly native_name: string;
+  readonly input_schema_hash: `sha256:${string}`;
+  readonly output_schema_hash: `sha256:${string}` | null;
+  readonly operation_class: ToolOperationClass;
+  readonly logical_input_hash: `sha256:${string}`;
+  readonly idempotency_key: `sha256:${string}`;
+  readonly summary: string;
+  readonly decision: null;
+  readonly document_hash: `sha256:${string}`;
+}
+
+export interface ToolApprovalDecisionV1 extends ToolApprovalBaseV1 {
+  readonly kind: "DECISION";
+  readonly approval_request_hash: `sha256:${string}`;
+  readonly operation_id: string;
+  readonly decision: "APPROVE" | "REJECT";
+  readonly decided_at: string;
+  readonly document_hash: `sha256:${string}`;
+}
+
+export type ToolApprovalV1 = ToolApprovalRequestV1 | ToolApprovalDecisionV1;
+export type HashableToolApprovalV1 =
+  Omit<ToolApprovalRequestV1, "document_hash"> | Omit<ToolApprovalDecisionV1, "document_hash">;
+
+export type ToolDispatchState = "NOT_SENT" | "MAYBE_SENT" | "RESULT_RECEIVED";
+
+export interface HashableToolCallV1 extends RuntimeDocument {
+  readonly protocol_version: "runtime-contract.v1";
+  readonly schema_version: "tool-call.v1";
+  readonly document_type: "tool-call";
+  readonly run_id: string;
+  readonly call_revision: number;
+  readonly previous_call_hash: `sha256:${string}` | null;
+  readonly stage: ToolCallStage;
+  readonly dispatch_state: ToolDispatchState;
+  readonly execution_request_hash: `sha256:${string}`;
+  readonly agent_definition: AgentDefinitionReference;
+  readonly task_contract: TaskContractReference;
+  readonly role: "worker" | "reviewer";
+  readonly profile: McpProfileReference;
+  readonly discovery_snapshot_hash: `sha256:${string}`;
+  readonly session_id: string;
+  readonly server_id: string;
+  readonly transport: McpTransportKind;
+  readonly protocol_revision: McpProtocolRevision;
+  readonly alias: string;
+  readonly native_name: string;
+  readonly input_schema_hash: `sha256:${string}`;
+  readonly output_schema_hash: `sha256:${string}` | null;
+  readonly operation_class: ToolOperationClass;
+  readonly logical_call_id: string;
+  readonly operation_id: string;
+  readonly call_id: string;
+  readonly idempotency_key: `sha256:${string}`;
+  readonly logical_arguments: JsonValue;
+  readonly logical_input_hash: `sha256:${string}`;
+  readonly approval_request_hash: `sha256:${string}` | null;
+  readonly prepared_at: string;
+  readonly terminal_at: string | null;
+  readonly result_hash: `sha256:${string}` | null;
+  readonly terminal_code: RuntimeToolErrorCode | null;
+}
+
+export interface ToolCallV1 extends HashableToolCallV1 {
+  readonly document_hash: `sha256:${string}`;
+}
+
+export interface ToolTextContentV1 {
+  readonly type: "text";
+  readonly text: string;
+}
+
+export interface ToolImageContentV1 {
+  readonly type: "image";
+  readonly media_type: string;
+  readonly data_base64: string;
+}
+
+export interface ToolAudioContentV1 {
+  readonly type: "audio";
+  readonly media_type: string;
+  readonly data_base64: string;
+}
+
+export interface ToolResourceLinkContentV1 {
+  readonly type: "resource-link";
+  readonly uri: string;
+  readonly name: string;
+  readonly mime_type: string | null;
+}
+
+export interface ToolEmbeddedResourceContentV1 {
+  readonly type: "embedded-resource";
+  readonly uri: string;
+  readonly mime_type: string;
+  readonly text: string | null;
+  readonly blob_base64: string | null;
+}
+
+export type ToolResultContentV1 =
+  | ToolTextContentV1
+  | ToolImageContentV1
+  | ToolAudioContentV1
+  | ToolResourceLinkContentV1
+  | ToolEmbeddedResourceContentV1;
+
+export interface ToolResultProvenanceV1 {
+  readonly profile: McpProfileReference;
+  readonly discovery_snapshot_hash: `sha256:${string}`;
+  readonly server_id: string;
+  readonly server_identity_hash: `sha256:${string}`;
+  readonly protocol_revision: McpProtocolRevision;
+  readonly transport: McpTransportKind;
+  readonly alias: string;
+  readonly native_name: string;
+  readonly input_schema_hash: `sha256:${string}`;
+  readonly output_schema_hash: `sha256:${string}` | null;
+  readonly call_id: string;
+  readonly idempotency_key: `sha256:${string}`;
+}
+
+export interface HashableToolResultV1 extends RuntimeDocument {
+  readonly protocol_version: "runtime-contract.v1";
+  readonly schema_version: "tool-result.v1";
+  readonly document_type: "tool-result";
+  readonly run_id: string;
+  readonly call_id: string;
+  readonly idempotency_key: `sha256:${string}`;
+  readonly status: "success" | "error";
+  readonly is_error: boolean;
+  readonly trust: "untrusted-content";
+  readonly content: readonly ToolResultContentV1[];
+  readonly structured_content: JsonValue | null;
+  readonly provenance: ToolResultProvenanceV1;
+  readonly trace: TraceContext;
+  readonly accounting: Readonly<{
+    content_blocks: number;
+    total_bytes: number;
+    structured_bytes: number;
+  }>;
+  readonly error: RuntimeError | null;
+}
+
+export interface ToolResultV1 extends HashableToolResultV1 {
+  readonly document_hash: `sha256:${string}`;
 }

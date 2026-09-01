@@ -203,6 +203,7 @@ describe("published protocol artifacts", () => {
       "execution-event.v1",
       "execution-request.v1",
       "execution-result.v1",
+      "mcp-discovery-snapshot.v1",
       "mcp-profile.v1",
       "model-catalog.v1",
       "model-selection-plan.v1",
@@ -225,6 +226,9 @@ describe("published protocol artifacts", () => {
       "skill-snapshot.v1",
       "superpowers-approval.v1",
       "superpowers-phase.v1",
+      "tool-approval.v1",
+      "tool-call.v1",
+      "tool-result.v1",
     ]);
     for (const entry of manifest.schemas) {
       const expectedPath = `contracts/runtime/${entry.schema_version}.schema.json`;

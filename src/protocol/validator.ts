@@ -7,6 +7,7 @@ import agentgatewayCapabilitiesSchema from "../../contracts/runtime/agentgateway
 import compiledContextSchema from "../../contracts/runtime/compiled-context.v1.schema.json" with { type: "json" };
 import modelCatalogSchema from "../../contracts/runtime/model-catalog.v1.schema.json" with { type: "json" };
 import modelSelectionPlanSchema from "../../contracts/runtime/model-selection-plan.v1.schema.json" with { type: "json" };
+import mcpDiscoverySnapshotSchema from "../../contracts/runtime/mcp-discovery-snapshot.v1.schema.json" with { type: "json" };
 import mcpProfileSchema from "../../contracts/runtime/mcp-profile.v1.schema.json" with { type: "json" };
 import routingPolicySchema from "../../contracts/runtime/routing-policy.v1.schema.json" with { type: "json" };
 import routingStateSchema from "../../contracts/runtime/routing-state.v1.schema.json" with { type: "json" };
@@ -24,6 +25,9 @@ import skillExecutionEvidenceSchema from "../../contracts/runtime/skill-executio
 import skillSnapshotSchema from "../../contracts/runtime/skill-snapshot.v1.schema.json" with { type: "json" };
 import superpowersApprovalSchema from "../../contracts/runtime/superpowers-approval.v1.schema.json" with { type: "json" };
 import superpowersPhaseSchema from "../../contracts/runtime/superpowers-phase.v1.schema.json" with { type: "json" };
+import toolApprovalSchema from "../../contracts/runtime/tool-approval.v1.schema.json" with { type: "json" };
+import toolCallSchema from "../../contracts/runtime/tool-call.v1.schema.json" with { type: "json" };
+import toolResultSchema from "../../contracts/runtime/tool-result.v1.schema.json" with { type: "json" };
 import {
   canonicalJson,
   deepFreezeJson,
@@ -59,6 +63,8 @@ const REGISTERED_SCHEMAS: Readonly<Record<string, string>> = {
   "model-catalog.v1": "https://toss.software/schemas/runtime/v1/model-catalog.v1.schema.json",
   "model-selection-plan.v1":
     "https://toss.software/schemas/runtime/v1/model-selection-plan.v1.schema.json",
+  "mcp-discovery-snapshot.v1":
+    "https://toss.software/schemas/runtime/v1/mcp-discovery-snapshot.v1.schema.json",
   "mcp-profile.v1": "https://toss.software/schemas/runtime/v1/mcp-profile.v1.schema.json",
   "operational-event.v1":
     "https://toss.software/schemas/runtime/v1/operational-event.v1.schema.json",
@@ -78,6 +84,9 @@ const REGISTERED_SCHEMAS: Readonly<Record<string, string>> = {
     "https://toss.software/schemas/runtime/v1/superpowers-approval.v1.schema.json",
   "superpowers-phase.v1":
     "https://toss.software/schemas/runtime/v1/superpowers-phase.v1.schema.json",
+  "tool-approval.v1": "https://toss.software/schemas/runtime/v1/tool-approval.v1.schema.json",
+  "tool-call.v1": "https://toss.software/schemas/runtime/v1/tool-call.v1.schema.json",
+  "tool-result.v1": "https://toss.software/schemas/runtime/v1/tool-result.v1.schema.json",
 };
 
 const FRAGMENTS = {
@@ -163,6 +172,7 @@ export function createProtocolValidator(): ProtocolValidator {
   ajv.addSchema(compiledContextSchema);
   ajv.addSchema(modelCatalogSchema);
   ajv.addSchema(modelSelectionPlanSchema);
+  ajv.addSchema(mcpDiscoverySnapshotSchema);
   ajv.addSchema(mcpProfileSchema);
   ajv.addSchema(routingPolicySchema);
   ajv.addSchema(routingStateSchema);
@@ -179,6 +189,9 @@ export function createProtocolValidator(): ProtocolValidator {
   ajv.addSchema(superpowersPhaseSchema);
   ajv.addSchema(superpowersApprovalSchema);
   ajv.addSchema(skillExecutionEvidenceSchema);
+  ajv.addSchema(toolApprovalSchema);
+  ajv.addSchema(toolCallSchema);
+  ajv.addSchema(toolResultSchema);
 
   const fragmentValidators = Object.fromEntries(
     Object.entries(FRAGMENTS).map(([name, schemaReference]) => {

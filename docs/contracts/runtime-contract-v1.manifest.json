@@ -48,6 +48,11 @@
       "id": "https://toss.software/schemas/runtime/v1/execution-result.v1.schema.json"
     },
     {
+      "schema_version": "mcp-discovery-snapshot.v1",
+      "path": "contracts/runtime/mcp-discovery-snapshot.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/mcp-discovery-snapshot.v1.schema.json"
+    },
+    {
       "schema_version": "mcp-profile.v1",
       "path": "contracts/runtime/mcp-profile.v1.schema.json",
       "id": "https://toss.software/schemas/runtime/v1/mcp-profile.v1.schema.json"
@@ -156,6 +161,21 @@
       "schema_version": "superpowers-phase.v1",
       "path": "contracts/runtime/superpowers-phase.v1.schema.json",
       "id": "https://toss.software/schemas/runtime/v1/superpowers-phase.v1.schema.json"
+    },
+    {
+      "schema_version": "tool-approval.v1",
+      "path": "contracts/runtime/tool-approval.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/tool-approval.v1.schema.json"
+    },
+    {
+      "schema_version": "tool-call.v1",
+      "path": "contracts/runtime/tool-call.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/tool-call.v1.schema.json"
+    },
+    {
+      "schema_version": "tool-result.v1",
+      "path": "contracts/runtime/tool-result.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/tool-result.v1.schema.json"
     }
   ]
 }

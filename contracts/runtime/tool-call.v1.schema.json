@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toss.software/schemas/runtime/v1/tool-call.v1.schema.json",
+  "title": "TOSS durable tool call v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "schema_version",
+    "document_type",
+    "run_id",
+    "call_revision",
+    "previous_call_hash",
+    "stage",
+    "dispatch_state",
+    "execution_request_hash",
+    "agent_definition",
+    "task_contract",
+    "role",
+    "profile",
+    "discovery_snapshot_hash",
+    "session_id",
+    "server_id",
+    "transport",
+    "protocol_revision",
+    "alias",
+    "native_name",
+    "input_schema_hash",
+    "output_schema_hash",
+    "operation_class",
+    "logical_call_id",
+    "operation_id",
+    "call_id",
+    "idempotency_key",
+    "logical_arguments",
+    "logical_input_hash",
+    "approval_request_hash",
+    "prepared_at",
+    "terminal_at",
+    "result_hash",
+    "terminal_code",
+    "document_hash"
+  ],
+  "properties": {
+    "protocol_version": { "const": "runtime-contract.v1" },
+    "schema_version": { "const": "tool-call.v1" },
+    "document_type": { "const": "tool-call" },
+    "run_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+    "call_revision": { "$ref": "#/$defs/positive_safe_integer" },
+    "previous_call_hash": { "$ref": "#/$defs/nullable_sha256" },
+    "stage": { "enum": ["PREPARED", "COMPLETED", "FAILED", "UNCERTAIN"] },
+    "dispatch_state": { "enum": ["NOT_SENT", "MAYBE_SENT", "RESULT_RECEIVED"] },
+    "execution_request_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+    "agent_definition": { "$ref": "#/$defs/agent_definition_reference" },
+    "task_contract": { "$ref": "#/$defs/task_contract_reference" },
+    "role": { "enum": ["worker", "reviewer"] },
+    "profile": { "$ref": "#/$defs/mcp_profile_reference" },
+    "discovery_snapshot_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+    "session_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+    "server_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+    "transport": { "enum": ["stdio", "streamable-http", "agentgateway"] },
+    "protocol_revision": { "enum": ["2025-06-18", "2026-07-28"] },
+    "alias": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+    "native_name": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+    "input_schema_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+    "output_schema_hash": { "$ref": "#/$defs/nullable_sha256" },
+    "operation_class": { "enum": ["read-only", "reversible-write", "irreversible"] },
+    "logical_call_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+    "operation_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+    "call_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+    "idempotency_key": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+    "logical_arguments": {},
+    "logical_input_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+    "approval_request_hash": { "$ref": "#/$defs/nullable_sha256" },
+    "prepared_at": { "type": "string", "format": "date-time", "pattern": "Z$" },
+    "terminal_at": {
+      "oneOf": [{ "type": "null" }, { "type": "string", "format": "date-time", "pattern": "Z$" }]
+    },
+    "result_hash": { "$ref": "#/$defs/nullable_sha256" },
+    "terminal_code": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "enum": [
+            "RUNTIME_TOOL_INVALID",
+            "RUNTIME_TOOL_SCHEMA_MISMATCH",
+            "RUNTIME_TOOL_PROTOCOL_DOWNGRADE",
+            "RUNTIME_TOOL_RESULT_INVALID",
+            "RUNTIME_TOOL_POLICY_DENIED",
+            "RUNTIME_TOOL_UNSUPPORTED",
+            "RUNTIME_TOOL_OPERATION_CONFLICT",
+            "RUNTIME_TOOL_APPROVAL_REQUIRED",
+            "RUNTIME_TOOL_APPROVAL_STALE",
+            "RUNTIME_TOOL_APPROVAL_REJECTED",
+            "RUNTIME_TOOL_EFFECT_UNCERTAIN",
+            "RUNTIME_TOOL_AUTHENTICATION",
+            "RUNTIME_TOOL_UNAVAILABLE",
+            "RUNTIME_TOOL_RATE_LIMIT",
+            "RUNTIME_TOOL_TIMEOUT",
+            "RUNTIME_TOOL_CANCELLED",
+            "RUNTIME_TOOL_INTERNAL"
+          ]
+        }
+      ]
+    },
+    "document_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
+  },
+  "$defs": {
+    "positive_safe_integer": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "nullable_sha256": {
+      "oneOf": [{ "type": "null" }, { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }]
+    },
+    "agent_definition_reference": {
+      "allOf": [
+        { "$ref": "runtime-common.v1.schema.json#/$defs/artifact_reference" },
+        { "type": "object", "properties": { "document_type": { "const": "agent-definition" } } }
+      ]
+    },
+    "task_contract_reference": {
+      "allOf": [
+        { "$ref": "runtime-common.v1.schema.json#/$defs/artifact_reference" },
+        { "type": "object", "properties": { "document_type": { "const": "task-contract" } } }
+      ]
+    },
+    "mcp_profile_reference": {
+      "allOf": [
+        { "$ref": "runtime-common.v1.schema.json#/$defs/artifact_reference" },
+        { "type": "object", "properties": { "document_type": { "const": "mcp-profile" } } }
+      ]
+    }
+  }
+}

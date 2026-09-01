@@ -393,13 +393,14 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 - Modify: `src/tools/contracts.ts`
 - Modify: `src/protocol/validator.ts`
 - Modify: `docs/contracts/runtime-contract-v1.manifest.json`
+- Modify: `test/documentation-integrity.test.ts`
 
 **Interfaces:**
 
 - Consumes: Task 1 profile identities, `JournalHead`, `TraceContext`, `RuntimeError`, and canonical JSON utilities.
 - Produces: `McpDiscoverySnapshotV1`, `ToolApprovalV1`, `ToolCallV1`, `ToolResultV1`, their hashable forms, four parsers, four hash functions, and `validateToolArguments`/`validateStructuredToolOutput`.
 
-- [ ] **Step 1: Write four-document RED tests**
+- [x] **Step 1: Write four-document RED tests**
 
   Assert canonical accept/freeze/hash behavior and reject unknown keys, bad stage fields, approval decisions not bound to requests, mismatched journal heads, raw arguments in approval, endpoints/commands/credentials in discovery, malformed provenance, unsupported content blocks, result annotations, invalid structured output, duplicate entries, bad order, over-limit bytes, and inconsistent aggregate counts.
 
@@ -416,7 +417,7 @@ export const TOOL_HARD_LIMITS = Object.freeze({
   });
   ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
   ```bash
   npm exec -- vitest run test/tool-contracts.test.ts --maxWorkers=4
@@ -424,15 +425,15 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 
   Expected: FAIL because the four schemas and parsers are absent.
 
-- [ ] **Step 3: Implement exact durable document shapes**
+- [x] **Step 3: Implement exact durable document shapes**
 
   `mcp-discovery-snapshot.v1` records run/session/profile hashes, created/expires timestamps, stale flag, server producer/revision/transport, native names, canonical schema hashes, and captured hints only. `tool-approval.v1` is a `REQUEST | DECISION` union binding exact run/head/authority/profile/snapshot/server/tool/schema/class/input/call/idempotency/summary/trace fields. `tool-call.v1` is append-only by revision and permits only coherent `PREPARED | COMPLETED | FAILED | UNCERTAIN` fields. `tool-result.v1` carries the five supported content kinds, optional structured content, `trust: "untrusted-content"`, exact provenance, stable terminal error, trace, size accounting, and document hash.
 
-- [ ] **Step 4: Implement bounded schema validation**
+- [x] **Step 4: Implement bounded schema validation**
 
   Compile profile input/output schemas with Ajv 2020 in strict mode, no coercion/default/removal, no remote resolution, and a bounded cache keyed by canonical schema hash. Capture and deep-freeze arguments before validation. Return only stable tool-domain failures; never forward Ajv messages to public results.
 
-- [ ] **Step 5: Register four schemas and run GREEN**
+- [x] **Step 5: Register four schemas and run GREEN**
 
   ```bash
   npm exec -- vitest run test/tool-contracts.test.ts test/tool-profile-contract.test.ts test/protocol-validator.test.ts test/documentation-integrity.test.ts --maxWorkers=4
@@ -440,10 +441,10 @@ export const TOOL_HARD_LIMITS = Object.freeze({
   npm run lint
   ```
 
-- [ ] **Step 6: Commit Task 2**
+- [x] **Step 6: Commit Task 2**
 
   ```bash
-  git add contracts/runtime/mcp-discovery-snapshot.v1.schema.json contracts/runtime/tool-approval.v1.schema.json contracts/runtime/tool-call.v1.schema.json contracts/runtime/tool-result.v1.schema.json src/tools/types.ts src/tools/contracts.ts src/protocol/validator.ts test/tool-contracts.test.ts docs/contracts/runtime-contract-v1.manifest.json
+  git add contracts/runtime/mcp-discovery-snapshot.v1.schema.json contracts/runtime/tool-approval.v1.schema.json contracts/runtime/tool-call.v1.schema.json contracts/runtime/tool-result.v1.schema.json src/tools/types.ts src/tools/contracts.ts src/protocol/validator.ts test/support/tool-fixtures.ts test/tool-contracts.test.ts docs/contracts/runtime-contract-v1.manifest.json test/documentation-integrity.test.ts
   git commit -m "feat: define durable tool contracts"
   ```
 

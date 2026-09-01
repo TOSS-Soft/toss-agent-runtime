@@ -1,21 +1,36 @@
-import Ajv2020Module from "ajv/dist/2020.js";
+import Ajv2020Module, { type ValidateFunction } from "ajv/dist/2020.js";
 import addFormatsModule from "ajv-formats";
 
 import { ProtocolJsonError } from "../protocol/errors.js";
 import {
   canonicalJson,
+  deepFreezeJson,
   parseJsonBytes,
   sha256,
   type JsonLimits,
   type JsonValue,
 } from "../protocol/json.js";
-import type { ValidationFailure, ValidationIssue, ValidationResult } from "../protocol/types.js";
+import type {
+  RuntimeDocument,
+  ValidationFailure,
+  ValidationIssue,
+  ValidationResult,
+} from "../protocol/types.js";
 import { createProtocolValidator } from "../protocol/validator.js";
 import {
   TOOL_HARD_LIMITS,
+  type HashableMcpDiscoverySnapshotV1,
   type HashableMcpProfileV1,
+  type HashableToolApprovalV1,
+  type HashableToolCallV1,
+  type HashableToolResultV1,
+  type McpDiscoverySnapshotV1,
   type McpProfileToolRuleV1,
   type McpProfileV1,
+  type ToolApprovalV1,
+  type ToolCallV1,
+  type ToolResultContentV1,
+  type ToolResultV1,
 } from "./types.js";
 
 const Ajv2020 = Ajv2020Module.default;
@@ -27,6 +42,11 @@ const PROFILE_DOCUMENT_LIMITS: JsonLimits = Object.freeze({
   maxMembers: 250_000,
 });
 const MAX_SCHEMA_DEPTH = 32;
+const TOOL_DOCUMENT_LIMITS: JsonLimits = Object.freeze({
+  maxBytes: TOOL_HARD_LIMITS.resultBytes,
+  maxDepth: 64,
+  maxMembers: 250_000,
+});
 const SECRET_FIELD =
   /(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|credential|private[_-]?key|bearer)/iu;
 const VALIDATOR = createProtocolValidator();
@@ -504,4 +524,339 @@ export function parseMcpProfile(input: string | Uint8Array): ValidationResult<Mc
   }
 }
 
-export type { HashableMcpProfileV1, McpProfileV1 };
+function documentHashIssue(
+  value: { readonly document_hash: `sha256:${string}` },
+  expected: `sha256:${string}`,
+): ValidationIssue | undefined {
+  return value.document_hash === expected
+    ? undefined
+    : issue("/document_hash", "canonicalHash", "document hash does not match canonical content");
+}
+
+function parseToolDocument<
+  T extends RuntimeDocument & { readonly document_hash: `sha256:${string}` },
+>(
+  input: string | Uint8Array,
+  documentType: string,
+  semanticIssues: (value: T) => readonly ValidationIssue[],
+): ValidationResult<T> {
+  const parsed = VALIDATOR.parse<T>(input, documentType, TOOL_DOCUMENT_LIMITS);
+  if (!parsed.ok) return parsed;
+  try {
+    const issues = semanticIssues(parsed.value);
+    return issues.length === 0 ? { ok: true, value: parsed.value } : failure(issues);
+  } catch {
+    return failure([issue("", "semantic", "tool document semantics are invalid")]);
+  }
+}
+
+function discoveryIssues(value: McpDiscoverySnapshotV1): readonly ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  const created = Date.parse(value.created_at);
+  const expires = Date.parse(value.expires_at);
+  if (!Number.isFinite(created) || !Number.isFinite(expires) || created >= expires) {
+    issues.push(issue("/expires_at", "timeOrder", "discovery expiry must follow creation"));
+  }
+  if (!orderedUnique(value.servers.map((server) => server.server_id))) {
+    issues.push(
+      issue("/servers", "order", "discovered servers must be bytewise sorted and unique"),
+    );
+  }
+  const aliases = new Set<string>();
+  for (const [serverIndex, server] of value.servers.entries()) {
+    if (!orderedUnique(server.tools.map((tool) => tool.alias))) {
+      issues.push(
+        issue(
+          `/servers/${serverIndex}/tools`,
+          "order",
+          "discovered aliases must be bytewise sorted and unique",
+        ),
+      );
+    }
+    for (const tool of server.tools) {
+      if (aliases.has(tool.alias)) {
+        issues.push(issue("/servers", "uniqueAlias", "discovered aliases must be globally unique"));
+      }
+      aliases.add(tool.alias);
+    }
+  }
+  const mismatch = documentHashIssue(value, hashMcpDiscoverySnapshot(value));
+  if (mismatch !== undefined) issues.push(mismatch);
+  return issues;
+}
+
+function approvalIssues(value: ToolApprovalV1): readonly ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  if (value.kind === "REQUEST") {
+    if (Buffer.byteLength(value.summary, "utf8") > TOOL_HARD_LIMITS.approvalSummaryBytes) {
+      issues.push(issue("/summary", "maxBytes", "approval summary exceeds its byte limit"));
+    }
+    if (value.operation_class === "read-only") {
+      issues.push(issue("/operation_class", "policy", "read-only tools cannot request approval"));
+    }
+  }
+  const mismatch = documentHashIssue(value, hashToolApproval(value));
+  if (mismatch !== undefined) issues.push(mismatch);
+  return issues;
+}
+
+function callIssues(value: ToolCallV1): readonly ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  if ((value.call_revision === 1) !== (value.previous_call_hash === null)) {
+    issues.push(
+      issue(
+        "/previous_call_hash",
+        "hashChain",
+        "first call revision has no predecessor and later revisions require one",
+      ),
+    );
+  }
+  if (value.logical_input_hash !== sha256(value.logical_arguments, TOOL_DOCUMENT_LIMITS)) {
+    issues.push(
+      issue("/logical_input_hash", "canonicalHash", "logical input hash does not match arguments"),
+    );
+  }
+  if (value.operation_class === "irreversible" && value.approval_request_hash === null) {
+    issues.push(
+      issue("/approval_request_hash", "approval", "irreversible calls require an approval request"),
+    );
+  }
+
+  const prepared =
+    value.stage === "PREPARED" &&
+    value.dispatch_state === "NOT_SENT" &&
+    value.terminal_at === null &&
+    value.result_hash === null &&
+    value.terminal_code === null;
+  const completed =
+    value.stage === "COMPLETED" &&
+    value.dispatch_state === "RESULT_RECEIVED" &&
+    value.terminal_at !== null &&
+    value.result_hash !== null &&
+    value.terminal_code === null;
+  const failed =
+    value.stage === "FAILED" &&
+    value.dispatch_state === "NOT_SENT" &&
+    value.terminal_at !== null &&
+    value.result_hash !== null &&
+    value.terminal_code !== null;
+  const uncertain =
+    value.stage === "UNCERTAIN" &&
+    value.dispatch_state === "MAYBE_SENT" &&
+    value.terminal_at !== null &&
+    value.result_hash === null &&
+    value.terminal_code === "RUNTIME_TOOL_EFFECT_UNCERTAIN";
+  if (!prepared && !completed && !failed && !uncertain) {
+    issues.push(issue("/stage", "stage", "tool call stage fields are inconsistent"));
+  }
+  if (value.terminal_at !== null && Date.parse(value.terminal_at) < Date.parse(value.prepared_at)) {
+    issues.push(issue("/terminal_at", "timeOrder", "terminal time precedes preparation"));
+  }
+  const mismatch = documentHashIssue(value, hashToolCall(value));
+  if (mismatch !== undefined) issues.push(mismatch);
+  return issues;
+}
+
+function decodedBase64Bytes(value: string): number {
+  return Buffer.from(value, "base64").byteLength;
+}
+
+function contentBytes(content: ToolResultContentV1): number {
+  switch (content.type) {
+    case "text":
+      return Buffer.byteLength(content.text, "utf8");
+    case "image":
+    case "audio":
+      return decodedBase64Bytes(content.data_base64);
+    case "resource-link":
+      return Buffer.byteLength(content.uri + content.name + (content.mime_type ?? ""), "utf8");
+    case "embedded-resource":
+      return (
+        Buffer.byteLength(content.uri + content.mime_type + (content.text ?? ""), "utf8") +
+        (content.blob_base64 === null ? 0 : decodedBase64Bytes(content.blob_base64))
+      );
+  }
+}
+
+function resultIssues(value: ToolResultV1): readonly ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  if (value.call_id !== value.provenance.call_id) {
+    issues.push(issue("/provenance/call_id", "identity", "result call identity does not match"));
+  }
+  if (value.idempotency_key !== value.provenance.idempotency_key) {
+    issues.push(
+      issue(
+        "/provenance/idempotency_key",
+        "identity",
+        "result idempotency identity does not match",
+      ),
+    );
+  }
+  const success = value.status === "success" && !value.is_error && value.error === null;
+  const error = value.status === "error" && value.is_error && value.error !== null;
+  if (!success && !error) {
+    issues.push(issue("/status", "status", "result status, error flag, and error must agree"));
+  }
+  if (value.structured_content !== null && value.provenance.output_schema_hash === null) {
+    issues.push(
+      issue(
+        "/structured_content",
+        "structuredOutput",
+        "structured output requires a declared output schema",
+      ),
+    );
+  }
+  const blockBytes = value.content.map(contentBytes);
+  if (blockBytes.some((bytes) => bytes > TOOL_HARD_LIMITS.contentBlockBytes)) {
+    issues.push(issue("/content", "maxBytes", "result content block exceeds its byte limit"));
+  }
+  const totalBytes = blockBytes.reduce((total, bytes) => total + bytes, 0);
+  const structuredBytes =
+    value.structured_content === null
+      ? 0
+      : Buffer.byteLength(canonicalJson(value.structured_content, TOOL_DOCUMENT_LIMITS), "utf8");
+  if (
+    value.accounting.content_blocks !== value.content.length ||
+    value.accounting.total_bytes !== totalBytes ||
+    value.accounting.structured_bytes !== structuredBytes
+  ) {
+    issues.push(issue("/accounting", "accounting", "result byte accounting is inconsistent"));
+  }
+  if (totalBytes + structuredBytes > TOOL_HARD_LIMITS.resultBytes) {
+    issues.push(issue("/accounting/total_bytes", "maxBytes", "tool result exceeds its byte limit"));
+  }
+  const mismatch = documentHashIssue(value, hashToolResult(value));
+  if (mismatch !== undefined) issues.push(mismatch);
+  return issues;
+}
+
+const SCHEMA_VALIDATORS = new Map<string, ValidateFunction>();
+
+function compiledSchema(schema: JsonValue): ValidateFunction {
+  if (!isRecord(schema)) throw new TypeError("tool schema must be an object");
+  const key = sha256(schema, PROFILE_DOCUMENT_LIMITS);
+  const cached = SCHEMA_VALIDATORS.get(key);
+  if (cached !== undefined) return cached;
+  const ajv = new Ajv2020({
+    allErrors: true,
+    allowUnionTypes: false,
+    coerceTypes: false,
+    removeAdditional: false,
+    strict: true,
+    useDefaults: false,
+  });
+  addFormats(ajv);
+  const validator = ajv.compile(schema);
+  if (SCHEMA_VALIDATORS.size >= 256)
+    SCHEMA_VALIDATORS.delete(SCHEMA_VALIDATORS.keys().next().value!);
+  SCHEMA_VALIDATORS.set(key, validator);
+  return validator;
+}
+
+function captureJson(value: JsonValue, maxBytes: number): ValidationResult<JsonValue> {
+  if (
+    !Number.isSafeInteger(maxBytes) ||
+    maxBytes < 1 ||
+    maxBytes > TOOL_HARD_LIMITS.argumentsBytes
+  ) {
+    return failure([issue("", "maxBytes", "tool value byte limit is invalid")]);
+  }
+  const limits: JsonLimits = { maxBytes, maxDepth: 32, maxMembers: 20_000 };
+  try {
+    return {
+      ok: true,
+      value: deepFreezeJson(parseJsonBytes(canonicalJson(value, limits), limits), limits),
+    };
+  } catch {
+    return failure([issue("", "json", "tool value exceeds its structural limit")]);
+  }
+}
+
+function validateAgainstSchema(
+  schema: JsonValue,
+  value: JsonValue,
+  maxBytes: number,
+): ValidationResult<JsonValue> {
+  const captured = captureJson(value, maxBytes);
+  if (!captured.ok) return captured;
+  try {
+    return compiledSchema(schema)(captured.value)
+      ? captured
+      : failure([issue("", "schema", "tool value does not satisfy its profile schema")]);
+  } catch {
+    return failure([issue("", "schema", "tool profile schema is unavailable")]);
+  }
+}
+
+export function hashMcpDiscoverySnapshot(
+  value: HashableMcpDiscoverySnapshotV1 | McpDiscoverySnapshotV1,
+): `sha256:${string}` {
+  return canonicalHash(value);
+}
+
+export function hashToolApproval(
+  value: HashableToolApprovalV1 | ToolApprovalV1,
+): `sha256:${string}` {
+  return canonicalHash(value);
+}
+
+export function hashToolCall(value: HashableToolCallV1 | ToolCallV1): `sha256:${string}` {
+  return canonicalHash(value);
+}
+
+export function hashToolResult(value: HashableToolResultV1 | ToolResultV1): `sha256:${string}` {
+  return canonicalHash(value);
+}
+
+export function parseMcpDiscoverySnapshot(
+  input: string | Uint8Array,
+): ValidationResult<McpDiscoverySnapshotV1> {
+  return parseToolDocument(input, "mcp-discovery-snapshot", discoveryIssues);
+}
+
+export function parseToolApproval(input: string | Uint8Array): ValidationResult<ToolApprovalV1> {
+  return parseToolDocument(input, "tool-approval", approvalIssues);
+}
+
+export function parseToolCall(input: string | Uint8Array): ValidationResult<ToolCallV1> {
+  return parseToolDocument(input, "tool-call", callIssues);
+}
+
+export function parseToolResult(input: string | Uint8Array): ValidationResult<ToolResultV1> {
+  return parseToolDocument(input, "tool-result", resultIssues);
+}
+
+export function validateToolArguments(
+  schema: JsonValue,
+  value: JsonValue,
+  maxBytes: number,
+): ValidationResult<JsonValue> {
+  return validateAgainstSchema(schema, value, maxBytes);
+}
+
+export function validateStructuredToolOutput(
+  schema: JsonValue | null,
+  value: JsonValue | null,
+  maxBytes: number,
+): ValidationResult<JsonValue | null> {
+  if (value === null) return { ok: true, value: null };
+  if (schema === null) {
+    return failure([
+      issue("", "structuredOutput", "structured output requires a declared output schema"),
+    ]);
+  }
+  return validateAgainstSchema(schema, value, maxBytes);
+}
+
+export type {
+  HashableMcpDiscoverySnapshotV1,
+  HashableMcpProfileV1,
+  HashableToolApprovalV1,
+  HashableToolCallV1,
+  HashableToolResultV1,
+  McpDiscoverySnapshotV1,
+  McpProfileV1,
+  ToolApprovalV1,
+  ToolCallV1,
+  ToolResultV1,
+};
