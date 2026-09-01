@@ -1,7 +1,18 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { access, chmod, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -254,6 +265,29 @@ async function residualSkillArtifacts(statePath: string): Promise<readonly strin
   }
 }
 
+async function directoryContentSnapshot(root: string): Promise<readonly string[]> {
+  let names: string[];
+  try {
+    names = await readdir(root, { recursive: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+  const snapshot: string[] = [];
+  for (const name of names.sort()) {
+    const absolutePath = path.join(root, name);
+    const stats = await lstat(absolutePath);
+    if (stats.isDirectory()) {
+      snapshot.push(`directory:${name}`);
+    } else if (stats.isFile()) {
+      snapshot.push(`file:${name}:${rawHash(await readFile(absolutePath))}`);
+    } else {
+      snapshot.push(`other:${name}`);
+    }
+  }
+  return snapshot;
+}
+
 function expectRecursivelyFrozenPlainData(value: unknown, seen = new WeakSet<object>()): void {
   if (value === null || ["string", "number", "boolean"].includes(typeof value)) return;
   expect(typeof value).toBe("object");
@@ -442,7 +476,7 @@ describe("Agent Skills public API", () => {
     [["brainstorming", "external-scripts"], "RUNTIME_SKILL_SCRIPT_UNAVAILABLE"],
     [["brainstorming", "future-runtime"], "BLOCKED_SUPERPOWERS_MISSING"],
   ] as const)(
-    "rejects an authorized but undelivered configured dependency %j before any runtime effect",
+    "rejects load and phase for an authorized but undelivered configured dependency %j before any runtime effect",
     async (requiredCapabilities, code) => {
       const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-skills-runtime-cap-")));
       roots.push(root);
@@ -506,12 +540,15 @@ describe("Agent Skills public API", () => {
           operation_id: "unavailable-capability",
           trace: TRACE,
         };
-        const stateBeforeRejection = (await readdir(statePath, { recursive: true })).sort();
+        const sourceBeforeRejection = await directoryContentSnapshot(configuredRoot);
+        const stateBeforeRejection = await directoryContentSnapshot(statePath);
+        await expect(host.load(selection)).rejects.toMatchObject({ code });
+        await expect(host.load(selection)).rejects.toMatchObject({ code });
         await expect(host.startPhase(request)).rejects.toMatchObject({ code });
         await expect(host.startPhase(request)).rejects.toMatchObject({ code });
-        expect((await readdir(statePath, { recursive: true })).sort()).toEqual(
-          stateBeforeRejection,
-        );
+        expect(await directoryContentSnapshot(configuredRoot)).toEqual(sourceBeforeRejection);
+        expect(await directoryContentSnapshot(statePath)).toEqual(stateBeforeRejection);
+        expect(await residualSkillArtifacts(statePath)).toEqual([]);
         await expect(access(processWitness)).rejects.toMatchObject({ code: "ENOENT" });
         await new Promise((resolve) => setImmediate(resolve));
         expect(networkConnections).toBe(0);
@@ -558,6 +595,8 @@ describe("Agent Skills public API", () => {
         query: null,
         descriptor: descriptorReference(descriptor),
       });
+      const snapshot = await host.load(selection);
+      await expect(host.load(selection)).resolves.toEqual(snapshot);
       await expect(
         host.startPhase({
           run_id: "run-inert-script",

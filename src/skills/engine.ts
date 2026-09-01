@@ -571,6 +571,12 @@ function exactSelectionAuthority(value: unknown): SkillSelection {
   return value as SkillSelection;
 }
 
+function exactDeliveredSelection(value: unknown): SkillSelection {
+  const selection = exactSelectionAuthority(value);
+  assertDeliveredRuntimeCapabilities(selection.descriptor);
+  return selection;
+}
+
 function copiedJournalHead(value: unknown): JournalHead {
   const head = closedDataRecord(value, ["journal_revision", "sequence", "entry_hash"]);
   if (
@@ -662,8 +668,7 @@ function captureStartRequest(value: unknown): CapturedStart {
   } catch {
     invalid();
   }
-  const selection = exactSelectionAuthority(source.selection);
-  assertDeliveredRuntimeCapabilities(selection.descriptor);
+  const selection = exactDeliveredSelection(source.selection);
   if (selection.descriptor.name !== handler.capability) integrity();
   const expectedJournalHead = copiedJournalHead(source.expected_journal_head);
   const trace = copiedTrace(source.trace);
@@ -3287,7 +3292,18 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
       return accept(() => Promise.resolve(options.catalog.select(snapshot, request)));
     },
     load(selection) {
-      return accept(() => options.loader.load(selection));
+      if (intakeStopped) return Promise.reject(new RuntimeSkillError("RUNTIME_SKILL_UNAVAILABLE"));
+      let captured: SkillSelection;
+      try {
+        captured = exactDeliveredSelection(selection);
+      } catch (error) {
+        return Promise.reject(
+          error instanceof RuntimeSkillError
+            ? error
+            : new RuntimeSkillError("RUNTIME_SKILL_INVALID"),
+        );
+      }
+      return accept(() => options.loader.load(captured));
     },
     assembleContext(selection, request) {
       return accept(() => options.loader.assembleContext(selection, request));
