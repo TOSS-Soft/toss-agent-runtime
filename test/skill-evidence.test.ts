@@ -33,11 +33,12 @@ import { builtInSuperpowersHandler } from "../src/skills/phases.js";
 import { createSkillsRuntimeHostForTest } from "../src/skills/runtime-host.js";
 import type { SkillSelection } from "../src/skills/catalog.js";
 import type {
+  SkillExecutionEvidenceV1,
   SkillSnapshotV1,
   SuperpowersPhaseName,
   SuperpowersPhaseV1,
 } from "../src/skills/types.js";
-import { validSuperpowersPhase } from "./support/skill-fixtures.js";
+import { validSkillExecutionEvidence, validSuperpowersPhase } from "./support/skill-fixtures.js";
 
 const TRACE = {
   trace_id: "1".repeat(32),
@@ -173,8 +174,110 @@ function resignJournalCommand(value: RunJournalEntryV1): RunJournalEntryV1 {
   });
 }
 
+function resignZeroPhaseJournalPath(
+  evidence: SkillExecutionEvidenceV1,
+  mutate: (entry: RunJournalEntryV1, index: number) => RunJournalEntryV1,
+): Record<string, unknown> {
+  if (evidence.terminal_journal_entry === null || evidence.approvals.length !== 0) {
+    throw new Error("zero-phase terminal evidence expected");
+  }
+  const pathEntries = [...evidence.journal_entries, evidence.terminal_journal_entry];
+  const resigned: RunJournalEntryV1[] = [];
+  for (const [index, original] of pathEntries.entries()) {
+    const previous = resigned.at(-1);
+    const mutated = mutate(original, index);
+    resigned.push(
+      resignJournalCommand({
+        ...mutated,
+        previous_entry_hash: previous?.entry_hash ?? ZERO_JOURNAL_HASH,
+      }),
+    );
+  }
+  const terminal = resigned.at(-1)!;
+  return resignEvidence({
+    ...evidence,
+    journal_entries: resigned.slice(0, -1),
+    terminal_journal_entry: terminal,
+    journal_head: {
+      journal_revision: terminal.journal_revision,
+      sequence: terminal.sequence,
+      entry_hash: terminal.entry_hash,
+    },
+    run_state: terminal.state,
+  });
+}
+
 describe("canonical Agent Skills evidence", () => {
+  it("hashes only exact plain evidence documents without observing hidden properties", () => {
+    const valid = Object.freeze({ ...validSkillExecutionEvidence() });
+    expect(hashSkillExecutionEvidence(valid)).toBe(valid.document_hash);
+
+    const invalidValues: object[] = [];
+    const missing: Record<string, unknown> = { ...valid };
+    delete missing.document_hash;
+    invalidValues.push(missing);
+    invalidValues.push({ ...valid, document_hash: 42 });
+
+    let getterCalls = 0;
+    for (const enumerable of [true, false]) {
+      const accessor = { ...valid };
+      Object.defineProperty(accessor, "document_hash", {
+        enumerable,
+        configurable: true,
+        get() {
+          getterCalls += 1;
+          return valid.document_hash;
+        },
+      });
+      invalidValues.push(accessor);
+    }
+    const hidden = { ...valid };
+    Object.defineProperty(hidden, "document_hash", {
+      enumerable: false,
+      configurable: true,
+      writable: true,
+      value: valid.document_hash,
+    });
+    invalidValues.push(hidden);
+    const exotic = Object.create({ inherited: true }) as object;
+    invalidValues.push(Object.assign(exotic, valid));
+    invalidValues.push(Object.assign({ ...valid }, { [Symbol("hidden")]: true }));
+    const nestedAccessor = { ...valid, journal_head: { ...valid.journal_head } };
+    Object.defineProperty(nestedAccessor.journal_head, "sequence", {
+      enumerable: true,
+      configurable: true,
+      get: () => valid.journal_head.sequence,
+    });
+    invalidValues.push(nestedAccessor);
+    const nestedHidden = { ...valid, journal_head: { ...valid.journal_head } };
+    Object.defineProperty(nestedHidden.journal_head, "hidden", {
+      enumerable: false,
+      configurable: true,
+      value: true,
+    });
+    invalidValues.push(nestedHidden);
+    invalidValues.push({ ...valid, journal_head: { ...valid.journal_head, sequence: -0 } });
+    invalidValues.push({ ...valid, journal_head: { ...valid.journal_head, sequence: Infinity } });
+    const cycle: Record<string, unknown> = { ...valid };
+    cycle.cycle = cycle;
+    invalidValues.push(cycle);
+
+    for (const candidate of invalidValues) {
+      expect(() => hashSkillExecutionEvidence(candidate as SkillExecutionEvidenceV1)).toThrow(
+        expect.objectContaining({ code: "RUNTIME_SKILL_LIMIT_EXCEEDED" }),
+      );
+    }
+    expect(getterCalls).toBe(0);
+  });
+
   it("rejects evidence structure before AST construction and closes public hash limits", () => {
+    const exactDense = `[${"0,".repeat(SKILL_EVIDENCE_JSON_LIMITS.maxMembers - 1)}0]`;
+    expect(parseSkillExecutionEvidence(exactDense)).toMatchObject({
+      ok: false,
+      code: "RUNTIME_DOCUMENT_INVALID",
+      issues: [{ keyword: "evidencePreflight" }],
+    });
+
     const denseMembers = SKILL_EVIDENCE_JSON_LIMITS.maxMembers + 1;
     const dense = `[${"0,".repeat(denseMembers - 1)}0]`;
     const denseResult = parseSkillExecutionEvidence(dense);
@@ -1267,6 +1370,110 @@ describe("canonical Agent Skills evidence", () => {
       ),
     ).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
 
+    const closedJournalRuns = [
+      {
+        runId: "run-review-journal-path",
+        states: ["CREATED", "ROUTED", "RUNNING", "REVIEW_PENDING", "BLOCKED"] as const,
+      },
+      {
+        runId: "run-retry-journal-path",
+        states: ["CREATED", "ROUTED", "RUNNING", "FAILED", "RUNNING", "BLOCKED"] as const,
+      },
+    ];
+    const closedJournalEvidence: SkillExecutionEvidenceV1[] = [];
+    for (const fixture of closedJournalRuns) {
+      let fixtureHead: JournalHead | null = null;
+      for (const state of fixture.states) {
+        const command = journalCommand(fixture.runId, state, fixtureHead);
+        const priorSequence = command.expected_revision;
+        fixtureHead = (
+          await journal.transition({
+            ...command,
+            command_id: `${fixture.runId}-${state.toLowerCase()}-${priorSequence}`,
+            reason_code: state === "BLOCKED" ? "BLOCKED_SUPERPOWERS_MISSING" : command.reason_code,
+          })
+        ).head;
+      }
+      const projected = await host.evidence(fixture.runId);
+      if (projected === null) throw new Error("closed journal evidence expected");
+      expect(parseSkillExecutionEvidence(canonicalJson(projected))).toEqual({
+        ok: true,
+        value: projected,
+      });
+      expect(projected.journal_entries.map((entry) => entry.state)).toEqual(
+        fixture.states.slice(0, -1),
+      );
+      closedJournalEvidence.push(projected);
+    }
+
+    const reviewEvidence = closedJournalEvidence[0]!;
+    const impossibleCreatedPredecessor = resignZeroPhaseJournalPath(
+      reviewEvidence,
+      (entry, index) =>
+        index === reviewEvidence.journal_entries.length
+          ? { ...entry, previous_state: "CREATED" }
+          : entry,
+    );
+    expect(parseSkillExecutionEvidence(canonicalJson(impossibleCreatedPredecessor))).toMatchObject({
+      ok: false,
+      code: "RUNTIME_DOCUMENT_INVALID",
+    });
+
+    const retryJournalEvidence = closedJournalEvidence[1]!;
+    const retryTerminalIndex = retryJournalEvidence.journal_entries.length;
+    for (const runAttempt of [1, 99]) {
+      const impossibleAttempt = resignZeroPhaseJournalPath(retryJournalEvidence, (entry, index) =>
+        index === retryTerminalIndex ? { ...entry, run_attempt: runAttempt } : entry,
+      );
+      expect(parseSkillExecutionEvidence(canonicalJson(impossibleAttempt))).toMatchObject({
+        ok: false,
+        code: "RUNTIME_DOCUMENT_INVALID",
+      });
+    }
+    const retryOmitted = resignEvidence({
+      ...retryJournalEvidence,
+      journal_entries: retryJournalEvidence.journal_entries.filter((_entry, index) => index !== 3),
+    });
+    const retryFork = resignEvidence({
+      ...retryJournalEvidence,
+      journal_entries: [
+        ...retryJournalEvidence.journal_entries,
+        resignJournalCommand({
+          ...retryJournalEvidence.journal_entries[2]!,
+          command_id: "forked-running-entry",
+        }),
+      ],
+    });
+    const retryDuplicate = resignEvidence({
+      ...retryJournalEvidence,
+      journal_entries: [
+        ...retryJournalEvidence.journal_entries,
+        retryJournalEvidence.journal_entries[2]!,
+      ],
+    });
+    const retryTerminal = retryJournalEvidence.terminal_journal_entry!;
+    const retryOrphan = resignEvidence({
+      ...retryJournalEvidence,
+      journal_entries: [
+        ...retryJournalEvidence.journal_entries,
+        resignJournalCommand({
+          ...retryTerminal,
+          journal_revision: retryTerminal.journal_revision + 1,
+          sequence: retryTerminal.sequence + 1,
+          previous_entry_hash: retryTerminal.entry_hash,
+          command_id: "orphan-retry-after-terminal",
+          previous_state: retryTerminal.state,
+          state: "RUNNING",
+        }),
+      ],
+    });
+    for (const impossible of [retryOmitted, retryFork, retryDuplicate, retryOrphan]) {
+      expect(parseSkillExecutionEvidence(canonicalJson(impossible))).toMatchObject({
+        ok: false,
+        code: "RUNTIME_DOCUMENT_INVALID",
+      });
+    }
+
     let mixedHead: JournalHead | null = null;
     for (const state of ["CREATED", "ROUTED", "RUNNING"] as const) {
       mixedHead = (await journal.transition(journalCommand("run-mixed-terminal", state, mixedHead)))
@@ -1320,10 +1527,35 @@ describe("canonical Agent Skills evidence", () => {
     });
     expect(mixedEvidence?.phases.at(-1)?.status).toBe("COMPLETED");
     if (mixedEvidence === null) throw new Error("mixed terminal evidence expected");
+    const mixedJournalEntries = (
+      mixedEvidence as SkillExecutionEvidenceV1 & {
+        readonly journal_entries: readonly RunJournalEntryV1[];
+      }
+    ).journal_entries;
+    expect(mixedJournalEntries.map((entry) => entry.state)).toEqual([
+      "CREATED",
+      "ROUTED",
+      "RUNNING",
+      "TOOL_PENDING",
+      "RUNNING",
+    ]);
     expect(parseSkillExecutionEvidence(canonicalJson(mixedEvidence))).toEqual({
       ok: true,
       value: mixedEvidence,
     });
+    expect(
+      parseSkillExecutionEvidence(
+        canonicalJson(
+          resignEvidence({
+            ...approvalEvidence,
+            journal_entries: [
+              ...approvalEvidence.journal_entries,
+              approvalProjection.request_journal_entry,
+            ],
+          }),
+        ),
+      ),
+    ).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
     expect(
       parseSkillExecutionEvidence(
         canonicalJson(resignEvidence({ ...mixedEvidence, terminal_journal_entry: null })),

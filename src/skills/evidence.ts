@@ -245,6 +245,7 @@ export function createSkillEvidenceBuilder(
           readonly projection: (typeof approvalProjections)[number];
         }
       >();
+      const approvalJournalHashes = new Set<`sha256:${string}`>();
       for (const entry of verified.journal.entries) {
         const metadata = entry.metadata;
         const kind =
@@ -261,6 +262,7 @@ export function createSkillEvidenceBuilder(
             decision_journal_entry: null,
           };
           approvalProjections.push(projection);
+          approvalJournalHashes.add(entry.entry_hash);
           if (pendingByHead.has(entry.entry_hash)) integrity();
           pendingByHead.set(entry.entry_hash, { entry, projection });
         } else if (kind === "superpowers-approval-decision") {
@@ -268,9 +270,20 @@ export function createSkillEvidenceBuilder(
           if (pending === undefined || pending.projection.decision !== null) integrity();
           pending.projection.decision = decisionMetadata(entry, pending.entry).decision;
           pending.projection.decision_journal_entry = entry;
+          approvalJournalHashes.add(entry.entry_hash);
         }
       }
       const approvals = approvalProjections.map((projection) => Object.freeze(projection));
+      const terminalJournalEntry =
+        zeroPhaseCode !== null && !approvalJournalHashes.has(finalJournal.entry_hash)
+          ? finalJournal
+          : null;
+      const journalEntries = verified.journal.entries.filter(
+        (entry) =>
+          !approvalJournalHashes.has(entry.entry_hash) &&
+          entry.entry_hash !== terminalJournalEntry?.entry_hash,
+      );
+      if (journalEntries.length > 1024) limitExceeded();
 
       const phaseByPackage = new Map<`sha256:${string}`, SuperpowersPhaseV1>();
       const catalogHashes = new Set<`sha256:${string}`>();
@@ -296,7 +309,8 @@ export function createSkillEvidenceBuilder(
         run_id: runId,
         journal_head: verified.journal.head,
         run_state: verified.journal.state,
-        terminal_journal_entry: zeroPhaseCode === null ? null : finalJournal,
+        journal_entries: journalEntries,
+        terminal_journal_entry: terminalJournalEntry,
         catalogs: [] as readonly SkillCatalogRoot[],
         snapshots: [] as readonly SkillSnapshotV1[],
         phases: verified.phases,
@@ -346,9 +360,10 @@ export function createSkillEvidenceBuilder(
       const withHandoff = { ...preimage, handoff_hash: handoffHash };
       const candidate = {
         ...withHandoff,
-        document_hash: hashSkillExecutionEvidence(
-          withHandoff as unknown as SkillExecutionEvidenceV1,
-        ),
+        document_hash: hashSkillExecutionEvidence({
+          ...withHandoff,
+          document_hash: `sha256:${"0".repeat(64)}`,
+        }),
       };
       const bytes = evidenceJson(candidate);
       if (Buffer.byteLength(bytes, "utf8") > SKILL_LIMITS.evidenceBytes) limitExceeded();

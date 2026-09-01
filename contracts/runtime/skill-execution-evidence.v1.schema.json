@@ -11,6 +11,7 @@
     "run_id",
     "journal_head",
     "run_state",
+    "journal_entries",
     "terminal_journal_entry",
     "catalogs",
     "snapshots",
@@ -40,6 +41,11 @@
         "CANCELLED",
         "INTERRUPTED"
       ]
+    },
+    "journal_entries": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": { "$ref": "run-journal-entry.v1.schema.json" }
     },
     "terminal_journal_entry": {
       "oneOf": [{ "type": "null" }, { "$ref": "run-journal-entry.v1.schema.json" }]

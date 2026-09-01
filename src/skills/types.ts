@@ -173,6 +173,7 @@ export interface SkillExecutionEvidenceV1 extends RuntimeDocument {
   readonly run_id: string;
   readonly journal_head: JournalHead;
   readonly run_state: RunState;
+  readonly journal_entries: readonly RunJournalEntryV1[];
   readonly terminal_journal_entry: RunJournalEntryV1 | null;
   readonly catalogs: readonly SkillCatalogRoot[];
   readonly snapshots: readonly SkillSnapshotV1[];

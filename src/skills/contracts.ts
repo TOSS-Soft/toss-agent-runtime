@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 
 import { createScanner } from "jsonc-parser";
 
-import { parseRunJournalEntry } from "../journal/entry.js";
+import { parseRunJournalEntry, ZERO_JOURNAL_HASH } from "../journal/entry.js";
 import { RUN_TRANSITION_MATRIX } from "../journal/state-machine.js";
 import type { RunJournalEntryV1, RunState } from "../journal/types.js";
 import {
@@ -52,10 +52,12 @@ const DOCUMENT_LIMITS: JsonLimits = Object.freeze({
 export const SKILL_EVIDENCE_JSON_LIMITS: JsonLimits = Object.freeze({
   maxBytes: SKILL_LIMITS.evidenceBytes,
   maxDepth: SKILL_LIMITS.nestingDepth + 8,
-  // The shortest schema-admitted member consumes at least four canonical UTF-8
-  // bytes including framing. This ceiling therefore admits every valid document
-  // below evidenceBytes while stopping scalar-dense JSON before an AST exists.
-  maxMembers: Math.ceil(SKILL_LIMITS.evidenceBytes / 4),
+  // Closed evidence has at most 512 phases, 128 approval projections, 256
+  // snapshots with 256 resources each, bounded catalog roots, and a journal
+  // path that must itself fit the 2 MiB envelope. 131,072 admits that legal
+  // surface (including the 128-approval shape) while rejecting scalar-dense
+  // non-evidence input long before jsonc-parser allocates an AST.
+  maxMembers: 131_072,
 });
 
 type EvidenceContainer =
@@ -133,6 +135,7 @@ function preflightEvidenceStructure(input: string | Uint8Array): void {
     const container = containers.at(-1);
     if (container === undefined) {
       if (rootState !== "value") throw new Error("trailing value");
+      if (token !== EVIDENCE_TOKEN.OPEN_BRACE) throw new Error("evidence root must be an object");
       rootState = "end";
       beginValue(token);
       continue;
@@ -195,6 +198,7 @@ function preflightEvidenceStructure(input: string | Uint8Array): void {
 
 interface EvidenceSerializationState {
   readonly chunks: string[];
+  readonly active: WeakSet<object>;
   bytes: number;
   members: number;
 }
@@ -233,13 +237,16 @@ function serializeEvidenceValue(
   if (typeof value === "string") return appendEvidenceString(state, value);
   if (typeof value === "boolean") return appendEvidenceChunk(state, value ? "true" : "false");
   if (typeof value === "number") {
-    if (!Number.isFinite(value)) evidenceLimit();
-    return appendEvidenceChunk(state, Object.is(value, -0) ? "0" : JSON.stringify(value));
+    if (!Number.isFinite(value) || Object.is(value, -0)) evidenceLimit();
+    return appendEvidenceChunk(state, JSON.stringify(value));
   }
   if (typeof value !== "object") evidenceLimit();
   if (Object.getOwnPropertySymbols(value).length !== 0) evidenceLimit();
+  if (state.active.has(value)) evidenceLimit();
+  state.active.add(value);
 
   if (Array.isArray(value)) {
+    if (Object.getPrototypeOf(value) !== Array.prototype) evidenceLimit();
     countEvidenceMembers(state, value.length);
     const ownNames = Object.getOwnPropertyNames(value);
     if (ownNames.length !== value.length + 1) evidenceLimit();
@@ -249,6 +256,7 @@ function serializeEvidenceValue(
       const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
       if (
         descriptor === undefined ||
+        !descriptor.enumerable ||
         descriptor.get !== undefined ||
         descriptor.set !== undefined
       ) {
@@ -256,29 +264,19 @@ function serializeEvidenceValue(
       }
       serializeEvidenceValue(descriptor.value, state, depth + 1, null);
     }
-    return appendEvidenceChunk(state, "]");
+    appendEvidenceChunk(state, "]");
+    state.active.delete(value);
+    return;
   }
 
   const prototype = Object.getPrototypeOf(value) as object | null;
   if (prototype !== Object.prototype && prototype !== null) evidenceLimit();
-  let enumerableCount = 0;
-  for (const key in value) {
-    if (!Object.hasOwn(value, key) || (depth === 0 && key === omittedRootKey)) continue;
-    enumerableCount += 1;
-    if (state.members + enumerableCount > SKILL_EVIDENCE_JSON_LIMITS.maxMembers) evidenceLimit();
-  }
-  countEvidenceMembers(state, enumerableCount);
-  const keys = Object.keys(value)
-    .filter((key) => depth !== 0 || key !== omittedRootKey)
-    .sort();
-  const ownNames = Object.getOwnPropertyNames(value).filter(
-    (key) => depth !== 0 || key !== omittedRootKey,
-  );
-  if (keys.length !== enumerableCount || ownNames.length !== keys.length) evidenceLimit();
-  appendEvidenceChunk(state, "{");
-  for (const [index, key] of keys.entries()) {
-    if (index > 0) appendEvidenceChunk(state, ",");
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const ownNames = Object.getOwnPropertyNames(value);
+  const enumerableNames = Object.keys(value);
+  if (ownNames.length !== enumerableNames.length) evidenceLimit();
+  for (const key of ownNames) {
+    const descriptor = descriptors[key];
     if (
       descriptor === undefined ||
       !descriptor.enumerable ||
@@ -287,15 +285,38 @@ function serializeEvidenceValue(
     ) {
       evidenceLimit();
     }
+  }
+  if (depth === 0 && omittedRootKey !== null) {
+    const omitted = descriptors[omittedRootKey];
+    if (
+      omitted === undefined ||
+      typeof omitted.value !== "string" ||
+      !/^sha256:[0-9a-f]{64}$/u.test(omitted.value)
+    ) {
+      evidenceLimit();
+    }
+  }
+  const keys = ownNames.filter((key) => depth !== 0 || key !== omittedRootKey).sort();
+  countEvidenceMembers(state, keys.length);
+  appendEvidenceChunk(state, "{");
+  for (const [index, key] of keys.entries()) {
+    if (index > 0) appendEvidenceChunk(state, ",");
+    const descriptor = descriptors[key]!;
     appendEvidenceString(state, key);
     appendEvidenceChunk(state, ":");
     serializeEvidenceValue(descriptor.value, state, depth + 1, null);
   }
   appendEvidenceChunk(state, "}");
+  state.active.delete(value);
 }
 
 function boundedEvidenceJson(value: unknown, omittedRootKey: string | null = null): string {
-  const state: EvidenceSerializationState = { chunks: [], bytes: 0, members: 0 };
+  const state: EvidenceSerializationState = {
+    chunks: [],
+    active: new WeakSet<object>(),
+    bytes: 0,
+    members: 0,
+  };
   serializeEvidenceValue(value, state, 0, omittedRootKey);
   return state.chunks.join("");
 }
@@ -993,6 +1014,48 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
   const requests = new Set<string>();
   const decisions = new Set<string>();
   const projectedJournalEntries = new Map<`sha256:${string}`, RunJournalEntryV1>();
+  const projectedJournalSources = new Map<
+    `sha256:${string}`,
+    "ordinary" | "approval-request" | "approval-decision" | "terminal"
+  >();
+  const projectedJournalSequences = new Set<number>();
+  const addProjectedJournalEntry = (
+    entry: RunJournalEntryV1,
+    source: "ordinary" | "approval-request" | "approval-decision" | "terminal",
+  ): void => {
+    if (
+      projectedJournalEntries.has(entry.entry_hash) ||
+      projectedJournalSequences.has(entry.sequence)
+    ) {
+      issues.push(
+        issue("/journal_entries", "projection", "journal entries must be projected exactly once"),
+      );
+      return;
+    }
+    projectedJournalEntries.set(entry.entry_hash, entry);
+    projectedJournalSources.set(entry.entry_hash, source);
+    projectedJournalSequences.add(entry.sequence);
+  };
+  for (const [index, entry] of value.journal_entries.entries()) {
+    const parsed = parseRunJournalEntry(canonicalJson(entry));
+    const metadataKind =
+      typeof entry.metadata === "object" &&
+      entry.metadata !== null &&
+      !Array.isArray(entry.metadata)
+        ? (entry.metadata as Readonly<Record<string, JsonValue>>).kind
+        : undefined;
+    if (
+      !parsed.ok ||
+      entry.run_id !== value.run_id ||
+      metadataKind === "superpowers-approval-pending" ||
+      metadataKind === "superpowers-approval-decision"
+    ) {
+      issues.push(
+        issue(`/journal_entries/${index}`, "binding", "ordinary journal entry is inconsistent"),
+      );
+    }
+    addProjectedJournalEntry(entry, "ordinary");
+  }
   for (const [index, approval] of value.approvals.entries()) {
     const requestResult = parseSuperpowersApproval(canonicalJson(approval.request));
     const decisionResult =
@@ -1043,7 +1106,7 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
       );
     }
     requests.add(approval.request.document_hash);
-    projectedJournalEntries.set(requestEntry.entry_hash, requestEntry);
+    addProjectedJournalEntry(requestEntry, "approval-request");
     if (phase !== undefined) pendingPhaseHashes.delete(phase.document_hash);
     if (approval.decision === null) {
       const terminal =
@@ -1113,7 +1176,7 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
       }
       decisions.add(approval.decision.document_hash);
       if (decisionEntry !== null) {
-        projectedJournalEntries.set(decisionEntry.entry_hash, decisionEntry);
+        addProjectedJournalEntry(decisionEntry, "approval-decision");
       }
     }
   }
@@ -1189,6 +1252,85 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
       issue("/terminal_journal_entry", "binding", "terminal journal entry is inconsistent"),
     );
   }
+  if (terminalEntry !== null) addProjectedJournalEntry(terminalEntry, "terminal");
+
+  const completeJournal = [...projectedJournalEntries.values()].sort(
+    (left, right) => left.sequence - right.sequence,
+  );
+  for (const [index, entry] of completeJournal.entries()) {
+    const previous = completeJournal[index - 1];
+    const entryResult = parseRunJournalEntry(canonicalJson(entry));
+    const firstInvalid =
+      previous === undefined &&
+      (entry.journal_revision !== 1 ||
+        entry.sequence !== 1 ||
+        entry.run_attempt !== 1 ||
+        entry.previous_entry_hash !== ZERO_JOURNAL_HASH ||
+        entry.previous_state !== null ||
+        entry.state !== "CREATED");
+    const successorInvalid =
+      previous !== undefined &&
+      (entry.journal_revision !== previous.journal_revision + 1 ||
+        entry.sequence !== previous.sequence + 1 ||
+        entry.previous_entry_hash !== previous.entry_hash ||
+        entry.previous_state !== previous.state ||
+        !projectedTransitionAllowed(previous.state, entry.state) ||
+        entry.run_attempt !== projectedRunAttempt(previous, entry.state) ||
+        !orderedTimestamp(previous.timestamp, entry.timestamp));
+    if (!entryResult.ok || entry.run_id !== value.run_id || firstInvalid || successorInvalid) {
+      issues.push(
+        issue(`/journal_entries/${index}`, "chain", "complete journal projection is inconsistent"),
+      );
+    }
+  }
+  const completeJournalHead = completeJournal.at(-1);
+  if (
+    completeJournal.length === 0 ||
+    completeJournalHead === undefined ||
+    completeJournal.length !== value.journal_head.sequence ||
+    completeJournalHead.journal_revision !== value.journal_head.journal_revision ||
+    completeJournalHead.sequence !== value.journal_head.sequence ||
+    completeJournalHead.entry_hash !== value.journal_head.entry_hash ||
+    completeJournalHead.state !== value.run_state
+  ) {
+    issues.push(
+      issue("/journal_head", "chain", "journal head is not the exact complete projected path"),
+    );
+  }
+  for (const [index, phase] of value.phases.entries()) {
+    const observed = projectedJournalEntries.get(phase.observed_journal_head.entry_hash);
+    if (
+      observed === undefined ||
+      observed.journal_revision !== phase.observed_journal_head.journal_revision ||
+      observed.sequence !== phase.observed_journal_head.sequence ||
+      observed.state !== "RUNNING"
+    ) {
+      issues.push(
+        issue(
+          `/phases/${index}/observed_journal_head`,
+          "binding",
+          "phase journal anchor is not exact RUNNING truth",
+        ),
+      );
+    }
+  }
+  for (const entry of completeJournal) {
+    const metadataKind =
+      typeof entry.metadata === "object" &&
+      entry.metadata !== null &&
+      !Array.isArray(entry.metadata)
+        ? (entry.metadata as Readonly<Record<string, JsonValue>>).kind
+        : undefined;
+    const source = projectedJournalSources.get(entry.entry_hash);
+    if (
+      (metadataKind === "superpowers-approval-pending" && source !== "approval-request") ||
+      (metadataKind === "superpowers-approval-decision" && source !== "approval-decision") ||
+      (source === "approval-request" && metadataKind !== "superpowers-approval-pending") ||
+      (source === "approval-decision" && metadataKind !== "superpowers-approval-decision")
+    ) {
+      issues.push(issue("/approvals", "projection", "approval journal entries are not one-to-one"));
+    }
+  }
   const finalApprovalEntry = value.approvals
     .map((approval) => approval.decision_journal_entry ?? approval.request_journal_entry)
     .find((entry) => entry.entry_hash === value.journal_head.entry_hash);
@@ -1196,29 +1338,6 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
     finalApprovalEntry !== undefined &&
     finalApprovalEntry.state === "BLOCKED" &&
     value.run_state === "BLOCKED";
-  let terminalPredecessor:
-    | Readonly<{
-        journal_revision: number;
-        sequence: number;
-        entry_hash: `sha256:${string}`;
-        state: RunState;
-        run_attempt?: number;
-        timestamp?: string;
-      }>
-    | undefined =
-    latest === undefined
-      ? undefined
-      : { ...latest.observed_journal_head, state: "RUNNING" as const };
-  for (const approval of value.approvals) {
-    for (const entry of [approval.request_journal_entry, approval.decision_journal_entry]) {
-      if (
-        entry !== null &&
-        (terminalPredecessor === undefined || entry.sequence > terminalPredecessor.sequence)
-      ) {
-        terminalPredecessor = entry;
-      }
-    }
-  }
   if (
     (finalApprovalEntry !== undefined && finalApprovalEntry.state !== value.run_state) ||
     (terminalEntry !== null && value.run_state !== "FAILED" && value.run_state !== "BLOCKED") ||
@@ -1234,46 +1353,6 @@ function evidenceIssues(value: SkillExecutionEvidenceV1): readonly ValidationIss
         "final journal proof is not present exactly once",
       ),
     );
-  }
-  if (terminalEntry !== null && terminalPredecessor !== undefined) {
-    const sequenceGap = terminalEntry.sequence - terminalPredecessor.sequence;
-    const revisionGap = terminalEntry.journal_revision - terminalPredecessor.journal_revision;
-    const adjacent = sequenceGap === 1;
-    const knownAttempt = terminalPredecessor.run_attempt;
-    const attemptInvalid =
-      knownAttempt !== undefined &&
-      (adjacent
-        ? terminalEntry.run_attempt !==
-          projectedRunAttempt(
-            { state: terminalPredecessor.state, run_attempt: knownAttempt },
-            terminalEntry.state,
-          )
-        : terminalEntry.run_attempt < knownAttempt ||
-          terminalEntry.run_attempt > knownAttempt + sequenceGap);
-    const invalid = adjacent
-      ? terminalEntry.previous_entry_hash !== terminalPredecessor.entry_hash ||
-        revisionGap !== 1 ||
-        terminalEntry.previous_state !== terminalPredecessor.state ||
-        attemptInvalid
-      : sequenceGap <= 1 ||
-        revisionGap <= 1 ||
-        sequenceGap !== revisionGap ||
-        terminalEntry.previous_entry_hash === terminalPredecessor.entry_hash ||
-        projectedJournalEntries.has(terminalEntry.previous_entry_hash) ||
-        terminalEntry.previous_state === null ||
-        !projectedTransitionAllowed(terminalEntry.previous_state, terminalEntry.state) ||
-        attemptInvalid ||
-        (terminalPredecessor.timestamp !== undefined &&
-          !orderedTimestamp(terminalPredecessor.timestamp, terminalEntry.timestamp));
-    if (invalid) {
-      issues.push(
-        issue(
-          "/terminal_journal_entry",
-          "predecessor",
-          "terminal journal projection is inconsistent with retained journal truth",
-        ),
-      );
-    }
   }
   if (value.phases.length > 0 && (value.run_state === "CREATED" || value.run_state === "ROUTED")) {
     issues.push(issue("/run_state", "state", "run state cannot precede retained skill phases"));
@@ -1342,12 +1421,18 @@ export function parseSkillExecutionEvidence(
   } catch {
     return failure([issue("", "evidencePreflight", "evidence JSON exceeds its structural budget")]);
   }
-  return parseDocument(
-    input,
-    "skill-execution-evidence",
-    SKILL_EVIDENCE_JSON_LIMITS,
-    evidenceIssues,
-  );
+  try {
+    return parseDocument(
+      input,
+      "skill-execution-evidence",
+      SKILL_EVIDENCE_JSON_LIMITS,
+      evidenceIssues,
+    );
+  } catch {
+    return failure([
+      issue("", "evidenceSemantic", "evidence exceeds a nested semantic document budget"),
+    ]);
+  }
 }
 
 export type {

@@ -1,3 +1,6 @@
+import { ZERO_JOURNAL_HASH } from "../../src/journal/entry.js";
+import { decideRunTransition } from "../../src/journal/state-machine.js";
+import type { RunJournalEntryV1, RunState } from "../../src/journal/types.js";
 import { sha256 } from "../../src/protocol/json.js";
 import { hashSkillCatalog } from "../../src/skills/contracts.js";
 import { builtInSuperpowersHandler } from "../../src/skills/phases.js";
@@ -205,6 +208,34 @@ export function validSuperpowersApprovalDecision() {
 }
 
 export function validSkillExecutionEvidence() {
+  const journalEntries: RunJournalEntryV1[] = [];
+  for (const state of ["CREATED", "ROUTED", "RUNNING"] as readonly RunState[]) {
+    const previous = journalEntries.at(-1);
+    const transition = decideRunTransition(
+      journalEntries,
+      {
+        run_id: "run-1",
+        expected_revision: previous?.journal_revision ?? 0,
+        expected_head_hash: previous?.entry_hash ?? ZERO_JOURNAL_HASH,
+        command_id: `fixture-${state.toLowerCase()}`,
+        operation_id: null,
+        next_state: state,
+        reason_code: `FIXTURE_${state}`,
+        trace: TRACE,
+        metadata: {},
+        side_effect: null,
+      },
+      () => new Date(`2026-08-30T12:00:0${journalEntries.length}.000Z`),
+    );
+    if (transition.kind !== "append") throw new Error("fixture transition must append");
+    journalEntries.push(transition.entry);
+  }
+  const journalFinal = journalEntries.at(-1)!;
+  const evidenceJournalHead = {
+    journal_revision: journalFinal.journal_revision,
+    sequence: journalFinal.sequence,
+    entry_hash: journalFinal.entry_hash,
+  };
   const snapshot = validSkillSnapshot();
   const catalogs = [
     {
@@ -224,6 +255,7 @@ export function validSkillExecutionEvidence() {
   const started = document({
     ...terminal,
     catalog_hash: catalogs[0]!.catalog_hash,
+    observed_journal_head: evidenceJournalHead,
     status: "STARTED" as const,
     output_hash: null,
   });
@@ -239,8 +271,9 @@ export function validSkillExecutionEvidence() {
     schema_version: "skill-execution-evidence.v1" as const,
     document_type: "skill-execution-evidence" as const,
     run_id: "run-1",
-    journal_head: JOURNAL_HEAD,
+    journal_head: evidenceJournalHead,
     run_state: "RUNNING" as const,
+    journal_entries: journalEntries,
     terminal_journal_entry: null,
     catalogs,
     snapshots: [snapshot],
