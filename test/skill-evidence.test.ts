@@ -1142,7 +1142,7 @@ describe("canonical Agent Skills evidence", () => {
     expect(reads).toBe(0);
   });
 
-  it("builds and parses a real history with more than 24 approvals", async () => {
+  it("builds and parses a canonical 25-approval history from one real approval", async () => {
     const root = await realpath(
       await mkdtemp(path.join(tmpdir(), "toss-evidence-many-approvals-")),
     );
@@ -1166,48 +1166,131 @@ describe("canonical Agent Skills evidence", () => {
       hasServiceListener: () => Promise.resolve("absent"),
     });
     const brainstorming = await selected(host, "brainstorming");
-    for (let index = 0; index < 25; index += 1) {
-      const started = await host.startPhase({
-        run_id: "run-many-approvals",
-        expected_journal_head: head,
-        execution_request_hash: EXECUTION_REQUEST_HASH,
-        selection: brainstorming.selection,
-        phase: "BRAINSTORMING",
-        input: Buffer.from(`brainstorming input ${index}`, "utf8"),
+    const started = await host.startPhase({
+      run_id: "run-many-approvals",
+      expected_journal_head: head,
+      execution_request_hash: EXECUTION_REQUEST_HASH,
+      selection: brainstorming.selection,
+      phase: "BRAINSTORMING",
+      input: Buffer.from("brainstorming input 0", "utf8"),
+      operation_id: "many-approval-phase-0",
+      trace: TRACE,
+    });
+    const pending = await host.completePhase({
+      run_id: "run-many-approvals",
+      expected_phase_revision: started.phase.phase_revision,
+      expected_phase_head_hash: started.phase.document_hash,
+      phase: started.phase.phase,
+      skill_snapshot_hash: started.phase.skill.snapshot_hash,
+      operation_id: started.phase.operation_id,
+      outcome: "COMPLETED",
+      terminal_code: null,
+      output: Buffer.from("approved plan 0", "utf8"),
+      trace: TRACE,
+    });
+    if (pending.approval?.kind !== "REQUEST") throw new Error("approval request expected");
+    const approved = await host.resumeApproval({
+      run_id: "run-many-approvals",
+      expected_journal_head: pending.approval.pending_journal_head,
+      phase: pending.approval.phase,
+      skill_name: pending.approval.skill_name,
+      skill_version: pending.approval.skill_version,
+      skill_snapshot_hash: pending.approval.skill_snapshot_hash,
+      approval_request_hash: pending.approval.document_hash,
+      operation_id: "a0000000-0000-4000-8000-000000000000",
+      decision: "APPROVE",
+      trace: TRACE,
+    });
+    const official = await journal.load("run-many-approvals");
+    if (official === null) throw new Error("many-approval official journal missing");
+    const journalEntries = [...official.entries];
+    const phases: SuperpowersPhaseV1[] = [started.phase, pending.phase, approved.phase];
+    let journalHead = approved.journal_head;
+    let previousPhaseHash = approved.phase.document_hash;
+    for (let index = 1; index < 25; index += 1) {
+      const nextStarted = resign({
+        ...started.phase,
+        phase_revision: index * 3 + 1,
+        previous_phase_hash: previousPhaseHash,
+        observed_journal_head: journalHead,
         operation_id: `many-approval-phase-${index}`,
+        input_hash: sha256({ index, kind: "input" }),
+      });
+      const nextPending = requestSuperpowersApproval({
+        started: nextStarted,
+        output_hash: sha256({ index, kind: "output" }),
+        occurred_at: now().toISOString(),
         trace: TRACE,
       });
-      const pending = await host.completePhase({
-        run_id: "run-many-approvals",
-        expected_phase_revision: started.phase.phase_revision,
-        expected_phase_head_hash: started.phase.document_hash,
-        phase: started.phase.phase,
-        skill_snapshot_hash: started.phase.skill.snapshot_hash,
-        operation_id: started.phase.operation_id,
-        outcome: "COMPLETED",
-        terminal_code: null,
-        output: Buffer.from(`approved plan ${index}`, "utf8"),
-        trace: TRACE,
+      const pendingTransition = decideRunTransition(
+        journalEntries,
+        approvalPendingCommand(nextPending),
+        now,
+      );
+      if (pendingTransition.kind !== "append") throw new Error("pending transition must append");
+      journalEntries.push(pendingTransition.entry);
+      const request = approvalRequest(nextPending, {
+        journal_revision: pendingTransition.entry.journal_revision,
+        sequence: pendingTransition.entry.sequence,
+        entry_hash: pendingTransition.entry.entry_hash,
       });
-      if (pending.approval?.kind !== "REQUEST") throw new Error("approval request expected");
-      const approved = await host.resumeApproval({
-        run_id: "run-many-approvals",
-        expected_journal_head: pending.approval.pending_journal_head,
-        phase: pending.approval.phase,
-        skill_name: pending.approval.skill_name,
-        skill_version: pending.approval.skill_version,
-        skill_snapshot_hash: pending.approval.skill_snapshot_hash,
-        approval_request_hash: pending.approval.document_hash,
+      const decision = approvalDecision(request, {
+        run_id: request.run_id,
+        expected_journal_head: request.pending_journal_head,
+        phase: request.phase,
+        skill_name: request.skill_name,
+        skill_version: request.skill_version,
+        skill_snapshot_hash: request.skill_snapshot_hash,
+        approval_request_hash: request.document_hash,
         operation_id: `a0000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
         decision: "APPROVE",
         trace: TRACE,
       });
-      head = approved.journal_head;
+      const terminal = approvalTerminalPhase({
+        pending: nextPending,
+        decision,
+        occurred_at: now().toISOString(),
+      });
+      const decisionTransition = decideRunTransition(
+        journalEntries,
+        approvalDecisionCommand({ request, decision, terminal }),
+        now,
+      );
+      if (decisionTransition.kind !== "append") throw new Error("decision must append");
+      journalEntries.push(decisionTransition.entry);
+      phases.push(nextStarted, nextPending, terminal);
+      journalHead = {
+        journal_revision: decisionTransition.entry.journal_revision,
+        sequence: decisionTransition.entry.sequence,
+        entry_hash: decisionTransition.entry.entry_hash,
+      };
+      previousPhaseHash = terminal.document_hash;
     }
+    const final = journalEntries.at(-1)!;
+    const engine = {
+      evidenceHistory: () =>
+        Promise.resolve({
+          phases,
+          journal: {
+            run_id: "run-many-approvals",
+            state: final.state,
+            head: journalHead,
+            entries: journalEntries,
+            unresolved_side_effects: [],
+          },
+        }),
+    } as unknown as SkillsEngine;
+    const builder = createSkillEvidenceBuilder({
+      statePath,
+      engine,
+      now,
+      randomId,
+      hasServiceListener: () => Promise.resolve("absent"),
+    });
 
-    const evidence = await host.evidence("run-many-approvals");
+    const evidence = await builder.evidence("run-many-approvals");
     if (evidence === null) throw new Error("many-approval evidence expected");
-    const serialized = canonicalJson(evidence, SKILL_EVIDENCE_JSON_LIMITS);
+    const serialized = canonicalSkillEvidenceJson(evidence);
     const bytes = Buffer.byteLength(serialized, "utf8");
     expect(evidence.approvals).toHaveLength(25);
     expect(bytes).toBeGreaterThan(0);
@@ -1216,7 +1299,7 @@ describe("canonical Agent Skills evidence", () => {
       ok: true,
       value: evidence,
     });
-  }, 75_000);
+  });
 
   it("builds and parses a semantically closed near-byte-limit approval projection", async () => {
     const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-evidence-near-byte-")));
