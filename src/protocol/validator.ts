@@ -127,6 +127,23 @@ export interface ProtocolValidator {
   ): ValidationResult<T>;
 }
 
+type ParsedDocumentValidator = <T extends RuntimeDocument>(
+  candidate: JsonValue,
+  expectedType: T["document_type"],
+) => ValidationResult<T>;
+
+const PARSED_DOCUMENT_VALIDATORS = new WeakMap<ProtocolValidator, ParsedDocumentValidator>();
+
+export function validateParsedProtocolDocument<T extends RuntimeDocument>(
+  validator: ProtocolValidator,
+  candidate: JsonValue,
+  expectedType: T["document_type"],
+): ValidationResult<T> {
+  const validate = PARSED_DOCUMENT_VALIDATORS.get(validator);
+  if (validate === undefined) throw new TypeError("unknown protocol validator");
+  return validate(candidate, expectedType);
+}
+
 export function createProtocolValidator(): ProtocolValidator {
   const ajv = new Ajv2020({
     allErrors: true,
@@ -170,7 +187,64 @@ export function createProtocolValidator(): ProtocolValidator {
     }),
   ) as Record<FragmentName, ValidateFunction>;
 
-  return {
+  const validateDocument = <T extends RuntimeDocument>(
+    candidate: JsonValue,
+    expectedType: T["document_type"],
+  ): ValidationResult<T> => {
+    if (!isJsonObject(candidate) || candidate.document_type !== expectedType) {
+      return {
+        ok: false,
+        code: "RUNTIME_DOCUMENT_INVALID",
+        issues: [
+          {
+            path: "/document_type",
+            keyword: "const",
+            message: `must equal ${JSON.stringify(expectedType)}`,
+          },
+        ],
+      };
+    }
+
+    const schemaVersion = candidate.schema_version;
+    if (typeof schemaVersion !== "string") {
+      return {
+        ok: false,
+        code: "RUNTIME_DOCUMENT_INVALID",
+        issues: [{ path: "/schema_version", keyword: "type", message: "must be string" }],
+      };
+    }
+
+    const schemaId = REGISTERED_SCHEMAS[schemaVersion];
+    if (schemaId === undefined) {
+      return {
+        ok: false,
+        code: "RUNTIME_DOCUMENT_UNSUPPORTED",
+        issues: [
+          {
+            path: "/schema_version",
+            keyword: "supported",
+            message: "schema version is not registered",
+          },
+        ],
+      };
+    }
+
+    const validate = ajv.getSchema(schemaId);
+    if (validate === undefined) {
+      throw new Error(`Registered schema is unavailable: ${schemaId}`);
+    }
+    if (!validate(candidate)) {
+      return {
+        ok: false,
+        code: "RUNTIME_DOCUMENT_INVALID",
+        issues: normalizeIssues(validate.errors),
+      };
+    }
+
+    return { ok: true, value: candidate as unknown as T };
+  };
+
+  const protocolValidator: ProtocolValidator = {
     validateFragment(name, value) {
       let candidate: JsonValue;
       try {
@@ -208,57 +282,9 @@ export function createProtocolValidator(): ProtocolValidator {
         return jsonFailure(error);
       }
 
-      if (!isJsonObject(candidate) || candidate.document_type !== expectedType) {
-        return {
-          ok: false,
-          code: "RUNTIME_DOCUMENT_INVALID",
-          issues: [
-            {
-              path: "/document_type",
-              keyword: "const",
-              message: `must equal ${JSON.stringify(expectedType)}`,
-            },
-          ],
-        };
-      }
-
-      const schemaVersion = candidate.schema_version;
-      if (typeof schemaVersion !== "string") {
-        return {
-          ok: false,
-          code: "RUNTIME_DOCUMENT_INVALID",
-          issues: [{ path: "/schema_version", keyword: "type", message: "must be string" }],
-        };
-      }
-
-      const schemaId = REGISTERED_SCHEMAS[schemaVersion];
-      if (schemaId === undefined) {
-        return {
-          ok: false,
-          code: "RUNTIME_DOCUMENT_UNSUPPORTED",
-          issues: [
-            {
-              path: "/schema_version",
-              keyword: "supported",
-              message: "schema version is not registered",
-            },
-          ],
-        };
-      }
-
-      const validate = ajv.getSchema(schemaId);
-      if (validate === undefined) {
-        throw new Error(`Registered schema is unavailable: ${schemaId}`);
-      }
-      if (!validate(candidate)) {
-        return {
-          ok: false,
-          code: "RUNTIME_DOCUMENT_INVALID",
-          issues: normalizeIssues(validate.errors),
-        };
-      }
-
-      return { ok: true, value: candidate as unknown as T };
+      return validateDocument(candidate, expectedType);
     },
   };
+  PARSED_DOCUMENT_VALIDATORS.set(protocolValidator, validateDocument);
+  return protocolValidator;
 }

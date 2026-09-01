@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -49,6 +50,7 @@ const TRACE = {
   trace_flags: 1,
 } as const;
 const EXECUTION_REQUEST_HASH = `sha256:${"e".repeat(64)}` as const;
+const DENSE_HEAP_TEST = "rejects near-2-MiB dense shapes under a 64 MiB old-space bound";
 const roots: string[] = [];
 
 type EvidenceSerializationProbe = Readonly<{
@@ -166,6 +168,197 @@ function resignEvidence(value: Record<string, unknown>): Record<string, unknown>
   };
 }
 
+function unboundedCanonicalJson(value: unknown): string {
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(unboundedCanonicalJson).join(",")}]`;
+  if (typeof value !== "object") throw new TypeError("JSON value expected");
+  return `{${Object.keys(value)
+    .sort()
+    .map(
+      (key) =>
+        `${JSON.stringify(key)}:${unboundedCanonicalJson((value as Record<string, unknown>)[key])}`,
+    )
+    .join(",")}}`;
+}
+
+function unboundedHash(value: unknown): `sha256:${string}` {
+  return `sha256:${createHash("sha256").update(unboundedCanonicalJson(value), "utf8").digest("hex")}`;
+}
+
+function highMemberEvidence(packageCount = 224): SkillExecutionEvidenceV1 {
+  const base = validSkillExecutionEvidence();
+  const capabilities = Array.from(
+    { length: 256 },
+    (_unused, index) => `A${index.toString(16).padStart(2, "0")}`,
+  );
+  const snapshots = Array.from({ length: packageCount }, (_unused, index) => {
+    const version = `1.0.${index.toString().padStart(3, "0")}`;
+    const skillMarkdownHash = sha256({ kind: "high-member-markdown", index });
+    const packageHash = sha256({
+      name: "test-driven-development",
+      description: "x",
+      version,
+      required_runtime_capabilities: capabilities,
+      skill_markdown_bytes: 1,
+      skill_markdown_hash: skillMarkdownHash,
+      resources: [],
+    });
+    const descriptor = resign({
+      protocol_version: "runtime-contract.v1",
+      schema_version: "skill-descriptor.v1",
+      document_type: "skill-descriptor",
+      name: "test-driven-development",
+      description: "x",
+      version,
+      source: { kind: "configured", identity: `skill-${index.toString().padStart(3, "0")}` },
+      package_hash: packageHash,
+      resource_count: 0,
+      total_bytes: 1,
+      required_runtime_capabilities: capabilities,
+    });
+    return resign({
+      protocol_version: "runtime-contract.v1",
+      schema_version: "skill-snapshot.v1",
+      document_type: "skill-snapshot",
+      descriptor,
+      skill_markdown_hash: skillMarkdownHash,
+      skill_markdown_bytes: 1,
+      resources: [],
+      package_hash: packageHash,
+      total_bytes: 1,
+    }) as unknown as SkillSnapshotV1;
+  }).sort((left, right) => left.document_hash.localeCompare(right.document_hash));
+  const descriptors = snapshots
+    .map((snapshot) => snapshot.descriptor)
+    .sort((left, right) => left.version.localeCompare(right.version));
+  const catalogHash = hashSkillCatalog(
+    descriptors.map((descriptor) => ({
+      name: descriptor.name,
+      version: descriptor.version,
+      source: descriptor.source,
+      package_hash: descriptor.package_hash,
+      document_hash: descriptor.document_hash,
+    })),
+  );
+  const handler = builtInSuperpowersHandler("TEST_DESIGN");
+  const phases: SuperpowersPhaseV1[] = [];
+  for (const [index, snapshot] of snapshots.entries()) {
+    const skill = {
+      name: snapshot.descriptor.name,
+      version: snapshot.descriptor.version,
+      source: snapshot.descriptor.source,
+      package_hash: snapshot.descriptor.package_hash,
+      document_hash: snapshot.descriptor.document_hash,
+      snapshot_hash: snapshot.document_hash,
+    };
+    const common = {
+      protocol_version: "runtime-contract.v1",
+      schema_version: "superpowers-phase.v1",
+      document_type: "superpowers-phase",
+      run_id: base.run_id,
+      execution_request_hash: EXECUTION_REQUEST_HASH,
+      observed_journal_head: base.journal_head,
+      catalog_hash: catalogHash,
+      skill,
+      phase: "TEST_DESIGN",
+      handler: { version: handler.version, hash: handler.hash },
+      operation_id: `high-member-${index}`,
+      predecessor_phase_hashes: [],
+      input_hash: sha256({ kind: "high-member-input", index }),
+      context_hash: sha256({ kind: "high-member-context", index }),
+      context_accounting: {
+        skill_markdown: {
+          path: "SKILL.md",
+          source_hash: snapshot.skill_markdown_hash,
+          state: "INCLUDED",
+          original_bytes: 1,
+          included_bytes: 1,
+          included_hash: snapshot.skill_markdown_hash,
+          original_conservative_units: 1,
+          included_conservative_units: 1,
+        },
+        resources: [],
+        original_utf8_bytes: 1,
+        included_utf8_bytes: 1,
+        original_conservative_units: 1,
+        included_conservative_units: 1,
+        remaining_bytes: 0,
+        remaining_conservative_units: 0,
+        segment_count: 1,
+        truncation_count: 0,
+      },
+      terminal_code: null,
+      occurred_at: "2026-08-30T12:00:03.000Z",
+      trace: TRACE,
+    } as const;
+    const started = resign({
+      ...common,
+      phase_revision: phases.length + 1,
+      previous_phase_hash: phases.at(-1)?.document_hash ?? `sha256:${"0".repeat(64)}`,
+      status: "STARTED",
+      output_hash: null,
+    }) as unknown as SuperpowersPhaseV1;
+    phases.push(started);
+    phases.push(
+      resign({
+        ...common,
+        phase_revision: phases.length + 1,
+        previous_phase_hash: started.document_hash,
+        status: "COMPLETED",
+        output_hash: sha256({ kind: "high-member-output", index }),
+      }) as unknown as SuperpowersPhaseV1,
+    );
+  }
+  const preimage = {
+    protocol_version: base.protocol_version,
+    schema_version: base.schema_version,
+    document_type: base.document_type,
+    run_id: base.run_id,
+    journal_head: base.journal_head,
+    run_state: base.run_state,
+    journal_path: base.journal_path,
+    terminal_journal_entry: null,
+    catalogs: [{ descriptors, catalog_hash: catalogHash }],
+    snapshots,
+    phases,
+    approvals: [],
+    terminal_code: null,
+  };
+  const withHandoff = {
+    ...preimage,
+    handoff_hash: unboundedHash({
+      schema_version: "skill-execution-handoff.v1",
+      evidence: preimage,
+    }),
+  };
+  return {
+    ...withHandoff,
+    document_hash: unboundedHash(withHandoff),
+  };
+}
+
+function denseSchemaOpenEvidence(shape: "array" | "object"): string {
+  const prefix =
+    '{"document_type":"skill-execution-evidence","schema_version":"skill-execution-evidence.v1","x":';
+  const targetBytes = 2_000_000;
+  if (shape === "array") {
+    const members = Math.floor((targetBytes - prefix.length - 2) / 2);
+    return `${prefix}[${"0,".repeat(members - 1)}0]}`;
+  }
+  const entries: string[] = [];
+  let bytes = prefix.length + 2;
+  for (let index = 0; ; index += 1) {
+    const entry = `${index === 0 ? "" : ","}${JSON.stringify(index.toString(36))}:0`;
+    if (bytes + entry.length > targetBytes) break;
+    entries.push(entry);
+    bytes += entry.length;
+  }
+  return `${prefix}{${entries.join("")}}}`;
+}
+
 function resignJournal(value: RunJournalEntryV1): RunJournalEntryV1 {
   const { entry_hash: entryHash, ...hashable } = value;
   void entryHash;
@@ -236,6 +429,30 @@ function resignZeroPhaseJournalPath(
 }
 
 describe("canonical Agent Skills evidence", () => {
+  it("parses the legal 224-snapshot evidence shape below the byte limit", () => {
+    const evidence = highMemberEvidence();
+    let observed: EvidenceSerializationProbe | null = null;
+    const serialized = skillContracts.withSkillEvidenceSerializationProbeForTest(
+      (probe) => {
+        observed = probe;
+      },
+      () => canonicalSkillEvidenceJson(evidence),
+    );
+
+    expect(serialized).toBe(unboundedCanonicalJson(evidence));
+    expect(Buffer.byteLength(serialized, "utf8")).toBeGreaterThan(1_800_000);
+    expect(Buffer.byteLength(serialized, "utf8")).toBeLessThan(SKILL_LIMITS.evidenceBytes);
+    expect(observed).not.toBeNull();
+    expect(observed!.members).toBeGreaterThan(131_072);
+    const parsed = parseSkillExecutionEvidence(serialized);
+    expect(parsed).toEqual({ ok: true, value: evidence });
+    if (parsed.ok) {
+      expect(Object.isFrozen(parsed.value)).toBe(true);
+      expect(Object.isFrozen(parsed.value.catalogs[0]?.descriptors[0])).toBe(true);
+      expect(Object.isFrozen(parsed.value.phases.at(-1)?.context_accounting)).toBe(true);
+    }
+  });
+
   it("emits canonical JSON strings incrementally and stops before an escaping value can overflow", () => {
     const corpus = [
       "",
@@ -340,15 +557,15 @@ describe("canonical Agent Skills evidence", () => {
     expect(getterCalls).toBe(0);
   });
 
-  it("rejects evidence structure before AST construction and closes public hash limits", () => {
-    const exactDense = `[${"0,".repeat(SKILL_EVIDENCE_JSON_LIMITS.maxMembers - 1)}0]`;
+  it("rejects malformed or schema-open dense evidence and closes public hash limits", () => {
+    const exactDense = `[${"0,".repeat(160_000 - 1)}0]`;
     expect(parseSkillExecutionEvidence(exactDense)).toMatchObject({
       ok: false,
       code: "RUNTIME_DOCUMENT_INVALID",
       issues: [{ keyword: "evidencePreflight" }],
     });
 
-    const denseMembers = SKILL_EVIDENCE_JSON_LIMITS.maxMembers + 1;
+    const denseMembers = 180_000;
     const dense = `[${"0,".repeat(denseMembers - 1)}0]`;
     const denseResult = parseSkillExecutionEvidence(dense);
     expect(denseResult).toMatchObject({
@@ -387,13 +604,6 @@ describe("canonical Agent Skills evidence", () => {
     expect(() => hashSkillExecutionEvidence(overByte as never)).toThrow(
       expect.objectContaining({ code: "RUNTIME_SKILL_LIMIT_EXCEEDED" }),
     );
-    const overMember = Array(SKILL_EVIDENCE_JSON_LIMITS.maxMembers + 1).fill(0);
-    expect(() => hashSkillExecutionHandoff(overMember as never)).toThrow(
-      expect.objectContaining({ code: "RUNTIME_SKILL_LIMIT_EXCEEDED" }),
-    );
-    expect(() => hashSkillExecutionEvidence(overMember as never)).toThrow(
-      expect.objectContaining({ code: "RUNTIME_SKILL_LIMIT_EXCEEDED" }),
-    );
     let overDepth: unknown = 0;
     for (let depth = 0; depth < SKILL_EVIDENCE_JSON_LIMITS.maxDepth + 2; depth += 1) {
       overDepth = [overDepth];
@@ -410,16 +620,119 @@ describe("canonical Agent Skills evidence", () => {
     });
 
     const exactDenseObject = `{${Array.from(
-      { length: SKILL_EVIDENCE_JSON_LIMITS.maxMembers },
+      { length: 160_000 },
       (_unused, index) => `${JSON.stringify(index.toString(36))}:0`,
     ).join(",")}}`;
     expect(Buffer.byteLength(exactDenseObject, "utf8")).toBeLessThan(SKILL_LIMITS.evidenceBytes);
-    expect(parseSkillExecutionEvidence(exactDenseObject)).toMatchObject({
+    const denseObjectResult = parseSkillExecutionEvidence(exactDenseObject);
+    expect(denseObjectResult).toMatchObject({
+      ok: false,
+      code: "RUNTIME_DOCUMENT_INVALID",
+    });
+    if (!denseObjectResult.ok) {
+      expect(denseObjectResult.issues.some((entry) => entry.keyword === "evidencePreflight")).toBe(
+        false,
+      );
+    }
+  });
+
+  it("rejects nested duplicate keys including escaped-equivalent spellings", () => {
+    for (const input of [
+      '{"x":1,"x":2}',
+      '{"outer":{"a":1,"\\u0061":2}}',
+      '{"outer":{"\\ud83d\\ude00":1,"😀":2}}',
+    ]) {
+      expect(parseSkillExecutionEvidence(input)).toMatchObject({
+        ok: false,
+        code: "RUNTIME_DOCUMENT_INVALID",
+        issues: [{ keyword: "evidencePreflight" }],
+      });
+    }
+
+    const evidence = validSkillExecutionEvidence();
+    const escaped = canonicalSkillEvidenceJson(evidence)
+      .replace('"document_type"', '"document_\\u0074ype"')
+      .replaceAll("run-1", "run\\u002d1");
+    expect(parseSkillExecutionEvidence(escaped)).toEqual({ ok: true, value: evidence });
+  });
+
+  it("matches the generic parser's rejection of malformed JSON without leaking diagnostics", () => {
+    const malformed = [
+      "",
+      '{"x":01}',
+      '{"x":1.}',
+      '{"x":1e}',
+      '{"x":1e400}',
+      '{"x":NaN}',
+      '{"x":"\\v"}',
+      '{"x":"line\nbreak"}',
+      '{"x":true,}',
+      '{"x":/* no */true}',
+      '{"x" true}',
+      '{"x":true "y":false}',
+      '{"x":true} trailing',
+      '{"x":[0,]}',
+      '{"x":{}} garbage',
+    ];
+    for (const input of malformed) {
+      expect(() => parseJsonBytes(input)).toThrow();
+      expect(parseSkillExecutionEvidence(input)).toMatchObject({
+        ok: false,
+        code: "RUNTIME_DOCUMENT_INVALID",
+        issues: [{ keyword: "evidencePreflight" }],
+      });
+    }
+    const invalidUtf8 = Uint8Array.from([0x7b, 0x22, 0x78, 0x22, 0x3a, 0x22, 0xc3, 0x28]);
+    expect(() => parseJsonBytes(invalidUtf8)).toThrow();
+    expect(parseSkillExecutionEvidence(invalidUtf8)).toMatchObject({
       ok: false,
       code: "RUNTIME_DOCUMENT_INVALID",
       issues: [{ keyword: "evidencePreflight" }],
     });
   });
+
+  it(
+    DENSE_HEAP_TEST,
+    () => {
+      const childShape = process.env.TOSS_SKILL_EVIDENCE_DENSE_SHAPE;
+      if (childShape === "array" || childShape === "object") {
+        const input = denseSchemaOpenEvidence(childShape);
+        expect(Buffer.byteLength(input, "utf8")).toBeGreaterThan(1_900_000);
+        expect(Buffer.byteLength(input, "utf8")).toBeLessThan(SKILL_LIMITS.evidenceBytes);
+        const result = parseSkillExecutionEvidence(input);
+        expect(result).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
+        if (!result.ok) {
+          expect(result.issues.some((entry) => entry.keyword === "evidencePreflight")).toBe(false);
+        }
+        return;
+      }
+
+      for (const shape of ["array", "object"] as const) {
+        const child = spawnSync(
+          process.execPath,
+          [
+            "--max-old-space-size=64",
+            path.join(process.cwd(), "node_modules/vitest/vitest.mjs"),
+            "run",
+            path.join(process.cwd(), "test/skill-evidence.test.ts"),
+            "-t",
+            DENSE_HEAP_TEST,
+            "--maxWorkers=1",
+          ],
+          {
+            cwd: process.cwd(),
+            encoding: "utf8",
+            env: { ...process.env, TOSS_SKILL_EVIDENCE_DENSE_SHAPE: shape },
+            maxBuffer: 1_048_576,
+            timeout: 60_000,
+          },
+        );
+        expect(child.signal, `${shape}: ${child.stderr}`).toBeNull();
+        expect(child.status, `${shape}: ${child.stdout}\n${child.stderr}`).toBe(0);
+      }
+    },
+    130_000,
+  );
 
   it("projects a metadata-dense official history as compact closed journal path links", async () => {
     const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-evidence-compact-path-")));

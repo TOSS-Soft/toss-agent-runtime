@@ -1,7 +1,5 @@
 import { createHash } from "node:crypto";
 
-import { createScanner } from "jsonc-parser";
-
 import { parseRunJournalEntry, ZERO_JOURNAL_HASH } from "../journal/entry.js";
 import { RUN_TRANSITION_MATRIX } from "../journal/state-machine.js";
 import type { RunJournalEntryV1, RunState } from "../journal/types.js";
@@ -19,7 +17,7 @@ import type {
   ValidationIssue,
   ValidationResult,
 } from "../protocol/types.js";
-import { createProtocolValidator } from "../protocol/validator.js";
+import { createProtocolValidator, validateParsedProtocolDocument } from "../protocol/validator.js";
 import type {
   HashableSkillDescriptorV1,
   HashableSkillExecutionEvidenceV1,
@@ -50,54 +48,28 @@ const DOCUMENT_LIMITS: JsonLimits = Object.freeze({
   maxMembers: 10_000,
 });
 
-const EVIDENCE_CLOSED_MEMBER_MIN_BYTES = 18;
-const EVIDENCE_TERMINAL_DOCUMENT_MAX_MEMBERS = 10_000;
-const EVIDENCE_FIXED_MEMBER_ALLOWANCE = 4_096;
-const EVIDENCE_SCHEMA_MEMBER_UPPER_BOUND =
-  Math.floor(SKILL_LIMITS.evidenceBytes / EVIDENCE_CLOSED_MEMBER_MIN_BYTES) +
-  EVIDENCE_TERMINAL_DOCUMENT_MAX_MEMBERS +
-  EVIDENCE_FIXED_MEMBER_ALLOWANCE;
-const EVIDENCE_MEMBER_CEILING = 131_072;
-
-if (EVIDENCE_SCHEMA_MEMBER_UPPER_BOUND >= EVIDENCE_MEMBER_CEILING) {
-  throw new Error("skill evidence member ceiling is below the closed schema bound");
-}
-
 export const SKILL_EVIDENCE_JSON_LIMITS: JsonLimits = Object.freeze({
   maxBytes: SKILL_LIMITS.evidenceBytes,
   maxDepth: SKILL_LIMITS.nestingDepth + 8,
-  // After ordinary journal metadata is replaced by eight-field path links,
-  // every repeatable closed evidence unit uses at least 18 canonical bytes per
-  // counted member. The sole arbitrary safe_json authority is the dedicated
-  // terminal journal document, whose own parser admits at most 10,000 members;
-  // 4,096 more cover every non-repeatable root/container member.
-  // floor(2 MiB / 18) + 10,000 + 4,096 = 130,604, so the next power-of-two
-  // ceiling is conservative for every byte-valid shape. The ceiling is exclusive.
-  maxMembers: EVIDENCE_MEMBER_CEILING,
+  // Evidence ingestion has no schema-member ceiling. This byte-derived bound
+  // remains only for the canonical writer's linear work accounting: no JSON
+  // member can be emitted without consuming at least one canonical byte.
+  maxMembers: SKILL_LIMITS.evidenceBytes,
 });
 
 type EvidenceContainer =
-  | { readonly kind: "array"; state: "valueOrEnd" | "commaOrEnd" }
-  | { readonly kind: "object"; state: "keyOrEnd" | "colon" | "value" | "commaOrEnd" };
+  { readonly kind: "array" } | { readonly kind: "object"; readonly keys: Set<string> };
 
-const EVIDENCE_TOKEN = Object.freeze({
-  OPEN_BRACE: 1,
-  CLOSE_BRACE: 2,
-  OPEN_BRACKET: 3,
-  CLOSE_BRACKET: 4,
-  COMMA: 5,
-  COLON: 6,
-  NULL: 7,
-  TRUE: 8,
-  FALSE: 9,
-  STRING: 10,
-  NUMBER: 11,
-  LINE_COMMENT: 12,
-  BLOCK_COMMENT: 13,
-  LINE_BREAK: 14,
-  TRIVIA: 15,
-  EOF: 17,
-});
+const EVIDENCE_SIMPLE_ESCAPES = Object.freeze({
+  '"': '"',
+  "\\": "\\",
+  "/": "/",
+  b: "\b",
+  f: "\f",
+  n: "\n",
+  r: "\r",
+  t: "\t",
+} as const);
 
 function evidenceInputText(input: string | Uint8Array): string {
   const bytes = typeof input === "string" ? Buffer.byteLength(input, "utf8") : input.byteLength;
@@ -106,110 +78,172 @@ function evidenceInputText(input: string | Uint8Array): string {
   return new TextDecoder("utf-8", { fatal: true }).decode(input);
 }
 
-function preflightEvidenceStructure(input: string | Uint8Array): void {
-  const scanner = createScanner(evidenceInputText(input), false);
+function preflightEvidenceStructure(input: string | Uint8Array): string {
+  const text = evidenceInputText(input);
   const containers: EvidenceContainer[] = [];
-  let rootState: "value" | "end" = "value";
-  let members = 0;
+  let cursor = 0;
+  let work = 0;
 
-  const countMember = () => {
-    members += 1;
-    if (members >= SKILL_EVIDENCE_JSON_LIMITS.maxMembers) throw new Error("member limit");
+  const accountWork = (): void => {
+    work += 1;
+    if (work > text.length + 1) throw new Error("work limit");
   };
-  const beginValue = (token: number): void => {
-    if (token === EVIDENCE_TOKEN.OPEN_BRACKET || token === EVIDENCE_TOKEN.OPEN_BRACE) {
-      if (token === EVIDENCE_TOKEN.OPEN_BRACKET) {
-        containers.push({ kind: "array", state: "valueOrEnd" });
-      } else {
-        containers.push({ kind: "object", state: "keyOrEnd" });
+  const skipWhitespace = (): void => {
+    while (
+      text[cursor] === " " ||
+      text[cursor] === "\t" ||
+      text[cursor] === "\n" ||
+      text[cursor] === "\r"
+    ) {
+      cursor += 1;
+    }
+  };
+  const parseString = (capture: boolean): string | null => {
+    if (text[cursor] !== '"') throw new Error("string expected");
+    cursor += 1;
+    const decoded: string[] = [];
+    let rawStart = cursor;
+    for (;;) {
+      if (cursor >= text.length) throw new Error("unterminated string");
+      const code = text.charCodeAt(cursor);
+      if (code === 0x22) {
+        if (capture) decoded.push(text.slice(rawStart, cursor));
+        cursor += 1;
+        return capture ? decoded.join("") : null;
       }
-      if (containers.length > SKILL_EVIDENCE_JSON_LIMITS.maxDepth + 1) {
-        throw new Error("depth limit");
+      if (code < 0x20) throw new Error("control character in string");
+      if (code !== 0x5c) {
+        cursor += 1;
+        continue;
       }
+      if (capture) decoded.push(text.slice(rawStart, cursor));
+      cursor += 1;
+      const escape = text[cursor];
+      if (escape === undefined) throw new Error("unterminated escape");
+      if (escape in EVIDENCE_SIMPLE_ESCAPES) {
+        if (capture) {
+          decoded.push(EVIDENCE_SIMPLE_ESCAPES[escape as keyof typeof EVIDENCE_SIMPLE_ESCAPES]);
+        }
+        cursor += 1;
+        rawStart = cursor;
+        continue;
+      }
+      if (escape !== "u") throw new Error("invalid escape");
+      const hex = text.slice(cursor + 1, cursor + 5);
+      if (hex.length !== 4 || !/^[0-9a-fA-F]{4}$/u.test(hex)) {
+        throw new Error("invalid unicode escape");
+      }
+      if (capture) decoded.push(String.fromCharCode(Number.parseInt(hex, 16)));
+      cursor += 5;
+      rawStart = cursor;
+    }
+  };
+  const parseNumber = (): void => {
+    const start = cursor;
+    if (text[cursor] === "-") cursor += 1;
+    if (text[cursor] === "0") {
+      cursor += 1;
+      if (/[0-9]/u.test(text[cursor] ?? "")) throw new Error("leading zero");
+    } else {
+      if (!/[1-9]/u.test(text[cursor] ?? "")) throw new Error("invalid number");
+      while (/[0-9]/u.test(text[cursor] ?? "")) cursor += 1;
+    }
+    if (text[cursor] === ".") {
+      cursor += 1;
+      if (!/[0-9]/u.test(text[cursor] ?? "")) throw new Error("invalid fraction");
+      while (/[0-9]/u.test(text[cursor] ?? "")) cursor += 1;
+    }
+    if (text[cursor] === "e" || text[cursor] === "E") {
+      cursor += 1;
+      if (text[cursor] === "+" || text[cursor] === "-") cursor += 1;
+      if (!/[0-9]/u.test(text[cursor] ?? "")) throw new Error("invalid exponent");
+      while (/[0-9]/u.test(text[cursor] ?? "")) cursor += 1;
+    }
+    if (!Number.isFinite(Number(text.slice(start, cursor)))) throw new Error("non-finite number");
+  };
+  const parseValue = (depth: number): void => {
+    accountWork();
+    if (depth > SKILL_EVIDENCE_JSON_LIMITS.maxDepth) throw new Error("depth limit");
+    skipWhitespace();
+    const token = text[cursor];
+    if (token === '"') {
+      parseString(false);
       return;
     }
-    if (
-      token !== EVIDENCE_TOKEN.NULL &&
-      token !== EVIDENCE_TOKEN.TRUE &&
-      token !== EVIDENCE_TOKEN.FALSE &&
-      token !== EVIDENCE_TOKEN.STRING &&
-      token !== EVIDENCE_TOKEN.NUMBER
-    ) {
-      throw new Error("invalid value");
+    for (const literal of ["true", "false", "null"] as const) {
+      if (text.startsWith(literal, cursor)) {
+        cursor += literal.length;
+        return;
+      }
     }
+    if (token === "-" || /[0-9]/u.test(token ?? "")) {
+      parseNumber();
+      return;
+    }
+    if (token === "[") {
+      containers.push({ kind: "array" });
+      cursor += 1;
+      skipWhitespace();
+      if (text[cursor] === "]") {
+        cursor += 1;
+        containers.pop();
+        return;
+      }
+      for (;;) {
+        parseValue(depth + 1);
+        skipWhitespace();
+        if (text[cursor] === "]") {
+          cursor += 1;
+          containers.pop();
+          return;
+        }
+        if (text[cursor] !== ",") throw new Error("invalid array separator");
+        cursor += 1;
+        skipWhitespace();
+        if (text[cursor] === "]") throw new Error("trailing array comma");
+      }
+    }
+    if (token === "{") {
+      const container: EvidenceContainer = { kind: "object", keys: new Set<string>() };
+      containers.push(container);
+      cursor += 1;
+      skipWhitespace();
+      if (text[cursor] === "}") {
+        cursor += 1;
+        containers.pop();
+        return;
+      }
+      for (;;) {
+        accountWork();
+        const key = parseString(true);
+        if (key === null || container.kind !== "object") throw new Error("invalid object key");
+        if (container.keys.has(key)) throw new Error("duplicate object key");
+        container.keys.add(key);
+        skipWhitespace();
+        if (text[cursor] !== ":") throw new Error("missing colon");
+        cursor += 1;
+        parseValue(depth + 1);
+        skipWhitespace();
+        if (text[cursor] === "}") {
+          cursor += 1;
+          containers.pop();
+          return;
+        }
+        if (text[cursor] !== ",") throw new Error("invalid object separator");
+        cursor += 1;
+        skipWhitespace();
+        if (text[cursor] === "}") throw new Error("trailing object comma");
+      }
+    }
+    throw new Error("invalid value");
   };
 
-  for (;;) {
-    const token: number = Number(scanner.scan());
-    if (Number(scanner.getTokenError()) !== 0) throw new Error("invalid token");
-    if (token === EVIDENCE_TOKEN.TRIVIA || token === EVIDENCE_TOKEN.LINE_BREAK) continue;
-    if (token === EVIDENCE_TOKEN.EOF) break;
-    if (token === EVIDENCE_TOKEN.LINE_COMMENT || token === EVIDENCE_TOKEN.BLOCK_COMMENT) {
-      throw new Error("comments unavailable");
-    }
-
-    const container = containers.at(-1);
-    if (container === undefined) {
-      if (rootState !== "value") throw new Error("trailing value");
-      if (token !== EVIDENCE_TOKEN.OPEN_BRACE) throw new Error("evidence root must be an object");
-      rootState = "end";
-      beginValue(token);
-      continue;
-    }
-
-    if (container.kind === "array") {
-      if (container.state === "valueOrEnd") {
-        if (token === EVIDENCE_TOKEN.CLOSE_BRACKET) {
-          containers.pop();
-          continue;
-        }
-        countMember();
-        container.state = "commaOrEnd";
-        beginValue(token);
-        continue;
-      }
-      if (token === EVIDENCE_TOKEN.COMMA) {
-        container.state = "valueOrEnd";
-        continue;
-      }
-      if (token === EVIDENCE_TOKEN.CLOSE_BRACKET) {
-        containers.pop();
-        continue;
-      }
-      throw new Error("invalid array");
-    }
-
-    if (container.state === "keyOrEnd") {
-      if (token === EVIDENCE_TOKEN.CLOSE_BRACE) {
-        containers.pop();
-        continue;
-      }
-      if (token !== EVIDENCE_TOKEN.STRING) throw new Error("invalid object key");
-      countMember();
-      container.state = "colon";
-      continue;
-    }
-    if (container.state === "colon") {
-      if (token !== EVIDENCE_TOKEN.COLON) throw new Error("missing colon");
-      container.state = "value";
-      continue;
-    }
-    if (container.state === "value") {
-      container.state = "commaOrEnd";
-      beginValue(token);
-      continue;
-    }
-    if (token === EVIDENCE_TOKEN.COMMA) {
-      container.state = "keyOrEnd";
-      continue;
-    }
-    if (token === EVIDENCE_TOKEN.CLOSE_BRACE) {
-      containers.pop();
-      continue;
-    }
-    throw new Error("invalid object");
-  }
-  if (rootState !== "end" || containers.length !== 0) throw new Error("incomplete JSON");
+  skipWhitespace();
+  if (text[cursor] !== "{") throw new Error("evidence root must be an object");
+  parseValue(0);
+  skipWhitespace();
+  if (cursor !== text.length || containers.length !== 0) throw new Error("trailing JSON input");
+  return text;
 }
 
 interface EvidenceSerializationState {
@@ -1497,21 +1531,42 @@ export function parseSuperpowersApproval(
   return parseDocument(input, "superpowers-approval", DOCUMENT_LIMITS, approvalIssues);
 }
 
+function freezeEvidenceJson(value: JsonValue): void {
+  if (typeof value !== "object" || value === null) return;
+  if (Array.isArray(value)) {
+    for (const child of value as readonly JsonValue[]) freezeEvidenceJson(child);
+  } else if (isRecord(value)) {
+    for (const key of Object.keys(value)) freezeEvidenceJson(value[key]!);
+  }
+  Object.freeze(value);
+}
+
 export function parseSkillExecutionEvidence(
   input: string | Uint8Array,
 ): ValidationResult<SkillExecutionEvidenceV1> {
+  let text: string;
   try {
-    preflightEvidenceStructure(input);
+    text = preflightEvidenceStructure(input);
   } catch {
     return failure([issue("", "evidencePreflight", "evidence JSON exceeds its structural budget")]);
   }
+  let candidate: JsonValue;
   try {
-    return parseDocument(
-      input,
-      "skill-execution-evidence",
-      SKILL_EVIDENCE_JSON_LIMITS,
-      evidenceIssues,
-    );
+    candidate = JSON.parse(text) as JsonValue;
+  } catch {
+    return failure([issue("", "json", "evidence JSON is invalid")]);
+  }
+  const parsed = validateParsedProtocolDocument<SkillExecutionEvidenceV1>(
+    VALIDATOR,
+    candidate,
+    "skill-execution-evidence",
+  );
+  if (!parsed.ok) return parsed;
+  try {
+    const issues = evidenceIssues(parsed.value);
+    if (issues.length !== 0) return failure(issues);
+    freezeEvidenceJson(candidate);
+    return parsed;
   } catch {
     return failure([
       issue("", "evidenceSemantic", "evidence exceeds a nested semantic document budget"),
