@@ -1,66 +1,66 @@
 {
-  "protocol_version": "runtime-contract.v1",
-  "schema_version": "superpowers-phase.v1",
-  "document_type": "superpowers-phase",
-  "run_id": "run-agent-skills-example",
-  "phase_revision": 2,
-  "previous_phase_hash": "sha256:12e6b62eb51707943baff048e044bbc6b67c6fd57dc03447d0d1719efd443cab",
-  "execution_request_hash": "sha256:62d7fb34a7feca556e7ff797cc06bcf68e3448df6fe00f4a76c86d3ffbf9e18e",
-  "observed_journal_head": {
-    "journal_revision": 3,
-    "sequence": 3,
-    "entry_hash": "sha256:dfbd2098fbadc9b7f33d15a19b4d54d054deed11fc5cc0e5c8eab9852437d58b"
+  "catalog_hash": "sha256:ee2932e15f55749c9cc49deee1e71ef0a9a7fc7eeb7033fc2ce6ea7f1cccba5a",
+  "context_accounting": {
+    "included_conservative_units": 110,
+    "included_utf8_bytes": 440,
+    "original_conservative_units": 110,
+    "original_utf8_bytes": 440,
+    "remaining_bytes": 2096661,
+    "remaining_conservative_units": 524166,
+    "resources": [],
+    "segment_count": 1,
+    "skill_markdown": {
+      "included_bytes": 440,
+      "included_conservative_units": 110,
+      "included_hash": "sha256:56eb80ed9bdb15a851f110b1c05277f5ac3b8c1bbe263cd6e4bd6e666563f3e0",
+      "original_bytes": 440,
+      "original_conservative_units": 110,
+      "path": "SKILL.md",
+      "source_hash": "sha256:56eb80ed9bdb15a851f110b1c05277f5ac3b8c1bbe263cd6e4bd6e666563f3e0",
+      "state": "INCLUDED"
+    },
+    "truncation_count": 0
   },
-  "catalog_hash": "sha256:11860fe5cb458882b4c44d811608ffc61b4134635f4ac67ee643acf6fe839aa7",
+  "context_hash": "sha256:95345514a46acd34130412c995fd6e37ee77ee878ba097f33a23a9ff06867fe0",
+  "document_hash": "sha256:07aa27762d63cb5aa54a08da659882986040d1ca8552cd9517b9f4a76b253bee",
+  "document_type": "superpowers-phase",
+  "execution_request_hash": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "handler": {
+    "hash": "sha256:a1eb6316125dd31c211c7b6f3161f29d553145c3d483b82542b774317d71c448",
+    "version": "agent-skills.v1"
+  },
+  "input_hash": "sha256:937a1fe965faa24c3db50cab1fa763a79594aab3fbf5db5eda708e1c39411ea0",
+  "observed_journal_head": {
+    "entry_hash": "sha256:f6783f4f3be273da03ad0e51e356157e8cb1e778d04ea6f07d2f055c540232eb",
+    "journal_revision": 3,
+    "sequence": 3
+  },
+  "occurred_at": "2026-08-30T12:00:00.000Z",
+  "operation_id": "approval-example-brainstorming",
+  "output_hash": "sha256:944bd69df59c98c4059dca7298225ed4b316fdba2b8f05a33bf6e3d4400eed60",
+  "phase": "BRAINSTORMING",
+  "phase_revision": 2,
+  "predecessor_phase_hashes": [],
+  "previous_phase_hash": "sha256:226cc2b369ef9a29c76908668f17896701f292ee19ac9dba6c1262bebe756510",
+  "protocol_version": "runtime-contract.v1",
+  "run_id": "run-agent-skills-approval-example",
+  "schema_version": "superpowers-phase.v1",
   "skill": {
-    "name": "test-driven-development",
-    "version": "1.0.0",
+    "document_hash": "sha256:3ec49b85923d9477fb79a16a03d32a9ea71495413cec2debe4a6d7bd67923f9b",
+    "name": "brainstorming",
+    "package_hash": "sha256:3cdb20401b362d728ea3706a5cfea59621a3aff4bdc4dbffb22918364ed3dd73",
+    "snapshot_hash": "sha256:c712cdd343603d8733f871d4ea6fe1ff8774cc0bad5587f1bf1bb3432548215c",
     "source": {
       "identity": "sha256:f10088565ee4d9cd7f02356804cf5b943a56e41209a8a5dd8a2f8d79feb3ab97",
       "kind": "bundled"
     },
-    "package_hash": "sha256:cc07f50ea5136dccbd3484238607f4c4578d38b05bb37c8605e40910f35dcbe3",
-    "document_hash": "sha256:afd8b9d9e9ab0166502d8e8fd1a72c4a76200547f193c0d428df0c3d27b44e8e",
-    "snapshot_hash": "sha256:9a95e52c081ea3637bcfdbc769aa983ac5de371c16f43ddc9393f975997129fa"
+    "version": "1.0.0"
   },
-  "phase": "TEST_DESIGN",
-  "handler": {
-    "version": "agent-skills.v1",
-    "hash": "sha256:5aa2e63500719cee5f8e1cc463a503c9d8b4c2903a1ab59e3a49858d1464c797"
-  },
-  "operation_id": "example-test-design",
-  "status": "COMPLETED",
-  "predecessor_phase_hashes": [],
-  "input_hash": "sha256:3f2974ee094605782ca4d1e636c9a765653f64d9f2ab7b0f9312bbc950366ccd",
-  "context_hash": "sha256:7376f9fe5e7a8c10a40cadfe0b0bb6a7deba1732146dc7cd0b1c3081a9d2f895",
-  "context_accounting": {
-    "skill_markdown": {
-      "path": "SKILL.md",
-      "source_hash": "sha256:ebbe76626e1677f1873a13f87001d2d4171ad1e292bbe4e2df14e558d942910d",
-      "state": "INCLUDED",
-      "original_bytes": 467,
-      "included_bytes": 467,
-      "included_hash": "sha256:ebbe76626e1677f1873a13f87001d2d4171ad1e292bbe4e2df14e558d942910d",
-      "original_conservative_units": 117,
-      "included_conservative_units": 117
-    },
-    "resources": [],
-    "original_utf8_bytes": 467,
-    "included_utf8_bytes": 467,
-    "original_conservative_units": 117,
-    "included_conservative_units": 117,
-    "remaining_bytes": 1581,
-    "remaining_conservative_units": 395,
-    "segment_count": 1,
-    "truncation_count": 0
-  },
-  "output_hash": "sha256:92b6e22734271169f0c338c881a7d32d93517d9b0a34525cf47a3e04a7203a5a",
+  "status": "APPROVAL_PENDING",
   "terminal_code": null,
-  "occurred_at": "2026-08-30T12:00:04.000Z",
   "trace": {
-    "trace_id": "11111111111111111111111111111111",
     "span_id": "2222222222222222",
-    "trace_flags": 1
-  },
-  "document_hash": "sha256:e310a95d404ca2f7d12360aa1383ea48974cb07e67805466e5b1d204c4d3cbaa"
+    "trace_flags": 1,
+    "trace_id": "11111111111111111111111111111111"
+  }
 }

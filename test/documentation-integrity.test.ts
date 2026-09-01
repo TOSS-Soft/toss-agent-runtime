@@ -6,6 +6,7 @@ import {
   createBaselineCapabilities,
   createProtocolValidator,
   createRunJournalStore,
+  decideRunTransition,
   hashAgentDefinition,
   hashAgentRegistryEntry,
   hashCompiledContext,
@@ -20,6 +21,7 @@ import {
   hashSkillSnapshot,
   hashSuperpowersApproval,
   hashSuperpowersPhase,
+  type JsonValue,
   parseAgentDefinition,
   parseAgentRegistryEntry,
   parseCompiledContext,
@@ -38,7 +40,9 @@ import {
   parseSkillSnapshot,
   parseSuperpowersApproval,
   parseSuperpowersPhase,
+  sha256,
   validateExecutionChain,
+  ZERO_JOURNAL_HASH,
 } from "../src/index.js";
 
 interface ContractManifest {
@@ -278,10 +282,92 @@ describe("published protocol artifacts", () => {
       expect(hashSuperpowersApproval(approval.value)).toBe(approval.value.document_hash);
       expect(hashSkillExecutionEvidence(evidence.value)).toBe(evidence.value.document_hash);
       expect(snapshot.value.descriptor).toEqual(descriptor.value);
-      expect(phase.value.catalog_hash).toBe(evidence.value.catalogs[0]?.catalog_hash);
-      expect(phase.value.context_accounting).toEqual(evidence.value.phases[0]?.context_accounting);
       expect(evidence.value.journal_path).toHaveLength(3);
     }
+  });
+
+  it("links the approval example to one canonical pending brainstorming transaction", async () => {
+    const phase = parseSuperpowersPhase(await readExample("superpowers-phase"));
+    const approval = parseSuperpowersApproval(await readExample("superpowers-approval"));
+    expect(phase.ok && approval.ok).toBe(true);
+    if (!phase.ok || !approval.ok) return;
+
+    expect(phase.value.status).toBe("APPROVAL_PENDING");
+    expect(approval.value).toMatchObject({
+      kind: "REQUEST",
+      run_id: phase.value.run_id,
+      phase_document_hash: phase.value.document_hash,
+      phase: phase.value.phase,
+      skill_name: phase.value.skill.name,
+      skill_version: phase.value.skill.version,
+      skill_snapshot_hash: phase.value.skill.snapshot_hash,
+      phase_operation_id: phase.value.operation_id,
+      decision: null,
+      trace: phase.value.trace,
+    });
+
+    const history = [];
+    for (const state of ["CREATED", "ROUTED", "RUNNING"] as const) {
+      const previous = history.at(-1);
+      const transition = decideRunTransition(
+        history,
+        {
+          run_id: phase.value.run_id,
+          expected_revision: previous?.journal_revision ?? 0,
+          expected_head_hash: previous?.entry_hash ?? ZERO_JOURNAL_HASH,
+          command_id: `approval-example-${state.toLowerCase()}`,
+          operation_id: null,
+          next_state: state,
+          reason_code: `EXAMPLE_${state}`,
+          trace: phase.value.trace,
+          metadata: {},
+          side_effect: null,
+        },
+        () => new Date(phase.value.occurred_at),
+      );
+      expect(transition.kind).toBe("append");
+      if (transition.kind !== "append") return;
+      history.push(transition.entry);
+    }
+    const running = history.at(-1)!;
+    expect(phase.value.observed_journal_head).toEqual({
+      journal_revision: running.journal_revision,
+      sequence: running.sequence,
+      entry_hash: running.entry_hash,
+    });
+
+    const operationHash = sha256({
+      kind: "superpowers-approval-pending",
+      run_id: phase.value.run_id,
+      operation_id: phase.value.operation_id,
+    });
+    const pending = decideRunTransition(
+      history,
+      {
+        run_id: phase.value.run_id,
+        expected_revision: phase.value.observed_journal_head.journal_revision,
+        expected_head_hash: phase.value.observed_journal_head.entry_hash,
+        command_id: `approval-pending:${operationHash}`,
+        operation_id: phase.value.operation_id,
+        next_state: "APPROVAL_PENDING",
+        reason_code: "SUPERPOWERS_APPROVAL_REQUIRED",
+        trace: phase.value.trace,
+        metadata: {
+          kind: "superpowers-approval-pending",
+          phase: phase.value as unknown as JsonValue,
+        },
+        side_effect: null,
+      },
+      () => new Date(phase.value.occurred_at),
+    );
+    expect(pending.kind).toBe("append");
+    if (pending.kind !== "append") return;
+    expect(pending.entry.state).toBe("APPROVAL_PENDING");
+    expect(approval.value.pending_journal_head).toEqual({
+      journal_revision: pending.entry.journal_revision,
+      sequence: pending.entry.sequence,
+      entry_hash: pending.entry.entry_hash,
+    });
   });
 
   it("loads the accepted agent-context examples through the package-root parsers with exact bindings", async () => {
@@ -477,6 +563,16 @@ describe("published protocol artifacts", () => {
     expect(architecture).not.toMatch(/Development execution may use an[\s\S]*?allowlist/iu);
     expect(changelog).not.toContain(
       "Agent Skills and Superpowers execution remain pending Issue #8",
+    );
+    const releaseDocs = [architecture, readme, changelog].join("\n").replaceAll(/\s+/gu, " ");
+    expect(releaseDocs).not.toMatch(
+      /\bNode(?:\.js)?\s*22\s*(?:\/|and|,)\s*(?:Node(?:\.js)?\s*)?24\b/iu,
+    );
+    expect(releaseDocs).not.toMatch(
+      /(?:\b(?:Node(?:\.js)? Current|Current Node(?:\.js)?)\b.{0,80}\b(?:CI|lane|matrix|release)\b|\b(?:CI|lane|matrix|release)\b.{0,80}\b(?:Node(?:\.js)? Current|Current Node(?:\.js)?)\b)/iu,
+    );
+    expect(releaseDocs).not.toMatch(
+      /(?:\b(?:Ubuntu|Linux)\b.{0,80}\b(?:active|mandatory|release|CI)\s+(?:CI\s+)?(?:lane|matrix)\b|\b(?:active|mandatory|release|CI)\s+(?:CI\s+)?(?:lane|matrix)\b.{0,80}\b(?:Ubuntu|Linux)\b)/iu,
     );
   });
 

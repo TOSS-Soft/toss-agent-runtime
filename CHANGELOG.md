@@ -21,7 +21,7 @@ All notable changes to this project are documented here. The format follows Keep
 - Immutable agent prompt/definition revisions, an append-only private lifecycle registry, exact active-versus-resume resolution, and a deterministic provenance-aware context compiler with fixed trust precedence, conservative byte/token accounting, and Unicode-safe untrusted truncation (#7). This boundary advertises schemas only and does not execute skills, tools, providers, or an agent loop.
 - Metadata-only Agent Skills discovery from explicit private roots and audited bundled packages, immutable post-selection snapshots, bounded progressive context, finite built-in Superpowers phases, durable private-socket approval pause/replay, and closed compact-journal skill evidence (#8). Skill scripts are integrity-hashed but never executed in v1.0.0.
 - Native launchd/systemd definition validation and installed-package supervision smoke tests for duplicate instances, permissions, status, signals, cleanup, and process reaping.
-- Deterministic package-content tests and credential-free Node.js 22/24 CI baseline.
+- Deterministic package-content tests and one credential-free macOS CI lane that automatically resolves the official latest Node.js LTS.
 - Commit-bound acceptance evidence for the Runtime Contract Protocol/package baseline (#2 and #4).
 
 ### Security
