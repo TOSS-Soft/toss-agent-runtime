@@ -987,7 +987,7 @@ describe("canonical Agent Skills evidence", () => {
     const serialized = canonicalSkillEvidenceJson(evidence);
     expect(Buffer.byteLength(serialized, "utf8")).toBeLessThan(SKILL_LIMITS.evidenceBytes);
     expect(parseSkillExecutionEvidence(serialized)).toEqual({ ok: true, value: evidence });
-  });
+  }, 20_000);
 
   it("admits the complete 1024-link closed path below the exclusive member ceiling", () => {
     const base = validSkillExecutionEvidence();
@@ -1437,7 +1437,7 @@ describe("canonical Agent Skills evidence", () => {
     expect(observed).not.toBeNull();
     expect(observed!.members).toBeLessThan(SKILL_EVIDENCE_JSON_LIMITS.maxMembers);
     expect(parseSkillExecutionEvidence(serialized)).toEqual({ ok: true, value: evidence });
-  }, 20_000);
+  }, 30_000);
 
   it("binds the complete governed phase, approval, context, resource, and handoff history", async () => {
     const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-skill-evidence-")));

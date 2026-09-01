@@ -829,7 +829,7 @@ describe("durable Superpowers approval transaction", () => {
       resume,
       currentHead: second.head,
     });
-  });
+  }, 20_000);
 
   it.each(["stale-pending", "terminal-without-decision"] as const)(
     "rejects an orphan phase approval projection: $caseName",

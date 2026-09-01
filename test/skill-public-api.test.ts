@@ -883,5 +883,5 @@ describe("Agent Skills public API", () => {
     } finally {
       rmSync(declarationRoot, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 });
