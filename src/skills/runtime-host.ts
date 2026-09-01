@@ -150,10 +150,7 @@ function createHost(options: CreateSkillsRuntimeHostTestOptions): SkillsHost {
       });
     },
     load: (selection) => accept(() => engine.load(selection)),
-    assembleContext: (request) => {
-      const { selection, ...contextRequest } = request;
-      return accept(() => engine.assembleContext(selection, contextRequest));
-    },
+    assembleContext: (request) => accept(() => engine.assembleContext(request)),
     startPhase: (request) => accept(() => engine.startPhase(request)),
     completePhase: (request) => accept(() => engine.completePhase(request)),
     resumeApproval: (request) => accept(() => engine.resumeApproval(request)),

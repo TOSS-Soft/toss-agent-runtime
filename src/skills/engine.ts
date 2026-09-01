@@ -270,7 +270,7 @@ export interface SkillsEngine {
   discover(request: SkillDiscoveryRequest): Promise<SkillCatalogSnapshot>;
   select(snapshot: SkillCatalogSnapshot, request: SkillSelectionRequest): Promise<SkillSelection>;
   load(selection: SkillSelection): Promise<SkillSnapshotV1>;
-  assembleContext(selection: SkillSelection, request: SkillContextRequest): Promise<SkillContext>;
+  assembleContext(request: SkillHostContextRequest): Promise<SkillContext>;
   startPhase(request: StartSuperpowersPhaseRequest): Promise<SuperpowersPhaseOutcome>;
   completePhase(request: CompleteSuperpowersPhaseRequest): Promise<SuperpowersPhaseOutcome>;
   resumeApproval(request: ResumeSuperpowersApprovalRequest): Promise<SuperpowersPhaseOutcome>;
@@ -284,6 +284,10 @@ export interface SkillsEngine {
   >;
   stopIntake(): void;
   flush(signal: AbortSignal): Promise<void>;
+}
+
+interface SkillHostContextRequest extends SkillContextRequest {
+  readonly selection: SkillSelection;
 }
 
 function integrity(): never {
@@ -575,6 +579,59 @@ function exactDeliveredSelection(value: unknown): SkillSelection {
   const selection = exactSelectionAuthority(value);
   assertDeliveredRuntimeCapabilities(selection.descriptor);
   return selection;
+}
+
+interface CapturedContextRequest {
+  readonly selection: SkillSelection;
+  readonly request: SkillContextRequest;
+}
+
+function captureContextRequest(value: unknown): CapturedContextRequest {
+  const source = closedDataRecord(value, [
+    "selection",
+    "snapshot",
+    "snapshot_hash",
+    "phase",
+    "max_bytes",
+    "max_tokens",
+  ]);
+  const selection = exactDeliveredSelection(source.selection);
+  if (
+    typeof source.snapshot_hash !== "string" ||
+    !HASH_PATTERN.test(source.snapshot_hash) ||
+    typeof source.phase !== "string" ||
+    typeof source.max_bytes !== "number" ||
+    !Number.isSafeInteger(source.max_bytes) ||
+    source.max_bytes < 0 ||
+    source.max_bytes > SKILL_LIMITS.phaseInputBytes ||
+    typeof source.max_tokens !== "number" ||
+    !Number.isSafeInteger(source.max_tokens) ||
+    source.max_tokens < 0 ||
+    source.max_tokens > Math.ceil(SKILL_LIMITS.phaseInputBytes / 4)
+  ) {
+    invalid();
+  }
+  try {
+    builtInSuperpowersHandler(source.phase as SuperpowersPhaseName);
+  } catch {
+    invalid();
+  }
+  let parsed: ReturnType<typeof parseSkillSnapshot>;
+  try {
+    parsed = parseSkillSnapshot(canonicalJson(source.snapshot));
+  } catch {
+    invalid();
+  }
+  if (!parsed.ok || parsed.value.document_hash !== source.snapshot_hash) invalid();
+  validateLoadedSnapshot(selection, parsed.value);
+  const request: SkillContextRequest = Object.freeze({
+    snapshot: parsed.value,
+    snapshot_hash: source.snapshot_hash,
+    phase: source.phase as SuperpowersPhaseName,
+    max_bytes: source.max_bytes,
+    max_tokens: source.max_tokens,
+  });
+  return Object.freeze({ selection, request });
 }
 
 function copiedJournalHead(value: unknown): JournalHead {
@@ -3305,8 +3362,19 @@ function createEngine(options: CreateSkillsEngineForTestOptions): SkillsEngine {
       }
       return accept(() => options.loader.load(captured));
     },
-    assembleContext(selection, request) {
-      return accept(() => options.loader.assembleContext(selection, request));
+    assembleContext(request) {
+      if (intakeStopped) return Promise.reject(new RuntimeSkillError("RUNTIME_SKILL_UNAVAILABLE"));
+      let captured: CapturedContextRequest;
+      try {
+        captured = captureContextRequest(request);
+      } catch (error) {
+        return Promise.reject(
+          error instanceof RuntimeSkillError
+            ? error
+            : new RuntimeSkillError("RUNTIME_SKILL_INVALID"),
+        );
+      }
+      return accept(() => options.loader.assembleContext(captured.selection, captured.request));
     },
     startPhase(request) {
       if (!officialJournal)

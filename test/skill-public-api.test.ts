@@ -245,6 +245,34 @@ async function writeConfiguredBrainstormingPackage(
   await writeFile(path.join(packageRoot, "scripts", "check.mjs"), script, { mode: 0o600 });
 }
 
+function configuredSnapshot(descriptor: SkillDescriptorV1, scriptBody: string): SkillSnapshotV1 {
+  const script = Buffer.from(scriptBody, "utf8");
+  const skillMarkdown = Buffer.from("# Configured brainstorming\n", "utf8");
+  const resources = [
+    {
+      path: "scripts/check.mjs",
+      role: "script" as const,
+      phases: [] as const,
+      priority: null,
+      media_type: "text/javascript",
+      bytes: script.byteLength,
+      hash: rawHash(script),
+    },
+  ];
+  const hashable = {
+    protocol_version: "runtime-contract.v1" as const,
+    schema_version: "skill-snapshot.v1" as const,
+    document_type: "skill-snapshot" as const,
+    descriptor,
+    skill_markdown_hash: rawHash(skillMarkdown),
+    skill_markdown_bytes: skillMarkdown.byteLength,
+    resources,
+    package_hash: descriptor.package_hash,
+    total_bytes: skillMarkdown.byteLength + script.byteLength,
+  };
+  return { ...hashable, document_hash: sha256(hashable) };
+}
+
 function descriptorReference(descriptor: SkillDescriptorV1): SkillDescriptorReference {
   return {
     name: descriptor.name,
@@ -476,7 +504,7 @@ describe("Agent Skills public API", () => {
     [["brainstorming", "external-scripts"], "RUNTIME_SKILL_SCRIPT_UNAVAILABLE"],
     [["brainstorming", "future-runtime"], "BLOCKED_SUPERPOWERS_MISSING"],
   ] as const)(
-    "rejects load and phase for an authorized but undelivered configured dependency %j before any runtime effect",
+    "rejects context, load, and phase for an authorized but undelivered configured dependency %j before any runtime effect",
     async (requiredCapabilities, code) => {
       const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-skills-runtime-cap-")));
       roots.push(root);
@@ -530,6 +558,15 @@ describe("Agent Skills public API", () => {
           query: null,
           descriptor: descriptorReference(descriptor),
         });
+        const snapshot = configuredSnapshot(selection.descriptor, scriptBody);
+        const contextRequest = {
+          selection,
+          snapshot,
+          snapshot_hash: snapshot.document_hash,
+          phase: "BRAINSTORMING" as const,
+          max_bytes: 4_096,
+          max_tokens: 1_024,
+        };
         const request = {
           run_id: "run-unavailable-capability",
           expected_journal_head: head,
@@ -542,6 +579,8 @@ describe("Agent Skills public API", () => {
         };
         const sourceBeforeRejection = await directoryContentSnapshot(configuredRoot);
         const stateBeforeRejection = await directoryContentSnapshot(statePath);
+        await expect(host.assembleContext(contextRequest)).rejects.toMatchObject({ code });
+        await expect(host.assembleContext(contextRequest)).rejects.toMatchObject({ code });
         await expect(host.load(selection)).rejects.toMatchObject({ code });
         await expect(host.load(selection)).rejects.toMatchObject({ code });
         await expect(host.startPhase(request)).rejects.toMatchObject({ code });
@@ -597,6 +636,38 @@ describe("Agent Skills public API", () => {
       });
       const snapshot = await host.load(selection);
       await expect(host.load(selection)).resolves.toEqual(snapshot);
+      const mutableSnapshot = JSON.parse(canonicalJson(snapshot)) as Record<string, unknown>;
+      const mutableContextRequest = {
+        selection,
+        snapshot: mutableSnapshot,
+        snapshot_hash: snapshot.document_hash,
+        phase: "BRAINSTORMING",
+        max_bytes: 4_096,
+        max_tokens: 1_024,
+      };
+      const acceptedContext = host.assembleContext(
+        mutableContextRequest as unknown as SkillHostContextRequest,
+      );
+      mutableSnapshot.total_bytes = 0;
+      mutableContextRequest.snapshot_hash = `sha256:${"f".repeat(64)}`;
+      mutableContextRequest.phase = "RED";
+      mutableContextRequest.max_bytes = 0;
+      mutableContextRequest.max_tokens = 0;
+      const context = await acceptedContext;
+      expect(context).toMatchObject({
+        phase: "BRAINSTORMING",
+        snapshot: { snapshot_hash: snapshot.document_hash },
+      });
+      await expect(
+        host.assembleContext({
+          selection,
+          snapshot,
+          snapshot_hash: snapshot.document_hash,
+          phase: "BRAINSTORMING",
+          max_bytes: 4_096,
+          max_tokens: 1_024,
+        }),
+      ).resolves.toEqual(context);
       await expect(
         host.startPhase({
           run_id: "run-inert-script",
@@ -609,6 +680,26 @@ describe("Agent Skills public API", () => {
           trace: TRACE,
         }),
       ).resolves.toMatchObject({ phase: { status: "STARTED" } });
+      const acceptedReplay = host.assembleContext({
+        selection,
+        snapshot,
+        snapshot_hash: snapshot.document_hash,
+        phase: "BRAINSTORMING",
+        max_bytes: 4_096,
+        max_tokens: 1_024,
+      });
+      host.stopIntake();
+      await expect(acceptedReplay).resolves.toEqual(context);
+      await expect(
+        host.assembleContext({
+          selection,
+          snapshot,
+          snapshot_hash: snapshot.document_hash,
+          phase: "BRAINSTORMING",
+          max_bytes: 4_096,
+          max_tokens: 1_024,
+        }),
+      ).rejects.toMatchObject({ code: "RUNTIME_SKILL_UNAVAILABLE" });
       await expect(access(witness)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       host.stopIntake();
