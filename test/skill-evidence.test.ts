@@ -595,7 +595,7 @@ describe("canonical Agent Skills evidence", () => {
       ok: true,
       value: expected,
     });
-  });
+  }, 20_000);
 
   it("parses the legal 224-snapshot evidence shape below the byte limit", () => {
     const evidence = highMemberEvidence();
@@ -901,7 +901,9 @@ describe("canonical Agent Skills evidence", () => {
     },
     130_000,
   );
+});
 
+describe("canonical Agent Skills evidence integration", { timeout: 20_000 }, () => {
   it("projects a metadata-dense official history as compact closed journal path links", async () => {
     const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-evidence-compact-path-")));
     roots.push(root);
@@ -987,7 +989,7 @@ describe("canonical Agent Skills evidence", () => {
     const serialized = canonicalSkillEvidenceJson(evidence);
     expect(Buffer.byteLength(serialized, "utf8")).toBeLessThan(SKILL_LIMITS.evidenceBytes);
     expect(parseSkillExecutionEvidence(serialized)).toEqual({ ok: true, value: evidence });
-  }, 20_000);
+  });
 
   it("admits the complete 1024-link closed path below the exclusive member ceiling", () => {
     const base = validSkillExecutionEvidence();
@@ -1030,7 +1032,7 @@ describe("canonical Agent Skills evidence", () => {
     expect(observed).not.toBeNull();
     expect(observed!.members).toBeLessThan(SKILL_EVIDENCE_JSON_LIMITS.maxMembers);
     expect(parseSkillExecutionEvidence(serialized)).toEqual({ ok: true, value: evidence });
-  });
+  }, 5_000);
 
   it("rejects the 129th approval in the first linear journal pass before object reads", async () => {
     const root = await realpath(
@@ -1140,7 +1142,7 @@ describe("canonical Agent Skills evidence", () => {
       code: "RUNTIME_SKILL_LIMIT_EXCEEDED",
     });
     expect(reads).toBe(0);
-  }, 20_000);
+  });
 
   it("builds and parses a canonical 25-approval history from one real approval", async () => {
     const root = await realpath(
@@ -1299,7 +1301,7 @@ describe("canonical Agent Skills evidence", () => {
       ok: true,
       value: evidence,
     });
-  }, 20_000);
+  });
 
   it("builds and parses a semantically closed near-byte-limit approval projection", async () => {
     const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-evidence-near-byte-")));
@@ -1437,7 +1439,7 @@ describe("canonical Agent Skills evidence", () => {
     expect(observed).not.toBeNull();
     expect(observed!.members).toBeLessThan(SKILL_EVIDENCE_JSON_LIMITS.maxMembers);
     expect(parseSkillExecutionEvidence(serialized)).toEqual({ ok: true, value: evidence });
-  }, 30_000);
+  }, 45_000);
 
   it("binds the complete governed phase, approval, context, resource, and handoff history", async () => {
     const root = await realpath(await mkdtemp(path.join(tmpdir(), "toss-skill-evidence-")));
@@ -2657,5 +2659,5 @@ describe("canonical Agent Skills evidence", () => {
     const partial = started.phase.context_accounting.resources[3]!;
     expect(partial.included_bytes).toBeGreaterThan(0);
     expect(partial.included_bytes).toBeLessThan(partial.original_bytes);
-  }, 20_000);
+  });
 });

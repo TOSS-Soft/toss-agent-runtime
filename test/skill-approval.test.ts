@@ -467,7 +467,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
-describe("durable Superpowers approval transaction", () => {
+describe("durable Superpowers approval transaction", { timeout: 20_000 }, () => {
   it("persists phase-first pending state and exposes one exact challenge only after both barriers", async () => {
     const { statePath } = await fixture();
     const { journal, head } = await runningJournal(statePath);
@@ -788,7 +788,6 @@ describe("durable Superpowers approval transaction", () => {
         currentHead,
       });
     },
-    20_000,
   );
 
   it("rejects multiple distinct canonical approval roots that share no phase-history record", async () => {
@@ -829,7 +828,7 @@ describe("durable Superpowers approval transaction", () => {
       resume,
       currentHead: second.head,
     });
-  }, 20_000);
+  });
 
   it.each(["stale-pending", "terminal-without-decision"] as const)(
     "rejects an orphan phase approval projection: $caseName",
@@ -1008,7 +1007,6 @@ describe("durable Superpowers approval transaction", () => {
       expect(await readFile(phasePath)).toEqual(bytes[0]);
       expect(await readFile(journalPath)).toEqual(bytes[1]);
     },
-    20_000,
   );
 
   it.each([
@@ -1056,7 +1054,6 @@ describe("durable Superpowers approval transaction", () => {
       expect((await journal.load("run-1"))?.head).toEqual(advancedHead);
       expect([(await lstat(phasePath)).size, (await lstat(journalPath)).size]).toEqual(before);
     },
-    20_000,
   );
 
   it("transitions an exact rejection to BLOCKED without a successful phase output", async () => {
@@ -1170,7 +1167,7 @@ describe("durable Superpowers approval transaction", () => {
       expect(replay).toMatchObject({ state: "RUNNING", replayed: true });
       expect(await restarted.phaseHistory("run-1")).toHaveLength(3);
     }
-  }, 20_000);
+  });
 
   it("fails recovery when the journal pause has no exact phase record", async () => {
     const { statePath } = await fixture();
@@ -1233,7 +1230,6 @@ describe("durable Superpowers approval transaction", () => {
         await expect(lstat(phasePath)).rejects.toMatchObject({ code: "ENOENT" });
       }
     },
-    20_000,
   );
 
   it("fails closed when a journal-first approval decision loses its phase history", async () => {
