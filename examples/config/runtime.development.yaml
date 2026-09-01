@@ -18,7 +18,7 @@ gateway_profiles:
     credential_reference: gateway-development-token
     body_observability: off
 provider_profiles: []
-mcp_profiles: []
+mcp_profiles: {}
 skill_roots: []
 secret_references:
   gateway-development-token:

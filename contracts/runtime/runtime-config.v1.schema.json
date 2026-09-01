@@ -76,10 +76,10 @@
       "items": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9._:-]{0,127}$" }
     },
     "mcp_profiles": {
-      "type": "array",
-      "uniqueItems": true,
-      "maxItems": 64,
-      "items": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9._:-]{0,127}$" }
+      "type": "object",
+      "maxProperties": 64,
+      "propertyNames": { "pattern": "^[A-Za-z][A-Za-z0-9._:-]{0,127}$" },
+      "additionalProperties": { "$ref": "#/$defs/mcp_profile_config" }
     },
     "skill_roots": {
       "type": "array",
@@ -98,6 +98,97 @@
         "properties": {
           "source": { "type": "string", "enum": ["env", "command"] },
           "key": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,127}$" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "mcp_environment_value": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": { "const": "literal" },
+            "value": { "type": "string", "maxLength": 4096 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "reference"],
+          "properties": {
+            "kind": { "const": "secret-reference" },
+            "reference": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9._:-]{0,127}$" }
+          }
+        }
+      ]
+    },
+    "mcp_stdio_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transport", "command", "args", "cwd", "environment"],
+      "properties": {
+        "transport": { "const": "stdio" },
+        "command": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "args": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "type": "string", "maxLength": 4096 }
+        },
+        "cwd": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "environment": {
+          "type": "object",
+          "maxProperties": 64,
+          "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,127}$" },
+          "additionalProperties": { "$ref": "#/$defs/mcp_environment_value" }
+        }
+      }
+    },
+    "mcp_http_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transport", "endpoint", "credential_reference"],
+      "properties": {
+        "transport": { "const": "streamable-http" },
+        "endpoint": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "credential_reference": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9._:-]{0,127}$" }
+          ]
+        }
+      }
+    },
+    "mcp_agentgateway_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transport", "gateway_profile"],
+      "properties": {
+        "transport": { "const": "agentgateway" },
+        "gateway_profile": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9._:-]{0,127}$" }
+      }
+    },
+    "mcp_binding": {
+      "oneOf": [
+        { "$ref": "#/$defs/mcp_stdio_binding" },
+        { "$ref": "#/$defs/mcp_http_binding" },
+        { "$ref": "#/$defs/mcp_agentgateway_binding" }
+      ]
+    },
+    "mcp_profile_config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile", "servers"],
+      "properties": {
+        "profile": { "$ref": "mcp-profile.v1.schema.json" },
+        "servers": {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 32,
+          "propertyNames": { "pattern": "^[A-Za-z][A-Za-z0-9._:-]{0,127}$" },
+          "additionalProperties": { "$ref": "#/$defs/mcp_binding" }
         }
       }
     }

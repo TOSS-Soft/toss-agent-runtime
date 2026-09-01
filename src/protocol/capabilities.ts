@@ -76,6 +76,8 @@ export function createBaselineCapabilities(platform: {
       "execution-event.v1",
       "execution-request.v1",
       "execution-result.v1",
+      "mcp-discovery-snapshot.v1",
+      "mcp-profile.v1",
       "model-catalog.v1",
       "model-selection-plan.v1",
       "operational-event.v1",
@@ -95,6 +97,9 @@ export function createBaselineCapabilities(platform: {
       "skill-snapshot.v1",
       "superpowers-approval.v1",
       "superpowers-phase.v1",
+      "tool-approval.v1",
+      "tool-call.v1",
+      "tool-result.v1",
     ]),
     provider_transports: Object.freeze(["agentgateway", "openai", "anthropic", "gemini"]),
     model_classes: Object.freeze([
@@ -182,14 +187,14 @@ export function parseRuntimeCapabilities(
     );
   }
   if (
-    result.value.features.mcp === "unavailable" &&
+    result.value.features.mcp !== "available" &&
     (result.value.mcp_transports.length > 0 || result.value.mcp_profiles.length > 0)
   ) {
     issues.push(
       capabilityIssue(
         "/mcp_transports",
         "featureCoherence",
-        "unavailable MCP cannot advertise transports or profiles",
+        "non-available MCP cannot advertise transports or profiles",
       ),
     );
   }

@@ -467,7 +467,7 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 - Consumes: `RuntimeConfigV1`, `McpProfileV1`, `AgentgatewayProfileV1`, `SecretReference`, and profile parsers.
 - Produces: `config.mcp_profiles: Readonly<Record<string, McpProfileConfig>>`, `McpProfileRegistry`, `createMcpProfileRegistry(config)`, and profile artifact references.
 
-- [ ] **Step 1: Write configuration and registry RED tests**
+- [x] **Step 1: Write configuration and registry RED tests**
 
   Cover `{}` default, obsolete array rejection, profile key/ID mismatch, hash mismatch, missing/extra binding, transport-specific closed fields, unsafe stdio paths, production HTTP, URL userinfo/query/fragment, missing secret references, missing gateway profiles, duplicated bindings, every 2025 header mapping, a 2026 header mapping on stdio, and a valid instance of each transport.
 
@@ -483,7 +483,7 @@ export const TOOL_HARD_LIMITS = Object.freeze({
   });
   ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
   ```bash
   npm exec -- vitest run test/config.test.ts test/tool-profile-registry.test.ts test/execution-chain.test.ts --maxWorkers=4
@@ -491,7 +491,7 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 
   Expected: FAIL because configuration still declares `mcp_profiles` as a string array.
 
-- [ ] **Step 3: Implement the closed binding union and registry**
+- [x] **Step 3: Implement the closed binding union and registry**
 
   Use exact bindings:
 
@@ -518,11 +518,11 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 
   Match map key to `profile_id`; profile `binding_name` to exactly one binding; reject extras and unsafe/missing dependencies. Return deep-frozen exact artifact references `{document_type:"mcp-profile", artifact_id, revision, hash}`.
 
-- [ ] **Step 4: Keep baseline capabilities truthful**
+- [x] **Step 4: Keep baseline capabilities truthful**
 
   Add all five schema names to `supported_schemas` while leaving baseline `mcp_transports`, `mcp_profiles`, and `features.mcp` empty/unavailable. Extend capability parsing tests to require no advertised profiles or transports when MCP is unavailable or blocked and exact non-empty transports/profiles when available.
 
-- [ ] **Step 5: Run GREEN and commit**
+- [x] **Step 5: Run GREEN and commit**
 
   ```bash
   npm exec -- vitest run test/config.test.ts test/tool-profile-registry.test.ts test/execution-chain.test.ts test/protocol-validator.test.ts --maxWorkers=4

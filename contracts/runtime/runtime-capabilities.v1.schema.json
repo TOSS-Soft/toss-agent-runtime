@@ -92,7 +92,12 @@
           "skill-execution-evidence.v1",
           "skill-snapshot.v1",
           "superpowers-approval.v1",
-          "superpowers-phase.v1"
+          "superpowers-phase.v1",
+          "mcp-profile.v1",
+          "mcp-discovery-snapshot.v1",
+          "tool-approval.v1",
+          "tool-call.v1",
+          "tool-result.v1"
         ]
       }
     },

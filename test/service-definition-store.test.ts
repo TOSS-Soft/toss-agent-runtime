@@ -66,7 +66,7 @@ logs:
 gateway_profile: null
 gateway_profiles: {}
 provider_profiles: []
-mcp_profiles: []
+mcp_profiles: {}
 skill_roots: []
 secret_references: {}
 `;

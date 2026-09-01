@@ -15,6 +15,7 @@ import {
 import { canonicalJson } from "../src/protocol/json.js";
 import { parseExecutionResult, validateExecutionChain } from "../src/protocol/result.js";
 import { loadValidChain } from "./support/protocol-fixtures.js";
+import { validMcpProfile } from "./support/tool-fixtures.js";
 
 describe("Runtime Contract Protocol v1 chain", () => {
   function eventWithHash(event: HashableExecutionEventV1): ExecutionEventV1 {
@@ -69,6 +70,8 @@ describe("Runtime Contract Protocol v1 chain", () => {
       "execution-event.v1",
       "execution-request.v1",
       "execution-result.v1",
+      "mcp-discovery-snapshot.v1",
+      "mcp-profile.v1",
       "model-catalog.v1",
       "model-selection-plan.v1",
       "operational-event.v1",
@@ -88,6 +91,9 @@ describe("Runtime Contract Protocol v1 chain", () => {
       "skill-snapshot.v1",
       "superpowers-approval.v1",
       "superpowers-phase.v1",
+      "tool-approval.v1",
+      "tool-call.v1",
+      "tool-result.v1",
     ]);
     expect(document.features).toEqual({
       providers: "available",
@@ -153,6 +159,34 @@ describe("Runtime Contract Protocol v1 chain", () => {
       ok: false,
       code: "RUNTIME_DOCUMENT_INVALID",
     });
+  });
+
+  it("rejects MCP resources while the feature is blocked", () => {
+    const baseline = createBaselineCapabilities({ os: "linux", arch: "x64", node: "22.23.1" });
+    const profile = validMcpProfile();
+    for (const mutation of [
+      { mcp_transports: ["stdio"] },
+      {
+        mcp_profiles: [
+          {
+            document_type: "mcp-profile",
+            artifact_id: profile.profile_id,
+            revision: profile.revision,
+            hash: profile.document_hash,
+          },
+        ],
+      },
+    ]) {
+      expect(
+        parseRuntimeCapabilities(
+          canonicalJson({
+            ...baseline,
+            ...mutation,
+            features: { ...baseline.features, mcp: "blocked" },
+          }),
+        ),
+      ).toMatchObject({ ok: false, code: "RUNTIME_DOCUMENT_INVALID" });
+    }
   });
 
   it("rejects partial or invented Agent Skills capability advertisements", () => {
