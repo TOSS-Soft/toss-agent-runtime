@@ -48,6 +48,11 @@
       "id": "https://toss.software/schemas/runtime/v1/execution-result.v1.schema.json"
     },
     {
+      "schema_version": "mcp-profile.v1",
+      "path": "contracts/runtime/mcp-profile.v1.schema.json",
+      "id": "https://toss.software/schemas/runtime/v1/mcp-profile.v1.schema.json"
+    },
+    {
       "schema_version": "model-catalog.v1",
       "path": "contracts/runtime/model-catalog.v1.schema.json",
       "id": "https://toss.software/schemas/runtime/v1/model-catalog.v1.schema.json"

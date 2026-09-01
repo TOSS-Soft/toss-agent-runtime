@@ -297,13 +297,14 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 - Create: `test/tool-profile-contract.test.ts`
 - Modify: `src/protocol/validator.ts`
 - Modify: `docs/contracts/runtime-contract-v1.manifest.json`
+- Modify: `test/documentation-integrity.test.ts`
 
 **Interfaces:**
 
 - Consumes: `RuntimeDocument`, `TaskContractReference`, `JsonValue`, `ValidationResult`, `canonicalJson`, `deepFreezeJson`, `sha256`, and `createProtocolValidator`.
 - Produces: `McpProfileV1`, profile rule/limit types, binding types, `TOOL_HARD_LIMITS`, `hashMcpProfile`, `parseMcpProfile`, `RuntimeToolError`, and `RuntimeToolErrorCode`.
 
-- [ ] **Step 1: Write profile schema, hash, and semantic RED tests**
+- [x] **Step 1: Write profile schema, hash, and semantic RED tests**
 
   Build one exact valid profile fixture, then reject unknown keys, wrong document hash, unsorted or duplicate servers/tools/roles/Task Contracts/content kinds/pointers, duplicate aliases across servers, remote or cyclic `$ref`, over-deep schemas, secret-shaped input properties, inconsistent schema hashes, and incoherent approval classes.
 
@@ -325,7 +326,7 @@ export const TOOL_HARD_LIMITS = Object.freeze({
   });
   ```
 
-- [ ] **Step 2: Run the focused test and witness RED**
+- [x] **Step 2: Run the focused test and witness RED**
 
   ```bash
   npm exec -- vitest run test/tool-profile-contract.test.ts --maxWorkers=4
@@ -333,11 +334,11 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 
   Expected: FAIL because the profile schema and tool contract modules do not exist.
 
-- [ ] **Step 3: Implement the closed profile schema and parser**
+- [x] **Step 3: Implement the closed profile schema and parser**
 
   Require ASCII bytewise order, unique exact identities, self-contained JSON Schema 2020-12, local fragment references only, canonical schema hashes, closed JSON objects, exact Task Contract artifact references, and the operation/approval matrix. Require `x_mcp_headers` to be empty for `2025-06-18`; accept only lowercase `x-mcp-*` names with profile-declared schema-property mappings for `2026-07-28`. Apply `TOOL_HARD_LIMITS` before schema compilation and recompute `document_hash` with only that field omitted.
 
-- [ ] **Step 4: Add the safe closed error table**
+- [x] **Step 4: Add the safe closed error table**
 
   ```ts
   export type RuntimeToolErrorCode =
@@ -362,7 +363,7 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 
   Give every code one fixed `category`, `retryable`, and `safe_message`. `RuntimeToolError` may carry frozen safe findings `{server_identity_hash, transport, trace_id}` but never native text.
 
-- [ ] **Step 5: Register the schema and run GREEN gates**
+- [x] **Step 5: Register the schema and run GREEN gates**
 
   Add the schema to `src/protocol/validator.ts` and the ASCII-sorted manifest. Prove schema-directory completeness.
 
@@ -372,10 +373,10 @@ export const TOOL_HARD_LIMITS = Object.freeze({
   npm run lint
   ```
 
-- [ ] **Step 6: Commit Task 1**
+- [x] **Step 6: Commit Task 1**
 
   ```bash
-  git add contracts/runtime/mcp-profile.v1.schema.json src/tools/types.ts src/tools/contracts.ts src/tools/errors.ts src/protocol/validator.ts test/support/tool-fixtures.ts test/tool-profile-contract.test.ts docs/contracts/runtime-contract-v1.manifest.json
+  git add contracts/runtime/mcp-profile.v1.schema.json src/tools/types.ts src/tools/contracts.ts src/tools/errors.ts src/protocol/validator.ts test/support/tool-fixtures.ts test/tool-profile-contract.test.ts docs/contracts/runtime-contract-v1.manifest.json test/documentation-integrity.test.ts
   git commit -m "feat: define MCP profile authority"
   ```
 

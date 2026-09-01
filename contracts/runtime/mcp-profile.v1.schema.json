@@ -1,0 +1,166 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toss.software/schemas/runtime/v1/mcp-profile.v1.schema.json",
+  "title": "TOSS MCP profile v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "schema_version",
+    "document_type",
+    "profile_id",
+    "revision",
+    "limits",
+    "servers",
+    "document_hash"
+  ],
+  "properties": {
+    "protocol_version": { "const": "runtime-contract.v1" },
+    "schema_version": { "const": "mcp-profile.v1" },
+    "document_type": { "const": "mcp-profile" },
+    "profile_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+    "revision": { "$ref": "#/$defs/positive_safe_integer" },
+    "limits": { "$ref": "#/$defs/limits" },
+    "servers": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": { "$ref": "#/$defs/server" }
+    },
+    "document_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
+  },
+  "$defs": {
+    "positive_safe_integer": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "discovery_pages_per_server",
+        "tools_per_server",
+        "schema_bytes",
+        "arguments_bytes",
+        "result_bytes",
+        "content_blocks",
+        "content_block_bytes",
+        "structured_output_bytes",
+        "discovery_timeout_ms",
+        "call_timeout_ms",
+        "session_lifetime_ms"
+      ],
+      "properties": {
+        "discovery_pages_per_server": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "tools_per_server": { "type": "integer", "minimum": 1, "maximum": 256 },
+        "schema_bytes": { "type": "integer", "minimum": 2, "maximum": 262144 },
+        "arguments_bytes": { "type": "integer", "minimum": 2, "maximum": 1048576 },
+        "result_bytes": { "type": "integer", "minimum": 2, "maximum": 4194304 },
+        "content_blocks": { "type": "integer", "minimum": 1, "maximum": 128 },
+        "content_block_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576 },
+        "structured_output_bytes": { "type": "integer", "minimum": 2, "maximum": 1048576 },
+        "discovery_timeout_ms": { "type": "integer", "minimum": 1, "maximum": 30000 },
+        "call_timeout_ms": { "type": "integer", "minimum": 1, "maximum": 120000 },
+        "session_lifetime_ms": { "type": "integer", "minimum": 1, "maximum": 900000 }
+      }
+    },
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["server_id", "binding_name", "protocol_revision", "x_mcp_headers", "tools"],
+      "properties": {
+        "server_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+        "binding_name": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+        "protocol_revision": { "enum": ["2025-06-18", "2026-07-28"] },
+        "x_mcp_headers": {
+          "type": "object",
+          "maxProperties": 32,
+          "propertyNames": { "pattern": "^x-mcp-[a-z0-9-]{1,64}$" },
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "^/"
+          }
+        },
+        "tools": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/tool" }
+        }
+      }
+    },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "alias",
+        "description",
+        "native_name",
+        "allowed_roles",
+        "task_contracts",
+        "input_schema",
+        "input_schema_hash",
+        "output_schema",
+        "output_schema_hash",
+        "operation_class",
+        "approval",
+        "content_kinds",
+        "sensitive_output_pointers"
+      ],
+      "properties": {
+        "alias": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+        },
+        "native_name": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+        "allowed_roles": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "items": { "enum": ["worker", "reviewer"] }
+        },
+        "task_contracts": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/task_contract_reference" }
+        },
+        "input_schema": { "type": "object", "maxProperties": 1024 },
+        "input_schema_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+        "output_schema": { "type": ["object", "null"], "maxProperties": 1024 },
+        "output_schema_hash": {
+          "oneOf": [{ "type": "null" }, { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }]
+        },
+        "operation_class": {
+          "enum": ["read-only", "reversible-write", "irreversible"]
+        },
+        "approval": { "enum": ["required", "not-required"] },
+        "content_kinds": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 5,
+          "items": {
+            "enum": ["text", "image", "audio", "resource-link", "embedded-resource"]
+          }
+        },
+        "sensitive_output_pointers": {
+          "type": "array",
+          "maxItems": 256,
+          "items": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^/" }
+        }
+      }
+    },
+    "task_contract_reference": {
+      "allOf": [
+        { "$ref": "runtime-common.v1.schema.json#/$defs/artifact_reference" },
+        { "type": "object", "properties": { "document_type": { "const": "task-contract" } } }
+      ]
+    }
+  }
+}

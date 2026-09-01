@@ -7,6 +7,7 @@ import agentgatewayCapabilitiesSchema from "../../contracts/runtime/agentgateway
 import compiledContextSchema from "../../contracts/runtime/compiled-context.v1.schema.json" with { type: "json" };
 import modelCatalogSchema from "../../contracts/runtime/model-catalog.v1.schema.json" with { type: "json" };
 import modelSelectionPlanSchema from "../../contracts/runtime/model-selection-plan.v1.schema.json" with { type: "json" };
+import mcpProfileSchema from "../../contracts/runtime/mcp-profile.v1.schema.json" with { type: "json" };
 import routingPolicySchema from "../../contracts/runtime/routing-policy.v1.schema.json" with { type: "json" };
 import routingStateSchema from "../../contracts/runtime/routing-state.v1.schema.json" with { type: "json" };
 import commonSchema from "../../contracts/runtime/runtime-common.v1.schema.json" with { type: "json" };
@@ -58,6 +59,7 @@ const REGISTERED_SCHEMAS: Readonly<Record<string, string>> = {
   "model-catalog.v1": "https://toss.software/schemas/runtime/v1/model-catalog.v1.schema.json",
   "model-selection-plan.v1":
     "https://toss.software/schemas/runtime/v1/model-selection-plan.v1.schema.json",
+  "mcp-profile.v1": "https://toss.software/schemas/runtime/v1/mcp-profile.v1.schema.json",
   "operational-event.v1":
     "https://toss.software/schemas/runtime/v1/operational-event.v1.schema.json",
   "prompt-template.v1": "https://toss.software/schemas/runtime/v1/prompt-template.v1.schema.json",
@@ -161,6 +163,7 @@ export function createProtocolValidator(): ProtocolValidator {
   ajv.addSchema(compiledContextSchema);
   ajv.addSchema(modelCatalogSchema);
   ajv.addSchema(modelSelectionPlanSchema);
+  ajv.addSchema(mcpProfileSchema);
   ajv.addSchema(routingPolicySchema);
   ajv.addSchema(routingStateSchema);
   ajv.addSchema(executionEventSchema);

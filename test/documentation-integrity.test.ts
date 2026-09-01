@@ -203,6 +203,7 @@ describe("published protocol artifacts", () => {
       "execution-event.v1",
       "execution-request.v1",
       "execution-result.v1",
+      "mcp-profile.v1",
       "model-catalog.v1",
       "model-selection-plan.v1",
       "operational-event.v1",
