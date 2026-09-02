@@ -1,0 +1,51 @@
+{
+  "protocol_version": "runtime-contract.v1",
+  "schema_version": "tool-result.v1",
+  "document_type": "tool-result",
+  "run_id": "run-1",
+  "call_id": "tool-call-1",
+  "idempotency_key": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "status": "success",
+  "is_error": false,
+  "trust": "untrusted-content",
+  "content": [
+    {
+      "type": "text",
+      "text": "2 repositories"
+    }
+  ],
+  "structured_content": {
+    "count": 2
+  },
+  "provenance": {
+    "profile": {
+      "document_type": "mcp-profile",
+      "artifact_id": "engineering-readonly",
+      "revision": 1,
+      "hash": "sha256:b24375aac9dd709f7c7c6848fbe8f3bf0faf062d8c17e0eb0b766e357a4a3451"
+    },
+    "discovery_snapshot_hash": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "server_id": "github",
+    "server_identity_hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "protocol_revision": "2025-06-18",
+    "transport": "agentgateway",
+    "alias": "repo.search",
+    "native_name": "search_repositories",
+    "input_schema_hash": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "output_schema_hash": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "call_id": "tool-call-1",
+    "idempotency_key": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "trace": {
+    "trace_id": "11111111111111111111111111111111",
+    "span_id": "2222222222222222",
+    "trace_flags": 1
+  },
+  "accounting": {
+    "content_blocks": 1,
+    "total_bytes": 14,
+    "structured_bytes": 11
+  },
+  "error": null,
+  "document_hash": "sha256:4772f271dbcf5cf6a94f2fb44a8dbd26de18d7e2c5b75d6c1b58e68939821ab0"
+}

@@ -13,6 +13,8 @@ import {
   hashExecutionRequest,
   hashModelCatalog,
   hashModelSelectionPlan,
+  hashMcpDiscoverySnapshot,
+  hashMcpProfile,
   hashPromptTemplate,
   hashRoutingPolicy,
   hashRoutingState,
@@ -21,6 +23,9 @@ import {
   hashSkillSnapshot,
   hashSuperpowersApproval,
   hashSuperpowersPhase,
+  hashToolApproval,
+  hashToolCall,
+  hashToolResult,
   type JsonValue,
   parseAgentDefinition,
   parseAgentRegistryEntry,
@@ -30,6 +35,8 @@ import {
   parseExecutionResult,
   parseModelCatalog,
   parseModelSelectionPlan,
+  parseMcpDiscoverySnapshot,
+  parseMcpProfile,
   parseProviderEvent,
   parsePromptTemplate,
   parseRoutingPolicy,
@@ -40,6 +47,9 @@ import {
   parseSkillSnapshot,
   parseSuperpowersApproval,
   parseSuperpowersPhase,
+  parseToolApproval,
+  parseToolCall,
+  parseToolResult,
   sha256,
   validateExecutionChain,
   ZERO_JOURNAL_HASH,
@@ -103,6 +113,10 @@ async function readContractSchemaCandidates(): Promise<readonly ContractSchemaCa
 
 async function readExample(name: string): Promise<Uint8Array> {
   return readFile(`examples/runtime-contract-v1/${name}.json`);
+}
+
+async function readToolExample(name: string): Promise<Uint8Array> {
+  return readFile(`examples/contracts/${name}.v1.json`);
 }
 
 describe("published protocol artifacts", () => {
@@ -253,6 +267,54 @@ describe("published protocol artifacts", () => {
     }
   });
 
+  it("loads exactly five safe MCP tool examples through public hash-bound parsers", async () => {
+    expect((await readdir("examples/contracts")).sort()).toEqual([
+      "mcp-discovery-snapshot.v1.json",
+      "mcp-profile.v1.json",
+      "tool-approval.v1.json",
+      "tool-call.v1.json",
+      "tool-result.v1.json",
+    ]);
+
+    const profile = parseMcpProfile(await readToolExample("mcp-profile"));
+    const discovery = parseMcpDiscoverySnapshot(await readToolExample("mcp-discovery-snapshot"));
+    const approval = parseToolApproval(await readToolExample("tool-approval"));
+    const call = parseToolCall(await readToolExample("tool-call"));
+    const result = parseToolResult(await readToolExample("tool-result"));
+
+    expect(profile.ok && discovery.ok && approval.ok && call.ok && result.ok).toBe(true);
+    if (!profile.ok || !discovery.ok || !approval.ok || !call.ok || !result.ok) return;
+    expect(hashMcpProfile(profile.value)).toBe(profile.value.document_hash);
+    expect(hashMcpDiscoverySnapshot(discovery.value)).toBe(discovery.value.document_hash);
+    expect(hashToolApproval(approval.value)).toBe(approval.value.document_hash);
+    expect(hashToolCall(call.value)).toBe(call.value.document_hash);
+    expect(hashToolResult(result.value)).toBe(result.value.document_hash);
+    expect(Object.isFrozen(result.value)).toBe(true);
+
+    const serialized = JSON.stringify([
+      profile.value,
+      discovery.value,
+      approval.value,
+      call.value,
+      result.value,
+    ]);
+    expect(serialized).not.toMatch(
+      /(?:https?:\/\/(?!json-schema\.org)|\/Users\/|\/private\/|authorization|api[_-]?token|password|raw[-_ ]?secret|credential)/iu,
+    );
+    for (const schema of [
+      "mcp-discovery-snapshot.v1",
+      "mcp-profile.v1",
+      "tool-approval.v1",
+      "tool-call.v1",
+      "tool-result.v1",
+    ]) {
+      expect(
+        createBaselineCapabilities({ os: "darwin", arch: "arm64", node: "24.8.0" })
+          .supported_schemas,
+      ).toContain(schema);
+    }
+  });
+
   it("loads all four governed routing examples through their public hash-bound parsers", async () => {
     const catalog = parseModelCatalog(await readExample("model-catalog"));
     const policy = parseRoutingPolicy(await readExample("routing-policy"));
@@ -298,7 +360,7 @@ describe("published protocol artifacts", () => {
 
     const protocol = await readFile("docs/contracts/runtime-contract-protocol-v1.md", "utf8");
     expect(protocol).toContain(
-      "`examples/runtime-contract-v1` directory groups four distinct reference sets.",
+      "`examples/runtime-contract-v1` directory groups four distinct reference sets,",
     );
     expect(protocol).toContain(
       "`skill-descriptor.json`, `skill-snapshot.json`, and `skill-execution-evidence.json` form the TDD fixture chain, whose evidence contains its completed `TEST_DESIGN` phase.",
@@ -630,6 +692,44 @@ describe("published protocol artifacts", () => {
     expect(changelog).not.toMatch(/Issue #6[^\n]*(?:executes|invokes) (?:a )?provider/iu);
     expect(readme).not.toContain("routing policy and fallback remain later governed layers");
     expect(protocolContract).not.toContain("routing policy and fallback remain later boundaries");
+  });
+
+  it("documents the complete scoped MCP broker trust and operations boundary", async () => {
+    const readme = await readFile("README.md", "utf8");
+    const protocol = await readFile("docs/contracts/runtime-contract-protocol-v1.md", "utf8");
+    const architecture = await readFile(
+      "docs/superpowers/specs/2026-08-19-v1-runtime-architecture-design.md",
+      "utf8",
+    );
+    const compatibility = await readFile("docs/contracts/toss-cli-v2.2-compatibility.md", "utf8");
+    const changelog = await readFile("CHANGELOG.md", "utf8");
+    const combined = [readme, protocol, architecture, compatibility, changelog]
+      .join("\n")
+      .replaceAll(/\s+/gu, " ");
+
+    expect(readme).toContain("## Scoped MCP tool broker");
+    for (const requirement of [
+      /profile.*?binding.*?separate/iu,
+      /stdio.*?streamable-http.*?agentgateway/iu,
+      /exact protocol revision/iu,
+      /role.*?Task Contract.*?intersection/iu,
+      /durable approval/iu,
+      /at-most-one broker dispatch/iu,
+      /NO_EFFECT_CONFIRMED.*?EFFECT_CONFIRMED/iu,
+      /text.*?image.*?audio.*?resource-link.*?embedded-resource/iu,
+      /structural.*?generic redaction/iu,
+      /credentials.*?(?:never|not).*?(?:model|persist)/iu,
+      /dynamic capabilities.*?ready profiles/iu,
+      /stop intake.*?discovery.*?read.*?write.*?recovery.*?connection.*?store.*?journal/iu,
+      /stable.*?RUNTIME_TOOL_/iu,
+      /latest Node\.js LTS.*?macOS/iu,
+      /protected live-credential.*?(?:absent|not included)/iu,
+    ]) {
+      expect(combined).toMatch(requirement);
+    }
+    for (const issue of ["#10", "#11", "#12", "#15"]) {
+      expect(combined).toMatch(new RegExp(`Issue ${issue}[^\\n]*(?:owns|remains|pending)`, "iu"));
+    }
   });
 
   it("documents explicit service installation and the package side-effect boundary", async () => {

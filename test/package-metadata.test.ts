@@ -306,6 +306,34 @@ describe("package metadata", () => {
     }
   });
 
+  it("publishes the complete scoped MCP tool contract without private declarations", async () => {
+    const packageFiles = JSON.parse(
+      await readFile("scripts/package-files.json", "utf8"),
+    ) as readonly string[];
+    const schemas = [
+      "mcp-discovery-snapshot.v1",
+      "mcp-profile.v1",
+      "tool-approval.v1",
+      "tool-call.v1",
+      "tool-result.v1",
+    ];
+    for (const schema of schemas) {
+      expect(packageFiles).toContain(`contracts/runtime/${schema}.schema.json`);
+      expect(packageFiles).toContain(`dist/contracts/runtime/${schema}.schema.json`);
+      expect(packageFiles).toContain(`examples/contracts/${schema}.json`);
+    }
+    for (const publicModule of ["contracts", "errors", "index", "public-broker", "types"]) {
+      expect(packageFiles).toContain(`dist/src/tools/${publicModule}.js`);
+      expect(packageFiles).toContain(`dist/src/tools/${publicModule}.d.ts`);
+    }
+    for (const privateModule of ["approval", "broker", "executor", "private-store"]) {
+      expect(packageFiles).not.toContain(`dist/src/tools/${privateModule}.d.ts`);
+      expect(packageFiles).not.toContain(`dist/src/tools/${privateModule}.d.ts.map`);
+      expect(packageFiles).not.toContain(`dist/src/tools/${privateModule}.js.map`);
+    }
+    expect(packageFiles).toEqual([...packageFiles].sort());
+  });
+
   it("matches the exact real dry-pack allowlist and keeps agent internals private", async () => {
     const expectedFiles = JSON.parse(
       await readFile("scripts/package-files.json", "utf8"),

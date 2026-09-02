@@ -185,11 +185,23 @@ gates persist a real paused run rather than being simulated in prompt text, and
 the private same-user local socket requires exact request binding and durable
 restart/replay.
 
-MCP discovery is filtered before tools reach the model. Input and output are
+MCP discovery is filtered before tools reach the model. The signed profile and
+local binding remain separate across `stdio`, `streamable-http`, and
+`agentgateway`; authorization intersects the exact role, Task Contract, server,
+alias, schema hashes, protocol revision, and live session. Input and output are
 validated against the discovered schemas. Tool output is always untrusted
-content with provenance. Policy classifies operations as read-only,
-reversible-write, or irreversible/high-impact and decides whether approval is
-required.
+content with provenance and structural then generic redaction. Policy classifies
+operations as read-only, reversible-write, or irreversible/high-impact and
+decides whether durable approval is required. Side-effect intent precedes the
+at-most-one broker dispatch; uncertain effects are never retried and require an
+exact `NO_EFFECT_CONFIRMED` or `EFFECT_CONFIRMED` disposition.
+
+MCP dynamic capabilities include only ready profiles and their exact transports.
+The broker owns recovery before readiness and shuts down by stopping intake,
+cancelling discovery and reads, settling writes, finishing recovery, closing
+connections and the private tool store, then closing the journal. Credentials
+are never model input or persisted evidence. Public errors use stable
+`RUNTIME_TOOL_*` codes without raw transport or SDK diagnostics.
 
 Skill scripts are package members only for integrity hashing. They are never
 executed, imported, evaluated, or spawned in v1.0.0. Development has no script

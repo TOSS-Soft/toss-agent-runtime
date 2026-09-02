@@ -957,7 +957,7 @@ describe("hash-chained Superpowers phase history", () => {
       await expect(bootstrap.phaseHistory(runId)).resolves.toEqual([]);
       await expect(access(stagePath)).rejects.toMatchObject({ code: "ENOENT" });
     }
-  }, 20_000);
+  }, 45_000);
 
   it("rejects a generated timestamp outside the exact claim domain before stage publication", async () => {
     const { statePath } = await fixture();

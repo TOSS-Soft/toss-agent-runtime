@@ -1122,35 +1122,35 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 - Consumes: all five contract hash functions, public broker API, package allowlist, and final test/build artifacts.
 - Produces: canonical examples, documented support/limitations, adversarial acceptance evidence, and a leak-free installable package.
 
-- [ ] **Step 1: Add end-to-end adversarial RED tests**
+- [x] **Step 1: Add end-to-end adversarial RED tests**
 
   Cover permission widening by model/binding/server, prompt injection in descriptions/schema descriptions/results, remote `$ref`, deep schemas, secret-shaped input, hostile headers, raw-token/stderr/SDK-error leakage, approval bypass/reuse, idempotency conflict, call/result partial failure, transport downgrade, stale snapshots, replay, retry suppression, and both uncertain dispositions across the three transport fixtures.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
   ```bash
   npm exec -- vitest run test/tool-adversarial-acceptance.test.ts --maxWorkers=4
   ```
 
-- [ ] **Step 3: Generate canonical examples through public hash functions**
+- [x] **Step 3: Generate canonical examples through public hash functions**
 
   Produce all five documents from fixtures and parse them back. Examples contain no live endpoint, command, local path, credential, or raw secret. Extend documentation integrity tests to prove hashes, manifest membership, schema registration, and example validity.
 
-- [ ] **Step 4: Update operator and protocol documentation**
+- [x] **Step 4: Update operator and protocol documentation**
 
   Document profile/binding separation, all three transports, exact protocol pinning, role/Task Contract intersection, durable approval, at-most-one broker dispatch, uncertain-effect recovery, supported result blocks, structural/generic redaction, credential limitations, dynamic capabilities, shutdown order, stable errors, and downstream ownership by Issues #10, #11, #12, and #15.
 
-- [ ] **Step 5: Lock package contents and public declaration safety**
+- [x] **Step 5: Lock package contents and public declaration safety**
 
   Include five schemas/examples and public tool declarations/runtime files. Exclude test fixtures, private-store declaration/maps, transport test seams, raw native observations, and generated temporary state. Make `scripts/package-test.mjs` install the tarball, parse all five examples, exercise baseline/dynamic capability APIs, and scan the tarball for credential/endpoint/path fixture markers and SDK types in public declarations.
 
-- [ ] **Step 6: Run focused acceptance GREEN**
+- [x] **Step 6: Run focused acceptance GREEN**
 
   ```bash
   npm exec -- vitest run test/tool-adversarial-acceptance.test.ts test/tool-broker-integration.test.ts test/tool-recovery.test.ts test/documentation-integrity.test.ts test/package-metadata.test.ts --maxWorkers=4
   ```
 
-- [ ] **Step 7: Run the complete release gate**
+- [x] **Step 7: Run the complete release gate**
 
   ```bash
   npm run format:check
@@ -1164,7 +1164,7 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 
   Expected: every command succeeds and `git status --short` lists only the intended Task 15 documentation/test/package changes before commit.
 
-- [ ] **Step 8: Record verification evidence and commit**
+- [x] **Step 8: Record verification evidence and commit**
 
   Record command names, UTC timestamps, exit status, test counts, package filename/hash, supported Node/macOS policy, and the explicit absence of a protected live-credential test in `docs/verification/issue-9-scoped-mcp-tools.md`.
 
@@ -1175,12 +1175,12 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 
 ## Completion checklist
 
-- [ ] Exactly five new runtime schemas exist, are registered, manifested, packaged, exemplified, and listed by runtime capabilities.
-- [ ] Every implementation task has a witnessed RED failure before production code and focused GREEN evidence after it.
-- [ ] All three transports pass official-server conformance and independent hostile-fixture tests.
-- [ ] Permission, reviewer, injection, approval, replay, retry suppression, crash, redaction, auth, unavailable, and partial-failure suites pass.
-- [ ] No call dispatch occurs before journal intent or required exact approval.
-- [ ] Recovery never redispatches a call whose external effect is uncertain.
-- [ ] Public package declarations contain no SDK or private-store surface.
-- [ ] Full release gate and package installation test pass on the repository's supported Node.js/macOS policy.
-- [ ] The branch remains `issue/9-scoped-mcp-tools` and the pull request targets `release/v1.0.0`.
+- [x] Exactly five new runtime schemas exist, are registered, manifested, packaged, exemplified, and listed by runtime capabilities.
+- [x] Every implementation task has a witnessed RED failure before production code and focused GREEN evidence after it.
+- [x] All three transports pass official-server conformance and independent hostile-fixture tests.
+- [x] Permission, reviewer, injection, approval, replay, retry suppression, crash, redaction, auth, unavailable, and partial-failure suites pass.
+- [x] No call dispatch occurs before journal intent or required exact approval.
+- [x] Recovery never redispatches a call whose external effect is uncertain.
+- [x] Public package declarations contain no SDK or private-store surface.
+- [x] Full release gate and package installation test pass on the repository's supported Node.js/macOS policy.
+- [ ] The branch remains `issue/9-scoped-mcp-tools` and the pull request targets `release/v1.0.0` (branch verified; no pull request created in this task).

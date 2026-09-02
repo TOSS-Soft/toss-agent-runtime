@@ -1,5 +1,5 @@
 import { execFile as execFileCallback, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmod,
   lstat,
@@ -126,6 +126,11 @@ const REQUIRED_FILES = Object.freeze([
   "docs/contracts/runtime-contract-v1.manifest.json",
   "docs/contracts/toss-cli-v2.2-compatibility.md",
   "examples/config/runtime.development.yaml",
+  "examples/contracts/mcp-discovery-snapshot.v1.json",
+  "examples/contracts/mcp-profile.v1.json",
+  "examples/contracts/tool-approval.v1.json",
+  "examples/contracts/tool-call.v1.json",
+  "examples/contracts/tool-result.v1.json",
   "examples/runtime-contract-v1/agent-context-execution-request.json",
   "examples/runtime-contract-v1/execution-event.json",
   "examples/runtime-contract-v1/execution-request.json",
@@ -151,6 +156,7 @@ const ALLOWED_PATHS = Object.freeze([
   /^dist\/src\/[a-z0-9_./-]+\.(?:js|js\.map|d\.ts|d\.ts\.map)$/,
   /^docs\/contracts\/[a-z0-9._-]+\.(?:md|json)$/,
   /^examples\/config\/runtime\.development\.yaml$/,
+  /^examples\/contracts\/[a-z0-9.-]+\.json$/,
   /^examples\/runtime-contract-v1\/[a-z0-9._-]+\.json$/,
 ]);
 
@@ -427,6 +433,132 @@ async function assertInstalledAgentContextExample(temporaryDirectory) {
     ],
     { cwd: temporaryDirectory, encoding: "utf8", maxBuffer: 4 * 1024 * 1024 },
   );
+}
+
+async function assertInstalledToolExamples(temporaryDirectory) {
+  await execFile(
+    process.execPath,
+    [
+      "--input-type=module",
+      "--eval",
+      `
+        import assert from "node:assert/strict";
+        import { readFile } from "node:fs/promises";
+        import path from "node:path";
+        import {
+          createBaselineCapabilities,
+          createRuntimeCapabilities,
+          createToolBroker,
+          hashMcpDiscoverySnapshot,
+          hashMcpProfile,
+          hashToolApproval,
+          hashToolCall,
+          hashToolResult,
+          parseMcpDiscoverySnapshot,
+          parseMcpProfile,
+          parseToolApproval,
+          parseToolCall,
+          parseToolResult,
+        } from "@toss-software/agent-runtime";
+
+        const exampleDirectory = path.join(
+          process.cwd(),
+          "node_modules",
+          "@toss-software",
+          "agent-runtime",
+          "examples",
+          "contracts",
+        );
+        const readExample = (name) => readFile(path.join(exampleDirectory, name + ".v1.json"));
+        const requireParsed = (result, label) => {
+          assert.equal(result.ok, true, label + " did not parse through the package root");
+          return result.value;
+        };
+
+        const profile = requireParsed(parseMcpProfile(await readExample("mcp-profile")), "profile");
+        const discovery = requireParsed(
+          parseMcpDiscoverySnapshot(await readExample("mcp-discovery-snapshot")),
+          "discovery",
+        );
+        const approval = requireParsed(
+          parseToolApproval(await readExample("tool-approval")),
+          "approval",
+        );
+        const call = requireParsed(parseToolCall(await readExample("tool-call")), "call");
+        const result = requireParsed(parseToolResult(await readExample("tool-result")), "result");
+        assert.equal(hashMcpProfile(profile), profile.document_hash);
+        assert.equal(hashMcpDiscoverySnapshot(discovery), discovery.document_hash);
+        assert.equal(hashToolApproval(approval), approval.document_hash);
+        assert.equal(hashToolCall(call), call.document_hash);
+        assert.equal(hashToolResult(result), result.document_hash);
+        assert.equal(typeof createToolBroker, "function");
+
+        const platform = { os: "darwin", arch: "arm64", node: "24.8.0" };
+        const baseline = createBaselineCapabilities(platform);
+        const ready = createRuntimeCapabilities(platform, [
+          { profile: discovery.profile, transports: [discovery.servers[0].transport], ready: true },
+        ]);
+        for (const schema of [
+          "mcp-discovery-snapshot.v1",
+          "mcp-profile.v1",
+          "tool-approval.v1",
+          "tool-call.v1",
+          "tool-result.v1",
+        ]) {
+          assert.ok(baseline.supported_schemas.includes(schema));
+        }
+        assert.equal(baseline.features.mcp, "unavailable");
+        assert.equal(ready.features.mcp, "available");
+        assert.deepEqual(ready.mcp_profiles, [discovery.profile]);
+        assert.deepEqual(ready.mcp_transports, [discovery.servers[0].transport]);
+      `,
+    ],
+    { cwd: temporaryDirectory, encoding: "utf8", maxBuffer: 4 * 1024 * 1024 },
+  );
+}
+
+async function assertInstalledToolPackageSafety(installedRoot, packageFiles) {
+  const publicDeclarations = await Promise.all(
+    ["dist/src/index.d.ts", "dist/src/tools/index.d.ts", "dist/src/tools/public-broker.d.ts"].map(
+      (relativePath) => readFile(path.join(installedRoot, relativePath), "utf8"),
+    ),
+  );
+  assert(
+    !/@modelcontextprotocol|ToolPrivateStore|NativeToolCallResult|ToolSdkClient/u.test(
+      publicDeclarations.join("\n"),
+    ),
+    "Installed MCP tool public declarations exposed an SDK or private-store type",
+  );
+  for (const privateDeclaration of [
+    "approval.d.ts",
+    "broker.d.ts",
+    "executor.d.ts",
+    "private-store.d.ts",
+  ]) {
+    await assertMissing(
+      path.join(installedRoot, "dist", "src", "tools", privateDeclaration),
+      `Private MCP tool declaration ${privateDeclaration}`,
+    );
+  }
+
+  const fixtureMarkers = Object.freeze([
+    "/Users/test",
+    '"cwd":"/private/runtime"',
+    "http://127.0.0.1:4123/mcp",
+    "raw-server-secret",
+    "server-secret",
+    "secret.invalid",
+  ]);
+  for (const entry of packageFiles) {
+    if (!/\.(?:d\.ts|js|json|md|map|yaml)$/u.test(entry.path)) continue;
+    const contents = await readFile(path.join(installedRoot, entry.path), "utf8");
+    for (const marker of fixtureMarkers) {
+      assert(
+        !contents.includes(marker),
+        `Published package retained a test fixture marker: ${marker}`,
+      );
+    }
+  }
 }
 
 async function assertInstalledAgentSkillsConsumer(temporaryDirectory) {
@@ -1084,6 +1216,7 @@ let temporaryDirectory;
 let packDirectory;
 let inheritedPackDestination;
 let tarballPath;
+let packageSha256;
 let primaryFailure;
 await assertCleanupContinuesAfterFailure();
 try {
@@ -1128,6 +1261,9 @@ try {
   tarballPath = path.join(packDirectory, packageReport.filename);
   const tarballMetadata = await lstat(tarballPath);
   assert(tarballMetadata.isFile(), "npm pack did not create its operation-owned tarball");
+  packageSha256 = createHash("sha256")
+    .update(await readFile(tarballPath))
+    .digest("hex");
   await assertMissing(
     path.join(root, packageReport.filename),
     "Package tarball in repository root",
@@ -1160,6 +1296,7 @@ try {
     { cwd: temporaryDirectory, encoding: "utf8" },
   );
   await assertInstalledAgentContextExample(temporaryDirectory);
+  await assertInstalledToolExamples(temporaryDirectory);
   await assertInstalledAgentSkillsConsumer(temporaryDirectory);
 
   const executable = path.join(
@@ -1174,6 +1311,7 @@ try {
     "@toss-software",
     "agent-runtime",
   );
+  await assertInstalledToolPackageSafety(installedRoot, packageReport.files);
   const api = await import(pathToFileURL(path.join(installedRoot, "dist", "src", "index.js")).href);
   assert(
     typeof api.createOperationalLogReader === "function" &&
@@ -1275,7 +1413,7 @@ try {
       process.stdout.write(`Prepack contents-only probe ${prepackProbe}\n`);
     }
     process.stdout.write(
-      `Verified ${packageReport.filename} (${packageReport.files.length} files, contents only)\n`,
+      `Verified ${packageReport.filename} (${packageReport.files.length} files, contents only, sha256:${packageSha256})\n`,
     );
   } else {
     assertServiceSmokeAllowed("installed supervision block");
@@ -1359,7 +1497,7 @@ try {
     );
 
     process.stdout.write(
-      `Verified ${packageReport.filename} (${packageReport.files.length} files)\n`,
+      `Verified ${packageReport.filename} (${packageReport.files.length} files, sha256:${packageSha256})\n`,
     );
   }
 } catch (error) {

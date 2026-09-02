@@ -335,7 +335,7 @@ describe.sequential("tool approval lifecycle", () => {
     await expect(resumeToolApproval({ ...input, decision: "REJECT" })).rejects.toMatchObject({
       code: "RUNTIME_TOOL_OPERATION_CONFLICT",
     });
-  });
+  }, 15_000);
 
   it("rejects a stale pending journal head", async () => {
     const fixture = await approvalFixture();

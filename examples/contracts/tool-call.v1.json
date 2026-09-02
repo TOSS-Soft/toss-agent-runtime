@@ -1,0 +1,54 @@
+{
+  "protocol_version": "runtime-contract.v1",
+  "schema_version": "tool-call.v1",
+  "document_type": "tool-call",
+  "run_id": "run-1",
+  "call_revision": 1,
+  "previous_call_hash": null,
+  "stage": "PREPARED",
+  "dispatch_state": "NOT_SENT",
+  "execution_request_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+  "agent_definition": {
+    "document_type": "agent-definition",
+    "artifact_id": "worker-agent",
+    "revision": 1,
+    "hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "task_contract": {
+    "document_type": "task-contract",
+    "artifact_id": "TASK-001",
+    "revision": 1,
+    "hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "role": "worker",
+  "profile": {
+    "document_type": "mcp-profile",
+    "artifact_id": "engineering-readonly",
+    "revision": 1,
+    "hash": "sha256:b24375aac9dd709f7c7c6848fbe8f3bf0faf062d8c17e0eb0b766e357a4a3451"
+  },
+  "discovery_snapshot_hash": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "session_id": "session-1",
+  "server_id": "github",
+  "transport": "agentgateway",
+  "protocol_revision": "2025-06-18",
+  "alias": "repo.search",
+  "native_name": "search_repositories",
+  "input_schema_hash": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "output_schema_hash": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "operation_class": "read-only",
+  "logical_call_id": "model-call-1",
+  "operation_id": "tool-operation-1",
+  "call_id": "tool-call-1",
+  "idempotency_key": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "logical_arguments": {
+    "query": "runtime"
+  },
+  "logical_input_hash": "sha256:47335ae73f15fe04a6d8dae9b05b23af51247873d01a356c1c5929954d6bb9c7",
+  "approval_request_hash": null,
+  "prepared_at": "2026-09-01T10:00:30.000Z",
+  "terminal_at": null,
+  "result_hash": null,
+  "terminal_code": null,
+  "document_hash": "sha256:4129f287d3fcb43f46ce732a3da700f967e2c2ae4d4bac079d9df30c536e1d02"
+}

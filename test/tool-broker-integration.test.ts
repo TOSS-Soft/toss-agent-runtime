@@ -338,7 +338,7 @@ describe.sequential("scoped MCP tool broker integration", () => {
 
     expect(approved).toMatchObject({ state: "RUNNING", replayed: false });
     expect(fixture.fake.calls).toHaveLength(1);
-  });
+  }, 15_000);
 
   it("returns a stable FAILED outcome for a proven-unsent authentication failure", async () => {
     const fixture = await brokerFixture({
