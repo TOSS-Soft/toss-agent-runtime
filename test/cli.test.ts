@@ -380,6 +380,91 @@ describe("baseline CLI", () => {
     });
   });
 
+  it("routes the hidden exact uncertain tool disposition command", async () => {
+    const calls: unknown[] = [];
+    const output = await runCli(
+      [
+        "tool-dispose",
+        "--run",
+        "run-1",
+        "--revision",
+        "5",
+        "--head",
+        `sha256:${"a".repeat(64)}`,
+        "--call",
+        "tool-call-1",
+        "--idempotency",
+        `sha256:${"1".repeat(64)}`,
+        "--disposition",
+        "NO_EFFECT_CONFIRMED",
+        "--json",
+      ],
+      {
+        ...services,
+        requestToolDisposition: (operation: unknown) => {
+          calls.push(operation);
+          return Promise.resolve({
+            kind: "tool-disposition" as const,
+            run_id: "run-1",
+            state: "RUNNING" as const,
+            call_id: "tool-call-1",
+            idempotency_key: `sha256:${"1".repeat(64)}` as const,
+            disposition: "NO_EFFECT_CONFIRMED" as const,
+            journal_head: {
+              journal_revision: 6,
+              sequence: 6,
+              entry_hash: `sha256:${"c".repeat(64)}` as const,
+            },
+            operation_hash: `sha256:${"d".repeat(64)}` as const,
+            replayed: false,
+          });
+        },
+      },
+    );
+
+    expect(calls).toEqual([
+      {
+        run_id: "run-1",
+        expected_journal_revision: 5,
+        expected_journal_head_hash: `sha256:${"a".repeat(64)}`,
+        call_id: "tool-call-1",
+        idempotency_key: `sha256:${"1".repeat(64)}`,
+        disposition: "NO_EFFECT_CONFIRMED",
+      },
+    ]);
+    expect(JSON.parse(output.stdout)).toMatchObject({
+      command: "tool-dispose",
+      ok: true,
+      data: { kind: "tool-disposition", state: "RUNNING" },
+    });
+  });
+
+  it.each([
+    [["tool-dispose"], "Missing option for tool-dispose: --run"],
+    [
+      [
+        "tool-dispose",
+        "--run",
+        "run-1",
+        "--revision",
+        "5",
+        "--head",
+        `sha256:${"a".repeat(64)}`,
+        "--call",
+        "tool-call-1",
+        "--idempotency",
+        `sha256:${"1".repeat(64)}`,
+        "--disposition",
+        "RETRY",
+      ],
+      "Tool disposition must be NO_EFFECT_CONFIRMED or EFFECT_CONFIRMED",
+    ],
+  ])("rejects malformed hidden tool disposition grammar %#", async (argv, message) => {
+    const output = await runCli(argv, services);
+    expect(output.exitCode).toBe(2);
+    expect(`${output.stdout}${output.stderr}`).toContain(message);
+  });
+
   it.each([
     [["tool-approve"], "Missing option for tool-approve: --run"],
     [

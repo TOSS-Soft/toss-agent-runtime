@@ -1001,21 +1001,21 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 - Consumes: journal unresolved side effects, durable calls/results, liveness/listener probes, service recovery participants, and exact human disposition.
 - Produces: `recoverToolCalls`, `disposeUncertain`, `ServiceToolDisposeRequestV1`, disposition response data, and ordered broker shutdown.
 
-- [ ] **Step 1: Write recovery/disposition RED tests**
+- [x] **Step 1: Write recovery/disposition RED tests**
 
   Cover exact result finishing journal completion without dispatch, orphan result quarantine, prepared-but-no-intent recovery, unresolved intent with proven-unsent evidence, unresolved intent with ambiguous delivery, no automatic retry, duplicate/conflicting dispositions, `NO_EFFECT_CONFIRMED` closing the ledger and `BLOCKED -> RUNNING`, `EFFECT_CONFIRMED` preserving unresolved ledger and `BLOCKED`, and proof neither disposition calls a transport.
 
-- [ ] **Step 2: Write shutdown-order RED tests**
+- [x] **Step 2: Write shutdown-order RED tests**
 
   Assert stop intake; cancel discovery/read; bounded write result publication; uncertain classification; close/reap connections; flush tool store; flush journal last. Approval-pending and uncertain records must survive restart without live clients.
 
-- [ ] **Step 3: Run RED**
+- [x] **Step 3: Run RED**
 
   ```bash
   npm exec -- vitest run test/tool-recovery.test.ts test/service-supervisor.test.ts --maxWorkers=4
   ```
 
-- [ ] **Step 4: Implement recovery and disposition**
+- [x] **Step 4: Implement recovery and disposition**
 
   Reconcile journal/store under the official per-run barrier. A synced exact result completes the journal; ambiguous dispatch becomes `UNCERTAIN`. Add the authenticated command:
 
@@ -1034,7 +1034,7 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 
   `NO_EFFECT_CONFIRMED` appends a hashed failure completion and permits a later new logical call. `EFFECT_CONFIRMED` appends only private operational evidence and keeps the run blocked with its intent unresolved.
 
-- [ ] **Step 5: Run GREEN and commit**
+- [x] **Step 5: Run GREEN and commit**
 
   ```bash
   npm exec -- vitest run test/tool-recovery.test.ts test/tool-executor.test.ts test/service-contracts.test.ts test/service-control.test.ts test/service-supervisor.test.ts test/cli.test.ts --maxWorkers=4

@@ -412,6 +412,7 @@
   "dist/src/skills/types.js",
   "dist/src/skills/types.js.map",
   "dist/src/tools/approval.js",
+  "dist/src/tools/broker.js",
   "dist/src/tools/contracts.d.ts",
   "dist/src/tools/contracts.d.ts.map",
   "dist/src/tools/contracts.js",

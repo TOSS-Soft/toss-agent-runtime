@@ -51,6 +51,7 @@ export interface ToolExecutorFaultHooks {
   readonly after_native_result?: (result: NativeToolCallResult) => unknown;
   readonly after_result_published?: (result: ToolResultV1) => unknown;
   readonly after_call_completed?: (call: ToolCallV1) => unknown;
+  readonly after_call_failed?: (call: ToolCallV1) => unknown;
   readonly before_journal_completion?: (call: ToolCallV1) => unknown;
   readonly after_journal_completed?: (result: ToolResultV1) => unknown;
 }
@@ -271,7 +272,8 @@ function failureResult(call: AuthorizedToolCall, code: RuntimeToolErrorCode): To
   return parsed.value;
 }
 
-function dispatchInputHash(call: ToolCallV1): `sha256:${string}` {
+/** @internal Durable recovery must use the exact side-effect input identity. */
+export function toolDispatchInputHash(call: ToolCallV1): `sha256:${string}` {
   return sha256({
     run_id: call.run_id,
     operation_id: call.operation_id,
@@ -448,7 +450,7 @@ export function createToolExecutor(options: CreateToolExecutorOptions): ToolExec
       if (stored?.stage === "COMPLETED") {
         const result = await options.tool_store.result(stored.run_id, stored.call_id);
         if (result === null || result.document_hash !== stored.result_hash) conflict();
-        const inputHash = dispatchInputHash(stored);
+        const inputHash = toolDispatchInputHash(stored);
         if (snapshot.state === "TOOL_PENDING" && unresolvedIntent(snapshot, stored, inputHash)) {
           await hooks.before_journal_completion?.(stored);
           await journalTransition(
@@ -469,7 +471,7 @@ export function createToolExecutor(options: CreateToolExecutorOptions): ToolExec
         return { kind: "replay", result };
       }
       if (stored?.stage === "FAILED") {
-        const inputHash = dispatchInputHash(stored);
+        const inputHash = toolDispatchInputHash(stored);
         const result = await options.tool_store.result(stored.run_id, stored.call_id);
         if (result === null || result.document_hash !== stored.result_hash) conflict();
         if (snapshot.state === "TOOL_PENDING" && unresolvedIntent(snapshot, stored, inputHash)) {
@@ -490,7 +492,7 @@ export function createToolExecutor(options: CreateToolExecutorOptions): ToolExec
         throw new RuntimeToolError(stored.terminal_code ?? "RUNTIME_TOOL_INTERNAL");
       }
       if (stored?.stage === "UNCERTAIN") {
-        const inputHash = dispatchInputHash(stored);
+        const inputHash = toolDispatchInputHash(stored);
         if (snapshot.state === "TOOL_PENDING" && unresolvedIntent(snapshot, stored, inputHash)) {
           await journalTransition(
             transition,
@@ -516,7 +518,7 @@ export function createToolExecutor(options: CreateToolExecutorOptions): ToolExec
         await hooks.after_prepared?.(stored);
       }
 
-      const inputHash = dispatchInputHash(stored);
+      const inputHash = toolDispatchInputHash(stored);
       if (snapshot.state === "TOOL_PENDING" && unresolvedIntent(snapshot, stored, inputHash)) {
         const persistedResult = await options.tool_store.result(stored.run_id, stored.call_id);
         if (persistedResult !== null) {
@@ -622,6 +624,7 @@ export function createToolExecutor(options: CreateToolExecutorOptions): ToolExec
         options.now().toISOString(),
       ),
     );
+    await hooks.after_call_failed?.(failedCall);
     await closeLedger(
       failedCall,
       inputHash,

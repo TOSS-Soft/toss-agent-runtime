@@ -8,9 +8,9 @@ import type { LoadedConfig } from "../src/config/types.js";
 import type {
   ServiceStatusV1,
   ServiceSuperpowersApproveRequestV1,
-  ServiceToolApproveRequestV1,
+  ServiceToolRequestV1,
   SuperpowersApprovalDataV1,
-  ToolApprovalDataV1,
+  ToolControlDataV1,
 } from "../src/service/contracts.js";
 import type { ServiceControlServer } from "../src/service/control.js";
 import { RuntimeServiceError } from "../src/service/errors.js";
@@ -216,8 +216,11 @@ describe("runtime service supervisor", () => {
         approval_decision_hash: `sha256:${"c".repeat(64)}`,
         replayed: false,
       });
-    const handleToolRequest = (request: ServiceToolApproveRequestV1): Promise<ToolApprovalDataV1> =>
-      Promise.resolve({
+    const handleToolRequest = (request: ServiceToolRequestV1): Promise<ToolControlDataV1> => {
+      if (request.command !== "tool-approve") {
+        return Promise.reject(new Error("unexpected tool request"));
+      }
+      return Promise.resolve({
         kind: "tool-approval",
         run_id: request.run_id,
         state: request.decision === "APPROVE" ? "RUNNING" : "BLOCKED",
@@ -231,6 +234,7 @@ describe("runtime service supervisor", () => {
         approval_decision_hash: `sha256:${"e".repeat(64)}`,
         replayed: false,
       });
+    };
     const participant = (name: string): RecoveryParticipant => ({
       recover: () => {
         events.push(`recover-${name}`);

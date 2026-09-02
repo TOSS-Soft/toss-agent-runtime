@@ -122,6 +122,7 @@ export interface ToolPrivateStore {
   recover(): Promise<ToolPrivateStoreRecovery>;
   appendCall(call: ToolCallV1): Promise<ToolCallV1>;
   latestCall(run_id: string, call_id: string): Promise<ToolCallV1 | null>;
+  latestCalls(): Promise<readonly ToolCallV1[]>;
   callHistory(run_id: string, call_id: string): Promise<readonly ToolCallV1[]>;
   publishApproval(approval: ToolApprovalV1): Promise<ToolApprovalV1>;
   approval(document_hash: `sha256:${string}`): Promise<ToolApprovalV1 | null>;
@@ -129,6 +130,7 @@ export interface ToolPrivateStore {
   result(run_id: string, call_id: string): Promise<ToolResultV1 | null>;
   recordOperation(operation: ToolStoreOperationV1): Promise<ToolStoreOperationV1>;
   operation(operation_id: string): Promise<ToolStoreOperationV1 | null>;
+  operationsForCall(run_id: string, call_id: string): Promise<readonly ToolStoreOperationV1[]>;
   stopIntake(): void;
   flush(): Promise<void>;
 }
@@ -310,7 +312,7 @@ function parseOperation(value: JsonValue): ToolStoreOperationV1 {
     ]) ||
     value.schema_version !== "tool-store-operation.v1" ||
     typeof value.operation_id !== "string" ||
-    !IDENTIFIER_PATTERN.test(value.operation_id) ||
+    (!IDENTIFIER_PATTERN.test(value.operation_id) && !UUID_PATTERN.test(value.operation_id)) ||
     typeof value.operation_kind !== "string" ||
     !["approval-decision", "recovery", "uncertain-disposition"].includes(value.operation_kind) ||
     typeof value.run_id !== "string" ||
@@ -1097,6 +1099,19 @@ export function createToolPrivateStore(options: CreateToolPrivateStoreOptions): 
       const state = await readScan();
       return state.calls.get(recordKey(runId, callId))?.at(-1)?.value ?? null;
     },
+    async latestCalls(): Promise<readonly ToolCallV1[]> {
+      const state = await readScan();
+      return Object.freeze(
+        [...state.calls.values()]
+          .map((history) => history.at(-1)?.value)
+          .filter((call): call is ToolCallV1 => call !== undefined)
+          .sort((left, right) =>
+            Buffer.from(`${left.run_id}\0${left.call_id}`).compare(
+              Buffer.from(`${right.run_id}\0${right.call_id}`),
+            ),
+          ),
+      );
+    },
     async callHistory(runId: string, callId: string): Promise<readonly ToolCallV1[]> {
       const state = await readScan();
       return Object.freeze(
@@ -1114,8 +1129,23 @@ export function createToolPrivateStore(options: CreateToolPrivateStoreOptions): 
     },
     recordOperation,
     async operation(operationId: string): Promise<ToolStoreOperationV1 | null> {
-      if (!IDENTIFIER_PATTERN.test(operationId)) invalid();
+      if (!IDENTIFIER_PATTERN.test(operationId) && !UUID_PATTERN.test(operationId)) invalid();
       return (await readScan()).operations.get(operationId)?.value ?? null;
+    },
+    async operationsForCall(
+      runId: string,
+      callId: string,
+    ): Promise<readonly ToolStoreOperationV1[]> {
+      if (!IDENTIFIER_PATTERN.test(runId) || !IDENTIFIER_PATTERN.test(callId)) invalid();
+      const state = await readScan();
+      return Object.freeze(
+        [...state.operations.values()]
+          .map((record) => record.value)
+          .filter((operation) => operation.run_id === runId && operation.call_id === callId)
+          .sort((left, right) =>
+            Buffer.from(left.operation_id).compare(Buffer.from(right.operation_id)),
+          ),
+      );
     },
     stopIntake(): void {
       intakeStopped = true;

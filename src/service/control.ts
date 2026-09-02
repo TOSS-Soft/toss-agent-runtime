@@ -28,9 +28,12 @@ import {
   type ServiceStatusV1,
   type ServiceSuperpowersApproveRequestV1,
   type ServiceToolApproveRequestV1,
+  type ServiceToolDisposeRequestV1,
   type ServiceToolRequestV1,
   type SuperpowersApprovalDataV1,
   type ToolApprovalDataV1,
+  type ToolControlDataV1,
+  type ToolDispositionDataV1,
 } from "./contracts.js";
 import {
   isRuntimeServiceErrorCode,
@@ -93,7 +96,7 @@ export interface CreateServiceControlServerOptions {
   readonly handleSkillRequest?: (
     request: ServiceSkillRequestV1,
   ) => Promise<SuperpowersApprovalDataV1>;
-  readonly handleToolRequest?: (request: ServiceToolRequestV1) => Promise<ToolApprovalDataV1>;
+  readonly handleToolRequest?: (request: ServiceToolRequestV1) => Promise<ToolControlDataV1>;
   /** @internal Deterministic current-platform seam for portable path-budget tests. */
   readonly socketPathPlatform?: "darwin" | "linux";
   /** @internal Deterministic Unix-socket ABI-budget seam for portable tests. */
@@ -163,6 +166,12 @@ export interface RequestSuperpowersApprovalDecisionOptions {
 export interface RequestToolApprovalDecisionOptions {
   readonly socketPath: string;
   readonly request: ServiceToolApproveRequestV1;
+  readonly idleTimeoutMs?: 5_000;
+}
+
+export interface RequestToolDispositionOptions {
+  readonly socketPath: string;
+  readonly request: ServiceToolDisposeRequestV1;
   readonly idleTimeoutMs?: 5_000;
 }
 
@@ -1249,20 +1258,40 @@ function validatedSkillResponse(
 
 function validatedToolResponse(
   request: ServiceToolRequestV1,
-  data: ToolApprovalDataV1,
+  data: ToolControlDataV1,
 ): ServiceControlResponseV1 | undefined {
   try {
-    if (
-      data.kind !== "tool-approval" ||
-      data.run_id !== request.run_id ||
-      data.call_id !== request.call_id ||
-      data.approval_request_hash !== request.approval_request_hash ||
-      data.state !== (request.decision === "APPROVE" ? "RUNNING" : "BLOCKED") ||
-      data.journal_head.journal_revision !== request.expected_journal_revision + 1 ||
-      data.journal_head.sequence !== request.expected_journal_revision + 1 ||
-      data.journal_head.entry_hash === request.expected_journal_head_hash
-    ) {
-      return undefined;
+    if (request.command === "tool-approve") {
+      if (
+        data.kind !== "tool-approval" ||
+        data.run_id !== request.run_id ||
+        data.call_id !== request.call_id ||
+        data.approval_request_hash !== request.approval_request_hash ||
+        data.state !== (request.decision === "APPROVE" ? "RUNNING" : "BLOCKED") ||
+        data.journal_head.journal_revision !== request.expected_journal_revision + 1 ||
+        data.journal_head.sequence !== request.expected_journal_revision + 1 ||
+        data.journal_head.entry_hash === request.expected_journal_head_hash
+      ) {
+        return undefined;
+      }
+    } else {
+      const resumes = request.disposition === "NO_EFFECT_CONFIRMED";
+      if (
+        data.kind !== "tool-disposition" ||
+        data.run_id !== request.run_id ||
+        data.call_id !== request.call_id ||
+        data.idempotency_key !== request.idempotency_key ||
+        data.disposition !== request.disposition ||
+        data.state !== (resumes ? "RUNNING" : "BLOCKED") ||
+        data.journal_head.journal_revision !==
+          request.expected_journal_revision + (resumes ? 1 : 0) ||
+        data.journal_head.sequence !== request.expected_journal_revision + (resumes ? 1 : 0) ||
+        (resumes
+          ? data.journal_head.entry_hash === request.expected_journal_head_hash
+          : data.journal_head.entry_hash !== request.expected_journal_head_hash)
+      ) {
+        return undefined;
+      }
     }
     const response: ServiceControlResponseV1 = {
       schema_version: "service-control-response.v1",
@@ -1433,7 +1462,7 @@ export function createServiceControlServer(
         return framedResponse(failureResponse(request.request_id, safeOperationFailure(error)));
       }
     }
-    if (request.command === "tool-approve") {
+    if (request.command === "tool-approve" || request.command === "tool-dispose") {
       if (options.handleToolRequest === undefined) {
         return framedResponse(failureResponse(request.request_id, "RUNTIME_SERVICE_UNAVAILABLE"));
       }
@@ -2165,7 +2194,8 @@ export async function requestProjectOperation(
       !validated.ok ||
       validated.value.command === "status" ||
       validated.value.command === "superpowers-approve" ||
-      validated.value.command === "tool-approve"
+      validated.value.command === "tool-approve" ||
+      validated.value.command === "tool-dispose"
     ) {
       controlInvalid();
     }
@@ -2257,6 +2287,51 @@ export async function requestToolApprovalDecision(
         validated.value.expected_journal_revision + 1 ||
       response.data.journal_head.sequence !== validated.value.expected_journal_revision + 1 ||
       response.data.journal_head.entry_hash === validated.value.expected_journal_head_hash
+    ) {
+      unavailable();
+    }
+    return response.data;
+  } catch (error) {
+    if (error instanceof RuntimeToolError) {
+      try {
+        throw new RuntimeToolError(error.code);
+      } catch (normalized) {
+        if (normalized instanceof RuntimeToolError) throw normalized;
+        unavailable();
+      }
+    }
+    if (error instanceof RuntimeServiceError && internalServiceErrors.has(error)) throw error;
+    unavailable();
+  }
+}
+
+export async function requestToolDisposition(
+  options: RequestToolDispositionOptions,
+): Promise<ToolDispositionDataV1> {
+  try {
+    const validated = parseServiceControlRequest(canonicalJson(options.request));
+    if (!validated.ok || validated.value.command !== "tool-dispose") controlInvalid();
+    const response = await readControlResponse(
+      { socketPath: options.socketPath, idleTimeoutMs: options.idleTimeoutMs ?? 5_000 },
+      validated.value,
+    );
+    if (!response.ok) throwControlFailure(response);
+    const resumes = validated.value.disposition === "NO_EFFECT_CONFIRMED";
+    if (
+      response.status !== null ||
+      response.data?.kind !== "tool-disposition" ||
+      response.data.run_id !== validated.value.run_id ||
+      response.data.call_id !== validated.value.call_id ||
+      response.data.idempotency_key !== validated.value.idempotency_key ||
+      response.data.disposition !== validated.value.disposition ||
+      response.data.state !== (resumes ? "RUNNING" : "BLOCKED") ||
+      response.data.journal_head.journal_revision !==
+        validated.value.expected_journal_revision + (resumes ? 1 : 0) ||
+      response.data.journal_head.sequence !==
+        validated.value.expected_journal_revision + (resumes ? 1 : 0) ||
+      (resumes
+        ? response.data.journal_head.entry_hash === validated.value.expected_journal_head_hash
+        : response.data.journal_head.entry_hash !== validated.value.expected_journal_head_hash)
     ) {
       unavailable();
     }

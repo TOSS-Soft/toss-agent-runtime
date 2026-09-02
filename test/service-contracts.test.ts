@@ -163,6 +163,33 @@ describe("local service contracts", () => {
     }
   });
 
+  it("accepts only the closed exact uncertain tool disposition request shape", () => {
+    const disposition = {
+      ...request,
+      command: "tool-dispose",
+      operation_id: "00000000-0000-4000-8000-000000000092",
+      run_id: "run-1",
+      expected_journal_revision: 5,
+      expected_journal_head_hash: `sha256:${"a".repeat(64)}`,
+      call_id: "tool-call-1",
+      idempotency_key: `sha256:${"1".repeat(64)}`,
+      disposition: "NO_EFFECT_CONFIRMED",
+    } as const;
+
+    expect(parseServiceControlRequest(canonicalJson(disposition))).toMatchObject({
+      ok: true,
+      value: disposition,
+    });
+    for (const mutation of [
+      { ...disposition, approval_request_hash: `sha256:${"b".repeat(64)}` },
+      { ...disposition, decision: "APPROVE" },
+      { ...disposition, idempotency_key: `sha256:${"A".repeat(64)}` },
+      { ...disposition, disposition: "RETRY" },
+    ]) {
+      expect(parseServiceControlRequest(canonicalJson(mutation))).toMatchObject({ ok: false });
+    }
+  });
+
   it("rejects input larger than the exact transport limit", () => {
     const bytes = new Uint8Array(MAX_CONTROL_MESSAGE_BYTES + 1);
     expect(parseServiceControlResponse(bytes)).toMatchObject({ ok: false });
@@ -321,6 +348,45 @@ describe("local service contracts", () => {
         canonicalJson({
           ...failure,
           error: { ...failure.error, safe_message: "forged detail" },
+        }),
+      ),
+    ).toMatchObject({ ok: false });
+  });
+
+  it("accepts closed uncertain tool disposition response data", () => {
+    const dispositionResponse = {
+      schema_version: "service-control-response.v1",
+      document_type: "service-control-response",
+      request_id: request.request_id,
+      ok: true,
+      status: null,
+      data: {
+        kind: "tool-disposition",
+        run_id: "run-1",
+        state: "RUNNING",
+        call_id: "tool-call-1",
+        idempotency_key: `sha256:${"1".repeat(64)}`,
+        disposition: "NO_EFFECT_CONFIRMED",
+        journal_head: {
+          journal_revision: 6,
+          sequence: 6,
+          entry_hash: `sha256:${"d".repeat(64)}`,
+        },
+        operation_hash: `sha256:${"e".repeat(64)}`,
+        replayed: false,
+      },
+      error: null,
+    } as const;
+
+    expect(parseServiceControlResponse(canonicalJson(dispositionResponse))).toMatchObject({
+      ok: true,
+      value: dispositionResponse,
+    });
+    expect(
+      parseServiceControlResponse(
+        canonicalJson({
+          ...dispositionResponse,
+          data: { ...dispositionResponse.data, approval_decision_hash: `sha256:${"f".repeat(64)}` },
         }),
       ),
     ).toMatchObject({ ok: false });

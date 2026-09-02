@@ -36,7 +36,8 @@
         { "$ref": "#/$defs/project_registration_data" },
         { "$ref": "#/$defs/project_list_data" },
         { "$ref": "#/$defs/superpowers_approval_data" },
-        { "$ref": "#/$defs/tool_approval_data" }
+        { "$ref": "#/$defs/tool_approval_data" },
+        { "$ref": "#/$defs/tool_disposition_data" }
       ]
     },
     "error": {
@@ -154,6 +155,32 @@
         "journal_head": { "$ref": "#/$defs/journal_head" },
         "approval_request_hash": { "$ref": "#/$defs/sha256" },
         "approval_decision_hash": { "$ref": "#/$defs/sha256" },
+        "replayed": { "type": "boolean" }
+      }
+    },
+    "tool_disposition_data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "run_id",
+        "state",
+        "call_id",
+        "idempotency_key",
+        "disposition",
+        "journal_head",
+        "operation_hash",
+        "replayed"
+      ],
+      "properties": {
+        "kind": { "const": "tool-disposition" },
+        "run_id": { "$ref": "#/$defs/identifier" },
+        "state": { "enum": ["RUNNING", "BLOCKED"] },
+        "call_id": { "$ref": "#/$defs/identifier" },
+        "idempotency_key": { "$ref": "#/$defs/sha256" },
+        "disposition": { "enum": ["NO_EFFECT_CONFIRMED", "EFFECT_CONFIRMED"] },
+        "journal_head": { "$ref": "#/$defs/journal_head" },
+        "operation_hash": { "$ref": "#/$defs/sha256" },
         "replayed": { "type": "boolean" }
       }
     },
@@ -541,7 +568,8 @@
             { "$ref": "#/$defs/project_registration_data" },
             { "$ref": "#/$defs/project_list_data" },
             { "$ref": "#/$defs/superpowers_approval_data" },
-            { "$ref": "#/$defs/tool_approval_data" }
+            { "$ref": "#/$defs/tool_approval_data" },
+            { "$ref": "#/$defs/tool_disposition_data" }
           ]
         },
         "error": { "type": "null" }
