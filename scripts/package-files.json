@@ -435,6 +435,7 @@
   "dist/src/tools/policy.d.ts.map",
   "dist/src/tools/policy.js",
   "dist/src/tools/policy.js.map",
+  "dist/src/tools/private-store.js",
   "dist/src/tools/profile.d.ts",
   "dist/src/tools/profile.d.ts.map",
   "dist/src/tools/profile.js",

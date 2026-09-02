@@ -48,7 +48,7 @@ const TOOL_DOCUMENT_LIMITS: JsonLimits = Object.freeze({
   maxMembers: 250_000,
 });
 const SECRET_FIELD =
-  /(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|credential|private[_-]?key|bearer)/iu;
+  /(?:authorization|api[_-]?key|api[_-]?token|access[_-]?token|refresh[_-]?token|password|passwd|secret|credential|private[_-]?key|bearer)/iu;
 const VALIDATOR = createProtocolValidator();
 
 type JsonRecord = { readonly [key: string]: JsonValue };

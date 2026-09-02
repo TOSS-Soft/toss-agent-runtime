@@ -8,7 +8,7 @@ import type { HashableToolResultV1, ToolResultContentV1, ToolResultV1 } from "./
 
 const REDACTED = "[REDACTED]";
 const SECRET_FIELD =
-  /(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|credential|private[_-]?key|bearer)/iu;
+  /(?:authorization|api[_-]?key|api[_-]?token|access[_-]?token|refresh[_-]?token|password|passwd|secret|credential|private[_-]?key|bearer)/iu;
 const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
 const MEDIA_TYPE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9!#$&^_.+\-/]{0,255}$/u;
 
@@ -99,7 +99,7 @@ function redactText(value: string): string {
   return value
     .replace(/\b(authorization\s*:\s*)(?:bearer\s+)?[^\s,;]+/giu, "$1[REDACTED]")
     .replace(
-      /\b((?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|private[_-]?key|token)\s*[=:]\s*)["']?[^\s,;&"']+["']?/giu,
+      /\b((?:api[_-]?key|api[_-]?token|access[_-]?token|refresh[_-]?token|password|passwd|secret|private[_-]?key|token)\s*[=:]\s*)["']?[^\s,;&"']+["']?/giu,
       "$1[REDACTED]",
     )
     .replace(/\b(bearer\s+)[A-Za-z0-9._~+/=-]+/giu, "$1[REDACTED]");

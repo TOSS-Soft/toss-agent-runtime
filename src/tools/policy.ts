@@ -27,7 +27,7 @@ const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const TRACE_ID_PATTERN = /^[0-9a-f]{32}$/u;
 const SPAN_ID_PATTERN = /^[0-9a-f]{16}$/u;
 const SECRET_FIELD =
-  /(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|credential|private[_-]?key|bearer)/iu;
+  /(?:authorization|api[_-]?key|api[_-]?token|access[_-]?token|refresh[_-]?token|password|passwd|secret|credential|private[_-]?key|bearer)/iu;
 
 export interface ToolCallRequestInput {
   readonly alias: string;

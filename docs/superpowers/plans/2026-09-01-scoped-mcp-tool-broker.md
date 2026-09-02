@@ -834,21 +834,21 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 - Consumes: tool document parsers/hashes, runtime state root, process/listener probes, and injectable crash hooks.
 - Produces: internal `ToolPrivateStore`, append-only call revisions, approval/result publication, operation log, exact lookup, recovery, quarantine, stop-intake, and flush.
 
-- [ ] **Step 1: Write filesystem and crash RED tests**
+- [x] **Step 1: Write filesystem and crash RED tests**
 
   Cover `0700`/`0600`, current owner, one link, symlink/no-follow denial, ancestor permissions, stable bigint identity, bounded reads, atomic create, file/directory sync, duplicate exact replay, conflicting operation IDs, append-only stages, orphan result quarantine, truncated files, mutation races, dead/live writer recovery, stop-intake races, and every publish hook before/after rename/sync.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
   ```bash
   npm exec -- vitest run test/tool-private-store.test.ts --maxWorkers=4
   ```
 
-- [ ] **Step 3: Implement the store using existing hardened patterns**
+- [x] **Step 3: Implement the store using existing hardened patterns**
 
   Adapt the security invariants from `src/skills/private-store.ts` and `src/service/definition-store.ts` without exporting native paths or test hooks. Store prepared arguments only after secret-shape rejection. Key records by run/call identity and document hash; append stage revisions and disposition operations; publish results before terminal call stages; quarantine any object that cannot be proven exact.
 
-- [ ] **Step 4: Run GREEN and commit**
+- [x] **Step 4: Run GREEN and commit**
 
   ```bash
   npm exec -- vitest run test/tool-private-store.test.ts test/skill-private-store.test.ts test/service-definition-store.test.ts --maxWorkers=4

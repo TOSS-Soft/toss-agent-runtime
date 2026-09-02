@@ -149,11 +149,11 @@ describe("MCP profile contract", () => {
     }
   });
 
-  it("rejects live-secret shaped input fields", () => {
+  it.each(["api_key", "api_token"])("rejects live-secret shaped input field %s", (field) => {
     const schema = {
       type: "object",
       additionalProperties: false,
-      properties: { api_key: { type: "string" } },
+      properties: { [field]: { type: "string" } },
     };
     const parsed = parseMcpProfile(canonicalJson(withInputSchema(schema)));
 
