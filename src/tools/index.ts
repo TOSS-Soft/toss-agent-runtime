@@ -1,5 +1,59 @@
-import { UnavailableCapabilityError } from "../version.js";
-
-export function requireToolBroker(): never {
-  throw new UnavailableCapabilityError("tools");
-}
+export {
+  createToolBroker,
+  type CreateToolBrokerOptions,
+  type DiscoverToolsRequest,
+  type DiscoveredToolView,
+  type DisposeUncertainToolRequest,
+  type InvokeToolRequest,
+  type OpenToolSessionRequest,
+  type ResumeToolApprovalRequest,
+  type ToolBroker,
+  type ToolBrokerAdapterContext,
+  type ToolDispositionOutcome,
+  type ToolInvocationOutcome,
+  type ToolProfileHealth,
+  type ToolSessionHandle,
+} from "./public-broker.js";
+export {
+  hashMcpDiscoverySnapshot,
+  hashMcpProfile,
+  hashToolApproval,
+  hashToolCall,
+  hashToolResult,
+  parseMcpDiscoverySnapshot,
+  parseMcpProfile,
+  parseToolApproval,
+  parseToolCall,
+  parseToolResult,
+  type HashableMcpDiscoverySnapshotV1,
+  type HashableMcpProfileV1,
+  type HashableToolApprovalV1,
+  type HashableToolCallV1,
+  type HashableToolResultV1,
+  type McpDiscoverySnapshotV1,
+  type McpProfileV1,
+  type ToolApprovalV1,
+  type ToolCallV1,
+  type ToolResultV1,
+} from "./contracts.js";
+export { RuntimeToolError, type RuntimeToolErrorCode } from "./errors.js";
+export type {
+  McpAgentgatewayBinding,
+  McpEnvironmentValue,
+  McpProfileConfig,
+  McpProfileLimitsV1,
+  McpProfileServerRuleV1,
+  McpProfileToolRuleV1,
+  McpProtocolRevision,
+  McpServerBinding,
+  McpStdioBinding,
+  McpStreamableHttpBinding,
+  McpTransportKind,
+  ToolApprovalDecisionV1,
+  ToolApprovalRequestV1,
+  ToolApprovalRule,
+  ToolCallStage,
+  ToolContentKind,
+  ToolOperationClass,
+  ToolUncertainDisposition,
+} from "./types.js";

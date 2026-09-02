@@ -8,7 +8,7 @@ import {
   type TransitionResult,
 } from "../journal/store.js";
 import type { TransitionCommand } from "../journal/state-machine.js";
-import type { SideEffectRecord } from "../journal/types.js";
+import type { JournalHead, SideEffectRecord } from "../journal/types.js";
 import { hashToolCall, hashToolResult, parseToolCall, parseToolResult } from "./contracts.js";
 import { RuntimeToolError, toolRuntimeError, type RuntimeToolErrorCode } from "./errors.js";
 import type { AuthorizedToolCall } from "./policy.js";
@@ -67,6 +67,7 @@ export interface ToolInvokeRequest {
   readonly call: AuthorizedToolCall;
   readonly operation_id: string;
   readonly approval_request_hash: `sha256:${string}` | null;
+  readonly expected_journal_head?: JournalHead | undefined;
   readonly connection: ToolTransportConnection;
   readonly signal: AbortSignal;
 }
@@ -434,6 +435,14 @@ export function createToolExecutor(options: CreateToolExecutorOptions): ToolExec
   async function startInvocation(request: ToolInvokeRequest): Promise<StartResult> {
     return await underBarrier(request.call.run_id, async (snapshot, transition) => {
       if (snapshot === null) conflict();
+      if (
+        request.expected_journal_head !== undefined &&
+        (snapshot.head.journal_revision !== request.expected_journal_head.journal_revision ||
+          snapshot.head.sequence !== request.expected_journal_head.sequence ||
+          snapshot.head.entry_hash !== request.expected_journal_head.entry_hash)
+      ) {
+        conflict();
+      }
       let stored = await options.tool_store.latestCall(request.call.run_id, request.call.call_id);
       if (
         stored !== null &&

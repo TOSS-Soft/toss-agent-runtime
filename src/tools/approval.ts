@@ -44,6 +44,7 @@ interface ToolApprovalDependencies {
 export interface RequestToolApprovalInput extends ToolApprovalDependencies {
   readonly call: AuthorizedToolCall;
   readonly operation_id: string;
+  readonly expected_journal_head?: JournalHead | undefined;
 }
 
 export interface ToolApprovalPendingOutcome {
@@ -489,6 +490,12 @@ export async function requestToolApproval(
     input.call.run_id,
     async (snapshot, transition) => {
       if (snapshot === null) stale();
+      if (
+        input.expected_journal_head !== undefined &&
+        !headMatches(snapshot.head, input.expected_journal_head)
+      ) {
+        stale();
+      }
       let call = await input.tool_store.latestCall(input.call.run_id, input.call.call_id);
       if (call !== null) {
         const expectedApproval = call.approval_request_hash;
@@ -658,6 +665,7 @@ export async function resumeToolApproval(
       call: input.current_call,
       operation_id: resolved.call.operation_id,
       approval_request_hash: resolved.approval.approval_request_hash,
+      expected_journal_head: resolved.journal_head,
       connection: input.connection,
       signal: input.signal,
     });

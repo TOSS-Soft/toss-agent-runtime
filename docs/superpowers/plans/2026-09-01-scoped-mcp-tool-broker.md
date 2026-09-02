@@ -1064,29 +1064,29 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 - Consumes: loaded config, profile registry, journal, credential/gateway/process/network seams, operational logger, clock/random ID, service listener, and all prior tool layers.
 - Produces: `createToolBroker(options): ToolBroker`, safe public exports, dynamic MCP capabilities, profile health findings, and supervisor recovery/flush participation.
 
-- [ ] **Step 1: Write public integration RED tests**
+- [x] **Step 1: Write public integration RED tests**
 
   Run one read-only call on each transport; one approved write; one auth failure; one unavailable server; one malicious result; one stale discovery; completed replay; and uncertain recovery. Assert only exact authorized aliases are visible, results are frozen/untrusted/redacted, and SDK/private types are absent from emitted declarations.
 
-- [ ] **Step 2: Write dynamic capability RED tests**
+- [x] **Step 2: Write dynamic capability RED tests**
 
   Assert no configuration => `unavailable`; configured but none ready => `blocked` with no advertised profiles; one ready => `available` with only its exact artifact reference and bound transports; mixed readiness advertises only ready profiles. Requested blocked/unavailable profiles fail negotiation before tool execution.
 
-- [ ] **Step 3: Run RED**
+- [x] **Step 3: Run RED**
 
   ```bash
   npm exec -- vitest run test/tool-broker-integration.test.ts test/tool-public-api.test.ts test/unavailable-boundaries.test.ts test/serve-smoke.test.ts --maxWorkers=4
   ```
 
-- [ ] **Step 4: Wire the production broker and lifecycle**
+- [x] **Step 4: Wire the production broker and lifecycle**
 
   Replace `requireToolBroker()` with the factory and closed public exports. Capture all mutating request values before state access, route journal mutations through `withRunJournalBarrier`, register broker recovery before service readiness, and preserve the Task 13 shutdown order. `health()` returns stable profile/server codes and hashes only.
 
-- [ ] **Step 5: Implement dynamic capability projection**
+- [x] **Step 5: Implement dynamic capability projection**
 
   Build from the immutable baseline plus registry/readiness observations. Sort exact profile references and transports bytewise; never advertise configured-but-unready profiles or infer support from dependencies alone.
 
-- [ ] **Step 6: Run GREEN and commit**
+- [x] **Step 6: Run GREEN and commit**
 
   ```bash
   npm exec -- vitest run test/tool-broker-integration.test.ts test/tool-public-api.test.ts test/unavailable-boundaries.test.ts test/serve-smoke.test.ts test/execution-chain.test.ts --maxWorkers=4

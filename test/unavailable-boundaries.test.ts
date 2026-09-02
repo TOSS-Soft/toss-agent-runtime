@@ -4,7 +4,7 @@ import { requireEvidenceEmitter } from "../src/evidence/index.js";
 import { requireAgentLoop } from "../src/orchestration/index.js";
 import * as routingApi from "../src/routing/index.js";
 import { requireSecurityRuntime } from "../src/security/index.js";
-import { requireToolBroker } from "../src/tools/index.js";
+import { createToolBroker } from "../src/tools/index.js";
 import {
   createAgentgatewayTransport,
   hashAgentgatewayCapabilities,
@@ -25,8 +25,11 @@ describe("future subsystem boundaries", () => {
     expect(routingApi).toHaveProperty("verifyResolvedRoute", expect.any(Function));
   });
 
+  it("treats the scoped MCP tool broker as delivered", () => {
+    expect(createToolBroker).toBeTypeOf("function");
+  });
+
   it.each([
-    ["tools", requireToolBroker],
     ["orchestration", requireAgentLoop],
     ["evidence", requireEvidenceEmitter],
     ["security", requireSecurityRuntime],

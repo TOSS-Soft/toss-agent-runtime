@@ -60,6 +60,7 @@ import { createProjectWatcher } from "../service/project/watcher.js";
 import { RuntimeSkillError } from "../skills/index.js";
 import { createSkillsRuntimeHost } from "../skills/runtime-host.js";
 import { RuntimeToolError, type RuntimeToolErrorCode } from "../tools/errors.js";
+import { createToolBroker as createRuntimeToolBroker } from "../tools/public-broker.js";
 import { PACKAGE_VERSION } from "../version.js";
 import { CliUsageError, parseCli, type BaselineCommand, type ServiceAction } from "./grammar.js";
 import {
@@ -182,6 +183,7 @@ export interface CreateMainServicesOptions {
   readonly requestProjectOperation?: typeof requestRuntimeProjectOperation;
   readonly requestToolApprovalDecision?: typeof requestRuntimeToolApprovalDecision;
   readonly requestToolDisposition?: typeof requestRuntimeToolDisposition;
+  readonly createToolBroker?: typeof createRuntimeToolBroker;
 }
 
 async function hashFile(filePath: string): Promise<string> {
@@ -418,6 +420,23 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
         now: options.now,
         randomId: randomUUID,
       });
+      const tools = (options.createToolBroker ?? createRuntimeToolBroker)({
+        config: loaded.config,
+        journal_store: journal,
+        state_path: loaded.config.paths.state,
+        platform: {
+          os: options.platform.os,
+          arch: options.platform.arch,
+          node: options.platform.node,
+        },
+        now: options.now,
+        create_session_id: () => `session-${randomUUID()}`,
+        is_process_alive: processLiveness,
+        has_service_listener: () =>
+          probeRuntimeServiceIdentity({ socketPath: loaded.config.paths.socket }).then(
+            (identity) => (identity === null ? "absent" : "present"),
+          ),
+      });
       return runSupervisor({
         loaded,
         signals: options.signals,
@@ -429,9 +448,10 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
         socketProbe: {
           identify: (socketPath) => probeRuntimeServiceIdentity({ socketPath }),
         },
-        recoveryParticipants: [journal, skills, projects],
+        recoveryParticipants: [journal, tools, skills, projects],
         journalParticipant: journal,
         interruptionRecorder: journal,
+        isDegraded: () => tools.health().some((profile) => profile.status !== "ready"),
         handleSkillRequest: async (request) => {
           const traceHash = createHash("sha256")
             .update(`skill-control:${request.operation_id}`, "utf8")
@@ -465,6 +485,69 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
             run_id: outcome.phase.run_id,
             state: outcome.state,
             phase: outcome.phase.phase,
+            journal_head: outcome.journal_head,
+            approval_request_hash: outcome.approval.approval_request_hash,
+            approval_decision_hash: outcome.approval.document_hash,
+            replayed: outcome.replayed,
+          };
+        },
+        handleToolRequest: async (request) => {
+          const traceHash = createHash("sha256")
+            .update(`tool-control:${request.operation_id}`, "utf8")
+            .digest("hex");
+          const trace = {
+            trace_id: traceHash.slice(0, 32),
+            span_id: traceHash.slice(32, 48),
+            trace_flags: 1,
+          } as const;
+          const expectedJournalHead = {
+            journal_revision: request.expected_journal_revision,
+            sequence: request.expected_journal_revision,
+            entry_hash: request.expected_journal_head_hash,
+          } as const;
+          if (request.command === "tool-dispose") {
+            const outcome = await tools.disposeUncertain({
+              run_id: request.run_id,
+              expected_journal_head: expectedJournalHead,
+              call_id: request.call_id,
+              idempotency_key: request.idempotency_key,
+              operation_id: request.operation_id,
+              disposition: request.disposition,
+              trace,
+            });
+            return {
+              kind: "tool-disposition",
+              run_id: outcome.call.run_id,
+              state: outcome.state,
+              call_id: outcome.call.call_id,
+              idempotency_key: outcome.call.idempotency_key,
+              disposition: outcome.disposition,
+              journal_head: outcome.journal_head,
+              operation_hash: outcome.operation_hash,
+              replayed: outcome.replayed,
+            };
+          }
+          const outcome = await tools.resumeApproval({
+            run_id: request.run_id,
+            expected_journal_head: expectedJournalHead,
+            call_id: request.call_id,
+            approval_request_hash: request.approval_request_hash,
+            operation_id: request.operation_id,
+            decision: request.decision,
+            trace,
+            signal: new AbortController().signal,
+          });
+          if (
+            outcome.approval?.kind !== "DECISION" ||
+            (outcome.state !== "RUNNING" && outcome.state !== "BLOCKED")
+          ) {
+            throw new RuntimeToolError("RUNTIME_TOOL_INTERNAL");
+          }
+          return {
+            kind: "tool-approval",
+            run_id: outcome.call.run_id,
+            state: outcome.state,
+            call_id: outcome.call.call_id,
             journal_head: outcome.journal_head,
             approval_request_hash: outcome.approval.approval_request_hash,
             approval_decision_hash: outcome.approval.document_hash,

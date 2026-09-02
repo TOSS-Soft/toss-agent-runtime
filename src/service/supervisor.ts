@@ -60,6 +60,7 @@ export interface RunSupervisorOptions {
   readonly interruptionRecorder: InterruptionRecorder;
   readonly handleSkillRequest?: CreateServiceControlServerOptions["handleSkillRequest"];
   readonly handleToolRequest?: CreateServiceControlServerOptions["handleToolRequest"];
+  readonly isDegraded?: () => boolean;
   readonly operationalLogger?: SupervisorOperationalLogger;
   readonly onReady: () => void;
   readonly acquireLock?: (options: AcquireInstanceLockOptions) => Promise<InstanceLock>;
@@ -340,9 +341,11 @@ export async function runSupervisor(options: RunSupervisorOptions): Promise<Supe
           pid: options.pid,
           started_at: lock!.owner.created_at,
           health:
-            health === "stopping" || options.operationalLogger?.isDegraded() !== true
+            health === "stopping"
               ? health
-              : "degraded",
+              : options.operationalLogger?.isDegraded() === true || options.isDegraded?.() === true
+                ? "degraded"
+                : health,
           accepting,
         });
         server = (options.createControlServer ?? createServiceControlServer)({
