@@ -40,6 +40,26 @@ export type BaselineCommand =
       level?: LogLevel;
       projectId?: string;
       runId?: string;
+    }>
+  | Readonly<{
+      name: "tool-approve";
+      runId: string;
+      expectedJournalRevision: number;
+      expectedJournalHeadHash: `sha256:${string}`;
+      callId: string;
+      approvalRequestHash: `sha256:${string}`;
+      decision: "APPROVE" | "REJECT";
+      json: boolean;
+    }>
+  | Readonly<{
+      name: "tool-dispose";
+      runId: string;
+      expectedJournalRevision: number;
+      expectedJournalHeadHash: `sha256:${string}`;
+      callId: string;
+      idempotencyKey: `sha256:${string}`;
+      disposition: "NO_EFFECT_CONFIRMED" | "EFFECT_CONFIRMED";
+      json: boolean;
     }>;
 
 export class CliUsageError extends Error {
@@ -192,6 +212,132 @@ function logCommand(args: readonly string[]): Extract<BaselineCommand, { name: "
   };
 }
 
+function toolApproveCommand(
+  args: readonly string[],
+): Extract<BaselineCommand, { name: "tool-approve" }> {
+  const values = new Map<string, string>();
+  let json = false;
+  const required = ["--run", "--revision", "--head", "--call", "--request", "--decision"];
+  for (let index = 0; index < args.length; index += 1) {
+    const option = args[index]!;
+    if (option === "--json") {
+      if (json) throw new CliUsageError("Duplicate option: --json");
+      json = true;
+      continue;
+    }
+    if (!required.includes(option)) {
+      const safeOption = option.startsWith("--") ? option.split("=", 1)[0]! : "<argument>";
+      throw new CliUsageError(`Unknown option for tool-approve: ${safeOption}`);
+    }
+    if (values.has(option)) throw new CliUsageError(`Duplicate option: ${option}`);
+    const value = args[index + 1];
+    if (value === undefined || value.startsWith("--")) {
+      throw new CliUsageError(`Missing value for ${option}`);
+    }
+    values.set(option, value);
+    index += 1;
+  }
+  for (const option of required) {
+    if (!values.has(option)) throw new CliUsageError(`Missing option for tool-approve: ${option}`);
+  }
+
+  const runId = values.get("--run")!;
+  const revisionText = values.get("--revision")!;
+  const head = values.get("--head")!;
+  const callId = values.get("--call")!;
+  const requestHash = values.get("--request")!;
+  const decision = values.get("--decision")!;
+  const identifier = /^[A-Za-z][A-Za-z0-9._:-]{0,127}$/u;
+  const hash = /^sha256:[0-9a-f]{64}$/u;
+  if (!identifier.test(runId)) throw new CliUsageError("Run ID is invalid");
+  if (!identifier.test(callId)) throw new CliUsageError("Tool call ID is invalid");
+  if (!/^[1-9][0-9]*$/u.test(revisionText)) {
+    throw new CliUsageError("Journal revision must be a positive integer");
+  }
+  const expectedJournalRevision = Number(revisionText);
+  if (!Number.isSafeInteger(expectedJournalRevision)) {
+    throw new CliUsageError("Journal revision must be a positive integer");
+  }
+  if (!hash.test(head)) throw new CliUsageError("Journal head hash is invalid");
+  if (!hash.test(requestHash)) throw new CliUsageError("Approval request hash is invalid");
+  if (decision !== "APPROVE" && decision !== "REJECT") {
+    throw new CliUsageError("Tool decision must be APPROVE or REJECT");
+  }
+  return {
+    name: "tool-approve",
+    runId,
+    expectedJournalRevision,
+    expectedJournalHeadHash: head as `sha256:${string}`,
+    callId,
+    approvalRequestHash: requestHash as `sha256:${string}`,
+    decision,
+    json,
+  };
+}
+
+function toolDisposeCommand(
+  args: readonly string[],
+): Extract<BaselineCommand, { name: "tool-dispose" }> {
+  const values = new Map<string, string>();
+  let json = false;
+  const required = ["--run", "--revision", "--head", "--call", "--idempotency", "--disposition"];
+  for (let index = 0; index < args.length; index += 1) {
+    const option = args[index]!;
+    if (option === "--json") {
+      if (json) throw new CliUsageError("Duplicate option: --json");
+      json = true;
+      continue;
+    }
+    if (!required.includes(option)) {
+      const safeOption = option.startsWith("--") ? option.split("=", 1)[0]! : "<argument>";
+      throw new CliUsageError(`Unknown option for tool-dispose: ${safeOption}`);
+    }
+    if (values.has(option)) throw new CliUsageError(`Duplicate option: ${option}`);
+    const value = args[index + 1];
+    if (value === undefined || value.startsWith("--")) {
+      throw new CliUsageError(`Missing value for ${option}`);
+    }
+    values.set(option, value);
+    index += 1;
+  }
+  for (const option of required) {
+    if (!values.has(option)) throw new CliUsageError(`Missing option for tool-dispose: ${option}`);
+  }
+
+  const runId = values.get("--run")!;
+  const revisionText = values.get("--revision")!;
+  const head = values.get("--head")!;
+  const callId = values.get("--call")!;
+  const idempotencyKey = values.get("--idempotency")!;
+  const disposition = values.get("--disposition")!;
+  const identifier = /^[A-Za-z][A-Za-z0-9._:-]{0,127}$/u;
+  const hash = /^sha256:[0-9a-f]{64}$/u;
+  if (!identifier.test(runId)) throw new CliUsageError("Run ID is invalid");
+  if (!identifier.test(callId)) throw new CliUsageError("Tool call ID is invalid");
+  if (!/^[1-9][0-9]*$/u.test(revisionText)) {
+    throw new CliUsageError("Journal revision must be a positive integer");
+  }
+  const expectedJournalRevision = Number(revisionText);
+  if (!Number.isSafeInteger(expectedJournalRevision)) {
+    throw new CliUsageError("Journal revision must be a positive integer");
+  }
+  if (!hash.test(head)) throw new CliUsageError("Journal head hash is invalid");
+  if (!hash.test(idempotencyKey)) throw new CliUsageError("Tool idempotency key is invalid");
+  if (disposition !== "NO_EFFECT_CONFIRMED" && disposition !== "EFFECT_CONFIRMED") {
+    throw new CliUsageError("Tool disposition must be NO_EFFECT_CONFIRMED or EFFECT_CONFIRMED");
+  }
+  return {
+    name: "tool-dispose",
+    runId,
+    expectedJournalRevision,
+    expectedJournalHeadHash: head as `sha256:${string}`,
+    callId,
+    idempotencyKey: idempotencyKey as `sha256:${string}`,
+    disposition,
+    json,
+  };
+}
+
 export function parseCli(argv: readonly string[]): BaselineCommand {
   if (argv.length === 0 || (argv.length === 1 && ["--help", "-h", "help"].includes(argv[0]!))) {
     return { name: "help" };
@@ -218,5 +364,7 @@ export function parseCli(argv: readonly string[]): BaselineCommand {
   }
   if (name === "project") return projectCommand(args);
   if (name === "logs") return logCommand(args);
+  if (name === "tool-approve") return toolApproveCommand(args);
+  if (name === "tool-dispose") return toolDisposeCommand(args);
   throw new CliUsageError("Unknown command");
 }

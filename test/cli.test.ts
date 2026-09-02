@@ -9,6 +9,7 @@ import { defaultConfig, RuntimeConfigError } from "../src/config/load.js";
 import type { ServiceStatusV1 } from "../src/service/contracts.js";
 import { RuntimeServiceError, type RuntimeServiceErrorCode } from "../src/service/errors.js";
 import { RuntimeProjectError } from "../src/service/project/errors.js";
+import { RuntimeToolError } from "../src/tools/errors.js";
 import { createServiceManager, type ServiceManagerStatus } from "../src/service/manager.js";
 
 const platform = { os: "linux" as const, arch: "x64", node: "22.23.1" };
@@ -320,6 +321,208 @@ describe("baseline CLI", () => {
       exitCode: 0,
       stdout: "Project unregistered\n",
       stderr: "",
+    });
+  });
+
+  it("routes the hidden exact tool approval command", async () => {
+    const calls: unknown[] = [];
+    const argv = [
+      "tool-approve",
+      "--run",
+      "run-1",
+      "--revision",
+      "4",
+      "--head",
+      `sha256:${"a".repeat(64)}`,
+      "--call",
+      "tool-call-1",
+      "--request",
+      `sha256:${"b".repeat(64)}`,
+      "--decision",
+      "APPROVE",
+      "--json",
+    ];
+    const output = await runCli(argv, {
+      ...services,
+      requestToolApprovalDecision: (operation: unknown) => {
+        calls.push(operation);
+        return Promise.resolve({
+          kind: "tool-approval" as const,
+          run_id: "run-1",
+          state: "RUNNING" as const,
+          call_id: "tool-call-1",
+          journal_head: {
+            journal_revision: 5,
+            sequence: 5,
+            entry_hash: `sha256:${"c".repeat(64)}` as const,
+          },
+          approval_request_hash: `sha256:${"b".repeat(64)}` as const,
+          approval_decision_hash: `sha256:${"d".repeat(64)}` as const,
+          replayed: false,
+        });
+      },
+    });
+
+    expect(calls).toEqual([
+      {
+        run_id: "run-1",
+        expected_journal_revision: 4,
+        expected_journal_head_hash: `sha256:${"a".repeat(64)}`,
+        call_id: "tool-call-1",
+        approval_request_hash: `sha256:${"b".repeat(64)}`,
+        decision: "APPROVE",
+      },
+    ]);
+    expect(JSON.parse(output.stdout)).toMatchObject({
+      command: "tool-approve",
+      ok: true,
+      data: { kind: "tool-approval", state: "RUNNING" },
+    });
+  });
+
+  it("routes the hidden exact uncertain tool disposition command", async () => {
+    const calls: unknown[] = [];
+    const output = await runCli(
+      [
+        "tool-dispose",
+        "--run",
+        "run-1",
+        "--revision",
+        "5",
+        "--head",
+        `sha256:${"a".repeat(64)}`,
+        "--call",
+        "tool-call-1",
+        "--idempotency",
+        `sha256:${"1".repeat(64)}`,
+        "--disposition",
+        "NO_EFFECT_CONFIRMED",
+        "--json",
+      ],
+      {
+        ...services,
+        requestToolDisposition: (operation: unknown) => {
+          calls.push(operation);
+          return Promise.resolve({
+            kind: "tool-disposition" as const,
+            run_id: "run-1",
+            state: "RUNNING" as const,
+            call_id: "tool-call-1",
+            idempotency_key: `sha256:${"1".repeat(64)}` as const,
+            disposition: "NO_EFFECT_CONFIRMED" as const,
+            journal_head: {
+              journal_revision: 6,
+              sequence: 6,
+              entry_hash: `sha256:${"c".repeat(64)}` as const,
+            },
+            operation_hash: `sha256:${"d".repeat(64)}` as const,
+            replayed: false,
+          });
+        },
+      },
+    );
+
+    expect(calls).toEqual([
+      {
+        run_id: "run-1",
+        expected_journal_revision: 5,
+        expected_journal_head_hash: `sha256:${"a".repeat(64)}`,
+        call_id: "tool-call-1",
+        idempotency_key: `sha256:${"1".repeat(64)}`,
+        disposition: "NO_EFFECT_CONFIRMED",
+      },
+    ]);
+    expect(JSON.parse(output.stdout)).toMatchObject({
+      command: "tool-dispose",
+      ok: true,
+      data: { kind: "tool-disposition", state: "RUNNING" },
+    });
+  });
+
+  it.each([
+    [["tool-dispose"], "Missing option for tool-dispose: --run"],
+    [
+      [
+        "tool-dispose",
+        "--run",
+        "run-1",
+        "--revision",
+        "5",
+        "--head",
+        `sha256:${"a".repeat(64)}`,
+        "--call",
+        "tool-call-1",
+        "--idempotency",
+        `sha256:${"1".repeat(64)}`,
+        "--disposition",
+        "RETRY",
+      ],
+      "Tool disposition must be NO_EFFECT_CONFIRMED or EFFECT_CONFIRMED",
+    ],
+  ])("rejects malformed hidden tool disposition grammar %#", async (argv, message) => {
+    const output = await runCli(argv, services);
+    expect(output.exitCode).toBe(2);
+    expect(`${output.stdout}${output.stderr}`).toContain(message);
+  });
+
+  it.each([
+    [["tool-approve"], "Missing option for tool-approve: --run"],
+    [
+      [
+        "tool-approve",
+        "--run",
+        "run-1",
+        "--revision",
+        "0",
+        "--head",
+        `sha256:${"a".repeat(64)}`,
+        "--call",
+        "tool-call-1",
+        "--request",
+        `sha256:${"b".repeat(64)}`,
+        "--decision",
+        "APPROVE",
+      ],
+      "Journal revision must be a positive integer",
+    ],
+  ])("rejects malformed hidden tool approval grammar %#", async (argv, message) => {
+    const output = await runCli(argv, services);
+    expect(output.exitCode).toBe(2);
+    expect(`${output.stdout}${output.stderr}`).toContain(message);
+  });
+
+  it("maps tool approval failures to fixed safe output", async () => {
+    const output = await runCli(
+      [
+        "tool-approve",
+        "--run",
+        "run-1",
+        "--revision",
+        "4",
+        "--head",
+        `sha256:${"a".repeat(64)}`,
+        "--call",
+        "tool-call-1",
+        "--request",
+        `sha256:${"b".repeat(64)}`,
+        "--decision",
+        "REJECT",
+        "--json",
+      ],
+      {
+        ...services,
+        requestToolApprovalDecision: () =>
+          Promise.reject(new RuntimeToolError("RUNTIME_TOOL_APPROVAL_STALE")),
+      },
+    );
+
+    expect(output.exitCode).toBe(6);
+    expect(JSON.parse(output.stdout)).toMatchObject({
+      command: "tool-approve",
+      error: {
+        code: "RUNTIME_TOOL_APPROVAL_STALE",
+        safe_message: "Tool approval is stale",
+      },
     });
   });
 

@@ -1,0 +1,178 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toss.software/schemas/runtime/v1/tool-approval.v1.schema.json",
+  "title": "TOSS tool approval v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "schema_version",
+    "document_type",
+    "kind",
+    "run_id",
+    "pending_journal_head",
+    "call_id",
+    "decision",
+    "trace",
+    "document_hash"
+  ],
+  "properties": {
+    "protocol_version": { "const": "runtime-contract.v1" },
+    "schema_version": { "const": "tool-approval.v1" },
+    "document_type": { "const": "tool-approval" },
+    "kind": { "enum": ["REQUEST", "DECISION"] },
+    "run_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+    "pending_journal_head": { "$ref": "#/$defs/journal_head" },
+    "call_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+    "decision": { "enum": ["APPROVE", "REJECT", null] },
+    "trace": { "$ref": "runtime-common.v1.schema.json#/$defs/trace_context" },
+    "document_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+    "execution_request_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+    "agent_definition": { "$ref": "#/$defs/agent_definition_reference" },
+    "task_contract": { "$ref": "#/$defs/task_contract_reference" },
+    "role": { "enum": ["worker", "reviewer"] },
+    "profile": { "$ref": "#/$defs/mcp_profile_reference" },
+    "discovery_snapshot_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+    "server_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+    "alias": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+    "native_name": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+    "input_schema_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+    "output_schema_hash": {
+      "oneOf": [{ "type": "null" }, { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }]
+    },
+    "operation_class": { "enum": ["read-only", "reversible-write", "irreversible"] },
+    "logical_input_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+    "idempotency_key": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048,
+      "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+    },
+    "approval_request_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+    "operation_id": {
+      "oneOf": [
+        {
+          "allOf": [
+            { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+            {
+              "not": {
+                "type": "string",
+                "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+              }
+            }
+          ]
+        },
+        {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        }
+      ]
+    },
+    "decided_at": { "type": "string", "format": "date-time", "pattern": "Z$" }
+  },
+  "$defs": {
+    "positive_safe_integer": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "journal_head": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["journal_revision", "sequence", "entry_hash"],
+      "properties": {
+        "journal_revision": { "$ref": "#/$defs/positive_safe_integer" },
+        "sequence": { "$ref": "#/$defs/positive_safe_integer" },
+        "entry_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
+      }
+    },
+    "agent_definition_reference": {
+      "allOf": [
+        { "$ref": "runtime-common.v1.schema.json#/$defs/artifact_reference" },
+        { "type": "object", "properties": { "document_type": { "const": "agent-definition" } } }
+      ]
+    },
+    "task_contract_reference": {
+      "allOf": [
+        { "$ref": "runtime-common.v1.schema.json#/$defs/artifact_reference" },
+        { "type": "object", "properties": { "document_type": { "const": "task-contract" } } }
+      ]
+    },
+    "mcp_profile_reference": {
+      "allOf": [
+        { "$ref": "runtime-common.v1.schema.json#/$defs/artifact_reference" },
+        { "type": "object", "properties": { "document_type": { "const": "mcp-profile" } } }
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "required": [
+        "execution_request_hash",
+        "agent_definition",
+        "task_contract",
+        "role",
+        "profile",
+        "discovery_snapshot_hash",
+        "server_id",
+        "alias",
+        "native_name",
+        "input_schema_hash",
+        "output_schema_hash",
+        "operation_class",
+        "logical_input_hash",
+        "idempotency_key",
+        "summary"
+      ],
+      "properties": {
+        "kind": { "const": "REQUEST" },
+        "decision": { "type": "null" },
+        "execution_request_hash": {},
+        "agent_definition": {},
+        "task_contract": {},
+        "role": {},
+        "profile": {},
+        "discovery_snapshot_hash": {},
+        "server_id": {},
+        "alias": {},
+        "native_name": {},
+        "input_schema_hash": {},
+        "output_schema_hash": {},
+        "operation_class": {},
+        "logical_input_hash": {},
+        "idempotency_key": {},
+        "summary": {},
+        "approval_request_hash": false,
+        "operation_id": false,
+        "decided_at": false
+      }
+    },
+    {
+      "required": ["approval_request_hash", "operation_id", "decided_at"],
+      "properties": {
+        "kind": { "const": "DECISION" },
+        "decision": { "enum": ["APPROVE", "REJECT"] },
+        "approval_request_hash": {},
+        "operation_id": {},
+        "decided_at": {},
+        "execution_request_hash": false,
+        "agent_definition": false,
+        "task_contract": false,
+        "role": false,
+        "profile": false,
+        "discovery_snapshot_hash": false,
+        "server_id": false,
+        "alias": false,
+        "native_name": false,
+        "input_schema_hash": false,
+        "output_schema_hash": false,
+        "operation_class": false,
+        "logical_input_hash": false,
+        "idempotency_key": false,
+        "summary": false
+      }
+    }
+  ]
+}

@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toss.software/schemas/runtime/v1/tool-result.v1.schema.json",
+  "title": "TOSS normalized tool result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "schema_version",
+    "document_type",
+    "run_id",
+    "call_id",
+    "idempotency_key",
+    "status",
+    "is_error",
+    "trust",
+    "content",
+    "structured_content",
+    "provenance",
+    "trace",
+    "accounting",
+    "error",
+    "document_hash"
+  ],
+  "properties": {
+    "protocol_version": { "const": "runtime-contract.v1" },
+    "schema_version": { "const": "tool-result.v1" },
+    "document_type": { "const": "tool-result" },
+    "run_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+    "call_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+    "idempotency_key": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+    "status": { "enum": ["success", "error"] },
+    "is_error": { "type": "boolean" },
+    "trust": { "const": "untrusted-content" },
+    "content": {
+      "type": "array",
+      "maxItems": 128,
+      "items": { "$ref": "#/$defs/content" }
+    },
+    "structured_content": {},
+    "provenance": { "$ref": "#/$defs/provenance" },
+    "trace": { "$ref": "runtime-common.v1.schema.json#/$defs/trace_context" },
+    "accounting": { "$ref": "#/$defs/accounting" },
+    "error": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "runtime-common.v1.schema.json#/$defs/runtime_error" }
+      ]
+    },
+    "document_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
+  },
+  "$defs": {
+    "nonnegative_safe_integer": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "nullable_sha256": {
+      "oneOf": [{ "type": "null" }, { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }]
+    },
+    "mcp_profile_reference": {
+      "allOf": [
+        { "$ref": "runtime-common.v1.schema.json#/$defs/artifact_reference" },
+        { "type": "object", "properties": { "document_type": { "const": "mcp-profile" } } }
+      ]
+    },
+    "text_content": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "text"],
+      "properties": {
+        "type": { "const": "text" },
+        "text": { "type": "string", "maxLength": 1048576 }
+      }
+    },
+    "binary_content": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "media_type", "data_base64"],
+      "properties": {
+        "type": { "enum": ["image", "audio"] },
+        "media_type": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "data_base64": {
+          "type": "string",
+          "maxLength": 1398104,
+          "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+        }
+      }
+    },
+    "resource_link_content": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "uri", "name", "mime_type"],
+      "properties": {
+        "type": { "const": "resource-link" },
+        "uri": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "mime_type": { "type": ["string", "null"], "maxLength": 256 }
+      }
+    },
+    "embedded_resource_content": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "uri", "mime_type", "text", "blob_base64"],
+      "properties": {
+        "type": { "const": "embedded-resource" },
+        "uri": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "mime_type": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "text": { "type": ["string", "null"], "maxLength": 1048576 },
+        "blob_base64": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "string",
+              "maxLength": 1398104,
+              "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+            }
+          ]
+        }
+      },
+      "oneOf": [
+        { "properties": { "text": { "type": "string" }, "blob_base64": { "type": "null" } } },
+        { "properties": { "text": { "type": "null" }, "blob_base64": { "type": "string" } } }
+      ]
+    },
+    "content": {
+      "oneOf": [
+        { "$ref": "#/$defs/text_content" },
+        { "$ref": "#/$defs/binary_content" },
+        { "$ref": "#/$defs/resource_link_content" },
+        { "$ref": "#/$defs/embedded_resource_content" }
+      ]
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile",
+        "discovery_snapshot_hash",
+        "server_id",
+        "server_identity_hash",
+        "protocol_revision",
+        "transport",
+        "alias",
+        "native_name",
+        "input_schema_hash",
+        "output_schema_hash",
+        "call_id",
+        "idempotency_key"
+      ],
+      "properties": {
+        "profile": { "$ref": "#/$defs/mcp_profile_reference" },
+        "discovery_snapshot_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+        "server_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+        "server_identity_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+        "protocol_revision": { "enum": ["2025-06-18", "2026-07-28"] },
+        "transport": { "enum": ["stdio", "streamable-http", "agentgateway"] },
+        "alias": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+        "native_name": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+        "input_schema_hash": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" },
+        "output_schema_hash": { "$ref": "#/$defs/nullable_sha256" },
+        "call_id": { "$ref": "runtime-common.v1.schema.json#/$defs/identifier" },
+        "idempotency_key": { "$ref": "runtime-common.v1.schema.json#/$defs/sha256" }
+      }
+    },
+    "accounting": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["content_blocks", "total_bytes", "structured_bytes"],
+      "properties": {
+        "content_blocks": { "$ref": "#/$defs/nonnegative_safe_integer" },
+        "total_bytes": { "$ref": "#/$defs/nonnegative_safe_integer" },
+        "structured_bytes": { "$ref": "#/$defs/nonnegative_safe_integer" }
+      }
+    }
+  }
+}

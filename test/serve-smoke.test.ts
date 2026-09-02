@@ -411,6 +411,7 @@ describe("serve command lifecycle integration", () => {
     expect((await lstat(path.join(config.paths.state, "skills", "phases"))).isDirectory()).toBe(
       true,
     );
+    expect((await lstat(path.join(config.paths.state, "tools"))).isDirectory()).toBe(true);
 
     const journal = createRunJournalStore({
       statePath: config.paths.state,

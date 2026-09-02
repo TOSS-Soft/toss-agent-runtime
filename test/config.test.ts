@@ -21,6 +21,7 @@ import {
   RuntimeConfigError,
 } from "../src/config/load.js";
 import * as servicePaths from "../src/service/paths.js";
+import { validMcpProfile } from "./support/tool-fixtures.js";
 
 const temporaryDirectories: string[] = [];
 const RUNTIME_CONFIG_BYTE_CAP = 2 * 1024 * 1024;
@@ -89,7 +90,7 @@ logs:
 gateway_profile: ${mode === "production" ? "gateway-production" : "null"}
 ${gatewayProfiles}
 provider_profiles: []
-mcp_profiles: []
+mcp_profiles: {}
 skill_roots: []
 ${secretReferences}
 `;
@@ -164,6 +165,306 @@ afterEach(async () => {
 });
 
 describe("runtime configuration", () => {
+  it("defaults to no configured MCP authority", () => {
+    expect(defaultConfig("darwin", "/Users/test").mcp_profiles).toEqual({});
+  });
+
+  it("rejects the obsolete MCP profile string-array shape", async () => {
+    const root = await temporaryDirectory();
+    const configPath = path.join(root, "legacy-mcp.json");
+    await writeFile(
+      configPath,
+      JSON.stringify({ ...defaultConfig("linux", root), mcp_profiles: ["legacy"] }),
+      { mode: 0o600 },
+    );
+
+    await expect(
+      loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home: root }),
+    ).rejects.toMatchObject({ code: "RUNTIME_CONFIG_INVALID" });
+  });
+
+  it("accepts one exact stdio MCP profile binding", async () => {
+    const root = await temporaryDirectory();
+    const configPath = path.join(root, "stdio-mcp.json");
+    const profile = validMcpProfile();
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        ...defaultConfig("linux", root),
+        mcp_profiles: {
+          [profile.profile_id]: {
+            profile,
+            servers: {
+              github: {
+                transport: "stdio",
+                command: "/usr/bin/node",
+                args: ["--stdio"],
+                cwd: root,
+                environment: {},
+              },
+            },
+          },
+        },
+      }),
+      { mode: 0o600 },
+    );
+
+    await expect(
+      loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home: root }),
+    ).resolves.toMatchObject({
+      config: { mcp_profiles: { [profile.profile_id]: { profile } } },
+    });
+  });
+
+  it("accepts a Streamable HTTP MCP binding with an existing secret reference", async () => {
+    const root = await temporaryDirectory();
+    const configPath = path.join(root, "http-mcp.json");
+    const profile = validMcpProfile();
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        ...defaultConfig("linux", root),
+        secret_references: { mcp_token: { source: "env", key: "MCP_TOKEN" } },
+        mcp_profiles: {
+          [profile.profile_id]: {
+            profile,
+            servers: {
+              github: {
+                transport: "streamable-http",
+                endpoint: "https://mcp.example.test/service",
+                credential_reference: "mcp_token",
+              },
+            },
+          },
+        },
+      }),
+      { mode: 0o600 },
+    );
+
+    await expect(
+      loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home: root }),
+    ).resolves.toMatchObject({
+      config: {
+        mcp_profiles: {
+          [profile.profile_id]: {
+            servers: { github: { transport: "streamable-http" } },
+          },
+        },
+      },
+    });
+  });
+
+  it("accepts an MCP binding to an existing agentgateway profile", async () => {
+    const root = await temporaryDirectory();
+    const configPath = path.join(root, "agentgateway-mcp.json");
+    const profile = validMcpProfile();
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        ...defaultConfig("linux", root),
+        gateway_profiles: {
+          gateway_development: {
+            protocol: "toss-agentgateway.v1",
+            endpoint: "https://gateway.example.test",
+            credential_reference: "gateway_token",
+            body_observability: "off",
+          },
+        },
+        secret_references: { gateway_token: { source: "env", key: "GATEWAY_TOKEN" } },
+        mcp_profiles: {
+          [profile.profile_id]: {
+            profile,
+            servers: {
+              github: {
+                transport: "agentgateway",
+                gateway_profile: "gateway_development",
+              },
+            },
+          },
+        },
+      }),
+      { mode: 0o600 },
+    );
+
+    await expect(
+      loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home: root }),
+    ).resolves.toMatchObject({
+      config: {
+        mcp_profiles: {
+          [profile.profile_id]: {
+            servers: { github: { transport: "agentgateway" } },
+          },
+        },
+      },
+    });
+  });
+
+  it("rejects unsafe stdio MCP command paths", async () => {
+    const root = await temporaryDirectory();
+    const configPath = path.join(root, "unsafe-stdio-mcp.json");
+    const profile = validMcpProfile();
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        ...defaultConfig("linux", root),
+        mcp_profiles: {
+          [profile.profile_id]: {
+            profile,
+            servers: {
+              github: {
+                transport: "stdio",
+                command: "node",
+                args: [],
+                cwd: root,
+                environment: {},
+              },
+            },
+          },
+        },
+      }),
+      { mode: 0o600 },
+    );
+
+    await expect(
+      loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home: root }),
+    ).rejects.toMatchObject({ code: "RUNTIME_CONFIG_INVALID" });
+  });
+
+  it.each([
+    "https://user@example.test/mcp",
+    "https://example.test/mcp?token=value",
+    "https://example.test/mcp#fragment",
+    "http://example.test/mcp",
+  ])("rejects unsafe Streamable HTTP MCP endpoint %s", async (endpoint) => {
+    const root = await temporaryDirectory();
+    const configPath = path.join(root, "unsafe-http-mcp.json");
+    const profile = validMcpProfile();
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        ...defaultConfig("linux", root),
+        mcp_profiles: {
+          [profile.profile_id]: {
+            profile,
+            servers: {
+              github: { transport: "streamable-http", endpoint, credential_reference: null },
+            },
+          },
+        },
+      }),
+      { mode: 0o600 },
+    );
+
+    await expect(
+      loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home: root }),
+    ).rejects.toMatchObject({ code: "RUNTIME_CONFIG_INVALID" });
+  });
+
+  it("rejects loopback HTTP for MCP in production", async () => {
+    const root = await temporaryDirectory();
+    const configPath = path.join(root, "production-http-mcp.json");
+    const profile = validMcpProfile();
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        ...defaultConfig("linux", root),
+        mode: "production",
+        gateway_profile: "gateway_production",
+        gateway_profiles: {
+          gateway_production: {
+            protocol: "toss-agentgateway.v1",
+            endpoint: "https://gateway.example.test",
+            credential_reference: "gateway_token",
+            body_observability: "off",
+          },
+        },
+        secret_references: { gateway_token: { source: "command", key: "GATEWAY_TOKEN" } },
+        mcp_profiles: {
+          [profile.profile_id]: {
+            profile,
+            servers: {
+              github: {
+                transport: "streamable-http",
+                endpoint: "http://127.0.0.1:3000/mcp",
+                credential_reference: null,
+              },
+            },
+          },
+        },
+      }),
+      { mode: 0o600 },
+    );
+
+    await expect(
+      loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home: root }),
+    ).rejects.toMatchObject({ code: "RUNTIME_CONFIG_INVALID" });
+  });
+
+  it.each([
+    {
+      name: "secret reference",
+      binding: {
+        transport: "streamable-http",
+        endpoint: "https://mcp.example.test/service",
+        credential_reference: "missing_token",
+      },
+    },
+    {
+      name: "gateway profile",
+      binding: { transport: "agentgateway", gateway_profile: "missing_gateway" },
+    },
+  ])("rejects an MCP binding with a missing $name", async ({ binding }) => {
+    const root = await temporaryDirectory();
+    const configPath = path.join(root, "missing-mcp-dependency.json");
+    const profile = validMcpProfile();
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        ...defaultConfig("linux", root),
+        mcp_profiles: {
+          [profile.profile_id]: { profile, servers: { github: binding } },
+        },
+      }),
+      { mode: 0o600 },
+    );
+
+    await expect(
+      loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home: root }),
+    ).rejects.toMatchObject({ code: "RUNTIME_CONFIG_INVALID" });
+  });
+
+  it("rejects transport-specific fields on the wrong MCP binding", async () => {
+    const root = await temporaryDirectory();
+    const configPath = path.join(root, "open-mcp-binding.json");
+    const profile = validMcpProfile();
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        ...defaultConfig("linux", root),
+        mcp_profiles: {
+          [profile.profile_id]: {
+            profile,
+            servers: {
+              github: {
+                transport: "stdio",
+                command: "/usr/bin/node",
+                args: [],
+                cwd: root,
+                environment: {},
+                endpoint: "https://mcp.example.test/service",
+              },
+            },
+          },
+        },
+      }),
+      { mode: 0o600 },
+    );
+
+    await expect(
+      loadConfig({ explicitPath: configPath, env: {}, platform: "linux", home: root }),
+    ).rejects.toMatchObject({ code: "RUNTIME_CONFIG_INVALID" });
+  });
+
   it("defaults to bundled skills without scanning a user or project root", () => {
     expect(defaultConfig("darwin", "/Users/test").skill_roots).toEqual([]);
   });

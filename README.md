@@ -1,8 +1,8 @@
 # TOSS Agent Runtime
 
-`@toss-software/agent-runtime` is the governed, provider-neutral execution runtime for TOSS. This development baseline publishes Runtime Contract Protocol v1, strict configuration loading, a truthful capability handshake, an immutable agent-definition registry and provenance-aware context compiler, the private Agent Skills host and built-in Superpowers phase engine, authenticated agentgateway transport, deterministic governed model-routing and budget planning, immutable append-only run journals, private structured operational logs, and the explicit per-user `toss-runtime` service-supervision foundation.
+`@toss-software/agent-runtime` is the governed, provider-neutral execution runtime for TOSS. This development baseline publishes Runtime Contract Protocol v1, strict configuration loading, a truthful capability handshake, an immutable agent-definition registry and provenance-aware context compiler, the private Agent Skills host and built-in Superpowers phase engine, the scoped MCP tool broker, authenticated agentgateway transport, deterministic governed model-routing and budget planning, immutable append-only run journals, private structured operational logs, and the explicit per-user `toss-runtime` service-supervision foundation.
 
-> Status: the package remains `0.0.0-development` until all v1 release waves and protected live-provider gates pass. Immutable run-journal persistence, explicit project intake, structured operational logging, the immutable agent registry/context compiler, Agent Skills/Superpowers execution, authenticated agentgateway transport, and the pure governed routing boundary are implemented; issue #28 still requires its separate real macOS login/native crash-loop acceptance, and protected live-provider/agentgateway smoke remains issue #15. npm `1.0.0` remains incomplete. The supervised runtime does not yet execute the complete agent loop, run MCP tools, or expose remote control.
+> Status: the package remains `0.0.0-development` until all v1 release waves and protected live-provider gates pass. Immutable run-journal persistence, explicit project intake, structured operational logging, the immutable agent registry/context compiler, Agent Skills/Superpowers execution, scoped MCP tool execution, authenticated agentgateway transport, and the pure governed routing boundary are implemented; issue #28 still requires its separate real macOS login/native crash-loop acceptance, and protected live-provider/agentgateway smoke remains issue #15. npm `1.0.0` remains incomplete. The supervised runtime does not yet execute the complete agent loop or expose remote control.
 
 ## Requirements
 
@@ -96,6 +96,16 @@ The response must attest its exact route, provider, model, gateway revision, cap
 
 Body observability defaults to `off`. The opt-in `redacted-metadata` mode emits only a frozen structural summary with correlation IDs, selected route ID, streaming flag, byte/count totals, status class, and monotonic duration. It contains no request or response content and observation failures cannot change the provider result. The transport never retries automatically; tool propagation belongs to issue #9, final release evidence to issue #12, and live protected credentials to issue #15. Protected live-provider and agentgateway smoke remains issue #15 and is not claimed by ordinary CI.
 
+## Scoped MCP tool broker
+
+The broker keeps the signed MCP profile and its local transport binding separate: the profile names exact servers, aliases, schemas, roles, Task Contracts, protocol revisions, risk classes, and limits, while configuration supplies the `stdio`, `streamable-http`, or `agentgateway` connection binding. Discovery exposes only profile-owned aliases and descriptions. Every call rechecks the exact profile, run, session, server, binding, exact protocol revision, role and Task Contract intersection, schema hashes, operation class, arguments, and TOSS-owned metadata before dispatch. Server descriptions, annotations, schemas, and results cannot widen that authority.
+
+Read-only calls and approved writes share one durable ledger. A required write enters durable approval before execution, and the executor records side-effect intent before its at-most-one broker dispatch. Exact completed calls replay without transport. A proven-unsent failure is safe to close; an unproven or post-dispatch failure becomes `RUNTIME_TOOL_EFFECT_UNCERTAIN`, is never retried automatically, and requires the exact `NO_EFFECT_CONFIRMED` or `EFFECT_CONFIRMED` disposition. Approval and disposition reuse is bound to the exact call, journal head, hash, decision, and operation identity.
+
+Native output supports bounded `text`, `image`, `audio`, `resource-link`, and `embedded-resource` blocks. It is always `untrusted-content`, validated against the profile, stripped of native annotations, then subjected to structural and generic redaction. Credentials are resolved only at the transport edge and are never model input or persisted tool evidence; raw endpoint, header, token, stderr, SDK error, argument, and native-result values are excluded from public errors and journal metadata.
+
+Dynamic capabilities advertise only ready profiles and their bound transports. Configured but unready profiles are `blocked`; absent configuration is `unavailable`. Graceful shutdown follows the broker order: stop intake, cancel discovery and read work, settle writes, finish recovery, close connections, close the private tool store, then close the run journal. Public failures use stable `RUNTIME_TOOL_*` codes and safe messages. The protected live-credential test is not included in ordinary CI; Issue #15 remains pending for that gate. Issue #10 owns worker/agent-loop execution, Issue #11 owns independent review proof, and Issue #12 owns aggregate evidence and reconciliation.
+
 ## Governed model routing and budgets
 
 The TOSS control plane authority owns the exact `model-catalog.v1`, `routing-policy.v1`, task classification, and any governed override. The runtime parses those bounded, hash-bound inputs together with `routing-state.v1`; fresh agentgateway capabilities may only remove authority. Route eligibility uses an AND capability intersection for boolean features and the minimum catalog/live numeric limit. Prompts, repository content, providers, and the gateway cannot mint a class, capability, budget, review rule, or override.
@@ -141,8 +151,8 @@ retry.
 
 Issue #7 advertises the four agent/context schemas only; Issue #7 does not
 execute Agent Skills, Superpowers, MCP tools, providers, or the agent loop.
-Issue #8 now delivers Agent Skills and Superpowers execution; Issue #9 owns MCP
-tools, and Issue #10 owns providers and the agent loop. The packaged examples are
+Issue #8 now delivers Agent Skills and Superpowers execution; Issue #9 owns and
+delivers the scoped MCP tool broker, and Issue #10 owns providers and the agent loop. The packaged examples are
 illustrative control-plane artifacts, not writable local configuration, and
 contain no credentials or local paths.
 
@@ -175,7 +185,7 @@ acceptance.
 
 `doctor` checks package, platform, Node, configuration, native manager state, restart backoff, and private socket health. A healthy active service with a matching socket identity passes the service check. Missing or stopped service state warns in development and fails in production; backoff, unsafe state, unavailable/degraded control, or identity mismatch fails. See the [Local Service Control v1 contract](docs/contracts/local-service-control-v1.md) for exact native commands, permissions, protocol bounds, stable failures, and shutdown ordering.
 
-`capabilities` advertises the delivered Agent Skills host/Superpowers capabilities, agentgateway and OpenAI, Anthropic, and Gemini normalized adapter transports, plus the available pure routing-planning boundary. MCP, the complete agent loop, review execution, and aggregate ACP evidence remain unavailable. An empty or unavailable capability is not an implementation promise. The supervised `serve` process owns the single-instance lock, private local status socket, private append-only run-journal store, and Agent Skills recovery/flush lifecycle. Active runs are durably recorded as `INTERRUPTED` before graceful shutdown removes the socket or lock. Complete agent execution remains unavailable until its later v1 waves.
+`capabilities` advertises the delivered Agent Skills host/Superpowers capabilities, agentgateway and OpenAI, Anthropic, and Gemini normalized adapter transports, plus the available pure routing-planning boundary. MCP status is dynamic: only ready profiles and their exact bound transports are advertised; configured but unready profiles remain blocked. The complete agent loop, review execution, and aggregate ACP evidence remain unavailable. An empty or unavailable capability is not an implementation promise. The supervised `serve` process owns the single-instance lock, private local status socket, private append-only run-journal store, Agent Skills lifecycle, and MCP broker recovery/flush lifecycle. Active runs are durably recorded as `INTERRUPTED` before graceful shutdown removes the socket or lock. Complete agent execution remains unavailable until its later v1 waves.
 
 Stable exit codes are `0` success, `2` usage, `3` invalid input, `4` blocked/policy, `5` validation, `6` conflict/stale revision, `69` unavailable capability, and `70` internal failure.
 
@@ -208,9 +218,10 @@ const catalog = await skills.discover({
 The public parser returns either a validated, deeply frozen domain value or a normalized failure. Input is bounded JSON; duplicate keys, unknown properties, unsupported schema versions, and unsafe JavaScript values are rejected.
 
 The same top-level API exports the five closed Agent Skills parsers and hashes,
-the self-contained `createSkillsHost()` factory, and immutable skill/phase/
-approval/evidence contracts alongside the project, agent/context, provider,
-gateway, and routing surfaces. Private skill catalog/loader/object store, engine
+the five MCP tool document parsers and hashes, the self-contained
+`createSkillsHost()` and `createToolBroker()` factories, and immutable skill,
+tool, approval, and evidence contracts alongside the project, agent/context,
+provider, gateway, and routing surfaces. Private skill catalog/loader/object store, engine
 and approval construction seams, mutation claims, callbacks, native handles,
 test factories, raw fetch/SSE/header parsers, credential caches, and operation
 hooks remain outside the public declaration and package export surface.
@@ -222,6 +233,7 @@ hooks remain outside the public declaration and package export surface.
 - [TOSS CLI v2.2 compatibility](docs/contracts/toss-cli-v2.2-compatibility.md)
 - [Schema manifest](docs/contracts/runtime-contract-v1.manifest.json)
 - [Complete example chain](examples/runtime-contract-v1)
+- [Scoped MCP tool examples](examples/contracts)
 
 Runtime output is execution evidence, not governance authority. Acceptance, policy, and artifact truth remain owned by the TOSS control plane and authoritative project artifacts.
 

@@ -6,8 +6,11 @@ import Ajv2020Module from "ajv/dist/2020.js";
 import { parseDocument } from "yaml";
 
 import configSchema from "../../contracts/runtime/runtime-config.v1.schema.json" with { type: "json" };
+import commonSchema from "../../contracts/runtime/runtime-common.v1.schema.json" with { type: "json" };
+import mcpProfileSchema from "../../contracts/runtime/mcp-profile.v1.schema.json" with { type: "json" };
 import {
   assertPlainJson,
+  canonicalJson,
   DEFAULT_JSON_LIMITS,
   deepFreezeJson,
   parseJsonBytes,
@@ -23,6 +26,8 @@ import type {
   RuntimePlatform,
 } from "./types.js";
 import { serviceSocketLayoutFits } from "../service/paths.js";
+import { parseMcpProfile } from "../tools/contracts.js";
+import type { McpServerBinding } from "../tools/types.js";
 
 const Ajv2020 = Ajv2020Module.default;
 const ajv = new Ajv2020({
@@ -32,6 +37,8 @@ const ajv = new Ajv2020({
   strict: true,
   useDefaults: false,
 });
+ajv.addSchema(commonSchema);
+ajv.addSchema(mcpProfileSchema);
 const validateConfig = ajv.compile(configSchema);
 const MAX_RUNTIME_CONFIG_BYTES = DEFAULT_JSON_LIMITS.maxBytes;
 
@@ -96,7 +103,7 @@ export function defaultConfig(
     gateway_profile: null,
     gateway_profiles: {},
     provider_profiles: [],
-    mcp_profiles: [],
+    mcp_profiles: {},
     skill_roots: [],
     secret_references: {},
   };
@@ -225,6 +232,123 @@ function assertGatewayProfiles(config: RuntimeConfigV1): void {
   }
 }
 
+function invalidMcpProfiles(): never {
+  throw new RuntimeConfigError("RUNTIME_CONFIG_INVALID", "MCP profile configuration is invalid");
+}
+
+function normalizedAbsolutePath(candidate: string): boolean {
+  return (
+    path.isAbsolute(candidate) &&
+    path.normalize(candidate) === candidate &&
+    !/[\u0000-\u001f\u007f]/u.test(candidate)
+  );
+}
+
+function assertMcpSecretReference(config: RuntimeConfigV1, reference: string): void {
+  const secret = config.secret_references[reference];
+  if (secret === undefined || (config.mode === "production" && secret.source !== "command")) {
+    invalidMcpProfiles();
+  }
+}
+
+function assertMcpHttpBinding(config: RuntimeConfigV1, binding: McpServerBinding): void {
+  if (binding.transport !== "streamable-http") return;
+  let endpoint: URL;
+  try {
+    endpoint = new URL(binding.endpoint);
+  } catch {
+    invalidMcpProfiles();
+  }
+  if (
+    endpoint.username !== "" ||
+    endpoint.password !== "" ||
+    endpoint.search !== "" ||
+    endpoint.hash !== ""
+  ) {
+    invalidMcpProfiles();
+  }
+  if (endpoint.protocol === "http:") {
+    if (
+      config.mode !== "development" ||
+      !["localhost", "127.0.0.1", "[::1]"].includes(endpoint.hostname)
+    ) {
+      invalidMcpProfiles();
+    }
+  } else if (endpoint.protocol !== "https:") {
+    invalidMcpProfiles();
+  }
+  if (binding.credential_reference !== null) {
+    assertMcpSecretReference(config, binding.credential_reference);
+  }
+}
+
+function assertMcpStdioBinding(config: RuntimeConfigV1, binding: McpServerBinding): void {
+  if (binding.transport !== "stdio") return;
+  if (!normalizedAbsolutePath(binding.command) || !normalizedAbsolutePath(binding.cwd)) {
+    invalidMcpProfiles();
+  }
+  if (binding.args.some((argument) => /[\u0000-\u001f\u007f]/u.test(argument))) {
+    invalidMcpProfiles();
+  }
+  for (const [name, value] of Object.entries(binding.environment)) {
+    if (value.kind === "literal") {
+      if (
+        /[\u0000]/u.test(value.value) ||
+        (config.mode === "production" &&
+          /(?:secret|token|password|credential|api[_-]?key|authorization)/iu.test(name))
+      ) {
+        invalidMcpProfiles();
+      }
+    } else {
+      assertMcpSecretReference(config, value.reference);
+    }
+  }
+}
+
+function assertMcpProfiles(config: RuntimeConfigV1): void {
+  const profileNames = Object.keys(config.mcp_profiles);
+  if (
+    !profileNames.every(
+      (name, index) => index === 0 || bytewiseCompare(profileNames[index - 1]!, name) < 0,
+    )
+  ) {
+    invalidMcpProfiles();
+  }
+  for (const [name, configured] of Object.entries(config.mcp_profiles)) {
+    const parsed = parseMcpProfile(canonicalJson(configured.profile));
+    if (!parsed.ok || parsed.value.profile_id !== name) invalidMcpProfiles();
+    const expectedBindings = parsed.value.servers
+      .map((server) => server.binding_name)
+      .sort(bytewiseCompare);
+    const actualBindings = Object.keys(configured.servers);
+    if (
+      actualBindings.length !== expectedBindings.length ||
+      actualBindings.some((binding, index) => binding !== expectedBindings[index])
+    ) {
+      invalidMcpProfiles();
+    }
+    for (const server of parsed.value.servers) {
+      const binding = configured.servers[server.binding_name];
+      if (binding === undefined) invalidMcpProfiles();
+      if (
+        Object.keys(server.x_mcp_headers).length > 0 &&
+        binding.transport !== "streamable-http" &&
+        binding.transport !== "agentgateway"
+      ) {
+        invalidMcpProfiles();
+      }
+      assertMcpStdioBinding(config, binding);
+      assertMcpHttpBinding(config, binding);
+      if (
+        binding.transport === "agentgateway" &&
+        config.gateway_profiles[binding.gateway_profile] === undefined
+      ) {
+        invalidMcpProfiles();
+      }
+    }
+  }
+}
+
 function invalidSkillRoots(): never {
   throw new RuntimeConfigError("RUNTIME_CONFIG_INVALID", "Configured skill roots are invalid");
 }
@@ -296,6 +420,7 @@ function assertConfig(
   });
   assertSkillRoots(config.skill_roots);
   assertGatewayProfiles(config);
+  assertMcpProfiles(config);
   return config;
 }
 

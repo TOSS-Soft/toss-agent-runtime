@@ -13,6 +13,7 @@ import {
 } from "../src/protocol/capabilities.js";
 import { canonicalJson } from "../src/protocol/json.js";
 import { RuntimeSkillError } from "../src/skills/errors.js";
+import { RuntimeToolError } from "../src/tools/errors.js";
 
 const lock = {
   schema_version: "service-lock.v1",
@@ -134,6 +135,61 @@ describe("local service contracts", () => {
     }
   });
 
+  it("accepts only the closed exact tool approval request shape", () => {
+    const approval = {
+      ...request,
+      command: "tool-approve",
+      operation_id: "00000000-0000-4000-8000-000000000091",
+      run_id: "run-1",
+      expected_journal_revision: 4,
+      expected_journal_head_hash: `sha256:${"a".repeat(64)}`,
+      call_id: "tool-call-1",
+      approval_request_hash: `sha256:${"c".repeat(64)}`,
+      decision: "APPROVE",
+    } as const;
+
+    expect(parseServiceControlRequest(canonicalJson(approval))).toMatchObject({
+      ok: true,
+      value: approval,
+    });
+    for (const mutation of [
+      { ...approval, phase: "BRAINSTORMING" },
+      { ...approval, skill_name: "brainstorming" },
+      { ...approval, call_id: "1-invalid" },
+      { ...approval, expected_journal_revision: 0 },
+      { ...approval, decision: "YES" },
+    ]) {
+      expect(parseServiceControlRequest(canonicalJson(mutation))).toMatchObject({ ok: false });
+    }
+  });
+
+  it("accepts only the closed exact uncertain tool disposition request shape", () => {
+    const disposition = {
+      ...request,
+      command: "tool-dispose",
+      operation_id: "00000000-0000-4000-8000-000000000092",
+      run_id: "run-1",
+      expected_journal_revision: 5,
+      expected_journal_head_hash: `sha256:${"a".repeat(64)}`,
+      call_id: "tool-call-1",
+      idempotency_key: `sha256:${"1".repeat(64)}`,
+      disposition: "NO_EFFECT_CONFIRMED",
+    } as const;
+
+    expect(parseServiceControlRequest(canonicalJson(disposition))).toMatchObject({
+      ok: true,
+      value: disposition,
+    });
+    for (const mutation of [
+      { ...disposition, approval_request_hash: `sha256:${"b".repeat(64)}` },
+      { ...disposition, decision: "APPROVE" },
+      { ...disposition, idempotency_key: `sha256:${"A".repeat(64)}` },
+      { ...disposition, disposition: "RETRY" },
+    ]) {
+      expect(parseServiceControlRequest(canonicalJson(mutation))).toMatchObject({ ok: false });
+    }
+  });
+
   it("rejects input larger than the exact transport limit", () => {
     const bytes = new Uint8Array(MAX_CONTROL_MESSAGE_BYTES + 1);
     expect(parseServiceControlResponse(bytes)).toMatchObject({ ok: false });
@@ -247,6 +303,133 @@ describe("local service contracts", () => {
         }),
       ),
     ).toMatchObject({ ok: false });
+  });
+
+  it("accepts closed tool approval data and fixed tool failures", () => {
+    const toolResponse = {
+      schema_version: "service-control-response.v1",
+      document_type: "service-control-response",
+      request_id: request.request_id,
+      ok: true,
+      status: null,
+      data: {
+        kind: "tool-approval",
+        run_id: "run-1",
+        state: "RUNNING",
+        call_id: "tool-call-1",
+        journal_head: {
+          journal_revision: 5,
+          sequence: 5,
+          entry_hash: `sha256:${"d".repeat(64)}`,
+        },
+        approval_request_hash: `sha256:${"c".repeat(64)}`,
+        approval_decision_hash: `sha256:${"e".repeat(64)}`,
+        replayed: false,
+      },
+      error: null,
+    } as const;
+    const error = new RuntimeToolError("RUNTIME_TOOL_APPROVAL_STALE");
+    const failure = {
+      ...toolResponse,
+      ok: false,
+      data: null,
+      error: {
+        code: error.code,
+        category: error.category,
+        retryable: error.retryable,
+        safe_message: error.safe_message,
+      },
+    } as const;
+
+    expect(parseServiceControlResponse(canonicalJson(toolResponse))).toMatchObject({ ok: true });
+    expect(parseServiceControlResponse(canonicalJson(failure))).toMatchObject({ ok: true });
+    expect(
+      parseServiceControlResponse(
+        canonicalJson({
+          ...failure,
+          error: { ...failure.error, safe_message: "forged detail" },
+        }),
+      ),
+    ).toMatchObject({ ok: false });
+  });
+
+  it("accepts closed uncertain tool disposition response data", () => {
+    const dispositionResponse = {
+      schema_version: "service-control-response.v1",
+      document_type: "service-control-response",
+      request_id: request.request_id,
+      ok: true,
+      status: null,
+      data: {
+        kind: "tool-disposition",
+        run_id: "run-1",
+        state: "RUNNING",
+        call_id: "tool-call-1",
+        idempotency_key: `sha256:${"1".repeat(64)}`,
+        disposition: "NO_EFFECT_CONFIRMED",
+        journal_head: {
+          journal_revision: 6,
+          sequence: 6,
+          entry_hash: `sha256:${"d".repeat(64)}`,
+        },
+        operation_hash: `sha256:${"e".repeat(64)}`,
+        replayed: false,
+      },
+      error: null,
+    } as const;
+
+    expect(parseServiceControlResponse(canonicalJson(dispositionResponse))).toMatchObject({
+      ok: true,
+      value: dispositionResponse,
+    });
+    expect(
+      parseServiceControlResponse(
+        canonicalJson({
+          ...dispositionResponse,
+          data: { ...dispositionResponse.data, approval_decision_hash: `sha256:${"f".repeat(64)}` },
+        }),
+      ),
+    ).toMatchObject({ ok: false });
+  });
+
+  it.each([
+    "RUNTIME_TOOL_INVALID",
+    "RUNTIME_TOOL_SCHEMA_MISMATCH",
+    "RUNTIME_TOOL_PROTOCOL_DOWNGRADE",
+    "RUNTIME_TOOL_RESULT_INVALID",
+    "RUNTIME_TOOL_POLICY_DENIED",
+    "RUNTIME_TOOL_UNSUPPORTED",
+    "RUNTIME_TOOL_OPERATION_CONFLICT",
+    "RUNTIME_TOOL_APPROVAL_REQUIRED",
+    "RUNTIME_TOOL_APPROVAL_STALE",
+    "RUNTIME_TOOL_APPROVAL_REJECTED",
+    "RUNTIME_TOOL_EFFECT_UNCERTAIN",
+    "RUNTIME_TOOL_AUTHENTICATION",
+    "RUNTIME_TOOL_UNAVAILABLE",
+    "RUNTIME_TOOL_RATE_LIMIT",
+    "RUNTIME_TOOL_TIMEOUT",
+    "RUNTIME_TOOL_CANCELLED",
+    "RUNTIME_TOOL_INTERNAL",
+  ] as const)("accepts the fixed safe %s service failure", (code) => {
+    const error = new RuntimeToolError(code);
+    expect(
+      parseServiceControlResponse(
+        canonicalJson({
+          schema_version: "service-control-response.v1",
+          document_type: "service-control-response",
+          request_id: request.request_id,
+          ok: false,
+          status: null,
+          data: null,
+          error: {
+            code: error.code,
+            category: error.category,
+            retryable: error.retryable,
+            safe_message: error.safe_message,
+          },
+        }),
+      ),
+    ).toMatchObject({ ok: true });
   });
 
   it("accepts every fixed safe skill error and rejects forged details", () => {

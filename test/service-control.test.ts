@@ -28,10 +28,15 @@ import { canonicalJson } from "../src/protocol/json.js";
 import type {
   ServiceStatusV1,
   ServiceSuperpowersApproveRequestV1,
+  ServiceToolApproveRequestV1,
+  ServiceToolDisposeRequestV1,
   SuperpowersApprovalDataV1,
+  ToolApprovalDataV1,
+  ToolDispositionDataV1,
 } from "../src/service/contracts.js";
 import { RuntimeProjectError } from "../src/service/project/errors.js";
 import { RuntimeSkillError } from "../src/skills/errors.js";
+import { RuntimeToolError } from "../src/tools/errors.js";
 import {
   createServiceControlServer,
   probePrivateServiceSocketListener,
@@ -39,6 +44,8 @@ import {
   requestProjectOperation,
   requestServiceStatus,
   requestSuperpowersApprovalDecision,
+  requestToolApprovalDecision,
+  requestToolDisposition,
   type ServiceControlOperationHooks,
   type ServiceControlServer,
 } from "../src/service/control.js";
@@ -193,6 +200,83 @@ function approvalData(
     approval_request_hash: request.approval_request_hash,
     approval_decision_hash: `sha256:${"e".repeat(64)}`,
     replayed,
+  };
+}
+
+function toolApprovalRequest(
+  overrides: Partial<ServiceToolApproveRequestV1> = {},
+): ServiceToolApproveRequestV1 {
+  return {
+    schema_version: "service-control-request.v1",
+    document_type: "service-control-request",
+    request_id: fixedRequestId,
+    command: "tool-approve",
+    operation_id: fixedOperationId,
+    run_id: "run-1",
+    expected_journal_revision: 4,
+    expected_journal_head_hash: `sha256:${"a".repeat(64)}`,
+    call_id: "tool-call-1",
+    approval_request_hash: `sha256:${"c".repeat(64)}`,
+    decision: "APPROVE",
+    ...overrides,
+  };
+}
+
+function toolApprovalData(
+  request: ServiceToolApproveRequestV1,
+  replayed = false,
+): ToolApprovalDataV1 {
+  return {
+    kind: "tool-approval",
+    run_id: request.run_id,
+    state: request.decision === "APPROVE" ? "RUNNING" : "BLOCKED",
+    call_id: request.call_id,
+    journal_head: {
+      journal_revision: request.expected_journal_revision + 1,
+      sequence: request.expected_journal_revision + 1,
+      entry_hash: `sha256:${"d".repeat(64)}`,
+    },
+    approval_request_hash: request.approval_request_hash,
+    approval_decision_hash: `sha256:${"e".repeat(64)}`,
+    replayed,
+  };
+}
+
+function toolDispositionRequest(
+  overrides: Partial<ServiceToolDisposeRequestV1> = {},
+): ServiceToolDisposeRequestV1 {
+  return {
+    schema_version: "service-control-request.v1",
+    document_type: "service-control-request",
+    request_id: fixedRequestId,
+    command: "tool-dispose",
+    operation_id: fixedOperationId,
+    run_id: "run-1",
+    expected_journal_revision: 5,
+    expected_journal_head_hash: `sha256:${"a".repeat(64)}`,
+    call_id: "tool-call-1",
+    idempotency_key: `sha256:${"1".repeat(64)}`,
+    disposition: "NO_EFFECT_CONFIRMED",
+    ...overrides,
+  };
+}
+
+function toolDispositionData(request: ServiceToolDisposeRequestV1): ToolDispositionDataV1 {
+  const resumes = request.disposition === "NO_EFFECT_CONFIRMED";
+  return {
+    kind: "tool-disposition",
+    run_id: request.run_id,
+    state: resumes ? "RUNNING" : "BLOCKED",
+    call_id: request.call_id,
+    idempotency_key: request.idempotency_key,
+    disposition: request.disposition,
+    journal_head: {
+      journal_revision: request.expected_journal_revision + (resumes ? 1 : 0),
+      sequence: request.expected_journal_revision + (resumes ? 1 : 0),
+      entry_hash: resumes ? `sha256:${"d".repeat(64)}` : request.expected_journal_head_hash,
+    },
+    operation_hash: `sha256:${"e".repeat(64)}`,
+    replayed: false,
   };
 }
 
@@ -1486,6 +1570,60 @@ describe("private service control socket", () => {
     expect(projectCalls).toBe(0);
   });
 
+  it("dispatches tool approval only to its authenticated handler and byte-replays it", async () => {
+    let toolCalls = 0;
+    let skillCalls = 0;
+    await listenControl({
+      handleSkillRequest: () => {
+        skillCalls += 1;
+        return Promise.resolve(approvalData(approvalRequest()));
+      },
+      handleToolRequest: (request) => {
+        toolCalls += 1;
+        if (request.command !== "tool-approve") throw new Error("unexpected tool request");
+        expect(request).toEqual(toolApprovalRequest());
+        return Promise.resolve(toolApprovalData(request));
+      },
+    });
+    const frame = `${canonicalJson(toolApprovalRequest())}\n`;
+
+    const first = await sendRaw(frame);
+    const second = await sendRaw(frame);
+
+    expect(second).toBe(first);
+    expect(JSON.parse(first)).toMatchObject({
+      ok: true,
+      status: null,
+      data: toolApprovalData(toolApprovalRequest()),
+      error: null,
+    });
+    expect(toolCalls).toBe(1);
+    expect(skillCalls).toBe(0);
+  });
+
+  it("dispatches uncertain disposition only to its authenticated tool handler", async () => {
+    let toolCalls = 0;
+    await listenControl({
+      handleToolRequest: (request) => {
+        toolCalls += 1;
+        if (request.command !== "tool-dispose") throw new Error("unexpected tool request");
+        expect(request).toEqual(toolDispositionRequest());
+        return Promise.resolve(toolDispositionData(request));
+      },
+    });
+
+    const frame = `${canonicalJson(toolDispositionRequest())}\n`;
+    const first = await sendRaw(frame);
+    const second = await sendRaw(frame);
+
+    expect(second).toBe(first);
+    expect(JSON.parse(first)).toMatchObject({
+      ok: true,
+      data: toolDispositionData(toolDispositionRequest()),
+    });
+    expect(toolCalls).toBe(1);
+  });
+
   it("rejects malformed approval and post-stop approval without dispatch", async () => {
     let calls = 0;
     const server = await listenControl({
@@ -2040,6 +2178,46 @@ describe("private service control socket", () => {
     await expect(
       requestSuperpowersApprovalDecision({ socketPath, request, idleTimeoutMs: 5_000 }),
     ).resolves.toEqual(approvalData(request));
+  });
+
+  it("requests one exactly bound tool decision and reconstructs a safe tool failure", async () => {
+    const request = toolApprovalRequest();
+    await listenControl({
+      handleToolRequest: (received) =>
+        received.command !== "tool-approve"
+          ? Promise.reject(new RuntimeToolError("RUNTIME_TOOL_INVALID"))
+          : received.request_id === fixedRequestId
+            ? Promise.resolve(toolApprovalData(received))
+            : Promise.reject(new RuntimeToolError("RUNTIME_TOOL_APPROVAL_STALE")),
+    });
+
+    await expect(
+      requestToolApprovalDecision({ socketPath, request, idleTimeoutMs: 5_000 }),
+    ).resolves.toEqual(toolApprovalData(request));
+
+    await expect(
+      requestToolApprovalDecision({
+        socketPath,
+        request: { ...request, request_id: otherRequestId },
+        idleTimeoutMs: 5_000,
+      }),
+    ).rejects.toEqual(new RuntimeToolError("RUNTIME_TOOL_APPROVAL_STALE"));
+  });
+
+  it("requests one exactly bound uncertain disposition over the private socket", async () => {
+    const request = toolDispositionRequest();
+    await listenControl({
+      handleToolRequest: (received) => {
+        if (received.command !== "tool-dispose") {
+          return Promise.reject(new RuntimeToolError("RUNTIME_TOOL_INVALID"));
+        }
+        return Promise.resolve(toolDispositionData(received));
+      },
+    });
+
+    await expect(
+      requestToolDisposition({ socketPath, request, idleTimeoutMs: 5_000 }),
+    ).resolves.toEqual(toolDispositionData(request));
   });
 
   it.each(["0", "a", "b", "c", "d", "e", "f"] as const)(

@@ -29,8 +29,23 @@ function authentication(): RuntimeProviderError {
   return new RuntimeProviderError("RUNTIME_PROVIDER_AUTHENTICATION");
 }
 
-function isRecord(value: JsonValue): value is { readonly [key: string]: JsonValue } {
+function isRecord(value: unknown): value is { readonly [key: string]: JsonValue } {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function normalizedScope(scope: Readonly<Record<string, JsonValue>> | undefined): {
+  readonly value?: Readonly<Record<string, JsonValue>>;
+} {
+  if (scope === undefined) return {};
+  let parsed: JsonValue;
+  try {
+    parsed = parseJsonBytes(canonicalJson(scope));
+  } catch {
+    throw authentication();
+  }
+  if (!isRecord(parsed)) throw authentication();
+  const value = deepFreezeJson(parsed) as Readonly<Record<string, JsonValue>>;
+  return { value };
 }
 
 function normalizedReference(reference: SecretReference): {
@@ -129,6 +144,7 @@ function startFlight(options: {
   readonly provider: GatewayCredentialProvider;
   readonly reference: SecretReference;
   readonly key: string;
+  readonly scope?: Readonly<Record<string, JsonValue>>;
   readonly state: Map<string, CredentialEntry>;
   readonly entry: CredentialEntry;
 }): CredentialFlight {
@@ -142,6 +158,7 @@ function startFlight(options: {
       options.provider.resolve(options.reference, {
         signal: controller.signal,
         minimum_validity_ms: MINIMUM_VALIDITY_MS,
+        ...(options.scope === undefined ? {} : { scope: options.scope }),
       }),
     )
     .then(normalizeLease)
@@ -209,24 +226,36 @@ export function createGatewayCredentialCoordinator(options: {
 }): GatewayCredentialCoordinator {
   const state = stateFor(options.provider);
   return Object.freeze({
-    async resolve(reference: SecretReference, signal: AbortSignal) {
+    async resolve(
+      reference: SecretReference,
+      signal: AbortSignal,
+      scope?: Readonly<Record<string, JsonValue>>,
+    ) {
       if (!(signal instanceof AbortSignal) || signal.aborted) throw authentication();
       const normalized = normalizedReference(reference);
-      let entry = state.get(normalized.key);
+      const normalizedCredentialScope = normalizedScope(scope);
+      const cacheKey = canonicalJson({
+        reference: normalized.value,
+        scope: normalizedCredentialScope.value ?? null,
+      });
+      let entry = state.get(cacheKey);
       if (entry?.lease !== undefined) {
         if (reusable(entry.lease, options.now)) return entry.lease;
         delete entry.lease;
       }
       if (entry === undefined) {
         entry = {};
-        state.set(normalized.key, entry);
+        state.set(cacheKey, entry);
       }
       const flight =
         entry.inflight ??
         startFlight({
           provider: options.provider,
           reference: normalized.value,
-          key: normalized.key,
+          key: cacheKey,
+          ...(normalizedCredentialScope.value === undefined
+            ? {}
+            : { scope: normalizedCredentialScope.value }),
           state,
           entry,
         });
@@ -234,7 +263,7 @@ export function createGatewayCredentialCoordinator(options: {
       const resolved = await awaitFlight({ flight, entry, signal });
       if (!reusable(resolved, options.now)) {
         if (entry.lease === resolved) delete entry.lease;
-        if (entry.inflight === undefined) state.delete(normalized.key);
+        if (entry.inflight === undefined) state.delete(cacheKey);
         throw authentication();
       }
       return resolved;

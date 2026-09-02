@@ -1,4 +1,7 @@
+import type { McpProfileReference } from "../agents/types.js";
+import type { McpTransportKind } from "../tools/types.js";
 import { PACKAGE_NAME, PACKAGE_VERSION, PROTOCOL_VERSION } from "../version.js";
+import { canonicalJson, deepFreezeJson, parseJsonBytes } from "./json.js";
 import type { ExecutionRequestV1 } from "./request.js";
 import type {
   ArtifactReference,
@@ -50,6 +53,12 @@ export interface RuntimeCapabilitiesV1 extends RuntimeDocument {
   }>;
 }
 
+export interface McpCapabilityReadiness {
+  readonly profile: McpProfileReference;
+  readonly transports: readonly McpTransportKind[];
+  readonly ready: boolean;
+}
+
 export function createBaselineCapabilities(platform: {
   readonly os: "darwin" | "linux";
   readonly arch: string;
@@ -76,6 +85,8 @@ export function createBaselineCapabilities(platform: {
       "execution-event.v1",
       "execution-request.v1",
       "execution-result.v1",
+      "mcp-discovery-snapshot.v1",
+      "mcp-profile.v1",
       "model-catalog.v1",
       "model-selection-plan.v1",
       "operational-event.v1",
@@ -95,6 +106,9 @@ export function createBaselineCapabilities(platform: {
       "skill-snapshot.v1",
       "superpowers-approval.v1",
       "superpowers-phase.v1",
+      "tool-approval.v1",
+      "tool-call.v1",
+      "tool-result.v1",
     ]),
     provider_transports: Object.freeze(["agentgateway", "openai", "anthropic", "gemini"]),
     model_classes: Object.freeze([
@@ -135,6 +149,52 @@ export function createBaselineCapabilities(platform: {
       evidence: "unavailable",
     }),
   });
+}
+
+function bytewiseCompare(left: string, right: string): number {
+  return Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8"));
+}
+
+function readinessKey(value: McpCapabilityReadiness): string {
+  return canonicalJson(value.profile);
+}
+
+export function createRuntimeCapabilities(
+  platform: Readonly<{
+    readonly os: "darwin" | "linux";
+    readonly arch: string;
+    readonly node: string;
+  }>,
+  readiness: readonly McpCapabilityReadiness[] = [],
+): RuntimeCapabilitiesV1 {
+  const baseline = createBaselineCapabilities(platform);
+  if (readiness.length === 0) return baseline;
+  const ready = readiness
+    .filter((entry) => entry.ready)
+    .sort((left, right) => bytewiseCompare(readinessKey(left), readinessKey(right)));
+  const profiles = ready.map((entry) => ({
+    document_type: entry.profile.document_type,
+    artifact_id: entry.profile.artifact_id,
+    revision: entry.profile.revision,
+    hash: entry.profile.hash,
+  }));
+  const transports = [...new Set(ready.flatMap((entry) => entry.transports))].sort(bytewiseCompare);
+  const candidate = deepFreezeJson(
+    parseJsonBytes(
+      canonicalJson({
+        ...baseline,
+        mcp_transports: transports,
+        mcp_profiles: profiles,
+        features: {
+          ...baseline.features,
+          mcp: ready.length === 0 ? "blocked" : "available",
+        },
+      }),
+    ),
+  ) as unknown as RuntimeCapabilitiesV1;
+  const parsed = parseRuntimeCapabilities(canonicalJson(candidate));
+  if (!parsed.ok) return baseline;
+  return parsed.value;
 }
 
 export function parseRuntimeCapabilities(
@@ -182,14 +242,14 @@ export function parseRuntimeCapabilities(
     );
   }
   if (
-    result.value.features.mcp === "unavailable" &&
+    result.value.features.mcp !== "available" &&
     (result.value.mcp_transports.length > 0 || result.value.mcp_profiles.length > 0)
   ) {
     issues.push(
       capabilityIssue(
         "/mcp_transports",
         "featureCoherence",
-        "unavailable MCP cannot advertise transports or profiles",
+        "non-available MCP cannot advertise transports or profiles",
       ),
     );
   }

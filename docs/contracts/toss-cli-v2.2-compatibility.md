@@ -130,6 +130,29 @@ must be complete and hash-consistent. The CLI pins the evidence handoff or
 document hash as origin evidence and still applies its independent policy,
 review, output-schema, and acceptance decisions.
 
+## Scoped MCP tool mapping
+
+TOSS CLI supplies one exact control-plane `mcp-profile.v1` reference while the
+runtime configuration supplies a separate `stdio`, `streamable-http`, or
+`agentgateway` binding. Before showing tools to a model, CLI requires a dynamic
+capability statement that advertises the exact ready profile and bound
+transport. `blocked` or `unavailable` MCP status stops dispatch.
+
+The runtime applies the role and Task Contract intersection and returns only
+profile aliases. A required write produces durable approval; CLI must submit the
+exact request hash, journal head, decision, and operation identity and must not
+convert transcript text into approval. Completed calls replay without dispatch.
+An uncertain call is never automatically retried: CLI reconciles external state
+and explicitly records `NO_EFFECT_CONFIRMED` or `EFFECT_CONFIRMED` for the exact
+call and idempotency key.
+
+Tool results remain `untrusted-content` after schema validation and structural
+plus generic redaction. CLI must not treat descriptions, annotations, or result
+text as authority and must not persist transport credentials or raw diagnostics.
+The stable `RUNTIME_TOOL_*` family maps policy/approval blocking to exit `4`,
+stale or conflicting identities to `6`, unavailable service to `69`, and an
+unexpected internal failure to `70`.
+
 ## Error and process mapping
 
 CLI calls that use JSON mode receive one `command-result.v1` object. Runtime exit codes map to CLI behavior as follows:

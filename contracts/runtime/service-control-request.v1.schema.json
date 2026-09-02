@@ -17,12 +17,15 @@
         "project-register",
         "project-unregister",
         "project-list",
-        "superpowers-approve"
+        "superpowers-approve",
+        "tool-approve",
+        "tool-dispose"
       ]
     },
     "root": { "type": "string", "minLength": 1, "maxLength": 4096 },
     "project_id": { "type": "string", "format": "uuid" },
     "run_id": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9._:-]{0,127}$" },
+    "call_id": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9._:-]{0,127}$" },
     "expected_journal_revision": {
       "type": "integer",
       "minimum": 1,
@@ -34,7 +37,9 @@
     "skill_version": { "$ref": "#/$defs/semver" },
     "skill_snapshot_hash": { "$ref": "#/$defs/sha256" },
     "approval_request_hash": { "$ref": "#/$defs/sha256" },
-    "decision": { "enum": ["APPROVE", "REJECT"] }
+    "decision": { "enum": ["APPROVE", "REJECT"] },
+    "idempotency_key": { "$ref": "#/$defs/sha256" },
+    "disposition": { "enum": ["NO_EFFECT_CONFIRMED", "EFFECT_CONFIRMED"] }
   },
   "$defs": {
     "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
@@ -64,6 +69,7 @@
         "root": false,
         "project_id": false,
         "run_id": false,
+        "call_id": false,
         "expected_journal_revision": false,
         "expected_journal_head_hash": false,
         "phase": false,
@@ -71,7 +77,9 @@
         "skill_version": false,
         "skill_snapshot_hash": false,
         "approval_request_hash": false,
-        "decision": false
+        "decision": false,
+        "idempotency_key": false,
+        "disposition": false
       }
     },
     {
@@ -80,6 +88,7 @@
         "command": { "const": "project-register" },
         "project_id": false,
         "run_id": false,
+        "call_id": false,
         "expected_journal_revision": false,
         "expected_journal_head_hash": false,
         "phase": false,
@@ -87,7 +96,9 @@
         "skill_version": false,
         "skill_snapshot_hash": false,
         "approval_request_hash": false,
-        "decision": false
+        "decision": false,
+        "idempotency_key": false,
+        "disposition": false
       }
     },
     {
@@ -96,6 +107,7 @@
         "command": { "const": "project-unregister" },
         "root": false,
         "run_id": false,
+        "call_id": false,
         "expected_journal_revision": false,
         "expected_journal_head_hash": false,
         "phase": false,
@@ -103,7 +115,9 @@
         "skill_version": false,
         "skill_snapshot_hash": false,
         "approval_request_hash": false,
-        "decision": false
+        "decision": false,
+        "idempotency_key": false,
+        "disposition": false
       }
     },
     {
@@ -113,6 +127,7 @@
         "root": false,
         "project_id": false,
         "run_id": false,
+        "call_id": false,
         "expected_journal_revision": false,
         "expected_journal_head_hash": false,
         "phase": false,
@@ -120,7 +135,9 @@
         "skill_version": false,
         "skill_snapshot_hash": false,
         "approval_request_hash": false,
-        "decision": false
+        "decision": false,
+        "idempotency_key": false,
+        "disposition": false
       }
     },
     {
@@ -139,7 +156,54 @@
       "properties": {
         "command": { "const": "superpowers-approve" },
         "root": false,
-        "project_id": false
+        "project_id": false,
+        "call_id": false,
+        "idempotency_key": false,
+        "disposition": false
+      }
+    },
+    {
+      "required": [
+        "operation_id",
+        "run_id",
+        "expected_journal_revision",
+        "expected_journal_head_hash",
+        "call_id",
+        "approval_request_hash",
+        "decision"
+      ],
+      "properties": {
+        "command": { "const": "tool-approve" },
+        "root": false,
+        "project_id": false,
+        "phase": false,
+        "skill_name": false,
+        "skill_version": false,
+        "skill_snapshot_hash": false,
+        "idempotency_key": false,
+        "disposition": false
+      }
+    },
+    {
+      "required": [
+        "operation_id",
+        "run_id",
+        "expected_journal_revision",
+        "expected_journal_head_hash",
+        "call_id",
+        "idempotency_key",
+        "disposition"
+      ],
+      "properties": {
+        "command": { "const": "tool-dispose" },
+        "root": false,
+        "project_id": false,
+        "phase": false,
+        "skill_name": false,
+        "skill_version": false,
+        "skill_snapshot_hash": false,
+        "approval_request_hash": false,
+        "decision": false
       }
     }
   ]

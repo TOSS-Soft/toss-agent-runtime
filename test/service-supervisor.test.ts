@@ -8,7 +8,9 @@ import type { LoadedConfig } from "../src/config/types.js";
 import type {
   ServiceStatusV1,
   ServiceSuperpowersApproveRequestV1,
+  ServiceToolRequestV1,
   SuperpowersApprovalDataV1,
+  ToolControlDataV1,
 } from "../src/service/contracts.js";
 import type { ServiceControlServer } from "../src/service/control.js";
 import { RuntimeServiceError } from "../src/service/errors.js";
@@ -171,7 +173,7 @@ beforeEach(async () => {
         gateway_profile: null,
         gateway_profiles: {},
         provider_profiles: [],
-        mcp_profiles: [],
+        mcp_profiles: {},
         skill_roots: [],
         secret_references: {},
       },
@@ -195,7 +197,7 @@ afterEach(async () => {
 });
 
 describe("runtime service supervisor", () => {
-  it("recovers the skills participant before readiness and forwards its distinct control handler", async () => {
+  it("recovers participants before readiness and forwards distinct approval handlers", async () => {
     const events: string[] = [];
     const handleSkillRequest = (
       request: ServiceSuperpowersApproveRequestV1,
@@ -214,6 +216,25 @@ describe("runtime service supervisor", () => {
         approval_decision_hash: `sha256:${"c".repeat(64)}`,
         replayed: false,
       });
+    const handleToolRequest = (request: ServiceToolRequestV1): Promise<ToolControlDataV1> => {
+      if (request.command !== "tool-approve") {
+        return Promise.reject(new Error("unexpected tool request"));
+      }
+      return Promise.resolve({
+        kind: "tool-approval",
+        run_id: request.run_id,
+        state: request.decision === "APPROVE" ? "RUNNING" : "BLOCKED",
+        call_id: request.call_id,
+        journal_head: {
+          journal_revision: request.expected_journal_revision + 1,
+          sequence: request.expected_journal_revision + 1,
+          entry_hash: `sha256:${"d".repeat(64)}`,
+        },
+        approval_request_hash: request.approval_request_hash,
+        approval_decision_hash: `sha256:${"e".repeat(64)}`,
+        replayed: false,
+      });
+    };
     const participant = (name: string): RecoveryParticipant => ({
       recover: () => {
         events.push(`recover-${name}`);
@@ -233,8 +254,10 @@ describe("runtime service supervisor", () => {
           participant("projects"),
         ],
         handleSkillRequest,
+        handleToolRequest,
         createControlServer: (serverOptions) => {
           expect(serverOptions.handleSkillRequest).toBe(handleSkillRequest);
+          expect(serverOptions.handleToolRequest).toBe(handleToolRequest);
           return fakeServer({
             listen: () => {
               events.push("listen");

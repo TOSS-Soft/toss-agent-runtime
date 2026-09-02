@@ -14,6 +14,7 @@ import type {
 } from "../protocol/types.js";
 import type { JournalHead } from "../journal/types.js";
 import type { SuperpowersPhaseName } from "../skills/types.js";
+import type { ToolUncertainDisposition } from "../tools/types.js";
 import { MAX_PROJECT_ROOT_BYTES, type ProjectRegistration } from "./project/types.js";
 
 const Ajv2020 = Ajv2020Module.default;
@@ -81,8 +82,32 @@ export interface ServiceSuperpowersApproveRequestV1 extends ServiceControlReques
 
 export type ServiceSkillRequestV1 = ServiceSuperpowersApproveRequestV1;
 
+export interface ServiceToolApproveRequestV1 extends ServiceControlRequestBaseV1 {
+  readonly command: "tool-approve";
+  readonly operation_id: string;
+  readonly run_id: string;
+  readonly expected_journal_revision: number;
+  readonly expected_journal_head_hash: `sha256:${string}`;
+  readonly call_id: string;
+  readonly approval_request_hash: `sha256:${string}`;
+  readonly decision: "APPROVE" | "REJECT";
+}
+
+export interface ServiceToolDisposeRequestV1 extends ServiceControlRequestBaseV1 {
+  readonly command: "tool-dispose";
+  readonly operation_id: string;
+  readonly run_id: string;
+  readonly expected_journal_revision: number;
+  readonly expected_journal_head_hash: `sha256:${string}`;
+  readonly call_id: string;
+  readonly idempotency_key: `sha256:${string}`;
+  readonly disposition: ToolUncertainDisposition;
+}
+
+export type ServiceToolRequestV1 = ServiceToolApproveRequestV1 | ServiceToolDisposeRequestV1;
+
 export type ServiceControlRequestV1 =
-  ServiceStatusRequestV1 | ServiceProjectRequestV1 | ServiceSkillRequestV1;
+  ServiceStatusRequestV1 | ServiceProjectRequestV1 | ServiceSkillRequestV1 | ServiceToolRequestV1;
 
 export interface ServiceStatusV1 {
   readonly package_version: string;
@@ -114,7 +139,33 @@ export interface SuperpowersApprovalDataV1 {
   readonly replayed: boolean;
 }
 
-export type ServiceControlDataV1 = ServiceProjectDataV1 | SuperpowersApprovalDataV1;
+export interface ToolApprovalDataV1 {
+  readonly kind: "tool-approval";
+  readonly run_id: string;
+  readonly state: "RUNNING" | "BLOCKED";
+  readonly call_id: string;
+  readonly journal_head: JournalHead;
+  readonly approval_request_hash: `sha256:${string}`;
+  readonly approval_decision_hash: `sha256:${string}`;
+  readonly replayed: boolean;
+}
+
+export interface ToolDispositionDataV1 {
+  readonly kind: "tool-disposition";
+  readonly run_id: string;
+  readonly state: "RUNNING" | "BLOCKED";
+  readonly call_id: string;
+  readonly idempotency_key: `sha256:${string}`;
+  readonly disposition: ToolUncertainDisposition;
+  readonly journal_head: JournalHead;
+  readonly operation_hash: `sha256:${string}`;
+  readonly replayed: boolean;
+}
+
+export type ToolControlDataV1 = ToolApprovalDataV1 | ToolDispositionDataV1;
+
+export type ServiceControlDataV1 =
+  ServiceProjectDataV1 | SuperpowersApprovalDataV1 | ToolControlDataV1;
 
 export interface ServiceControlResponseV1 {
   readonly schema_version: "service-control-response.v1";

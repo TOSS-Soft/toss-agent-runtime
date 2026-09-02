@@ -1,0 +1,76 @@
+{
+  "protocol_version": "runtime-contract.v1",
+  "schema_version": "mcp-profile.v1",
+  "document_type": "mcp-profile",
+  "profile_id": "engineering-readonly",
+  "revision": 1,
+  "limits": {
+    "discovery_pages_per_server": 8,
+    "tools_per_server": 32,
+    "schema_bytes": 65536,
+    "arguments_bytes": 131072,
+    "result_bytes": 524288,
+    "content_blocks": 32,
+    "content_block_bytes": 131072,
+    "structured_output_bytes": 131072,
+    "discovery_timeout_ms": 10000,
+    "call_timeout_ms": 30000,
+    "session_lifetime_ms": 300000
+  },
+  "servers": [
+    {
+      "server_id": "github",
+      "binding_name": "github",
+      "protocol_revision": "2025-06-18",
+      "x_mcp_headers": {},
+      "tools": [
+        {
+          "alias": "repo.search",
+          "description": "Search repositories allowed by the task.",
+          "native_name": "search_repositories",
+          "allowed_roles": ["reviewer", "worker"],
+          "task_contracts": [
+            {
+              "document_type": "task-contract",
+              "artifact_id": "TASK-001",
+              "revision": 1,
+              "hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+          ],
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["query"],
+            "properties": {
+              "query": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              }
+            }
+          },
+          "input_schema_hash": "sha256:f796da79ee3fb18a7bb6ba96e7bcf12122e11d65711ad7052d4de3a7d31f60e1",
+          "output_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["count"],
+            "properties": {
+              "count": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "output_schema_hash": "sha256:ecc6aa20bd19947541a89239a03675e5a4991cd99b01de6b103e893f124fd746",
+          "operation_class": "read-only",
+          "approval": "not-required",
+          "content_kinds": ["text"],
+          "sensitive_output_pointers": []
+        }
+      ]
+    }
+  ],
+  "document_hash": "sha256:b24375aac9dd709f7c7c6848fbe8f3bf0faf062d8c17e0eb0b766e357a4a3451"
+}

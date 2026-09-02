@@ -434,7 +434,7 @@ Issue #7 advertises the four agent/context schemas only; Issue #7 does not
 execute Agent Skills, Superpowers, MCP tools, providers, or the agent loop.
 Schema support therefore MUST NOT make skills, MCP, agent-loop, review, or
 evidence availability true. Issue #8 owns Agent Skills loading, Superpowers
-phases, approval pauses, and skill evidence. Issue #9 owns MCP tool brokering,
+phases, approval pauses, and skill evidence. Issue #9 delivers MCP tool brokering,
 approvals, and side-effect idempotency. Issue #10 owns provider calls and the
 agent loop, including provider-neutral turns, structured output, pause/resume,
 and terminal status.
@@ -490,16 +490,68 @@ authenticity still requires the handoff/document hash to be pinned by a trusted
 consumer or checked against trusted private state. The artifact is evidence,
 not TOSS governance acceptance.
 
-## 14. Stable failures
+## 14. Scoped MCP tool broker
+
+An `mcp-profile.v1` artifact is TOSS control-plane authority and remains
+separate from its local runtime binding. The profile fixes servers, aliases,
+schemas and hashes, roles, Task Contracts, exact protocol revision, operation
+class, approval policy, output kinds, redaction pointers, and limits. The local
+binding selects exactly one `stdio`, `streamable-http`, or `agentgateway`
+transport without adding tools or permissions. Discovery is all-or-nothing and
+publishes only profile-owned metadata; server descriptions and annotations are
+non-authoritative.
+
+Authorization is an ordered intersection of the exact run/session/request,
+profile, server and binding, role and Task Contract intersection, schema hashes,
+operation policy, bounded arguments, and TOSS-owned metadata. Remote/cyclic or
+over-deep schemas, secret-shaped input fields, unapproved headers, stale
+snapshots, identity drift, and exact protocol revision downgrade fail before
+tool execution. Dynamic capabilities advertise only ready profiles and their
+bound transports. An empty configuration is `unavailable`; configured but unready is
+`blocked` with no profile advertisement.
+
+Every accepted call first persists a closed `tool-call.v1` preparation and then
+records journal side-effect intent before at-most-one broker dispatch. A
+required reversible or irreversible write enters durable approval and does not
+dispatch until an exact human decision resumes the exact journal head. Exact
+completed replay does not call transport again. A positively proven-unsent
+failure closes safely; any unproven or post-dispatch failure is
+`RUNTIME_TOOL_EFFECT_UNCERTAIN`, is never retried, and remains blocked until an
+operator records `NO_EFFECT_CONFIRMED` or `EFFECT_CONFIRMED`. Both dispositions
+are hash-bound, idempotent for an exact replay, and reject conflicting reuse.
+
+`tool-result.v1` supports bounded `text`, `image`, `audio`, `resource-link`, and
+`embedded-resource` blocks plus an optional bounded structured value. All tool
+content is `untrusted-content`. The normalizer removes annotations, validates
+the exact output schema, applies structural JSON-pointer redaction and generic
+redaction, and exposes only fixed safe failure details. Credentials are never
+model input and are not persisted in profile documents, discovery, approvals,
+calls, results, journals, logs, or errors. Transport implementations may resolve
+named credentials at the last responsible boundary but cannot reflect raw
+endpoint, header, token, stderr, SDK-error, argument, or native-result values.
+
+Shutdown order is normative: stop intake; cancel discovery and read operations;
+settle accepted writes; finish recovery; close connections; close the private
+tool store; then close the run journal. Stable `RUNTIME_TOOL_*` errors distinguish
+invalid input, schema/protocol/result integrity, policy, approval, conflict,
+uncertain effect, authentication, availability, rate limit, timeout,
+cancellation, and internal failure. Issue #10 owns worker and agent-loop
+execution, Issue #11 owns independent review execution proof, Issue #12 owns
+aggregate evidence and authoritative reconciliation, and Issue #15 remains
+pending for the protected live-credential gate. That protected live-credential
+test is absent from ordinary CI.
+
+## 15. Stable failures
 
 Library validation returns `RUNTIME_DOCUMENT_INVALID` for malformed content and `RUNTIME_DOCUMENT_UNSUPPORTED` for a recognized envelope requiring an unimplemented version or capability. Issues contain a JSON Pointer-like path, stable keyword, and safe message in deterministic order.
 
 CLI JSON mode returns one `command-result.v1` document. Exit codes are `0` success, `2` usage, `3` invalid input, `4` policy/blocked, `5` validation, `6` conflict/stale revision, `69` unavailable, and `70` internal. Failure output MUST be safe to persist and MUST NOT echo secret-shaped option values.
 
-## 15. Reference artifacts
+## 16. Reference artifacts
 
 The schema manifest maps every exact version to a stable `$id`. The
-`examples/runtime-contract-v1` directory groups four distinct reference sets.
+`examples/runtime-contract-v1` directory groups four distinct reference sets,
+and `examples/contracts` contains the fifth MCP tool reference set.
 `execution-request.json`, `execution-event.json`, and `execution-result.json`
 form the legacy execution chain. The model catalog, routing policy, prior
 routing state, and model-selection plan form the governed routing set. The
@@ -521,3 +573,8 @@ Package verification loads all five through public root parsers and recomputes
 their document hashes. The evidence example demonstrates the final compact
 `journal_path`, catalog-root membership, snapshot closure, and exact
 `context_accounting` shape without embedding bodies, native paths, or secrets.
+The MCP set contains one canonical `mcp-profile.v1`,
+`mcp-discovery-snapshot.v1`, approval request, prepared call, and normalized
+result. Package verification loads all five through the public root parsers and
+recomputes their document hashes without live endpoints, commands, local paths,
+credentials, or raw secrets.

@@ -30,9 +30,18 @@ import {
   probeServiceIdentity as probeRuntimeServiceIdentity,
   requestProjectOperation as requestRuntimeProjectOperation,
   requestServiceStatus as requestRuntimeServiceStatus,
+  requestToolApprovalDecision as requestRuntimeToolApprovalDecision,
+  requestToolDisposition as requestRuntimeToolDisposition,
   type ProjectControlOperation,
 } from "../service/control.js";
-import type { ServiceProjectDataV1, ServiceStatusV1 } from "../service/contracts.js";
+import type {
+  ServiceProjectDataV1,
+  ServiceStatusV1,
+  ServiceToolApproveRequestV1,
+  ServiceToolDisposeRequestV1,
+  ToolApprovalDataV1,
+  ToolDispositionDataV1,
+} from "../service/contracts.js";
 import { ensureServiceConfig } from "../service/definition-store.js";
 import { RuntimeServiceError } from "../service/errors.js";
 import { acquireInstanceLock, type ProcessLiveness } from "../service/instance-lock.js";
@@ -50,6 +59,8 @@ import { createProjectRegistry } from "../service/project/registry.js";
 import { createProjectWatcher } from "../service/project/watcher.js";
 import { RuntimeSkillError } from "../skills/index.js";
 import { createSkillsRuntimeHost } from "../skills/runtime-host.js";
+import { RuntimeToolError, type RuntimeToolErrorCode } from "../tools/errors.js";
+import { createToolBroker as createRuntimeToolBroker } from "../tools/public-broker.js";
 import { PACKAGE_VERSION } from "../version.js";
 import { CliUsageError, parseCli, type BaselineCommand, type ServiceAction } from "./grammar.js";
 import {
@@ -104,6 +115,12 @@ export interface CliServices {
   readonly requestProjectOperation?: (
     operation: ProjectControlOperation,
   ) => Promise<ServiceProjectDataV1>;
+  readonly requestToolApprovalDecision?: (
+    operation: ToolApprovalControlOperation,
+  ) => Promise<ToolApprovalDataV1>;
+  readonly requestToolDisposition?: (
+    operation: ToolDispositionControlOperation,
+  ) => Promise<ToolDispositionDataV1>;
   readonly readOperationalLogs?: (
     filter: OperationalLogFilter,
   ) => Promise<OperationalLogReadResult>;
@@ -111,6 +128,26 @@ export interface CliServices {
     filter: OperationalLogFilter,
   ) => Promise<AsyncIterable<OperationalEventV1>>;
 }
+
+export type ToolApprovalControlOperation = Pick<
+  ServiceToolApproveRequestV1,
+  | "run_id"
+  | "expected_journal_revision"
+  | "expected_journal_head_hash"
+  | "call_id"
+  | "approval_request_hash"
+  | "decision"
+>;
+
+export type ToolDispositionControlOperation = Pick<
+  ServiceToolDisposeRequestV1,
+  | "run_id"
+  | "expected_journal_revision"
+  | "expected_journal_head_hash"
+  | "call_id"
+  | "idempotency_key"
+  | "disposition"
+>;
 
 export interface CliOutput {
   readonly exitCode: ExitCode;
@@ -144,6 +181,9 @@ export interface CreateMainServicesOptions {
   readonly requestServiceStatus?: typeof requestRuntimeServiceStatus;
   readonly probeServiceIdentity?: typeof probeRuntimeServiceIdentity;
   readonly requestProjectOperation?: typeof requestRuntimeProjectOperation;
+  readonly requestToolApprovalDecision?: typeof requestRuntimeToolApprovalDecision;
+  readonly requestToolDisposition?: typeof requestRuntimeToolDisposition;
+  readonly createToolBroker?: typeof createRuntimeToolBroker;
 }
 
 async function hashFile(filePath: string): Promise<string> {
@@ -297,6 +337,30 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
         socketPath: await serviceSocketPath(),
         operation,
       }),
+    requestToolApprovalDecision: async (operation) =>
+      (options.requestToolApprovalDecision ?? requestRuntimeToolApprovalDecision)({
+        socketPath: await serviceSocketPath(),
+        request: {
+          schema_version: "service-control-request.v1",
+          document_type: "service-control-request",
+          request_id: randomUUID(),
+          command: "tool-approve",
+          operation_id: randomUUID(),
+          ...operation,
+        },
+      }),
+    requestToolDisposition: async (operation) =>
+      (options.requestToolDisposition ?? requestRuntimeToolDisposition)({
+        socketPath: await serviceSocketPath(),
+        request: {
+          schema_version: "service-control-request.v1",
+          document_type: "service-control-request",
+          request_id: randomUUID(),
+          command: "tool-dispose",
+          operation_id: randomUUID(),
+          ...operation,
+        },
+      }),
     readOperationalLogs: async (filter) => (await operationalLogReader()).read(filter),
     followOperationalLogs: async (filter) => {
       const reader = await operationalLogReader();
@@ -356,6 +420,23 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
         now: options.now,
         randomId: randomUUID,
       });
+      const tools = (options.createToolBroker ?? createRuntimeToolBroker)({
+        config: loaded.config,
+        journal_store: journal,
+        state_path: loaded.config.paths.state,
+        platform: {
+          os: options.platform.os,
+          arch: options.platform.arch,
+          node: options.platform.node,
+        },
+        now: options.now,
+        create_session_id: () => `session-${randomUUID()}`,
+        is_process_alive: processLiveness,
+        has_service_listener: () =>
+          probeRuntimeServiceIdentity({ socketPath: loaded.config.paths.socket }).then(
+            (identity) => (identity === null ? "absent" : "present"),
+          ),
+      });
       return runSupervisor({
         loaded,
         signals: options.signals,
@@ -367,9 +448,10 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
         socketProbe: {
           identify: (socketPath) => probeRuntimeServiceIdentity({ socketPath }),
         },
-        recoveryParticipants: [journal, skills, projects],
+        recoveryParticipants: [journal, tools, skills, projects],
         journalParticipant: journal,
         interruptionRecorder: journal,
+        isDegraded: () => tools.health().some((profile) => profile.status !== "ready"),
         handleSkillRequest: async (request) => {
           const traceHash = createHash("sha256")
             .update(`skill-control:${request.operation_id}`, "utf8")
@@ -403,6 +485,69 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
             run_id: outcome.phase.run_id,
             state: outcome.state,
             phase: outcome.phase.phase,
+            journal_head: outcome.journal_head,
+            approval_request_hash: outcome.approval.approval_request_hash,
+            approval_decision_hash: outcome.approval.document_hash,
+            replayed: outcome.replayed,
+          };
+        },
+        handleToolRequest: async (request) => {
+          const traceHash = createHash("sha256")
+            .update(`tool-control:${request.operation_id}`, "utf8")
+            .digest("hex");
+          const trace = {
+            trace_id: traceHash.slice(0, 32),
+            span_id: traceHash.slice(32, 48),
+            trace_flags: 1,
+          } as const;
+          const expectedJournalHead = {
+            journal_revision: request.expected_journal_revision,
+            sequence: request.expected_journal_revision,
+            entry_hash: request.expected_journal_head_hash,
+          } as const;
+          if (request.command === "tool-dispose") {
+            const outcome = await tools.disposeUncertain({
+              run_id: request.run_id,
+              expected_journal_head: expectedJournalHead,
+              call_id: request.call_id,
+              idempotency_key: request.idempotency_key,
+              operation_id: request.operation_id,
+              disposition: request.disposition,
+              trace,
+            });
+            return {
+              kind: "tool-disposition",
+              run_id: outcome.call.run_id,
+              state: outcome.state,
+              call_id: outcome.call.call_id,
+              idempotency_key: outcome.call.idempotency_key,
+              disposition: outcome.disposition,
+              journal_head: outcome.journal_head,
+              operation_hash: outcome.operation_hash,
+              replayed: outcome.replayed,
+            };
+          }
+          const outcome = await tools.resumeApproval({
+            run_id: request.run_id,
+            expected_journal_head: expectedJournalHead,
+            call_id: request.call_id,
+            approval_request_hash: request.approval_request_hash,
+            operation_id: request.operation_id,
+            decision: request.decision,
+            trace,
+            signal: new AbortController().signal,
+          });
+          if (
+            outcome.approval?.kind !== "DECISION" ||
+            (outcome.state !== "RUNNING" && outcome.state !== "BLOCKED")
+          ) {
+            throw new RuntimeToolError("RUNTIME_TOOL_INTERNAL");
+          }
+          return {
+            kind: "tool-approval",
+            run_id: outcome.call.run_id,
+            state: outcome.state,
+            call_id: outcome.call.call_id,
             journal_head: outcome.journal_head,
             approval_request_hash: outcome.approval.approval_request_hash,
             approval_decision_hash: outcome.approval.document_hash,
@@ -657,6 +802,63 @@ function projectFailure(commandName: string, json: boolean, error: unknown): Cli
   );
 }
 
+function toolErrorExitCode(code: RuntimeToolErrorCode): Exclude<ExitCode, 0> {
+  if (code === "RUNTIME_TOOL_OPERATION_CONFLICT" || code === "RUNTIME_TOOL_APPROVAL_STALE") {
+    return 6;
+  }
+  if (code === "RUNTIME_TOOL_INVALID") return 3;
+  if (
+    code === "RUNTIME_TOOL_POLICY_DENIED" ||
+    code === "RUNTIME_TOOL_APPROVAL_REQUIRED" ||
+    code === "RUNTIME_TOOL_APPROVAL_REJECTED" ||
+    code === "RUNTIME_TOOL_AUTHENTICATION"
+  ) {
+    return 4;
+  }
+  if (
+    code === "RUNTIME_TOOL_UNAVAILABLE" ||
+    code === "RUNTIME_TOOL_RATE_LIMIT" ||
+    code === "RUNTIME_TOOL_TIMEOUT" ||
+    code === "RUNTIME_TOOL_CANCELLED"
+  ) {
+    return 69;
+  }
+  return 5;
+}
+
+function toolFailure(
+  commandName: "tool-approve" | "tool-dispose",
+  json: boolean,
+  error: unknown,
+): CliOutput {
+  if (error instanceof RuntimeToolError) {
+    return outputForResult(
+      commandResult({
+        command: commandName,
+        exitCode: toolErrorExitCode(error.code),
+        error: {
+          code: error.code,
+          category: error.category,
+          retryable: error.retryable,
+          safe_message: error.safe_message,
+        },
+      }),
+      json,
+      "",
+    );
+  }
+  if (error instanceof RuntimeServiceError) return serviceFailure(commandName, json, error);
+  return outputForResult(
+    commandResult({
+      command: commandName,
+      exitCode: 70,
+      error: runtimeError("RUNTIME_TOOL_INTERNAL", "internal", "Tool operation failed"),
+    }),
+    json,
+    "",
+  );
+}
+
 function loggingFailure(json: boolean, error: unknown): CliOutput {
   if (error instanceof RuntimeConfigError || error instanceof RuntimeServiceError) {
     return serviceFailure("logs", json, error);
@@ -782,6 +984,98 @@ async function project(
     return outputForResult(result, command.json, human);
   } catch (error) {
     return projectFailure(commandName, command.json, error);
+  }
+}
+
+async function toolApprove(
+  command: Extract<BaselineCommand, { name: "tool-approve" }>,
+  services: CliServices,
+): Promise<CliOutput> {
+  if (!isSupportedPlatform(services.platform)) {
+    return outputForResult(
+      commandResult({
+        command: "tool-approve",
+        exitCode: 5,
+        error: runtimeError(
+          "RUNTIME_PLATFORM_UNSUPPORTED",
+          "unsupported-capability",
+          "Platform is unsupported",
+        ),
+      }),
+      command.json,
+      "",
+    );
+  }
+  if (services.requestToolApprovalDecision === undefined) {
+    return toolFailure(
+      "tool-approve",
+      command.json,
+      new RuntimeToolError("RUNTIME_TOOL_UNAVAILABLE"),
+    );
+  }
+  try {
+    const data = await services.requestToolApprovalDecision({
+      run_id: command.runId,
+      expected_journal_revision: command.expectedJournalRevision,
+      expected_journal_head_hash: command.expectedJournalHeadHash,
+      call_id: command.callId,
+      approval_request_hash: command.approvalRequestHash,
+      decision: command.decision,
+    });
+    return outputForResult(
+      commandResult({ command: "tool-approve", exitCode: 0, data: jsonValue(data) }),
+      command.json,
+      command.decision === "APPROVE" ? "Tool call approved" : "Tool call rejected",
+    );
+  } catch (error) {
+    return toolFailure("tool-approve", command.json, error);
+  }
+}
+
+async function toolDispose(
+  command: Extract<BaselineCommand, { name: "tool-dispose" }>,
+  services: CliServices,
+): Promise<CliOutput> {
+  if (!isSupportedPlatform(services.platform)) {
+    return outputForResult(
+      commandResult({
+        command: "tool-dispose",
+        exitCode: 5,
+        error: runtimeError(
+          "RUNTIME_PLATFORM_UNSUPPORTED",
+          "unsupported-capability",
+          "Platform is unsupported",
+        ),
+      }),
+      command.json,
+      "",
+    );
+  }
+  if (services.requestToolDisposition === undefined) {
+    return toolFailure(
+      "tool-dispose",
+      command.json,
+      new RuntimeToolError("RUNTIME_TOOL_UNAVAILABLE"),
+    );
+  }
+  try {
+    const data = await services.requestToolDisposition({
+      run_id: command.runId,
+      expected_journal_revision: command.expectedJournalRevision,
+      expected_journal_head_hash: command.expectedJournalHeadHash,
+      call_id: command.callId,
+      idempotency_key: command.idempotencyKey,
+      disposition: command.disposition,
+    });
+    return outputForResult(
+      commandResult({ command: "tool-dispose", exitCode: 0, data: jsonValue(data) }),
+      command.json,
+      command.disposition === "NO_EFFECT_CONFIRMED"
+        ? "Tool call cleared for retry"
+        : "Tool effect confirmed; run remains blocked",
+    );
+  } catch (error) {
+    return toolFailure("tool-dispose", command.json, error);
   }
 }
 
@@ -1099,6 +1393,8 @@ export async function runCli(argv: readonly string[], services: CliServices): Pr
   if (command.name === "doctor") return doctor(command, services);
   if (command.name === "service") return service(command, services);
   if (command.name === "project") return project(command, services);
+  if (command.name === "tool-approve") return toolApprove(command, services);
+  if (command.name === "tool-dispose") return toolDispose(command, services);
   if (command.name === "logs") return logs(command, services);
   return serve(command, services);
 }

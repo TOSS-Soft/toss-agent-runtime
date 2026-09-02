@@ -1,4 +1,5 @@
 import type { RuntimeDocument, ValidationResult } from "../protocol/types.js";
+import type { JsonValue } from "../protocol/json.js";
 import type { SecretReference } from "../config/types.js";
 import type { ProviderAdapterCapabilities, ProviderKind } from "../providers/types.js";
 
@@ -56,17 +57,22 @@ export interface GatewayCredentialProvider {
     options: {
       readonly signal: AbortSignal;
       readonly minimum_validity_ms: 30_000;
+      readonly scope?: Readonly<Record<string, JsonValue>>;
     },
   ): Promise<unknown>;
 }
 
 export interface GatewayCredentialCoordinator {
-  resolve(reference: SecretReference, signal: AbortSignal): Promise<GatewayCredentialLease>;
+  resolve(
+    reference: SecretReference,
+    signal: AbortSignal,
+    scope?: Readonly<Record<string, JsonValue>>,
+  ): Promise<GatewayCredentialLease>;
   clear(): void;
 }
 
 export interface AgentgatewayFetchOptions {
-  readonly method: "GET" | "POST";
+  readonly method: "GET" | "POST" | "DELETE";
   readonly headers: Headers;
   readonly redirect: "error";
   readonly signal: AbortSignal;
