@@ -933,21 +933,21 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 - Consumes: prepared call, exact pending journal head, snapshot freshness, private store, executor, and authenticated same-user socket.
 - Produces: `requestToolApproval`, `resumeToolApproval`, `ServiceToolApproveRequestV1`, `ToolApprovalDataV1`, and internal CLI command `tool-approve`.
 
-- [ ] **Step 1: Write approval lifecycle RED tests**
+- [x] **Step 1: Write approval lifecycle RED tests**
 
   Assert reversible default/irreversible pause, reversible explicit waiver, no native call before approval, durable request before `APPROVAL_PENDING`, restart then approve, reject to `BLOCKED`, exact duplicate replay, conflicting decision, stale head, stale/expired snapshot, changed input/tool/schema/profile/role/run, cross-run reuse, operation-ID conflict, bounded redacted summary, and shutdown intake races.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
   ```bash
   npm exec -- vitest run test/tool-approval.test.ts --maxWorkers=4
   ```
 
-- [ ] **Step 3: Implement exact request/decision binding**
+- [x] **Step 3: Implement exact request/decision binding**
 
   Persist the prepared call and approval request, then append `APPROVAL_PENDING`. Resume requires all request fields and expected head to match, records a decision once, revalidates profile binding and snapshot freshness, and moves approved calls `APPROVAL_PENDING -> RUNNING` before invoking Task 11. Rejection records the decision and moves to `BLOCKED` without creating side-effect intent.
 
-- [ ] **Step 4: Extend the closed service protocol**
+- [x] **Step 4: Extend the closed service protocol**
 
   Add this request branch and matching response data:
 
@@ -966,7 +966,7 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 
   Route only through the existing authenticated local socket; apply request hash/replay cache; expose no model-callable approval API. Add the tool-domain safe error variants to the closed service response schema and add an internal CLI grammar branch that serializes this exact request.
 
-- [ ] **Step 5: Run service and approval GREEN gates**
+- [x] **Step 5: Run service and approval GREEN gates**
 
   ```bash
   npm exec -- vitest run test/tool-approval.test.ts test/service-contracts.test.ts test/service-control.test.ts test/service-supervisor.test.ts test/cli.test.ts --maxWorkers=4

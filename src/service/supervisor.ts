@@ -59,6 +59,7 @@ export interface RunSupervisorOptions {
   readonly journalParticipant?: RecoveryParticipant;
   readonly interruptionRecorder: InterruptionRecorder;
   readonly handleSkillRequest?: CreateServiceControlServerOptions["handleSkillRequest"];
+  readonly handleToolRequest?: CreateServiceControlServerOptions["handleToolRequest"];
   readonly operationalLogger?: SupervisorOperationalLogger;
   readonly onReady: () => void;
   readonly acquireLock?: (options: AcquireInstanceLockOptions) => Promise<InstanceLock>;
@@ -354,6 +355,9 @@ export async function runSupervisor(options: RunSupervisorOptions): Promise<Supe
           ...(options.handleSkillRequest === undefined
             ? {}
             : { handleSkillRequest: options.handleSkillRequest }),
+          ...(options.handleToolRequest === undefined
+            ? {}
+            : { handleToolRequest: options.handleToolRequest }),
         });
         await server.listen();
         await logLifecycle("service.ready");

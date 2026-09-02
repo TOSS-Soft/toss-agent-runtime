@@ -25,6 +25,7 @@ import { TOOL_HARD_LIMITS } from "./types.js";
 const HASH_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const OBJECT_NAME_PATTERN = /^[0-9a-f]{64}$/u;
 const IDENTIFIER_PATTERN = /^[A-Za-z][A-Za-z0-9._:-]{0,127}$/u;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const STORE_RECORD_SCHEMA = "tool-private-record.v1";
 const CHUNK_BYTES = 512 * 1024;
 const MAX_OBJECT_ENTRIES = 8_192;
@@ -269,7 +270,9 @@ function parseManifest(bytes: Uint8Array): StoredManifest | null {
     (value.call_revision !== null &&
       (!Number.isSafeInteger(value.call_revision) || Number(value.call_revision) < 1)) ||
     (value.operation_id !== null &&
-      (typeof value.operation_id !== "string" || !IDENTIFIER_PATTERN.test(value.operation_id))) ||
+      (typeof value.operation_id !== "string" ||
+        (!IDENTIFIER_PATTERN.test(value.operation_id) &&
+          !UUID_PATTERN.test(value.operation_id)))) ||
     !Number.isSafeInteger(value.payload_bytes) ||
     Number(value.payload_bytes) < 2 ||
     Number(value.payload_bytes) > MAX_DOCUMENT_BYTES ||

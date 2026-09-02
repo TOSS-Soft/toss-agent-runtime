@@ -96,6 +96,23 @@ describe("durable tool documents", () => {
     }
   });
 
+  it("allows only the initial irreversible preparation to await its approval hash", () => {
+    const prepared = withDocumentHash({
+      ...validToolCall(),
+      operation_class: "irreversible" as const,
+    });
+    const uncertain = withDocumentHash({
+      ...prepared,
+      stage: "UNCERTAIN" as const,
+      dispatch_state: "MAYBE_SENT" as const,
+      terminal_at: "2026-09-01T10:01:00.000Z",
+      terminal_code: "RUNTIME_TOOL_EFFECT_UNCERTAIN" as const,
+    });
+
+    expect(parseToolCall(canonicalJson(prepared))).toMatchObject({ ok: true });
+    expect(parseToolCall(canonicalJson(uncertain))).toMatchObject({ ok: false });
+  });
+
   it("rejects result annotations instead of treating them as trust", () => {
     const result = validToolResult();
     const parsed = parseToolResult(

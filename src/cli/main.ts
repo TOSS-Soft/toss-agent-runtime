@@ -30,9 +30,15 @@ import {
   probeServiceIdentity as probeRuntimeServiceIdentity,
   requestProjectOperation as requestRuntimeProjectOperation,
   requestServiceStatus as requestRuntimeServiceStatus,
+  requestToolApprovalDecision as requestRuntimeToolApprovalDecision,
   type ProjectControlOperation,
 } from "../service/control.js";
-import type { ServiceProjectDataV1, ServiceStatusV1 } from "../service/contracts.js";
+import type {
+  ServiceProjectDataV1,
+  ServiceStatusV1,
+  ServiceToolApproveRequestV1,
+  ToolApprovalDataV1,
+} from "../service/contracts.js";
 import { ensureServiceConfig } from "../service/definition-store.js";
 import { RuntimeServiceError } from "../service/errors.js";
 import { acquireInstanceLock, type ProcessLiveness } from "../service/instance-lock.js";
@@ -50,6 +56,7 @@ import { createProjectRegistry } from "../service/project/registry.js";
 import { createProjectWatcher } from "../service/project/watcher.js";
 import { RuntimeSkillError } from "../skills/index.js";
 import { createSkillsRuntimeHost } from "../skills/runtime-host.js";
+import { RuntimeToolError, type RuntimeToolErrorCode } from "../tools/errors.js";
 import { PACKAGE_VERSION } from "../version.js";
 import { CliUsageError, parseCli, type BaselineCommand, type ServiceAction } from "./grammar.js";
 import {
@@ -104,6 +111,9 @@ export interface CliServices {
   readonly requestProjectOperation?: (
     operation: ProjectControlOperation,
   ) => Promise<ServiceProjectDataV1>;
+  readonly requestToolApprovalDecision?: (
+    operation: ToolApprovalControlOperation,
+  ) => Promise<ToolApprovalDataV1>;
   readonly readOperationalLogs?: (
     filter: OperationalLogFilter,
   ) => Promise<OperationalLogReadResult>;
@@ -111,6 +121,16 @@ export interface CliServices {
     filter: OperationalLogFilter,
   ) => Promise<AsyncIterable<OperationalEventV1>>;
 }
+
+export type ToolApprovalControlOperation = Pick<
+  ServiceToolApproveRequestV1,
+  | "run_id"
+  | "expected_journal_revision"
+  | "expected_journal_head_hash"
+  | "call_id"
+  | "approval_request_hash"
+  | "decision"
+>;
 
 export interface CliOutput {
   readonly exitCode: ExitCode;
@@ -144,6 +164,7 @@ export interface CreateMainServicesOptions {
   readonly requestServiceStatus?: typeof requestRuntimeServiceStatus;
   readonly probeServiceIdentity?: typeof probeRuntimeServiceIdentity;
   readonly requestProjectOperation?: typeof requestRuntimeProjectOperation;
+  readonly requestToolApprovalDecision?: typeof requestRuntimeToolApprovalDecision;
 }
 
 async function hashFile(filePath: string): Promise<string> {
@@ -296,6 +317,18 @@ export function createMainServices(options: CreateMainServicesOptions): CliServi
       (options.requestProjectOperation ?? requestRuntimeProjectOperation)({
         socketPath: await serviceSocketPath(),
         operation,
+      }),
+    requestToolApprovalDecision: async (operation) =>
+      (options.requestToolApprovalDecision ?? requestRuntimeToolApprovalDecision)({
+        socketPath: await serviceSocketPath(),
+        request: {
+          schema_version: "service-control-request.v1",
+          document_type: "service-control-request",
+          request_id: randomUUID(),
+          command: "tool-approve",
+          operation_id: randomUUID(),
+          ...operation,
+        },
       }),
     readOperationalLogs: async (filter) => (await operationalLogReader()).read(filter),
     followOperationalLogs: async (filter) => {
@@ -657,6 +690,59 @@ function projectFailure(commandName: string, json: boolean, error: unknown): Cli
   );
 }
 
+function toolErrorExitCode(code: RuntimeToolErrorCode): Exclude<ExitCode, 0> {
+  if (code === "RUNTIME_TOOL_OPERATION_CONFLICT" || code === "RUNTIME_TOOL_APPROVAL_STALE") {
+    return 6;
+  }
+  if (code === "RUNTIME_TOOL_INVALID") return 3;
+  if (
+    code === "RUNTIME_TOOL_POLICY_DENIED" ||
+    code === "RUNTIME_TOOL_APPROVAL_REQUIRED" ||
+    code === "RUNTIME_TOOL_APPROVAL_REJECTED" ||
+    code === "RUNTIME_TOOL_AUTHENTICATION"
+  ) {
+    return 4;
+  }
+  if (
+    code === "RUNTIME_TOOL_UNAVAILABLE" ||
+    code === "RUNTIME_TOOL_RATE_LIMIT" ||
+    code === "RUNTIME_TOOL_TIMEOUT" ||
+    code === "RUNTIME_TOOL_CANCELLED"
+  ) {
+    return 69;
+  }
+  return 5;
+}
+
+function toolFailure(json: boolean, error: unknown): CliOutput {
+  if (error instanceof RuntimeToolError) {
+    return outputForResult(
+      commandResult({
+        command: "tool-approve",
+        exitCode: toolErrorExitCode(error.code),
+        error: {
+          code: error.code,
+          category: error.category,
+          retryable: error.retryable,
+          safe_message: error.safe_message,
+        },
+      }),
+      json,
+      "",
+    );
+  }
+  if (error instanceof RuntimeServiceError) return serviceFailure("tool-approve", json, error);
+  return outputForResult(
+    commandResult({
+      command: "tool-approve",
+      exitCode: 70,
+      error: runtimeError("RUNTIME_TOOL_INTERNAL", "internal", "Tool operation failed"),
+    }),
+    json,
+    "",
+  );
+}
+
 function loggingFailure(json: boolean, error: unknown): CliOutput {
   if (error instanceof RuntimeConfigError || error instanceof RuntimeServiceError) {
     return serviceFailure("logs", json, error);
@@ -782,6 +868,47 @@ async function project(
     return outputForResult(result, command.json, human);
   } catch (error) {
     return projectFailure(commandName, command.json, error);
+  }
+}
+
+async function toolApprove(
+  command: Extract<BaselineCommand, { name: "tool-approve" }>,
+  services: CliServices,
+): Promise<CliOutput> {
+  if (!isSupportedPlatform(services.platform)) {
+    return outputForResult(
+      commandResult({
+        command: "tool-approve",
+        exitCode: 5,
+        error: runtimeError(
+          "RUNTIME_PLATFORM_UNSUPPORTED",
+          "unsupported-capability",
+          "Platform is unsupported",
+        ),
+      }),
+      command.json,
+      "",
+    );
+  }
+  if (services.requestToolApprovalDecision === undefined) {
+    return toolFailure(command.json, new RuntimeToolError("RUNTIME_TOOL_UNAVAILABLE"));
+  }
+  try {
+    const data = await services.requestToolApprovalDecision({
+      run_id: command.runId,
+      expected_journal_revision: command.expectedJournalRevision,
+      expected_journal_head_hash: command.expectedJournalHeadHash,
+      call_id: command.callId,
+      approval_request_hash: command.approvalRequestHash,
+      decision: command.decision,
+    });
+    return outputForResult(
+      commandResult({ command: "tool-approve", exitCode: 0, data: jsonValue(data) }),
+      command.json,
+      command.decision === "APPROVE" ? "Tool call approved" : "Tool call rejected",
+    );
+  } catch (error) {
+    return toolFailure(command.json, error);
   }
 }
 
@@ -1099,6 +1226,7 @@ export async function runCli(argv: readonly string[], services: CliServices): Pr
   if (command.name === "doctor") return doctor(command, services);
   if (command.name === "service") return service(command, services);
   if (command.name === "project") return project(command, services);
+  if (command.name === "tool-approve") return toolApprove(command, services);
   if (command.name === "logs") return logs(command, services);
   return serve(command, services);
 }

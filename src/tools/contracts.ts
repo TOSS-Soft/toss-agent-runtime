@@ -616,7 +616,11 @@ function callIssues(value: ToolCallV1): readonly ValidationIssue[] {
       issue("/logical_input_hash", "canonicalHash", "logical input hash does not match arguments"),
     );
   }
-  if (value.operation_class === "irreversible" && value.approval_request_hash === null) {
+  if (
+    value.operation_class === "irreversible" &&
+    value.approval_request_hash === null &&
+    !(value.stage === "PREPARED" && value.call_revision === 1)
+  ) {
     issues.push(
       issue("/approval_request_hash", "approval", "irreversible calls require an approval request"),
     );

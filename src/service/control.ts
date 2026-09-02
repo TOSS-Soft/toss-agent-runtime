@@ -27,7 +27,10 @@ import {
   type ServiceSkillRequestV1,
   type ServiceStatusV1,
   type ServiceSuperpowersApproveRequestV1,
+  type ServiceToolApproveRequestV1,
+  type ServiceToolRequestV1,
   type SuperpowersApprovalDataV1,
+  type ToolApprovalDataV1,
 } from "./contracts.js";
 import {
   isRuntimeServiceErrorCode,
@@ -43,6 +46,11 @@ import {
 } from "./paths.js";
 import { RuntimeProjectError, type RuntimeProjectErrorCode } from "./project/errors.js";
 import { RuntimeSkillError, type RuntimeSkillErrorCode } from "../skills/errors.js";
+import {
+  isRuntimeToolErrorCode,
+  RuntimeToolError,
+  type RuntimeToolErrorCode,
+} from "../tools/errors.js";
 
 const RESPONSE_FRAME_BYTES = MAX_CONTROL_MESSAGE_BYTES + 1;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
@@ -85,6 +93,7 @@ export interface CreateServiceControlServerOptions {
   readonly handleSkillRequest?: (
     request: ServiceSkillRequestV1,
   ) => Promise<SuperpowersApprovalDataV1>;
+  readonly handleToolRequest?: (request: ServiceToolRequestV1) => Promise<ToolApprovalDataV1>;
   /** @internal Deterministic current-platform seam for portable path-budget tests. */
   readonly socketPathPlatform?: "darwin" | "linux";
   /** @internal Deterministic Unix-socket ABI-budget seam for portable tests. */
@@ -148,6 +157,12 @@ export interface RequestProjectOperationOptions {
 export interface RequestSuperpowersApprovalDecisionOptions {
   readonly socketPath: string;
   readonly request: ServiceSuperpowersApproveRequestV1;
+  readonly idleTimeoutMs?: 5_000;
+}
+
+export interface RequestToolApprovalDecisionOptions {
+  readonly socketPath: string;
+  readonly request: ServiceToolApproveRequestV1;
   readonly idleTimeoutMs?: 5_000;
 }
 
@@ -1080,7 +1095,8 @@ async function reclaimStaleStagedSockets(options: {
   }
 }
 
-type ControlErrorCode = RuntimeServiceErrorCode | RuntimeProjectErrorCode | RuntimeSkillErrorCode;
+type ControlErrorCode =
+  RuntimeServiceErrorCode | RuntimeProjectErrorCode | RuntimeSkillErrorCode | RuntimeToolErrorCode;
 
 function plainError(code: ControlErrorCode): Readonly<{
   code: ControlErrorCode;
@@ -1088,8 +1104,9 @@ function plainError(code: ControlErrorCode): Readonly<{
   retryable: boolean;
   safe_message: string;
 }> {
-  const error =
-    code === "BLOCKED_SUPERPOWERS_MISSING" || code.startsWith("RUNTIME_SKILL_")
+  const error = code.startsWith("RUNTIME_TOOL_")
+    ? new RuntimeToolError(code as RuntimeToolErrorCode)
+    : code === "BLOCKED_SUPERPOWERS_MISSING" || code.startsWith("RUNTIME_SKILL_")
       ? new RuntimeSkillError(code as RuntimeSkillErrorCode)
       : code.startsWith("RUNTIME_PROJECT_") || code === "RUNTIME_OPERATION_CONFLICT"
         ? new RuntimeProjectError(code as RuntimeProjectErrorCode)
@@ -1230,6 +1247,39 @@ function validatedSkillResponse(
   }
 }
 
+function validatedToolResponse(
+  request: ServiceToolRequestV1,
+  data: ToolApprovalDataV1,
+): ServiceControlResponseV1 | undefined {
+  try {
+    if (
+      data.kind !== "tool-approval" ||
+      data.run_id !== request.run_id ||
+      data.call_id !== request.call_id ||
+      data.approval_request_hash !== request.approval_request_hash ||
+      data.state !== (request.decision === "APPROVE" ? "RUNNING" : "BLOCKED") ||
+      data.journal_head.journal_revision !== request.expected_journal_revision + 1 ||
+      data.journal_head.sequence !== request.expected_journal_revision + 1 ||
+      data.journal_head.entry_hash === request.expected_journal_head_hash
+    ) {
+      return undefined;
+    }
+    const response: ServiceControlResponseV1 = {
+      schema_version: "service-control-response.v1",
+      document_type: "service-control-response",
+      request_id: request.request_id,
+      ok: true,
+      status: null,
+      data,
+      error: null,
+    };
+    const parsed = parseServiceControlResponse(canonicalJson(response));
+    return parsed.ok ? parsed.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function canonicalProjectRequest(request: ServiceProjectRequestV1): ServiceProjectRequestV1 {
   if (request.command === "project-list") return request;
   if (request.command === "project-register") {
@@ -1246,7 +1296,18 @@ function canonicalSkillRequest(request: ServiceSkillRequestV1): ServiceSkillRequ
   return { ...request, operation_id: request.operation_id.toLowerCase() };
 }
 
+function canonicalToolRequest(request: ServiceToolRequestV1): ServiceToolRequestV1 {
+  return { ...request, operation_id: request.operation_id.toLowerCase() };
+}
+
 function safeOperationFailure(error: unknown): ControlErrorCode {
+  if (error instanceof RuntimeToolError) {
+    try {
+      return new RuntimeToolError(error.code).code;
+    } catch {
+      return "RUNTIME_SERVICE_UNAVAILABLE";
+    }
+  }
   if (error instanceof RuntimeSkillError) {
     try {
       return new RuntimeSkillError(error.code).code;
@@ -1275,6 +1336,7 @@ function validatedConfiguration(options: CreateServiceControlServerOptions): boo
       typeof options.handleProjectRequest === "function") &&
     (options.handleSkillRequest === undefined ||
       typeof options.handleSkillRequest === "function") &&
+    (options.handleToolRequest === undefined || typeof options.handleToolRequest === "function") &&
     typeof options.serviceInstanceId === "string" &&
     UUID_PATTERN.test(options.serviceInstanceId)
   );
@@ -1364,6 +1426,21 @@ export function createServiceControlServer(
         const canonicalRequest = canonicalSkillRequest(request);
         const data = await options.handleSkillRequest(canonicalRequest);
         const success = validatedSkillResponse(canonicalRequest, data);
+        return framedResponse(
+          success ?? failureResponse(request.request_id, "RUNTIME_SERVICE_UNAVAILABLE"),
+        );
+      } catch (error) {
+        return framedResponse(failureResponse(request.request_id, safeOperationFailure(error)));
+      }
+    }
+    if (request.command === "tool-approve") {
+      if (options.handleToolRequest === undefined) {
+        return framedResponse(failureResponse(request.request_id, "RUNTIME_SERVICE_UNAVAILABLE"));
+      }
+      try {
+        const canonicalRequest = canonicalToolRequest(request);
+        const data = await options.handleToolRequest(canonicalRequest);
+        const success = validatedToolResponse(canonicalRequest, data);
         return framedResponse(
           success ?? failureResponse(request.request_id, "RUNTIME_SERVICE_UNAVAILABLE"),
         );
@@ -2025,6 +2102,10 @@ async function readControlResponse(
 function throwControlFailure(response: ServiceControlResponseV1): never {
   const code = response.error?.code;
   if (typeof code !== "string") unavailable();
+  if (code.startsWith("RUNTIME_TOOL_")) {
+    if (!isRuntimeToolErrorCode(code)) unavailable();
+    throw new RuntimeToolError(code);
+  }
   if (code === "BLOCKED_SUPERPOWERS_MISSING" || code.startsWith("RUNTIME_SKILL_")) {
     try {
       throw new RuntimeSkillError(code as RuntimeSkillErrorCode);
@@ -2083,7 +2164,8 @@ export async function requestProjectOperation(
     if (
       !validated.ok ||
       validated.value.command === "status" ||
-      validated.value.command === "superpowers-approve"
+      validated.value.command === "superpowers-approve" ||
+      validated.value.command === "tool-approve"
     ) {
       controlInvalid();
     }
@@ -2145,6 +2227,46 @@ export async function requestSuperpowersApprovalDecision(
         throw new RuntimeSkillError(error.code);
       } catch (normalized) {
         if (normalized instanceof RuntimeSkillError) throw normalized;
+        unavailable();
+      }
+    }
+    if (error instanceof RuntimeServiceError && internalServiceErrors.has(error)) throw error;
+    unavailable();
+  }
+}
+
+export async function requestToolApprovalDecision(
+  options: RequestToolApprovalDecisionOptions,
+): Promise<ToolApprovalDataV1> {
+  try {
+    const validated = parseServiceControlRequest(canonicalJson(options.request));
+    if (!validated.ok || validated.value.command !== "tool-approve") controlInvalid();
+    const response = await readControlResponse(
+      { socketPath: options.socketPath, idleTimeoutMs: options.idleTimeoutMs ?? 5_000 },
+      validated.value,
+    );
+    if (!response.ok) throwControlFailure(response);
+    if (
+      response.status !== null ||
+      response.data?.kind !== "tool-approval" ||
+      response.data.run_id !== validated.value.run_id ||
+      response.data.call_id !== validated.value.call_id ||
+      response.data.approval_request_hash !== validated.value.approval_request_hash ||
+      response.data.state !== (validated.value.decision === "APPROVE" ? "RUNNING" : "BLOCKED") ||
+      response.data.journal_head.journal_revision !==
+        validated.value.expected_journal_revision + 1 ||
+      response.data.journal_head.sequence !== validated.value.expected_journal_revision + 1 ||
+      response.data.journal_head.entry_hash === validated.value.expected_journal_head_hash
+    ) {
+      unavailable();
+    }
+    return response.data;
+  } catch (error) {
+    if (error instanceof RuntimeToolError) {
+      try {
+        throw new RuntimeToolError(error.code);
+      } catch (normalized) {
+        if (normalized instanceof RuntimeToolError) throw normalized;
         unavailable();
       }
     }

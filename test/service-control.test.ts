@@ -28,10 +28,13 @@ import { canonicalJson } from "../src/protocol/json.js";
 import type {
   ServiceStatusV1,
   ServiceSuperpowersApproveRequestV1,
+  ServiceToolApproveRequestV1,
   SuperpowersApprovalDataV1,
+  ToolApprovalDataV1,
 } from "../src/service/contracts.js";
 import { RuntimeProjectError } from "../src/service/project/errors.js";
 import { RuntimeSkillError } from "../src/skills/errors.js";
+import { RuntimeToolError } from "../src/tools/errors.js";
 import {
   createServiceControlServer,
   probePrivateServiceSocketListener,
@@ -39,6 +42,7 @@ import {
   requestProjectOperation,
   requestServiceStatus,
   requestSuperpowersApprovalDecision,
+  requestToolApprovalDecision,
   type ServiceControlOperationHooks,
   type ServiceControlServer,
 } from "../src/service/control.js";
@@ -185,6 +189,45 @@ function approvalData(
     run_id: request.run_id,
     state: request.decision === "APPROVE" ? "RUNNING" : "BLOCKED",
     phase: request.phase,
+    journal_head: {
+      journal_revision: request.expected_journal_revision + 1,
+      sequence: request.expected_journal_revision + 1,
+      entry_hash: `sha256:${"d".repeat(64)}`,
+    },
+    approval_request_hash: request.approval_request_hash,
+    approval_decision_hash: `sha256:${"e".repeat(64)}`,
+    replayed,
+  };
+}
+
+function toolApprovalRequest(
+  overrides: Partial<ServiceToolApproveRequestV1> = {},
+): ServiceToolApproveRequestV1 {
+  return {
+    schema_version: "service-control-request.v1",
+    document_type: "service-control-request",
+    request_id: fixedRequestId,
+    command: "tool-approve",
+    operation_id: fixedOperationId,
+    run_id: "run-1",
+    expected_journal_revision: 4,
+    expected_journal_head_hash: `sha256:${"a".repeat(64)}`,
+    call_id: "tool-call-1",
+    approval_request_hash: `sha256:${"c".repeat(64)}`,
+    decision: "APPROVE",
+    ...overrides,
+  };
+}
+
+function toolApprovalData(
+  request: ServiceToolApproveRequestV1,
+  replayed = false,
+): ToolApprovalDataV1 {
+  return {
+    kind: "tool-approval",
+    run_id: request.run_id,
+    state: request.decision === "APPROVE" ? "RUNNING" : "BLOCKED",
+    call_id: request.call_id,
     journal_head: {
       journal_revision: request.expected_journal_revision + 1,
       sequence: request.expected_journal_revision + 1,
@@ -1486,6 +1529,36 @@ describe("private service control socket", () => {
     expect(projectCalls).toBe(0);
   });
 
+  it("dispatches tool approval only to its authenticated handler and byte-replays it", async () => {
+    let toolCalls = 0;
+    let skillCalls = 0;
+    await listenControl({
+      handleSkillRequest: () => {
+        skillCalls += 1;
+        return Promise.resolve(approvalData(approvalRequest()));
+      },
+      handleToolRequest: (request) => {
+        toolCalls += 1;
+        expect(request).toEqual(toolApprovalRequest());
+        return Promise.resolve(toolApprovalData(request));
+      },
+    });
+    const frame = `${canonicalJson(toolApprovalRequest())}\n`;
+
+    const first = await sendRaw(frame);
+    const second = await sendRaw(frame);
+
+    expect(second).toBe(first);
+    expect(JSON.parse(first)).toMatchObject({
+      ok: true,
+      status: null,
+      data: toolApprovalData(toolApprovalRequest()),
+      error: null,
+    });
+    expect(toolCalls).toBe(1);
+    expect(skillCalls).toBe(0);
+  });
+
   it("rejects malformed approval and post-stop approval without dispatch", async () => {
     let calls = 0;
     const server = await listenControl({
@@ -2040,6 +2113,28 @@ describe("private service control socket", () => {
     await expect(
       requestSuperpowersApprovalDecision({ socketPath, request, idleTimeoutMs: 5_000 }),
     ).resolves.toEqual(approvalData(request));
+  });
+
+  it("requests one exactly bound tool decision and reconstructs a safe tool failure", async () => {
+    const request = toolApprovalRequest();
+    await listenControl({
+      handleToolRequest: (received) =>
+        received.request_id === fixedRequestId
+          ? Promise.resolve(toolApprovalData(received))
+          : Promise.reject(new RuntimeToolError("RUNTIME_TOOL_APPROVAL_STALE")),
+    });
+
+    await expect(
+      requestToolApprovalDecision({ socketPath, request, idleTimeoutMs: 5_000 }),
+    ).resolves.toEqual(toolApprovalData(request));
+
+    await expect(
+      requestToolApprovalDecision({
+        socketPath,
+        request: { ...request, request_id: otherRequestId },
+        idleTimeoutMs: 5_000,
+      }),
+    ).rejects.toEqual(new RuntimeToolError("RUNTIME_TOOL_APPROVAL_STALE"));
   });
 
   it.each(["0", "a", "b", "c", "d", "e", "f"] as const)(

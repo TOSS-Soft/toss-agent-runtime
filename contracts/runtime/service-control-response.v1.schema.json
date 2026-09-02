@@ -35,7 +35,8 @@
         { "type": "null" },
         { "$ref": "#/$defs/project_registration_data" },
         { "$ref": "#/$defs/project_list_data" },
-        { "$ref": "#/$defs/superpowers_approval_data" }
+        { "$ref": "#/$defs/superpowers_approval_data" },
+        { "$ref": "#/$defs/tool_approval_data" }
       ]
     },
     "error": {
@@ -126,6 +127,30 @@
         "run_id": { "$ref": "#/$defs/identifier" },
         "state": { "enum": ["RUNNING", "BLOCKED"] },
         "phase": { "$ref": "#/$defs/phase" },
+        "journal_head": { "$ref": "#/$defs/journal_head" },
+        "approval_request_hash": { "$ref": "#/$defs/sha256" },
+        "approval_decision_hash": { "$ref": "#/$defs/sha256" },
+        "replayed": { "type": "boolean" }
+      }
+    },
+    "tool_approval_data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "run_id",
+        "state",
+        "call_id",
+        "journal_head",
+        "approval_request_hash",
+        "approval_decision_hash",
+        "replayed"
+      ],
+      "properties": {
+        "kind": { "const": "tool-approval" },
+        "run_id": { "$ref": "#/$defs/identifier" },
+        "state": { "enum": ["RUNNING", "BLOCKED"] },
+        "call_id": { "$ref": "#/$defs/identifier" },
         "journal_head": { "$ref": "#/$defs/journal_head" },
         "approval_request_hash": { "$ref": "#/$defs/sha256" },
         "approval_decision_hash": { "$ref": "#/$defs/sha256" },
@@ -299,6 +324,144 @@
         },
         {
           "properties": {
+            "code": { "const": "RUNTIME_TOOL_INVALID" },
+            "category": { "const": "invalid-input" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Tool input is invalid" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_TOOL_SCHEMA_MISMATCH" },
+            "category": { "const": "integrity" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Tool schema does not match its profile" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_TOOL_PROTOCOL_DOWNGRADE" },
+            "category": { "const": "integrity" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Tool protocol revision was downgraded" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_TOOL_RESULT_INVALID" },
+            "category": { "const": "integrity" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Tool result is invalid" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_TOOL_POLICY_DENIED" },
+            "category": { "const": "policy-denied" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Tool call is denied by policy" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_TOOL_UNSUPPORTED" },
+            "category": { "const": "unsupported-capability" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Tool capability is unsupported" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_TOOL_OPERATION_CONFLICT" },
+            "category": { "const": "stale-revision" },
+            "retryable": { "const": false },
+            "safe_message": {
+              "const": "Tool operation conflicts with an existing operation"
+            }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_TOOL_APPROVAL_REQUIRED" },
+            "category": { "const": "approval-required" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Tool call requires human approval" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_TOOL_APPROVAL_STALE" },
+            "category": { "const": "stale-revision" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Tool approval is stale" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_TOOL_APPROVAL_REJECTED" },
+            "category": { "const": "policy-denied" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Tool approval was rejected" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_TOOL_EFFECT_UNCERTAIN" },
+            "category": { "const": "integrity" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Tool effect is uncertain" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_TOOL_AUTHENTICATION" },
+            "category": { "const": "authentication" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Tool authentication failed" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_TOOL_UNAVAILABLE" },
+            "category": { "const": "unavailable" },
+            "retryable": { "const": true },
+            "safe_message": { "const": "Tool service is unavailable" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_TOOL_RATE_LIMIT" },
+            "category": { "const": "rate-limit" },
+            "retryable": { "const": true },
+            "safe_message": { "const": "Tool rate limit exceeded" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_TOOL_TIMEOUT" },
+            "category": { "const": "timeout" },
+            "retryable": { "const": true },
+            "safe_message": { "const": "Tool call timed out" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_TOOL_CANCELLED" },
+            "category": { "const": "cancelled" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Tool call was cancelled" }
+          }
+        },
+        {
+          "properties": {
+            "code": { "const": "RUNTIME_TOOL_INTERNAL" },
+            "category": { "const": "internal" },
+            "retryable": { "const": false },
+            "safe_message": { "const": "Tool operation failed" }
+          }
+        },
+        {
+          "properties": {
             "code": { "const": "RUNTIME_OPERATION_CONFLICT" },
             "category": { "const": "stale-revision" },
             "retryable": { "const": false },
@@ -377,7 +540,8 @@
           "oneOf": [
             { "$ref": "#/$defs/project_registration_data" },
             { "$ref": "#/$defs/project_list_data" },
-            { "$ref": "#/$defs/superpowers_approval_data" }
+            { "$ref": "#/$defs/superpowers_approval_data" },
+            { "$ref": "#/$defs/tool_approval_data" }
           ]
         },
         "error": { "type": "null" }

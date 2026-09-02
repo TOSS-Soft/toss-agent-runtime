@@ -17,12 +17,14 @@
         "project-register",
         "project-unregister",
         "project-list",
-        "superpowers-approve"
+        "superpowers-approve",
+        "tool-approve"
       ]
     },
     "root": { "type": "string", "minLength": 1, "maxLength": 4096 },
     "project_id": { "type": "string", "format": "uuid" },
     "run_id": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9._:-]{0,127}$" },
+    "call_id": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9._:-]{0,127}$" },
     "expected_journal_revision": {
       "type": "integer",
       "minimum": 1,
@@ -64,6 +66,7 @@
         "root": false,
         "project_id": false,
         "run_id": false,
+        "call_id": false,
         "expected_journal_revision": false,
         "expected_journal_head_hash": false,
         "phase": false,
@@ -80,6 +83,7 @@
         "command": { "const": "project-register" },
         "project_id": false,
         "run_id": false,
+        "call_id": false,
         "expected_journal_revision": false,
         "expected_journal_head_hash": false,
         "phase": false,
@@ -96,6 +100,7 @@
         "command": { "const": "project-unregister" },
         "root": false,
         "run_id": false,
+        "call_id": false,
         "expected_journal_revision": false,
         "expected_journal_head_hash": false,
         "phase": false,
@@ -113,6 +118,7 @@
         "root": false,
         "project_id": false,
         "run_id": false,
+        "call_id": false,
         "expected_journal_revision": false,
         "expected_journal_head_hash": false,
         "phase": false,
@@ -139,7 +145,28 @@
       "properties": {
         "command": { "const": "superpowers-approve" },
         "root": false,
-        "project_id": false
+        "project_id": false,
+        "call_id": false
+      }
+    },
+    {
+      "required": [
+        "operation_id",
+        "run_id",
+        "expected_journal_revision",
+        "expected_journal_head_hash",
+        "call_id",
+        "approval_request_hash",
+        "decision"
+      ],
+      "properties": {
+        "command": { "const": "tool-approve" },
+        "root": false,
+        "project_id": false,
+        "phase": false,
+        "skill_name": false,
+        "skill_version": false,
+        "skill_snapshot_hash": false
       }
     }
   ]
