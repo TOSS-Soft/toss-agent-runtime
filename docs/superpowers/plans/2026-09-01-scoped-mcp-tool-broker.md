@@ -761,7 +761,7 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 - Consumes: `EffectiveAgentAuthority`, exact execution request hash, active session/snapshot, profile rule, captured arguments, transport observation, and native result.
 - Produces: `authorizeToolCall(input): AuthorizedToolCall`, `deriveToolIdentity(input)`, `normalizeToolResult(input): ToolResultV1`, and structural/generic redaction helpers.
 
-- [ ] **Step 1: Write authority cross-product RED tests**
+- [x] **Step 1: Write authority cross-product RED tests**
 
   Vary run/request/trace identity, definition, role, Task Contract, profile reference, session, snapshot, alias, server, schema, arguments, secret-shaped keys, operation class, approval, timeout/result limits, and reviewer role one dimension at a time. Prove bindings, model `_meta`, server annotations, descriptions, output, and approved header mappings cannot widen authority.
 
@@ -776,17 +776,17 @@ export const TOOL_HARD_LIMITS = Object.freeze({
   );
   ```
 
-- [ ] **Step 2: Write normalization/redaction RED tests**
+- [x] **Step 2: Write normalization/redaction RED tests**
 
   Cover all five supported block kinds, per-block/total bounds, base64 validation, embedded resource bounds, dropped annotations, structured schema match/mismatch, declared JSON-pointer replacement, escaped pointer tokens, generic token/key patterns, invalid/partial/is-error native results, and absence of raw input/output in journal/log metadata.
 
-- [ ] **Step 3: Run RED**
+- [x] **Step 3: Run RED**
 
   ```bash
   npm exec -- vitest run test/tool-policy.test.ts test/tool-redaction.test.ts --maxWorkers=4
   ```
 
-- [ ] **Step 4: Implement the exact policy order and local identity**
+- [x] **Step 4: Implement the exact policy order and local identity**
 
   Evaluate the ten checks from the approved spec in order and stop on first denial. Derive a closed `_meta` member from captured authority:
 
@@ -810,7 +810,7 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 
   Reject caller/model `_meta`; derive stable call/idempotency hashes from run, logical call ID, tool identity, and canonical input hash.
 
-- [ ] **Step 5: Implement bounded normalization and run GREEN**
+- [x] **Step 5: Implement bounded normalization and run GREEN**
 
   Validate before allocation where possible, structurally redact declared pointers before persistence, apply generic text/key redaction second, drop annotations, preserve only safe counts/status/provenance, and build/hash/freeze `tool-result.v1`.
 

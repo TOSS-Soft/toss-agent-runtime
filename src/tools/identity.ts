@@ -1,7 +1,30 @@
-import { canonicalJson, deepFreezeJson, parseJsonBytes, sha256 } from "../protocol/json.js";
+import {
+  canonicalJson,
+  deepFreezeJson,
+  parseJsonBytes,
+  sha256,
+  type JsonValue,
+} from "../protocol/json.js";
 import { RuntimeToolError } from "./errors.js";
 import type { McpProtocolRevision, McpTransportKind } from "./types.js";
 import type { ToolServerObservation } from "./transports/types.js";
+
+export interface ToolIdentityInput {
+  readonly run_id: string;
+  readonly logical_call_id: string;
+  readonly mcp_profile_hash: `sha256:${string}`;
+  readonly discovery_snapshot_hash: `sha256:${string}`;
+  readonly server_id: string;
+  readonly tool_alias: string;
+  readonly native_tool_name: string;
+  readonly logical_arguments: JsonValue;
+}
+
+export interface DerivedToolIdentity {
+  readonly logical_input_hash: `sha256:${string}`;
+  readonly call_id: string;
+  readonly idempotency_key: `sha256:${string}`;
+}
 
 function resultInvalid(): never {
   throw new RuntimeToolError("RUNTIME_TOOL_RESULT_INVALID");
@@ -54,4 +77,24 @@ export function sameToolServerObservation(
     left.protocol_revision === right.protocol_revision &&
     left.transport === right.transport
   );
+}
+
+export function deriveToolIdentity(input: ToolIdentityInput): DerivedToolIdentity {
+  const logicalInputHash = sha256(input.logical_arguments);
+  const identity = {
+    run_id: input.run_id,
+    logical_call_id: input.logical_call_id,
+    mcp_profile_hash: input.mcp_profile_hash,
+    discovery_snapshot_hash: input.discovery_snapshot_hash,
+    server_id: input.server_id,
+    tool_alias: input.tool_alias,
+    native_tool_name: input.native_tool_name,
+    logical_input_hash: logicalInputHash,
+  };
+  const callHash = sha256({ kind: "toss-tool-call.v1", ...identity });
+  return Object.freeze({
+    logical_input_hash: logicalInputHash,
+    call_id: `tool-call-${callHash.slice("sha256:".length, "sha256:".length + 32)}`,
+    idempotency_key: sha256({ kind: "toss-tool-idempotency.v1", ...identity }),
+  });
 }
