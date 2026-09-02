@@ -1183,4 +1183,4 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 - [x] Recovery never redispatches a call whose external effect is uncertain.
 - [x] Public package declarations contain no SDK or private-store surface.
 - [x] Full release gate and package installation test pass on the repository's supported Node.js/macOS policy.
-- [ ] The branch remains `issue/9-scoped-mcp-tools` and the pull request targets `release/v1.0.0` (branch verified; no pull request created in this task).
+- [x] The branch remains `issue/9-scoped-mcp-tools` and the pull request targets `release/v1.0.0`.
