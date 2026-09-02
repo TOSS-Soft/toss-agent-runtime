@@ -870,7 +870,7 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 - Consumes: journal store/barrier, private store, authorized call, transport connection, result normalizer, clock/random ID, and fault hooks.
 - Produces: internal `ToolExecutor.invoke`, result replay, journal commands, exact dispatch count, and safe terminal outcomes.
 
-- [ ] **Step 1: Write executor RED tests**
+- [x] **Step 1: Write executor RED tests**
 
   Witness crash/fault points before prepared publication, after prepared publication, before intent, after intent, before transport dispatch, during dispatch, after native result, after result sync, and before journal completion. Assert no transport call before `TOOL_PENDING` intent, completed replay returns persisted result with zero redispatch, same key/different input conflicts, proven-unsent failure closes the ledger and reaches `FAILED`, and possible effect reaches `BLOCKED` with unresolved intent.
 
@@ -886,21 +886,21 @@ export const TOOL_HARD_LIMITS = Object.freeze({
   expect(transport.calls).toHaveLength(1);
   ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
   ```bash
   npm exec -- vitest run test/tool-executor.test.ts --maxWorkers=4
   ```
 
-- [ ] **Step 3: Implement one-dispatch execution under the run barrier**
+- [x] **Step 3: Implement one-dispatch execution under the run barrier**
 
   Capture/freeze input; compute input/call/idempotency hashes; persist `PREPARED`; append side-effect `INTENT`; resolve transport credentials; dispatch exactly once; normalize/redact/validate; publish result; append `COMPLETED` store stage; then append journal side-effect `COMPLETED` and return to `RUNNING`. Do not retry on auth, rate limit, timeout, cancellation, or native failure after possible dispatch.
 
-- [ ] **Step 4: Implement exact failure classification**
+- [x] **Step 4: Implement exact failure classification**
 
   Use `FAILED` only with transport proof that bytes were not sent. Use `UNCERTAIN` plus journal `BLOCKED` whenever delivery/effect is ambiguous. Public outcomes include only stable code, retryability, safe message, hashes, and trace identity.
 
-- [ ] **Step 5: Run GREEN and commit**
+- [x] **Step 5: Run GREEN and commit**
 
   ```bash
   npm exec -- vitest run test/tool-executor.test.ts test/journal-state-machine.test.ts test/journal-store.test.ts --maxWorkers=4
