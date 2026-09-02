@@ -316,6 +316,7 @@ describe("package metadata", () => {
     expect(expectedFiles).toEqual([...expectedFiles].sort());
 
     const sdkBoundaryDeclarations = await Promise.all([
+      readFile("dist/src/tools/transports/agentgateway.d.ts", "utf8"),
       readFile("dist/src/tools/transports/sdk-client.d.ts", "utf8"),
       readFile("dist/src/tools/transports/stdio.d.ts", "utf8"),
       readFile("dist/src/tools/transports/streamable-http.d.ts", "utf8"),

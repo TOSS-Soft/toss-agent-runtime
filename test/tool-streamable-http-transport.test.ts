@@ -436,7 +436,10 @@ describe("safe Streamable HTTP MCP transport", () => {
         };
       },
       protocol_revision: "2026-07-28",
-      approved_header_mappings: { Tenant: "/tenant", Enabled: "/nested/enabled" },
+      approved_header_mappings: {
+        "x-mcp-tenant": "/tenant",
+        "x-mcp-enabled": "/nested/enabled",
+      },
     });
     await safeFetch(ENDPOINT, {
       method: "POST",
@@ -449,13 +452,13 @@ describe("safe Streamable HTTP MCP transport", () => {
       }),
     });
 
-    expect(requests[0]?.headers.get("mcp-param-tenant")).toBe("acme");
-    expect(requests[0]?.headers.get("mcp-param-enabled")).toBe("true");
+    expect(requests[0]?.headers.get("x-mcp-tenant")).toBe("acme");
+    expect(requests[0]?.headers.get("x-mcp-enabled")).toBe("true");
     expect(requests[0]?.headers.get("accept")).toBe("application/json, text/event-stream");
     await expect(
       safeFetch(ENDPOINT, {
         method: "POST",
-        headers: { "mcp-param-attacker": "widen" },
+        headers: { "x-mcp-attacker": "widen" },
         body: "{}",
       }),
     ).rejects.toMatchObject({ code: "RUNTIME_TOOL_INVALID" });

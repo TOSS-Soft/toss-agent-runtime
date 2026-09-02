@@ -675,21 +675,21 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 - Consumes: validated `AgentgatewayProfileV1`, `GatewayCredentialCoordinator`, gateway fetch/attestation primitives, exact execution authority, and server/profile/tool scope.
 - Produces: `createAgentgatewayToolTransport(options): ToolTransportAdapter`.
 
-- [ ] **Step 1: Write gateway RED tests**
+- [x] **Step 1: Write gateway RED tests**
 
   Verify derived path `/v1/toss/mcp/{percent-encoded-server-id}`, no caller endpoint, fresh lease per scoped connection/request policy, exact run/agent/Task Contract/profile/server/tool scope, fixed correlation and attestation headers, idempotency propagation, route absence, auth, expiry, capability downgrade, protocol mismatch, cancellation, and token non-disclosure.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
   ```bash
   npm exec -- vitest run test/tool-agentgateway-transport.test.ts --maxWorkers=4
   ```
 
-- [ ] **Step 3: Implement derived-route and lease policy**
+- [x] **Step 3: Implement derived-route and lease policy**
 
   Reuse validated gateway origin and credential coordinator, percent-encode only `server_id`, require exact MCP route attestation, and emit only W3C trace, run/request, profile/snapshot, tool/call, and idempotency fields. Translate gateway errors into tool-domain codes and discard provider-domain/native bodies.
 
-- [ ] **Step 4: Run GREEN and commit**
+- [x] **Step 4: Run GREEN and commit**
 
   ```bash
   npm exec -- vitest run test/tool-agentgateway-transport.test.ts test/agentgateway-transport.test.ts test/agentgateway-credentials.test.ts --maxWorkers=4

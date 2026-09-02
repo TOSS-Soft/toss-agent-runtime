@@ -37,11 +37,19 @@ export interface FakeResolvedRouteConfiguration {
   >;
 }
 
+export interface FakeMcpRouteConfiguration {
+  readonly server_id: string;
+  readonly protocol_revision: "2025-06-18" | "2026-07-28";
+  readonly capabilities?: string;
+  readonly respond: (request: CapturedGatewayRequest) => FakeGatewayResponse;
+}
+
 export interface FakeAgentgateway {
   readonly endpoint: string;
   readonly requests: readonly CapturedGatewayRequest[];
   setResponse(path: string, response: FakeGatewayResponse): void;
   configureResolvedRoute(configuration: FakeResolvedRouteConfiguration): void;
+  configureMcpRoute(configuration: FakeMcpRouteConfiguration): void;
   close(): Promise<void>;
 }
 
@@ -60,23 +68,54 @@ function sendResponse(response: ServerResponse, fixture: FakeGatewayResponse): v
   response.end();
 }
 
+function singleHeader(request: CapturedGatewayRequest, name: string): string {
+  const value = request.headers[name];
+  if (typeof value !== "string") {
+    throw new Error(`Fake agentgateway request is missing ${name}`);
+  }
+  return value;
+}
+
 export async function startFakeAgentgateway(): Promise<FakeAgentgateway> {
   const responses = new Map<string, FakeGatewayResponse>();
+  const mcpRoutes = new Map<string, FakeMcpRouteConfiguration>();
   const requests: CapturedGatewayRequest[] = [];
   const server = createServer((request, response) => {
     void (async () => {
       const path = request.url ?? "/";
-      requests.push(
-        Object.freeze({
-          method: request.method ?? "",
-          path,
-          headers: Object.freeze({ ...request.headers }),
-          body: await readRequestBody(request),
-        }),
-      );
+      const captured = Object.freeze({
+        method: request.method ?? "",
+        path,
+        headers: Object.freeze({ ...request.headers }),
+        body: await readRequestBody(request),
+      });
+      requests.push(captured);
+      const mcpRoute = mcpRoutes.get(path);
+      const configured = mcpRoute?.respond(captured);
+      const fixture =
+        mcpRoute === undefined || configured === undefined
+          ? responses.get(path)
+          : {
+              ...configured,
+              headers: {
+                "x-toss-mcp-scope-sha256": singleHeader(
+                  captured,
+                  "x-toss-mcp-scope-sha256",
+                ),
+                "x-toss-mcp-profile-sha256": singleHeader(
+                  captured,
+                  "x-toss-mcp-profile-sha256",
+                ),
+                "x-toss-mcp-server-id": mcpRoute.server_id,
+                "x-toss-mcp-protocol-version": mcpRoute.protocol_revision,
+                "x-toss-mcp-capabilities": mcpRoute.capabilities ?? "tools",
+                "x-toss-gateway-request-id": "gateway-mcp-request-1",
+                ...configured.headers,
+              },
+            };
       sendResponse(
         response,
-        responses.get(path) ?? {
+        fixture ?? {
           status: 404,
           body: "fake agentgateway route missing",
         },
@@ -127,6 +166,12 @@ export async function startFakeAgentgateway(): Promise<FakeAgentgateway> {
         },
         body: configuration.body,
       });
+    },
+    configureMcpRoute(configuration) {
+      mcpRoutes.set(
+        `/v1/toss/mcp/${encodeURIComponent(configuration.server_id)}`,
+        configuration,
+      );
     },
     async close() {
       server.close();

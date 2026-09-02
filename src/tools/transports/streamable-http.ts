@@ -32,6 +32,7 @@ const ALLOWED_SDK_HEADERS = new Set([
   "mcp-session-id",
 ]);
 const HEADER_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/u;
+const MCP_PARAMETER_HEADER = /^x-mcp-[a-z0-9-]{1,64}$/u;
 
 export interface HttpDnsAddress {
   readonly address: string;
@@ -237,12 +238,15 @@ function approvedMappings(
         name.length < 1 ||
         name.length > 64 ||
         !HEADER_TOKEN.test(name) ||
+        !MCP_PARAMETER_HEADER.test(name) ||
         lowerNames.has(lower)
       ) {
         invalid();
       }
       lowerNames.add(lower);
-      return Object.freeze({ name, path: parsePointer(captured[name]!) });
+      const pointer = captured[name];
+      if (typeof pointer !== "string") invalid();
+      return Object.freeze({ name, path: parsePointer(pointer) });
     }),
   );
 }
@@ -339,7 +343,7 @@ function fixedHeaders(options: {
     const argumentsValue = toolArguments(options.body);
     for (const mapping of options.mappings) {
       const value = headerValue(atPointer(argumentsValue, mapping.path));
-      if (value !== null) headers.set(`Mcp-Param-${mapping.name}`, encodedHeaderValue(value));
+      if (value !== null) headers.set(mapping.name, encodedHeaderValue(value));
     }
   }
   return headers;

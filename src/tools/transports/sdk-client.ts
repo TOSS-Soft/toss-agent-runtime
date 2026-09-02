@@ -365,6 +365,7 @@ export function classifyMcpSdkError(error: unknown): RuntimeToolError {
   if (SdkHttpError.isInstance(error)) {
     if (error.status === 401) return new RuntimeToolError("RUNTIME_TOOL_AUTHENTICATION");
     if (error.status === 403) return new RuntimeToolError("RUNTIME_TOOL_POLICY_DENIED");
+    if (error.status === 404) return new RuntimeToolError("RUNTIME_TOOL_UNAVAILABLE");
     if (error.status === 429) return new RuntimeToolError("RUNTIME_TOOL_RATE_LIMIT");
     if (error.status >= 500) return new RuntimeToolError("RUNTIME_TOOL_UNAVAILABLE");
   }
