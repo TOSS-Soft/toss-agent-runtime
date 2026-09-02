@@ -712,7 +712,7 @@ export const TOOL_HARD_LIMITS = Object.freeze({
 - Consumes: profile registry, three transport adapters, snapshot contracts, clock/random ID, and a snapshot persistence port.
 - Produces: `ToolSessionManager`, `openSession`, `discover`, `markListChanged`, `closeSession`, frozen `DiscoveredToolView`, and persisted `McpDiscoverySnapshotV1`.
 
-- [ ] **Step 1: Write discovery RED tests**
+- [x] **Step 1: Write discovery RED tests**
 
   Cover one session per run/profile, no cross-run reuse, full pagination, page/tool/schema/time bounds, changing order normalization, duplicate cursors, native duplicate tools, alias collisions, profile/live schema equality, risky annotation mismatch, harmless less-risky annotations, injected server descriptions ignored, stale notification, expiry, reconnect identity/revision change, partial-server failure, per-server serialization, and persistence before exposure.
 
@@ -726,17 +726,17 @@ export const TOOL_HARD_LIMITS = Object.freeze({
   expect(view.tools[0]?.description).toBe(profile.servers[0]?.tools[0]?.description);
   ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
   ```bash
   npm exec -- vitest run test/tool-discovery.test.ts --maxWorkers=4
   ```
 
-- [ ] **Step 3: Implement virtual-session and discovery state**
+- [x] **Step 3: Implement virtual-session and discovery state**
 
   Connect only configured profile servers, paginate to completion under profile/hard limits, canonical-compare native input/output schemas, retain annotations solely as captured mismatch evidence, build explicit alias mappings, persist the complete snapshot, then publish the model view. A list-change event atomically marks the snapshot stale; new calls require bounded rediscovery while already-dispatched calls retain their captured snapshot.
 
-- [ ] **Step 4: Run GREEN and commit**
+- [x] **Step 4: Run GREEN and commit**
 
   ```bash
   npm exec -- vitest run test/tool-discovery.test.ts test/tool-contracts.test.ts --maxWorkers=4
