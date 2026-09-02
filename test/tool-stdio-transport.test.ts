@@ -18,9 +18,9 @@ const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
   await Promise.all(
-    temporaryDirectories.splice(0).map(async (directory) =>
-      rm(directory, { force: true, recursive: true }),
-    ),
+    temporaryDirectories
+      .splice(0)
+      .map(async (directory) => rm(directory, { force: true, recursive: true })),
   );
 });
 
@@ -123,9 +123,9 @@ describe("hardened stdio MCP transport", () => {
       cwd: root,
       shell: false,
     });
-    await expect(
-      connection.listTools(null, new AbortController().signal),
-    ).resolves.toMatchObject({ tools: [{ name: "echo" }] });
+    await expect(connection.listTools(null, new AbortController().signal)).resolves.toMatchObject({
+      tools: [{ name: "echo" }],
+    });
 
     await connection.close(new AbortController().signal);
     expect(observations.some((observation) => observation.event === "exit")).toBe(true);
@@ -138,9 +138,7 @@ describe("hardened stdio MCP transport", () => {
   ])("rejects a %s before spawning", async (_name, change) => {
     const root = await temporaryDirectory();
     expect(() =>
-      createStdioToolTransport(
-        adapterOptions({ ...binding(root), ...change }),
-      ),
+      createStdioToolTransport(adapterOptions({ ...binding(root), ...change })),
     ).toThrowError(expect.objectContaining({ code: "RUNTIME_TOOL_INVALID" }));
   });
 
@@ -209,9 +207,9 @@ describe("hardened stdio MCP transport", () => {
     });
 
     await new Promise<void>((resolve) => setTimeout(resolve, 130));
-    await expect(
-      connection.listTools(null, new AbortController().signal),
-    ).rejects.toMatchObject({ code: "RUNTIME_TOOL_AUTHENTICATION" });
+    await expect(connection.listTools(null, new AbortController().signal)).rejects.toMatchObject({
+      code: "RUNTIME_TOOL_AUTHENTICATION",
+    });
     expect(observations.some((observation) => observation.event === "exit")).toBe(true);
   });
 

@@ -41,10 +41,7 @@ export class FakeMcpSdkClient implements ToolSdkClientPort {
     return this.serverCapabilities;
   }
 
-  listToolsPage(
-    cursor: string | null,
-    options: ToolSdkRequestOptions,
-  ): Promise<unknown> {
+  listToolsPage(cursor: string | null, options: ToolSdkRequestOptions): Promise<unknown> {
     void options;
     this.listCursors.push(cursor);
     if (this.listError !== undefined) return Promise.reject(this.listError);

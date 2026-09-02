@@ -98,14 +98,8 @@ export async function startFakeAgentgateway(): Promise<FakeAgentgateway> {
           : {
               ...configured,
               headers: {
-                "x-toss-mcp-scope-sha256": singleHeader(
-                  captured,
-                  "x-toss-mcp-scope-sha256",
-                ),
-                "x-toss-mcp-profile-sha256": singleHeader(
-                  captured,
-                  "x-toss-mcp-profile-sha256",
-                ),
+                "x-toss-mcp-scope-sha256": singleHeader(captured, "x-toss-mcp-scope-sha256"),
+                "x-toss-mcp-profile-sha256": singleHeader(captured, "x-toss-mcp-profile-sha256"),
                 "x-toss-mcp-server-id": mcpRoute.server_id,
                 "x-toss-mcp-protocol-version": mcpRoute.protocol_revision,
                 "x-toss-mcp-capabilities": mcpRoute.capabilities ?? "tools",
@@ -168,10 +162,7 @@ export async function startFakeAgentgateway(): Promise<FakeAgentgateway> {
       });
     },
     configureMcpRoute(configuration) {
-      mcpRoutes.set(
-        `/v1/toss/mcp/${encodeURIComponent(configuration.server_id)}`,
-        configuration,
-      );
+      mcpRoutes.set(`/v1/toss/mcp/${encodeURIComponent(configuration.server_id)}`, configuration);
     },
     async close() {
       server.close();

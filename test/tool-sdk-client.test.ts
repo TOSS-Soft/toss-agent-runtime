@@ -12,10 +12,7 @@ import {
   createToolSdkClientFactory,
 } from "../src/tools/transports/sdk-client.js";
 import type { McpProtocolRevision } from "../src/tools/types.js";
-import {
-  fakeMcpClientFactoryCapture,
-  startOfficialMcpServer,
-} from "./helpers/fake-mcp.js";
+import { fakeMcpClientFactoryCapture, startOfficialMcpServer } from "./helpers/fake-mcp.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 
@@ -60,10 +57,7 @@ describe("private MCP SDK client boundary", () => {
       name: "repo.search",
       annotations: { read_only_hint: true },
     });
-    const second = await connection.listTools(
-      first.next_cursor,
-      new AbortController().signal,
-    );
+    const second = await connection.listTools(first.next_cursor, new AbortController().signal);
     expect(second.next_cursor).toBeNull();
     expect(second.tools.map((tool) => tool.name)).toEqual(["repo.get"]);
 
@@ -165,9 +159,9 @@ describe("private MCP SDK client boundary", () => {
     const connection = await pending;
     client.listError = new DOMException("native abort detail", "AbortError");
 
-    await expect(
-      connection.listTools(null, new AbortController().signal),
-    ).rejects.toMatchObject({ code: "RUNTIME_TOOL_CANCELLED" });
+    await expect(connection.listTools(null, new AbortController().signal)).rejects.toMatchObject({
+      code: "RUNTIME_TOOL_CANCELLED",
+    });
     const controller = new AbortController();
     controller.abort();
     await expect(connection.close(controller.signal)).rejects.toMatchObject({
@@ -183,14 +177,14 @@ describe("private MCP SDK client boundary", () => {
     const connection = await pending;
 
     client.listResult = { tools: [{ name: "bad", inputSchema: null }] };
-    await expect(
-      connection.listTools(null, new AbortController().signal),
-    ).rejects.toMatchObject({ code: "RUNTIME_TOOL_RESULT_INVALID" });
+    await expect(connection.listTools(null, new AbortController().signal)).rejects.toMatchObject({
+      code: "RUNTIME_TOOL_RESULT_INVALID",
+    });
 
     client.listResult = { tools: [], nextCursor: "x".repeat(4_097) };
-    await expect(
-      connection.listTools(null, new AbortController().signal),
-    ).rejects.toMatchObject({ code: "RUNTIME_TOOL_RESULT_INVALID" });
+    await expect(connection.listTools(null, new AbortController().signal)).rejects.toMatchObject({
+      code: "RUNTIME_TOOL_RESULT_INVALID",
+    });
   });
 
   it.each([

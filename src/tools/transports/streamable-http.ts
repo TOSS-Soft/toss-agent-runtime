@@ -9,7 +9,12 @@ import {
 } from "@modelcontextprotocol/client";
 
 import type { RuntimeMode, SecretReference } from "../../config/types.js";
-import { canonicalJson, deepFreezeJson, parseJsonBytes, type JsonValue } from "../../protocol/json.js";
+import {
+  canonicalJson,
+  deepFreezeJson,
+  parseJsonBytes,
+  type JsonValue,
+} from "../../protocol/json.js";
 import { RuntimeToolError } from "../errors.js";
 import type { McpProtocolRevision, McpStreamableHttpBinding } from "../types.js";
 import { createToolSdkClientFactory } from "./sdk-client.js";
@@ -107,7 +112,11 @@ function unavailable(): never {
 
 function normalizedIp(address: string): string | null {
   const family = isIP(address);
-  if (family === 4) return address.split(".").map((part) => String(Number(part))).join(".");
+  if (family === 4)
+    return address
+      .split(".")
+      .map((part) => String(Number(part)))
+      .join(".");
   if (family !== 6) return null;
   try {
     const hostname = new URL(`http://[${address}]/`).hostname;
@@ -203,19 +212,20 @@ function captureRecord<T>(value: T): T {
   }
 }
 
-function isJsonObject(
-  value: unknown,
-): value is { readonly [key: string]: JsonValue } {
+function isJsonObject(value: unknown): value is { readonly [key: string]: JsonValue } {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function parsePointer(pointer: string): readonly string[] {
   if (pointer === "" || !pointer.startsWith("/") || pointer.length > 1_024) invalid();
   return Object.freeze(
-    pointer.slice(1).split("/").map((token) => {
-      if (/~(?:[^01]|$)/u.test(token)) invalid();
-      return token.replaceAll("~1", "/").replaceAll("~0", "~");
-    }),
+    pointer
+      .slice(1)
+      .split("/")
+      .map((token) => {
+        if (/~(?:[^01]|$)/u.test(token)) invalid();
+        return token.replaceAll("~1", "/").replaceAll("~0", "~");
+      }),
   );
 }
 
@@ -293,11 +303,7 @@ function toolArguments(body: string | null): unknown {
   } catch {
     return undefined;
   }
-  if (
-    !isJsonObject(parsed) ||
-    parsed.method !== "tools/call" ||
-    !isJsonObject(parsed.params)
-  ) {
+  if (!isJsonObject(parsed) || parsed.method !== "tools/call" || !isJsonObject(parsed.params)) {
     return undefined;
   }
   return parsed.params.arguments;
@@ -452,7 +458,9 @@ async function boundedResponse(response: Response): Promise<Response> {
       bytes += next.value.byteLength;
       if (bytes > MAX_HTTP_BODY_BYTES) {
         await reader.cancel();
-        controller.error(new SdkError(SdkErrorCode.InvalidResult, "Response body exceeded its limit"));
+        controller.error(
+          new SdkError(SdkErrorCode.InvalidResult, "Response body exceeded its limit"),
+        );
         return;
       }
       controller.enqueue(next.value);
@@ -472,11 +480,13 @@ export function createSafeStreamableHttpFetch(
   options: CreateSafeStreamableHttpFetchOptions,
 ): SafeHttpFetch {
   const endpoint = new URL(options.endpoint.href);
-  const approvedAddresses = Object.freeze(options.approved_addresses.map((address) => {
-    const normalized = normalizedIp(address);
-    if (normalized === null) invalid();
-    return normalized;
-  }));
+  const approvedAddresses = Object.freeze(
+    options.approved_addresses.map((address) => {
+      const normalized = normalizedIp(address);
+      if (normalized === null) invalid();
+      return normalized;
+    }),
+  );
   const mappings = approvedMappings(options.approved_header_mappings);
   if (mappings.length > 0 && options.protocol_revision !== "2026-07-28") invalid();
   const now = options.now ?? (() => new Date());
@@ -547,8 +557,7 @@ export function createSafeStreamableHttpFetch(
       network.response.redirected ||
       (network.response.status >= 300 && network.response.status < 400)
     ) {
-      const status =
-        network.response instanceof Response ? network.response.status : 500;
+      const status = network.response instanceof Response ? network.response.status : 500;
       throw new SdkHttpError(SdkErrorCode.SendFailed, "Redirect refused", { status });
     }
     return await boundedResponse(network.response);

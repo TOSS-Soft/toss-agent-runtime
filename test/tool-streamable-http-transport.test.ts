@@ -131,9 +131,7 @@ function fakeMcpNetwork(
   };
 }
 
-function adapterOptions(
-  overrides: Readonly<Record<string, unknown>> = {},
-) {
+function adapterOptions(overrides: Readonly<Record<string, unknown>> = {}) {
   return {
     binding: binding(),
     mode: "production" as const,
@@ -157,9 +155,7 @@ describe("safe Streamable HTTP MCP transport", () => {
     ["fragment", "https://example.test/mcp#fragment", "development"],
   ] as const)("rejects %s", (_name, endpoint, mode) => {
     expect(() =>
-      createStreamableHttpToolTransport(
-        adapterOptions({ binding: binding(endpoint), mode }),
-      ),
+      createStreamableHttpToolTransport(adapterOptions({ binding: binding(endpoint), mode })),
     ).toThrowError(expect.objectContaining({ code: "RUNTIME_TOOL_INVALID" }));
   });
 
@@ -249,9 +245,9 @@ describe("safe Streamable HTTP MCP transport", () => {
       signal: new AbortController().signal,
       on_tools_changed: () => undefined,
     });
-    await expect(
-      connection.listTools(null, new AbortController().signal),
-    ).resolves.toMatchObject({ tools: [{ name: "echo" }] });
+    await expect(connection.listTools(null, new AbortController().signal)).resolves.toMatchObject({
+      tools: [{ name: "echo" }],
+    });
     await expect(
       connection.callTool(
         { name: "echo", arguments: { value: "hello" }, trusted_meta: null },

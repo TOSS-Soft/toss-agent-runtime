@@ -126,10 +126,13 @@ function capturedRecord<T>(value: T): T {
 function parsePointer(pointer: string): readonly string[] {
   if (pointer === "" || !pointer.startsWith("/") || pointer.length > 512) invalid();
   return Object.freeze(
-    pointer.slice(1).split("/").map((token) => {
-      if (/~(?:[^01]|$)/u.test(token)) invalid();
-      return token.replaceAll("~1", "/").replaceAll("~0", "~");
-    }),
+    pointer
+      .slice(1)
+      .split("/")
+      .map((token) => {
+        if (/~(?:[^01]|$)/u.test(token)) invalid();
+        return token.replaceAll("~1", "/").replaceAll("~0", "~");
+      }),
   );
 }
 
@@ -618,7 +621,9 @@ async function boundedResponse(response: Response): Promise<Response> {
       total += next.value.byteLength;
       if (total > MAX_HTTP_BODY_BYTES) {
         await reader.cancel();
-        controller.error(new SdkError(SdkErrorCode.InvalidResult, "Response body exceeded its limit"));
+        controller.error(
+          new SdkError(SdkErrorCode.InvalidResult, "Response body exceeded its limit"),
+        );
         return;
       }
       controller.enqueue(next.value);
@@ -673,9 +678,8 @@ function createGatewayFetch(options: {
     const scopeHash = sha256(scope);
     let token: string;
     try {
-      token = (
-        await options.credentials.resolve(options.credential_reference, signal, scope)
-      ).token;
+      token = (await options.credentials.resolve(options.credential_reference, signal, scope))
+        .token;
     } catch {
       throw new RuntimeToolError(
         signal.aborted ? "RUNTIME_TOOL_CANCELLED" : "RUNTIME_TOOL_AUTHENTICATION",

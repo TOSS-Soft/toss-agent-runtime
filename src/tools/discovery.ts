@@ -1,18 +1,8 @@
 import type { McpProfileReference } from "../agents/types.js";
-import {
-  canonicalJson,
-  deepFreezeJson,
-  parseJsonBytes,
-  type JsonValue,
-} from "../protocol/json.js";
-import {
-  hashMcpDiscoverySnapshot,
-  parseMcpDiscoverySnapshot,
-} from "./contracts.js";
+import { canonicalJson, deepFreezeJson, parseJsonBytes, type JsonValue } from "../protocol/json.js";
+import { hashMcpDiscoverySnapshot, parseMcpDiscoverySnapshot } from "./contracts.js";
 import { RuntimeToolError } from "./errors.js";
-import {
-  captureToolServerObservation,
-} from "./identity.js";
+import { captureToolServerObservation } from "./identity.js";
 import type { McpProfileRegistry, RegisteredMcpProfile } from "./profile.js";
 import type {
   McpDiscoveredServerV1,
@@ -290,8 +280,12 @@ function validateNativeTool(
   }
   const annotations = capturedJson(native.annotations);
   if (
-    ![annotations.read_only_hint, annotations.destructive_hint, annotations.idempotent_hint,
-      annotations.open_world_hint].every((value) => value === null || typeof value === "boolean")
+    ![
+      annotations.read_only_hint,
+      annotations.destructive_hint,
+      annotations.idempotent_hint,
+      annotations.open_world_hint,
+    ].every((value) => value === null || typeof value === "boolean")
   ) {
     resultInvalid();
   }
@@ -321,7 +315,7 @@ function validPage(value: unknown): value is {
     Array.isArray((value as { readonly tools?: unknown }).tools) &&
     ((value as { readonly next_cursor?: unknown }).next_cursor === null ||
       (typeof (value as { readonly next_cursor?: unknown }).next_cursor === "string" &&
-        ((value as { readonly next_cursor: string }).next_cursor.length > 0) &&
+        (value as { readonly next_cursor: string }).next_cursor.length > 0 &&
         Buffer.byteLength((value as { readonly next_cursor: string }).next_cursor) <= 4_096))
   );
 }
@@ -547,10 +541,7 @@ export function createToolSessionManager(
     }
 
     function markListChanged(serverId: string): void {
-      if (
-        closed ||
-        !profile.profile.servers.some((server) => server.server_id === serverId)
-      ) {
+      if (closed || !profile.profile.servers.some((server) => server.server_id === serverId)) {
         return;
       }
       dirty = true;
@@ -569,10 +560,7 @@ export function createToolSessionManager(
         return serialize(async () => {
           ensureActive(signal);
           if (currentView !== null && !dirty && !currentView.stale) return currentView;
-          const deadline = discoveryDeadline(
-            signal,
-            profile.profile.limits.discovery_timeout_ms,
-          );
+          const deadline = discoveryDeadline(signal, profile.profile.limits.discovery_timeout_ms);
           const previousSnapshot = currentSnapshot;
           const previousConnections = connections;
           const discoveredConnections = new Map<string, ToolTransportConnection>();

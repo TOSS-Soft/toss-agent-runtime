@@ -146,7 +146,9 @@ function toolListPage(value: unknown): ToolListPage {
   const nextCursor = copied.nextCursor;
   if (
     nextCursor !== undefined &&
-    (typeof nextCursor !== "string" || nextCursor.length < 1 || nextCursor.length > MAX_CURSOR_LENGTH)
+    (typeof nextCursor !== "string" ||
+      nextCursor.length < 1 ||
+      nextCursor.length > MAX_CURSOR_LENGTH)
   ) {
     resultInvalid();
   }
@@ -178,8 +180,7 @@ function nativeContent(value: unknown): NativeToolContent {
         type: "resource-link",
         uri: stringField(value.uri, 4_096),
         name: stringField(value.name, 256),
-        mime_type:
-          value.mimeType === undefined ? null : stringField(value.mimeType, 256),
+        mime_type: value.mimeType === undefined ? null : stringField(value.mimeType, 256),
       });
     case "resource": {
       if (!isRecord(value.resource)) resultInvalid();
@@ -195,9 +196,7 @@ function nativeContent(value: unknown): NativeToolContent {
         type: "embedded-resource",
         uri: stringField(value.resource.uri, 4_096),
         mime_type:
-          value.resource.mimeType === undefined
-            ? null
-            : stringField(value.resource.mimeType, 256),
+          value.resource.mimeType === undefined ? null : stringField(value.resource.mimeType, 256),
         text: text === undefined ? null : stringField(text, 4 * 1024 * 1024),
         blob_base64: blob === undefined ? null : stringField(blob, 4 * 1024 * 1024),
       });
@@ -224,8 +223,7 @@ function nativeCallResult(value: unknown): NativeToolCallResult {
   }
   return Object.freeze({
     content: Object.freeze(copied.content.map((content) => nativeContent(content))),
-    structured_content:
-      copied.structuredContent === undefined ? null : copied.structuredContent,
+    structured_content: copied.structuredContent === undefined ? null : copied.structuredContent,
     is_error: copied.isError === true,
   });
 }
@@ -247,9 +245,7 @@ function safeCallRequest(request: NativeToolCallRequest): ToolSdkCallParams {
   try {
     argumentsCopy = jsonObject(request.arguments, NATIVE_FRAME_LIMITS);
     metadataCopy =
-      request.trusted_meta === null
-        ? undefined
-        : jsonObject(request.trusted_meta, SCHEMA_LIMITS);
+      request.trusted_meta === null ? undefined : jsonObject(request.trusted_meta, SCHEMA_LIMITS);
   } catch (error) {
     if (error instanceof RuntimeToolError) throw error;
     inputInvalid();
@@ -265,8 +261,7 @@ function protocolRevisionOptions(revision: McpProtocolRevision): ToolSdkClientCr
   const supportedProtocolVersions: readonly [McpProtocolRevision] = Object.freeze([revision]);
   return Object.freeze({
     supported_protocol_versions: supportedProtocolVersions,
-    version_negotiation:
-      revision === "2026-07-28" ? Object.freeze({ pin: revision }) : "legacy",
+    version_negotiation: revision === "2026-07-28" ? Object.freeze({ pin: revision }) : "legacy",
     client_capabilities: Object.freeze({}),
     accepts_server_requests: false,
     auto_fulfill: false,
@@ -456,25 +451,15 @@ export function createToolSdkClientFactory(
         if (port.getNegotiatedProtocolVersion() !== request.protocol_revision) {
           throw new RuntimeToolError("RUNTIME_TOOL_PROTOCOL_DOWNGRADE");
         }
-        const server = serverObservation(
-          port,
-          request.protocol_revision,
-          request.transport_kind,
-        );
+        const server = serverObservation(port, request.protocol_revision, request.transport_kind);
         const connection: ToolTransportConnection = {
           server,
           async listTools(cursor: string | null, signal: AbortSignal): Promise<ToolListPage> {
-            if (
-              cursor !== null &&
-              (cursor.length < 1 || cursor.length > MAX_CURSOR_LENGTH)
-            ) {
+            if (cursor !== null && (cursor.length < 1 || cursor.length > MAX_CURSOR_LENGTH)) {
               inputInvalid();
             }
             const raw = await sdkOperation(async () =>
-              port.listToolsPage(
-                cursor,
-                requestOptions(signal, request.timeout_ms),
-              ),
+              port.listToolsPage(cursor, requestOptions(signal, request.timeout_ms)),
             );
             return toolListPage(raw);
           },

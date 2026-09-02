@@ -55,10 +55,12 @@ afterEach(async () => {
   await Promise.all(activeGateways.splice(0).map(async (gateway) => gateway.close()));
 });
 
-function credentials(options: {
-  readonly scopes?: unknown[];
-  readonly expires_at?: string;
-} = {}) {
+function credentials(
+  options: {
+    readonly scopes?: unknown[];
+    readonly expires_at?: string;
+  } = {},
+) {
   const provider: GatewayCredentialProvider = {
     resolve(_reference, resolveOptions) {
       options.scopes?.push(
@@ -202,9 +204,7 @@ describe("scoped agentgateway MCP transport", () => {
     const call: NativeToolCallRequest = {
       name: "search",
       arguments: { query: "runtime" },
-      trusted_meta: toolMetadata() as unknown as NonNullable<
-        NativeToolCallRequest["trusted_meta"]
-      >,
+      trusted_meta: toolMetadata() as unknown as NonNullable<NativeToolCallRequest["trusted_meta"]>,
     };
     await expect(connection.callTool(call, new AbortController().signal)).resolves.toMatchObject({
       content: [{ type: "text", text: "gateway result" }],
@@ -213,10 +213,7 @@ describe("scoped agentgateway MCP transport", () => {
 
     expect(fake.requests.length).toBeGreaterThanOrEqual(5);
     expect(fake.requests.map((request) => request.path)).toEqual(
-      Array.from(
-        { length: fake.requests.length },
-        () => "/v1/toss/mcp/github%3Aenterprise",
-      ),
+      Array.from({ length: fake.requests.length }, () => "/v1/toss/mcp/github%3Aenterprise"),
     );
     const callRequest = fake.requests.find((request) =>
       Buffer.from(request.body).includes(Buffer.from('"method":"tools/call"')),

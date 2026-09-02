@@ -13,11 +13,7 @@ import type {
   ToolTransportAdapter,
   ToolTransportConnection,
 } from "../src/tools/transports/types.js";
-import type {
-  McpProfileServerRuleV1,
-  McpProfileV1,
-  McpStdioBinding,
-} from "../src/tools/types.js";
+import type { McpProfileServerRuleV1, McpProfileV1, McpStdioBinding } from "../src/tools/types.js";
 import { rehashMcpProfile, validMcpProfile } from "./support/tool-fixtures.js";
 
 const EXECUTION_HASH = `sha256:${"8".repeat(64)}` as const;
@@ -193,12 +189,14 @@ function store(events: string[] = []) {
   return { value, snapshots };
 }
 
-function managerFixture(options: {
-  readonly profile?: McpProfileV1;
-  readonly adapters?: Readonly<Record<string, ToolTransportAdapter>>;
-  readonly snapshot_store?: ToolDiscoverySnapshotStore;
-  readonly now?: () => Date;
-} = {}) {
+function managerFixture(
+  options: {
+    readonly profile?: McpProfileV1;
+    readonly adapters?: Readonly<Record<string, ToolTransportAdapter>>;
+    readonly snapshot_store?: ToolDiscoverySnapshotStore;
+    readonly now?: () => Date;
+  } = {},
+) {
   const profile = options.profile ?? validMcpProfile();
   const fallback = fakeAdapter([{ pages: defaultPages(profile) }]);
   return createToolSessionManager({
@@ -260,9 +258,7 @@ describe("run-scoped MCP discovery sessions", () => {
     } as const;
     const first = manager.openSession(input);
     expect(manager.openSession(input)).toBe(first);
-    expect(
-      manager.openSession({ ...input, run_id: "run-2" }),
-    ).not.toBe(first);
+    expect(manager.openSession({ ...input, run_id: "run-2" })).not.toBe(first);
     expect(() =>
       manager.openSession({
         ...input,
@@ -339,7 +335,10 @@ describe("run-scoped MCP discovery sessions", () => {
             ])
           : new Map([["<first>", { tools: [approved, extra], next_cursor: null }]]);
       const adapter = fakeAdapter([{ pages }]);
-      const session = managerFixture({ profile, adapters: { github: adapter.adapter } }).openSession({
+      const session = managerFixture({
+        profile,
+        adapters: { github: adapter.adapter },
+      }).openSession({
         run_id: "run-1",
         execution_request_hash: EXECUTION_HASH,
         profile: reference(profile),

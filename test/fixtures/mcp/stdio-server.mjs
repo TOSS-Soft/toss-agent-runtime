@@ -2,7 +2,8 @@ import { writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 const args = process.argv.slice(2);
-const option = (name) => args.find((argument) => argument.startsWith(`${name}=`))?.slice(name.length + 1);
+const option = (name) =>
+  args.find((argument) => argument.startsWith(`${name}=`))?.slice(name.length + 1);
 const observationPath = option("--observe");
 const hangInitialize = args.includes("--hang-initialize");
 const ignoreClose = args.includes("--ignore-close");

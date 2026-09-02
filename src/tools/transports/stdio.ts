@@ -1,7 +1,4 @@
-import {
-  spawn as nodeSpawn,
-  type ChildProcessWithoutNullStreams,
-} from "node:child_process";
+import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import path from "node:path";
 
 import {
@@ -108,10 +105,8 @@ export interface CreateStdioToolTransportOptions {
 
 const defaultClock: StdioClock = Object.freeze({
   now: () => new Date(),
-  setTimeout: (
-    callback: () => void,
-    milliseconds: number,
-  ): ReturnType<typeof setTimeout> => setTimeout(callback, milliseconds),
+  setTimeout: (callback: () => void, milliseconds: number): ReturnType<typeof setTimeout> =>
+    setTimeout(callback, milliseconds),
   clearTimeout: (handle: ReturnType<typeof setTimeout>): void => clearTimeout(handle),
 });
 
@@ -179,10 +174,7 @@ function validateBinding(binding: McpStdioBinding, mode: RuntimeMode): void {
     invalid();
   }
   for (const [name, value] of Object.entries(binding.environment)) {
-    if (
-      !/^[A-Za-z_][A-Za-z0-9_]{0,127}$/u.test(name) ||
-      FIXED_ENVIRONMENT_KEYS.has(name)
-    ) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/u.test(name) || FIXED_ENVIRONMENT_KEYS.has(name)) {
       invalid();
     }
     if (value.kind === "literal") {
@@ -481,9 +473,7 @@ class HardenedStdioSdkTransport implements Transport {
 
   #running(): boolean {
     return (
-      this.#child !== undefined &&
-      this.#child.exitCode === null &&
-      this.#child.signalCode === null
+      this.#child !== undefined && this.#child.exitCode === null && this.#child.signalCode === null
     );
   }
 
@@ -675,9 +665,7 @@ export function createStdioToolTransport(
         async listTools(cursor, signal) {
           if (expired) {
             throw new RuntimeToolError(
-              resolved.secret_bounded
-                ? "RUNTIME_TOOL_AUTHENTICATION"
-                : "RUNTIME_TOOL_UNAVAILABLE",
+              resolved.secret_bounded ? "RUNTIME_TOOL_AUTHENTICATION" : "RUNTIME_TOOL_UNAVAILABLE",
             );
           }
           if (closed) throw new RuntimeToolError("RUNTIME_TOOL_UNAVAILABLE");
@@ -686,9 +674,7 @@ export function createStdioToolTransport(
         async callTool(call, signal) {
           if (expired) {
             throw new RuntimeToolError(
-              resolved.secret_bounded
-                ? "RUNTIME_TOOL_AUTHENTICATION"
-                : "RUNTIME_TOOL_UNAVAILABLE",
+              resolved.secret_bounded ? "RUNTIME_TOOL_AUTHENTICATION" : "RUNTIME_TOOL_UNAVAILABLE",
             );
           }
           if (closed) throw new RuntimeToolError("RUNTIME_TOOL_UNAVAILABLE");

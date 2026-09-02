@@ -6,9 +6,7 @@ import { createMcpProfileRegistry } from "../src/tools/profile.js";
 import type { McpProfileV1 } from "../src/tools/types.js";
 import { rehashMcpProfile, validMcpProfile } from "./support/tool-fixtures.js";
 
-function configuredRuntime(
-  mutate?: (profile: McpProfileV1) => McpProfileV1,
-): RuntimeConfigV1 {
+function configuredRuntime(mutate?: (profile: McpProfileV1) => McpProfileV1): RuntimeConfigV1 {
   const base = defaultConfig("darwin", "/Users/test");
   const original: McpProfileV1 = validMcpProfile();
   const profile = mutate?.(original) ?? original;
